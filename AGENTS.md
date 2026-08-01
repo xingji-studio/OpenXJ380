@@ -70,7 +70,6 @@ XJ380/
 - User app link rules depend on the generated Ninja XAPI runtime objects under `out/xapi/`.
 
 ## ANTI-PATTERNS (THIS PROJECT)
-- Do not leak source or non-official images; `README.md` marks the project confidential.
 - Do not push directly to `main`; create a separate branch, open a PR, and merge only after review.
 - Do not edit generated Mbed TLS files marked `DO NOT EDIT`; regenerate or update wrappers instead.
 - Do not use stb font parsing on untrusted fonts; `font/ttf/stb_ttf.h` explicitly has no security guarantee.
