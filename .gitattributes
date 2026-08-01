@@ -1,0 +1,26 @@
+# Keep text files normalized in the repository and checked out with LF.
+# This prevents /bin/sh scripts from receiving CRLF line endings on checkout.
+* text=auto eol=lf
+
+# Windows command files are the only text files that should keep CRLF.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Binary files must never be line-ending converted.
+*.a binary
+*.bmp binary
+*.efi binary
+*.elf binary
+*.fd binary
+*.ico binary
+*.img binary
+*.jpg binary
+*.jpeg binary
+*.km binary
+*.o binary
+*.png binary
+*.ttf binary
+*.vmdk binary
+*.wav binary
+*.xz binary
+*.zip binary

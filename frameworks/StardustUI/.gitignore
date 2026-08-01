@@ -1,0 +1,17 @@
+*.a
+*.o
+*.elf
+build/
+
+# Example outputs
+examples/*/build/
+
+# Local tooling
+compile_commands.json
+.clangd
+
+# Rust wrapper build artifacts
+third_party/ab_glyph_rasterizer/wrapper/target/
+
+# Local upstream checkout used for reference/testing, not for commit
+third_party/ab_glyph_rasterizer/upstream/

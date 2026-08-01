@@ -1,0 +1,6 @@
+{
+  "component": "Mbed TLS",
+  "selected_license": "Apache-2.0",
+  "upstream_license_expression": "Apache-2.0 OR GPL-2.0-or-later",
+  "license_file": "third_party/mbedtls-src/LICENSE"
+}

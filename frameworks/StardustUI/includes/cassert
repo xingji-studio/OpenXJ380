@@ -1,0 +1,7 @@
+#pragma once
+
+#ifdef XJ380
+#define assert(expr) ((void)0)
+#else
+#include_next <cassert>
+#endif

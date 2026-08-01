@@ -1,0 +1,21 @@
+---
+CompileFlags:
+  Add:
+    - "-g3"
+    - "-mno-red-zone"
+    - "-nostdlib"
+    - "-ffreestanding"
+    - "-fno-builtin"
+    - "-m64"
+    - "-fno-stack-protector"
+    - "-fno-exceptions"
+    - "-fno-rtti"
+    - "-fshort-wchar"
+    - "-nostdinc"
+    - "-fno-use-cxa-atexit"
+    - "-fno-threadsafe-statics"
+    - "-I${workspaceFolder}/boot/include"
+
+Diagnostics:
+  ClangTidy:
+    FastCheckFilter: Strict

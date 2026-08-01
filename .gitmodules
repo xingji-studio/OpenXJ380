@@ -1,0 +1,3 @@
+[submodule "frameworks/StardustUI"]
+	path = frameworks/StardustUI
+	url = https://github.com/xingji-studio/StardustUI.git
