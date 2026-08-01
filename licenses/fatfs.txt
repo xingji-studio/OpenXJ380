@@ -1,0 +1,8 @@
+FatFs is copyright (C) 2026, ChaN, all right reserved.
+
+FatFs module is an open source software. Redistribution and use in source and
+binary forms, with or without modification, are permitted provided that the
+following condition is retained: this copyright notice and disclaimer are
+retained in the source code and binary redistributions.
+
+This software is provided "AS IS" without any warranty, express or implied.

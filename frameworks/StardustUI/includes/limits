@@ -1,0 +1,36 @@
+#pragma once
+
+#ifdef XJ380
+#include "../platforms/xj380/xapi/stdint.h"
+#include "../platforms/xj380/xapi/krlibc.h"
+
+namespace std {
+template <typename T>
+struct numeric_limits;
+
+template <>
+struct numeric_limits<float> {
+    static constexpr float max() { return __FLT_MAX__; }
+};
+
+template <>
+struct numeric_limits<double> {
+    static constexpr double max() { return __DBL_MAX__; }
+    static double infinity() { return __builtin_huge_val(); }
+    static double quiet_NaN() { return __builtin_nan(""); }
+};
+
+template <>
+struct numeric_limits<int64_t> {
+    static constexpr int64_t min() { return static_cast<int64_t>(-9223372036854775807LL - 1LL); }
+    static constexpr int64_t max() { return static_cast<int64_t>(9223372036854775807LL); }
+};
+
+template <>
+struct numeric_limits<uint64_t> {
+    static constexpr uint64_t max() { return static_cast<uint64_t>(18446744073709551615ULL); }
+};
+}
+#else
+#include_next <limits>
+#endif

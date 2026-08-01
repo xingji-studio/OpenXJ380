@@ -1,0 +1,12 @@
+#pragma once
+
+#ifdef XJ380
+typedef decltype(sizeof(0)) stardustui_cpp_size_t;
+
+inline void* operator new(stardustui_cpp_size_t, void* ptr) noexcept { return ptr; }
+inline void* operator new[](stardustui_cpp_size_t, void* ptr) noexcept { return ptr; }
+inline void operator delete(void*, void*) noexcept {}
+inline void operator delete[](void*, void*) noexcept {}
+#else
+#include_next <new>
+#endif

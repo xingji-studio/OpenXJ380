@@ -1,0 +1,1 @@
+#define MBEDTLS_NO_UDBL_DIVISION

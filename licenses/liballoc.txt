@@ -1,0 +1,5 @@
+liballoc-x86_64.a is obtained from the plos-clan/liballoc release identified by
+the XJ380 build. Before distribution, replace this file with that exact
+release's upstream license text, version, source URL, and any required source
+offer. The archive is an external binary input and its license is not present
+in this repository.

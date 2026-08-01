@@ -1,0 +1,4 @@
+lwIP is distributed under BSD-style notices carried in its source files.
+Redistributions must retain the applicable copyright notices, conditions, and
+disclaimers from the exact lwIP source files compiled into netserver.sys.
+See kmod/netserver/lwip/ for the complete notices.

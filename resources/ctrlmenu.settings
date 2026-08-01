@@ -1,0 +1,73 @@
+# XJ380 控制中心页面配置（UTF-8，字段用 | 分隔）
+# page|页面标识|侧栏标题
+# h1/h2/h3|标题；text|正文；value|左侧文字|右侧值
+# button|文字|值|按钮文字|action
+# input|文字|值|按钮文字|action
+# switch|文字|说明|状态值|action
+# divider；space|像素；dynamic|default_apps 或 network_status
+# 以 @ 开头的值由 ctrlmenu 的动态值注册表提供。
+# 可显示文字支持 中文^English 双语格式。
+
+page|system|系统^System
+h1|系统^System
+text|查看 XJ380、硬件和当前显示环境的基本信息。^View basic information about XJ380, hardware, and the current display environment.
+h2|系统信息^System Information
+value|产品^Product|XJ380 操作系统^XJ380 Operating System
+value|发行版本^Release Version|@os_version
+value|系统版本^System Version|@system_version
+value|内核版本^Kernel Version|@kernel_version
+h2|设备规格^Device Specifications
+value|处理器^Processor|@cpu
+value|运行内存^Memory|@memory
+value|系统类型^System Type|x64 操作系统，基于 x86_64 处理器^x64 operating system, based on x86_64 processors
+h3|显示^Display
+value|当前分辨率^Current Resolution|@resolution
+switch|以 MB 显示内存^Show memory in MB|关闭时以 GB 显示^Shows GB when disabled|@memory_mb|toggle_memory_unit
+
+page|network|网络^Network
+h1|网络^Network
+text|查看 NetworkManager 当前导出的连接状态。^View the connection status currently exported by NetworkManager.
+h2|运行状态^Runtime Status
+value|状态文件^Status File|/run/NetworkManager/status
+dynamic|network_status
+
+page|appearance|外观^Appearance
+h1|外观^Appearance
+text|调整桌面和控制中心的显示方式。^Adjust how the desktop and Control Center are displayed.
+h2|桌面背景^Desktop Background
+h3|壁纸文件^Wallpaper File
+input|文件路径^File Path|@background|更改^Change|edit_background
+text|输入系统内可读取的图片绝对路径，确认后桌面会使用新壁纸。^Enter an absolute path to a readable image. The desktop will use it after confirmation.
+
+page|apps|应用^Apps
+h1|应用^Apps
+text|为不同文件扩展名选择默认打开程序。^Choose default programs for file extensions.
+h2|默认应用^Default Apps
+dynamic|default_apps
+
+page|time|时间与位置^Time & Region
+h1|时间与位置^Time & Region
+text|查看当前时间并调整本地时区偏移。^View the current time and adjust the local time zone offset.
+h2|当前时间^Current Time
+value|本地时间^Local Time|@current_time
+h3|时区偏移^Time Zone Offset
+button|向东调整一小时^Move one hour east|@timezone|+1 小时^+1 Hour|timezone_plus
+button|向西调整一小时^Move one hour west|@timezone|-1 小时^-1 Hour|timezone_minus
+
+page|device|设备^Devices
+h1|设备^Devices
+text|管理输入设备及其他硬件相关选项。^Manage input devices and other hardware-related options.
+h2|鼠标^Mouse
+h3|滚轮^Scroll Wheel
+switch|控制中心滚轮反转^Reverse Control Center scrolling|反转本次控制中心会话的页面滚动方向^Reverse page scrolling for this Control Center session|@wheel_reverse|toggle_wheel_reverse
+divider
+h2|配置能力示例^Configuration Examples
+text|页面支持一级、二级、三级标题、正文、键值、右侧按钮、右侧输入框、开关、分隔线和动态列表。^Pages support headings, text, key-value rows, right-side buttons, inputs, switches, dividers, and dynamic lists.
+
+page|language|语言^Language
+h1|语言^Language
+text|切换系统显示语言。^Switch the system display language.
+h2|显示语言^Display Language
+value|当前语言^Current Language|@language
+button|中文^Chinese|@language|设为中文^Use Chinese|language_zh
+button|English^English|@language|Use English^Use English|language_en
