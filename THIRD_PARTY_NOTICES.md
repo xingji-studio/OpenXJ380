@@ -16,7 +16,7 @@ generates a distributable bundle at `out/compliance/third-party`.
 | litehtml | BSD-3-Clause | `third_party/litehtml/LICENSE` |
 | Gumbo Parser | Apache-2.0 | `third_party/litehtml/src/gumbo/LICENSE` |
 | libvterm | MIT | `third_party/libvterm/LICENSE` |
-| libwebp | BSD-3-Clause | embedded in source headers |
+| libwebp | BSD-3-Clause + PATENTS | user/browser/third_party/libwebp/COPYING; user/browser/third_party/libwebp/PATENTS; user/browser/third_party/libwebp/AUTHORS |
 | NanoSVG | Zlib | embedded in source headers |
 | Mbed TLS | Apache-2.0 | `third_party/mbedtls-license-selection.json` |
 | Lexbor | Apache-2.0 | `third_party/lexbor/LICENSE` and `NOTICE` |

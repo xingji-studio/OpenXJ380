@@ -9,7 +9,7 @@
     {"name":"litehtml","slug":"litehtml","license":"BSD-3-Clause","license_files":["third_party/litehtml/LICENSE"],"source_files":["third_party/litehtml"],"bundle_source":false},
     {"name":"Gumbo Parser","slug":"gumbo","license":"Apache-2.0","license_files":["third_party/litehtml/src/gumbo/LICENSE"],"source_files":["third_party/litehtml/src/gumbo"],"bundle_source":false},
     {"name":"libvterm","slug":"libvterm","license":"MIT","license_files":["third_party/libvterm/LICENSE"],"source_files":["third_party/libvterm"],"bundle_source":false},
-    {"name":"libwebp","slug":"libwebp","license":"BSD-3-Clause","license_files":["user/browser/third_party/libwebp/src/webp/types.h"],"source_files":["user/browser/third_party/libwebp"],"bundle_source":false},
+    {"name":"libwebp","slug":"libwebp","license":"BSD-3-Clause","license_files":["user/browser/third_party/libwebp/COPYING","user/browser/third_party/libwebp/PATENTS","user/browser/third_party/libwebp/AUTHORS"],"source_files":["user/browser/third_party/libwebp"],"bundle_source":false},
     {"name":"NanoSVG","slug":"nanosvg","license":"Zlib","license_files":["user/browser/third_party/nanosvg/nanosvg.h"],"source_files":["user/browser/third_party/nanosvg"],"bundle_source":false},
     {"name":"Mbed TLS","slug":"mbedtls","license":"Apache-2.0","license_files":["third_party/mbedtls-src/LICENSE","third_party/mbedtls-license-selection.json"],"source_files":["third_party/mbedtls-src"],"bundle_source":false},
     {"name":"Lexbor","slug":"lexbor","license":"Apache-2.0","license_files":["third_party/lexbor/LICENSE","third_party/lexbor/NOTICE"],"source_files":["third_party/lexbor"],"bundle_source":false},
