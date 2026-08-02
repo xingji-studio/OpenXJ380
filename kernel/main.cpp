@@ -12,7 +12,6 @@
 #include <fs/fatfs/fatfs.h>
 #include <fs/partition.h>
 #include <fs/vfs/devfs.h>
-#include <fs/vfs/sys.h>
 #include <fs/vfs/vfs.h>
 #include <hda/hda.h>
 #include <hda/pcspk.h>
@@ -66,8 +65,8 @@ static const char *busybox_alias_applets[] = {
     "readlink","realpath","reset",    "rm",       "rmdir",    "route",    "sed",     "sh",
     "sleep",   "sort",    "stat",     "stty",     "sync",     "tail",     "tar",     "test",
     "top",     "touch",   "tr",       "true",     "tty",      "umount",   "uname",   "uniq",
-    "unzip",   "uptime",  "usleep",   "vi",       "wc",       "wget",     "which",   "whoami",
-    "xargs",   "xxd",     "xz",       "xzcat",    "zcat",     NULL,
+    "unzip",   "uptime",  "usleep",   "vi",       "wc",       "which",   "whoami",
+    "xargs",   "xxd",     "zcat",     NULL,
 };//暴力枚举这一块，好像只能这么做了
 
 static const char *busybox_binary_path = "/apps/busybox";
