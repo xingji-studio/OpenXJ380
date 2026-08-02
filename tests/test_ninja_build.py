@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -58,6 +60,57 @@ class NinjaBuildSourceToolTests(unittest.TestCase):
             ],
             commands,
         )
+
+
+class NinjaBuildImageResourceTests(unittest.TestCase):
+    def test_default_image_staging_helpers_are_available(self) -> None:
+        # Given: the default vdisk/prepare configuration from tools.ninja_build.
+        helper_paths = (
+            "tools/stage_image_xbps.sh",
+            "tools/stage_xbps_bootstrap.sh",
+            "tools/stage_prepared_root.sh",
+            "tools/stage_elf_deps.sh",
+            "tools/stage_image_toolchain.sh",
+        )
+
+        # Then: every referenced helper is part of the public source tree.
+        for helper_path in helper_paths:
+            self.assertTrue((ROOT / helper_path).is_file(), helper_path)
+
+        self.assertTrue(os.access(ROOT / "tools/stage_elf_deps.sh", os.X_OK))
+        self.assertTrue(os.access(ROOT / "tools/stage_xbps_bootstrap.sh", os.X_OK))
+
+
+class NinjaBuildQemuFirmwareTests(unittest.TestCase):
+    def test_qemu_uses_explicit_ovmf_firmware_override(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            firmware = Path(tmp) / "OVMF test.fd"
+            firmware.write_bytes(b"firmware")
+
+            with mock.patch.dict(
+                os.environ,
+                {"OVMF_FIRMWARE": str(firmware), "SUDO": "0"},
+                clear=False,
+            ):
+                command = ninja_build.qemu_cmd()
+
+        self.assertIn(f"-bios '{firmware}'", command)
+        self.assertNotIn("-bios OVMF.fd", command)
+
+    def test_qemu_falls_back_to_system_ovmf_firmware(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            firmware = Path(tmp) / "OVMF.fd"
+            firmware.write_bytes(b"firmware")
+
+            with (
+                mock.patch.dict(os.environ, {"SUDO": "0"}, clear=False),
+                mock.patch.object(ninja_build, "OVMF_FIRMWARE_CANDIDATES", (firmware,)),
+            ):
+                os.environ.pop("OVMF_FIRMWARE", None)
+                command = ninja_build.qemu_cmd()
+
+        self.assertIn(f"-bios {firmware}", command)
+        self.assertNotIn("-bios OVMF.fd", command)
 
 
 if __name__ == "__main__":

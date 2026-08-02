@@ -44,6 +44,13 @@ class LicenseComplianceTests(unittest.TestCase):
 
         self.assertEqual([], referenced_by)
 
+    def test_root_ovmf_firmware_is_not_distributed(self) -> None:
+        self.assertFalse((ROOT / "OVMF.fd").exists())
+        tracked_paths = subprocess.check_output(
+            ["git", "ls-files", "OVMF.fd"], cwd=ROOT, text=True
+        ).splitlines()
+        self.assertEqual([], tracked_paths)
+
     def test_mbedtls_apache_selection_is_machine_readable(self) -> None:
         selection = json.loads(
             (ROOT / "third_party/mbedtls-license-selection.json").read_text(encoding="utf-8")
@@ -87,6 +94,54 @@ class LicenseComplianceTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
 
         self.assertIn("KCONFIG_NOTIMESTAMP=1", build_script)
+
+    def test_libwebp_license_material_is_complete(self) -> None:
+        libwebp_root = ROOT / "user/browser/third_party/libwebp"
+        for name in ("COPYING", "PATENTS", "AUTHORS"):
+            self.assertTrue((libwebp_root / name).is_file(), name)
+
+        manifest = json.loads(
+            (ROOT / "third_party/compliance-manifest.json").read_text(encoding="utf-8")
+        )
+        libwebp = next(component for component in manifest["components"] if component["slug"] == "libwebp")
+
+        self.assertEqual(
+            [
+                "user/browser/third_party/libwebp/COPYING",
+                "user/browser/third_party/libwebp/PATENTS",
+                "user/browser/third_party/libwebp/AUTHORS",
+            ],
+            libwebp["license_files"],
+        )
+
+        notices = (ROOT / "THIRD_PARTY_NOTICES.md").read_text(encoding="utf-8")
+        self.assertIn("user/browser/third_party/libwebp/COPYING", notices)
+        self.assertIn("user/browser/third_party/libwebp/PATENTS", notices)
+        self.assertIn("user/browser/third_party/libwebp/AUTHORS", notices)
+
+    def test_xiaolai_font_license_material_is_complete(self) -> None:
+        font_path = ROOT / "frameworks/StardustUI/fonts/xiaolai.ttf"
+        license_path = ROOT / "frameworks/StardustUI/fonts/LICENSES.md"
+
+        self.assertTrue(font_path.is_file())
+        self.assertTrue(license_path.is_file())
+
+        license_text = license_path.read_text(encoding="utf-8")
+        self.assertIn("Xiaolai SC", license_text)
+        self.assertIn("Copyright © 2020 LXGW", license_text)
+        self.assertIn("SIL OPEN FONT LICENSE Version 1.1", license_text)
+
+        manifest = json.loads(
+            (ROOT / "third_party/compliance-manifest.json").read_text(encoding="utf-8")
+        )
+        xiaolai = next(component for component in manifest["components"] if component["slug"] == "xiaolai-font")
+        self.assertEqual("OFL-1.1", xiaolai["license"])
+        self.assertEqual(["frameworks/StardustUI/fonts/LICENSES.md"], xiaolai["license_files"])
+        self.assertEqual(["frameworks/StardustUI/fonts/xiaolai.ttf"], xiaolai["source_files"])
+
+        notices = (ROOT / "THIRD_PARTY_NOTICES.md").read_text(encoding="utf-8")
+        self.assertIn("Xiaolai SC font", notices)
+        self.assertIn("frameworks/StardustUI/fonts/LICENSES.md", notices)
 
     def test_third_party_manifest_references_existing_materials(self) -> None:
         manifest = json.loads(
