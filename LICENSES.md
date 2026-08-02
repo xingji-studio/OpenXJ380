@@ -13,7 +13,7 @@ binary distribution. The command-line image installs the repository notices at
 | Musl libc `elf.h` | MIT license | `include/elf.h` | `glibc-elf-h.txt` |
 | liballoc | MIT license | `liballoc-x86_64.a` origin | `liballoc.txt` |
 | XJ380 project notices | Project notice | `THIRD_PARTY_NOTICES.md` | `THIRD_PARTY_NOTICES.md` |
-| MikanOS hankaku | Apache-2.0 license | `font/hankaku.bin` `third_party/mikanos-hankaku/hankaku.txt` | `mikanos.txt` |
+| MikanOS hankaku font | Apache-2.0 | `third_party/mikanos-hankaku`; `font/hankaku.bin` | `third-party compliance bundle` |
 
 ## Retained Linux compatibility payload
 
