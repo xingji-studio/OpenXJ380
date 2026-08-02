@@ -1,4 +1,6 @@
 /* See LICENSE file for copyright and license details. */
+/* libutf is under MIT license. License file third_party/libutf/LICENSE */
+
 #include <proto.hpp>
 
 /* lookup table for the number of bytes expected in a sequence */

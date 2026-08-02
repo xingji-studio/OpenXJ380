@@ -10,9 +10,10 @@ binary distribution. The command-line image installs the repository notices at
 | --- | --- | --- | --- |
 | FatFs | ChaN permissive license | `driver/fs/fatfs/ff.cpp` | `fatfs.txt` |
 | lwIP | BSD-style | `kmod/netserver/lwip/` | `lwip.txt` |
-| GNU libc `elf.h` | LGPL-2.1-or-later | `include/elf.h` | `glibc-elf-h.txt` |
-| liballoc | Upstream license required | `liballoc-x86_64.a` origin | `liballoc.txt` |
+| Musl libc `elf.h` | MIT license | `include/elf.h` | `glibc-elf-h.txt` |
+| liballoc | MIT license | `liballoc-x86_64.a` origin | `liballoc.txt` |
 | XJ380 project notices | Project notice | `THIRD_PARTY_NOTICES.md` | `THIRD_PARTY_NOTICES.md` |
+| MikanOS hankaku | Apache-2.0 license | `font/hankaku.bin` `third_party/mikanos-hankaku/hankaku.txt` | `mikanos.txt` |
 
 ## Retained Linux compatibility payload
 
