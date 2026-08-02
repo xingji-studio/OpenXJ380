@@ -22,6 +22,7 @@ generates a distributable bundle at `out/compliance/third-party`.
 | Lexbor | Apache-2.0 | `third_party/lexbor/LICENSE` and `NOTICE` |
 | StardustUI | MIT | `frameworks/StardustUI/LICENSE` |
 | RapidJSON | MIT | embedded in `rapidjson.h` |
+| parson JSON parser | MIT | `third_party/parson/LICENSE`; `third_party/parson/SOURCE.md`; `lib/xapi_json_impl.inc` |
 | Rust alloc/compiler_builtins | Apache-2.0 OR MIT | `third_party/rust-runtime` |
 | BusyBox 1.31.1 | GPL-2.0-only | `third_party/busybox-source` |
 | MikanOS hankaku.bin | Apache-2.0 | `font/hankaku.bin` |
