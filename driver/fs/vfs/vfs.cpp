@@ -20,6 +20,7 @@
 #include <syscall/syscall.h>
 #include <device.h>
 #include <task/poll.h>
+#include <rng.h>
 
 vfs_node_t rootdir = NULL;
 
@@ -519,9 +520,12 @@ vfs_node_t vfs_do_search(vfs_node_t dir, const char *name) {
     return child;
 }
 
-static vfs_node_t vfs_open_impl(const char *str, bool follow_final_symlink, bool allow_alias) {
+static constexpr unsigned VFS_MAX_LINK_DEPTH = 40;
+
+static vfs_node_t vfs_open_impl(const char *str, bool follow_final_symlink, bool allow_alias, unsigned link_depth) {
     if (unlikely(str == NULL)) return NULL;
     if (unlikely(str[0] != '/')) return NULL;
+    if (unlikely(link_depth > VFS_MAX_LINK_DEPTH)) return NULL;
     if (str[1] == '\0') return rootdir; // 根目录
 
     char *path = strdup(str + 1);
@@ -566,7 +570,7 @@ static vfs_node_t vfs_open_impl(const char *str, bool follow_final_symlink, bool
                 target_path[len] = '\0';
                 if (target_path[0] == '/')
                 {
-                    target = vfs_open(target_path);
+                    target = vfs_open_impl(target_path, true, true, link_depth + 1);
                 }
                 else
                 {
@@ -586,7 +590,7 @@ static vfs_node_t vfs_open_impl(const char *str, bool follow_final_symlink, bool
                     free(joined_target);
                     free(parent_path);
                     if (full_target == NULL) goto err;
-                    target = vfs_open(full_target);
+                    target = vfs_open_impl(full_target, true, true, link_depth + 1);
                     free(full_target);
                 }
                 if (!dynamic_symlink) current->linkto = target;
@@ -607,7 +611,7 @@ err:
         char *alias_target = vfs_alias_target_dup(str);
         if (alias_target != NULL) {
             write_serial_fmt("[busybox-debug] vfs_alias_hit %s -> %s\n", str, alias_target);
-            vfs_node_t alias_node = vfs_open_impl(alias_target, follow_final_symlink, false);
+            vfs_node_t alias_node = vfs_open_impl(alias_target, follow_final_symlink, false, link_depth + 1);
             free(alias_target);
             return alias_node;
         }
@@ -616,11 +620,11 @@ err:
 }
 
 vfs_node_t vfs_open(const char *str) {
-    return vfs_open_impl(str, true, true);
+    return vfs_open_impl(str, true, true, 0);
 }
 
 vfs_node_t vfs_open_no_follow(const char *str) {
-    return vfs_open_impl(str, false, true);
+    return vfs_open_impl(str, false, true, 0);
 }
 
 void vfs_update(vfs_node_t node) {
@@ -925,32 +929,94 @@ void *general_map(vfs_read_t read_callback, void *file, uint64_t addr, uint64_t 
 
 spin_t get_path_lock = SPIN_INIT;
 
-// 使用请记得free掉返回的buff
-char *vfs_get_fullpath(vfs_node_t node) {
+// The caller owns the returned absolute path.
+char *vfs_get_fullpath(vfs_node_t node)
+{
     if (node == NULL) return NULL;
-    int inital = 32;
+
     spin_lock(&get_path_lock);
-    vfs_node_t *nodes = (vfs_node_t *)malloc(sizeof(vfs_node_t) * inital);
-    // not_null_assets(nodes, "vfs_get_fullpath: null alloc.");
-    int count = 0;
-    for (vfs_node_t cur = node; cur; cur = cur->parent) {
-        if (count >= inital) {
-            inital *= 2;
-            nodes   = (vfs_node_t *)realloc((void *)nodes, (size_t)(sizeof(vfs_node_t) * inital));
+
+    size_t capacity = 32;
+    size_t count    = 0;
+    vfs_node_t *nodes = (vfs_node_t *)malloc(sizeof(vfs_node_t) * capacity);
+    if (nodes == NULL)
+    {
+        spin_unlock(&get_path_lock);
+        return NULL;
+    }
+
+    for (vfs_node_t current = node; current != NULL; current = current->parent)
+    {
+        if (count == capacity)
+        {
+            if (capacity > (size_t)-1 / 2 / sizeof(vfs_node_t))
+            {
+                free(nodes);
+                spin_unlock(&get_path_lock);
+                return NULL;
+            }
+
+            capacity *= 2;
+            vfs_node_t *expanded = (vfs_node_t *)realloc(nodes, sizeof(vfs_node_t) * capacity);
+            if (expanded == NULL)
+            {
+                free(nodes);
+                spin_unlock(&get_path_lock);
+                return NULL;
+            }
+            nodes = expanded;
         }
-        nodes[count++] = cur;
+        nodes[count++] = current;
     }
-    // 正常的路径都不应该超过这个数值
-    char *buff = (char *)malloc(256);
-    strcpy(buff, "/");
-    for (int j = count - 1; j >= 0; j--) {
-        if (nodes[j] == rootdir) continue;
-        strcat(buff, nodes[j]->name);
-        if (j != 0) strcat(buff, "/");
+
+    size_t path_length = 1;
+    for (size_t index = count; index > 0; index--)
+    {
+        vfs_node_t current = nodes[index - 1];
+        if (current == rootdir) continue;
+        if (current->name == NULL)
+        {
+            free(nodes);
+            spin_unlock(&get_path_lock);
+            return NULL;
+        }
+
+        size_t name_length = strlen(current->name);
+        size_t separator   = index > 1 ? 1 : 0;
+        if (name_length > (size_t)-1 - path_length - separator - 1)
+        {
+            free(nodes);
+            spin_unlock(&get_path_lock);
+            return NULL;
+        }
+        path_length += name_length + separator;
     }
+
+    char *path = (char *)malloc(path_length + 1);
+    if (path == NULL)
+    {
+        free(nodes);
+        spin_unlock(&get_path_lock);
+        return NULL;
+    }
+
+    char *cursor = path;
+    *cursor++ = '/';
+    for (size_t index = count; index > 0; index--)
+    {
+        vfs_node_t current = nodes[index - 1];
+        if (current == rootdir) continue;
+
+        size_t name_length = strlen(current->name);
+        memcpy(cursor, current->name, name_length);
+        cursor += name_length;
+        if (index > 1) *cursor++ = '/';
+    }
+    *cursor = '\0';
+
     free(nodes);
     spin_unlock(&get_path_lock);
-    return buff;
+    return path;
 }
 
 char *at_resolve_pathname(int dirfd, char *pathname) {
@@ -1357,23 +1423,7 @@ static size_t urandom_read(int drive, uint8_t *buffer, size_t number, size_t lba
     UNUSED(lba);
     if (buffer == NULL) return 0;
 
-    tm tm_now;
-    time_read(&tm_now);
-    uint64_t seed = nanoTime() ^ ((uint64_t)mktime(&tm_now) << 32);
-    tcb_t task = get_current_task();
-    if (task != NULL)
-    {
-        seed ^= (uint64_t)task->tid;
-        if (task->parent_group != NULL) seed ^= ((uint64_t)task->parent_group->pid << 16);
-    }
-
-    for (size_t i = 0; i < number; i++)
-    {
-        seed ^= seed << 13;
-        seed ^= seed >> 7;
-        seed ^= seed << 17;
-        buffer[i] = (uint8_t)(seed & 0xffU);
-    }
+    get_random_bytes(buffer, number);
     return number;
 }
 

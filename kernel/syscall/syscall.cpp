@@ -680,15 +680,15 @@ extern "C" uint64_t c_syscall_handler(struct X64_REGS *regs, uint64_t user_rsp)
     case XAPI_POWER_ACTION: regs->rax = (uint64_t)-ENOSYS; break;
     case XAPI_NOTIFY_SEND: case XAPI_NOTIFY_SET_PROCOR: regs->rax = (uint64_t)-ENOSYS; break;
 
-    /* XJ380API 隐藏版（严禁泄露） */
+    /* Private XJ380 extension range; this is not a stable public ABI. */
     case SXAH_CHECK_TERMINAL_INIT_STATUS: regs->rax = (uint64_t)check_terminal_init_status(); break;
     case SXAH_SYSCALL_RETURN:
         // get_current_task()->parent_group->msgprci = false;
         // message_end();
         break;
     case SXAH_MARK_IS_TERMINAL: mark_process_is_terminal(); break;
-    case SXAH_READ_OUTPUT_BUFFER: read_terminal_app_output_buffer((char *)regs->rdi); break;
-    case SXAH_WRITE_INPUT_BUFFER: write_terminal_app_output_buffer((char *)regs->rdi); break;
+    case SXAH_READ_OUTPUT_BUFFER: regs->rax = read_terminal_app_output_buffer((char *)regs->rdi); break;
+    case SXAH_WRITE_INPUT_BUFFER: regs->rax = write_terminal_app_output_buffer((const char *)regs->rdi); break;
     case SXAH_CHECK_INPUT_BUFFER: regs->rax = check_input_waiting_status(); break;
     case SXAH_UNLOCK_OUTPUT_LOCK: terminal_finish_app_output(); break;
     case SXAH_MESSAGE_ASK: regs->rax = message_ask(regs->rdi, regs->rsi, regs->rdx, regs->r10, regs->r8); break;

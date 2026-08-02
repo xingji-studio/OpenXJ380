@@ -351,7 +351,7 @@ extern "C" void handle_page_fault(struct X64_REGS *frame, uint64_t error_code)
                             : error_code & 0x10 ? "DecodeAddress"
                                                 : "Unknown";
 
-    // 长大后在学习吧！
+    // User faults may be satisfied by the process lazy-allocation map.
     if (current_task != NULL)
     {
         pcb_t current_proc = current_task->parent_group;

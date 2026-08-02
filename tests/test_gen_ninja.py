@@ -1,26 +1,37 @@
+import os
 import subprocess
+import sys
 import tempfile
 import unittest
-import os
+from functools import cache
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
+@cache
 def generated_ninja_text() -> str:
-    with tempfile.NamedTemporaryFile(suffix=".ninja") as out:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp_path = Path(temp_dir)
+        out = temp_path / "build.ninja"
+        rust_libdir = temp_path / "rustlib"
+        rust_libdir.mkdir()
+        (rust_libdir / "libcore-test.rlib").touch()
+        (rust_libdir / "libcompiler_builtins-test.rlib").touch()
+
         env = os.environ.copy()
         env["RUST_TARGET"] = "x86_64-unknown-linux-gnu"
+        env["RUST_TARGET_LIBDIR"] = str(rust_libdir)
         env.pop("DIAGNOSTICS_COLOR", None)
         env.pop("RUST_DIAGNOSTICS_COLOR", None)
         subprocess.run(
-            ["python3", "tools/gen_ninja.py", "--out", out.name],
+            [sys.executable, "tools/gen_ninja.py", "--out", str(out)],
             cwd=ROOT,
             env=env,
             check=True,
         )
-        return Path(out.name).read_text(encoding="utf-8")
+        return out.read_text(encoding="utf-8")
 
 
 class GenNinjaDependencyTests(unittest.TestCase):

@@ -17,6 +17,43 @@ static void copy(char *target, const char *source)
     *target = '\0';
 }
 
+static void read_line(char *buffer)
+{
+    buffer[0] = '\0';
+    enter_syscall(XAPI_INPUT, (uint64_t)buffer, 0, 0, 0, 0, 0);
+}
+
+static bool authenticate()
+{
+    char username[64] = {};
+    char password[64] = {};
+    if (enter_syscall(XAPI_USER_OOBE_REQUIRED, 0, 0, 0, 0, 0, 0) != 0)
+    {
+        output("First boot setup\nUsername: ");
+        read_line(username);
+        output("Password: ");
+        read_line(password);
+        int64_t result = (int64_t)enter_syscall(XAPI_USER_CREATE_FIRST, (uint64_t)username,
+                                                 (uint64_t)password, 0, 0, 0, 0);
+        for (char &ch : password) ch = '\0';
+        if (result != 0) { output("Account setup failed; registry may be invalid.\n"); return false; }
+        return true;
+    }
+
+    for (;;)
+    {
+        output("Username: ");
+        read_line(username);
+        output("Password: ");
+        read_line(password);
+        int64_t result = (int64_t)enter_syscall(XAPI_USER_LOGIN, (uint64_t)username,
+                                                 (uint64_t)password, 0, 0, 0, 0);
+        for (char &ch : password) ch = '\0';
+        if (result == 0) return true;
+        output(result == -11 ? "Too many attempts; wait and retry.\n" : "Login failed.\n");
+    }
+}
+
 static int split(char *line, char **arguments, int capacity)
 {
     int count = 0;
@@ -40,6 +77,7 @@ extern "C" int main(int argc, char *argv[], char *envp[])
     (void)envp;
 
     output("XJ380 CLI\n");
+    if (!authenticate()) return 1;
     for (;;)
     {
         output("xj380$ ");
