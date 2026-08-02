@@ -88,6 +88,23 @@ class LicenseComplianceTests(unittest.TestCase):
 
         self.assertIn("KCONFIG_NOTIMESTAMP=1", build_script)
 
+    def test_ttf_font_license_material_is_complete(self) -> None:
+        license_text = (ROOT / "font/ttf/LICENSES.md").read_text(encoding="utf-8")
+        self.assertIn("Adobe", license_text)
+        self.assertIn("Maple Mono Project Authors", license_text)
+
+        manifest = json.loads(
+            (ROOT / "third_party/compliance-manifest.json").read_text(encoding="utf-8")
+        )
+        components = {component["slug"]: component for component in manifest["components"]}
+        for slug, source_file in (
+            ("maple-font", "font/ttf/XJ380C.ttf"),
+            ("source-han-sans", "font/ttf/XJ380F.ttf"),
+        ):
+            self.assertEqual("OFL-1.1", components[slug]["license"])
+            self.assertEqual(["font/ttf/LICENSES.md"], components[slug]["license_files"])
+            self.assertEqual([source_file], components[slug]["source_files"])
+
     def test_third_party_manifest_references_existing_materials(self) -> None:
         manifest = json.loads(
             (ROOT / "third_party/compliance-manifest.json").read_text(encoding="utf-8")
