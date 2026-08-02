@@ -1,4 +1,3 @@
-// 版权所有©XINGJI Studios 2017-2026 保留所有权利。
 // XJ380图像头文件
 // GOP.hpp
 #pragma once

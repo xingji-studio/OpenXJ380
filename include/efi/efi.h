@@ -1,4 +1,3 @@
-// 版权所有©XINGJI Studios 2017-2026 保留所有权利。
 // XJ380UEFI引导头文件
 #ifndef _EFI_H_
 #define _EFI_H_
