@@ -1,7 +1,8 @@
 .vscode
 out
 esp
-serial*
+serial*.log
+serial*.txt
 .vs
 .idea/
 .trae
