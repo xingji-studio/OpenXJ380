@@ -24,7 +24,7 @@ generates a distributable bundle at `out/compliance/third-party`.
 | RapidJSON | MIT | embedded in `rapidjson.h` |
 | Rust alloc/compiler_builtins | Apache-2.0 OR MIT | `third_party/rust-runtime` |
 | BusyBox 1.31.1 | GPL-2.0-only | `third_party/busybox-source` |
-| hankaku.bin | Apache-2.0 | `font/hankaku.bin` |
+| MikanOS hankaku.bin | Apache-2.0 | `font/hankaku.bin` |
 | maple-font | SIL OPEN FONT LICENSE | `font/ttf/XJ380C.ttf` |
 | Source Han Sans font | SIL OPEN FONT LICENSE | `font/ttf/XJ380F.ttf` |
 
