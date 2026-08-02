@@ -1,3 +1,5 @@
+// Portions derived from MikanOS (https://github.com/uchan-nos/mikanos), Apache-2.0.
+
 // XJ380图像头文件
 // GOP.hpp
 #pragma once
