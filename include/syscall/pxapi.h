@@ -37,7 +37,7 @@ typedef struct {
 // XJ380API XAPI Edition
 #define XAPI_OFFEST 380
 
-// 一些隐藏的API，不对外开放，严禁泄露！
+// Private extension syscall numbers. They are internal ABI, not a security boundary.
 #define SXAH_SYSCALL_RETURN         128956723895689201      // syscall返回
 #define SXAH_CREATE_KERNEL_TERMINAL 128956723895689202      // 创建内核态进程
 #define SXAH_CHECK_USER_PASSWORD    128956723895689203      // 检查用户密码

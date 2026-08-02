@@ -35,7 +35,7 @@ extern "C" {
 #define LAPIC_LDR_OFFEST      0xd0
 #define LAPIC_DFR_OFFEST      0xe0
 #define LAPIC_SVR_OFFEST      0xf0
-// 0x100 ~ 0x2e0 懒得一个个打了，反正也用不着，要用了再说
+// 0x100-0x2e0 are reserved until a concrete interrupt vector is assigned.
 #define LAPIC_LVT_CMCI_OFFEST 0x2f0
 #define LAPIC_ICR_OFFEST      0x300
 #define LAPIC_REG_ICR0        0x300

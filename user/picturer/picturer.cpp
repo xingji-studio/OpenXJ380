@@ -24,7 +24,7 @@ static void picturer_MessagePrcor(UINT64 Type, UINT64 hData, UINT64 lData)
     }
 }
 
-// 红温了，用数学库会重复声明，只能这样了
+// Keep these helpers local because the freestanding math declarations conflict with the app runtime.
 double st_fabs(double x)
 {
     if (x < 0) { return -x; }

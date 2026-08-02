@@ -601,16 +601,15 @@ void print_box_ttfl(SHEET_INFO *sht, SHEET *csheet, char *buf, SHEET_BUFFER fc,
     print_fmt_box_ttf(sht, csheet, fc, (int)x, (int)y, size, i_width, "%s", buf);
 }
 
-extern SHEET
-    *zhe_shi_yi_ge_sha_bi_dao_ji_zhi_de_cao_zuo_da_jia_bu_yao_xue___GuoqiFish_is_shabi_and_this_var_is_cao_gao_zhi;
+extern SHEET *ttf_measurement_sheet;
 
 uint64_t calc_ttf_length(char *str, int size)
 {
-    // 懒得整了就这样吧
+    // Render into the measurement sheet and return the accumulated glyph width.
     uint32_t temp_i_width = 0;
     print_fmt_box_ttf(
         sht_img,
-        zhe_shi_yi_ge_sha_bi_dao_ji_zhi_de_cao_zuo_da_jia_bu_yao_xue___GuoqiFish_is_shabi_and_this_var_is_cao_gao_zhi,
+        ttf_measurement_sheet,
         {0, 0, 0, 0}, 0, 0, size, &temp_i_width, "%s", str);
     return temp_i_width;
 }

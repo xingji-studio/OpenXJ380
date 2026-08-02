@@ -7,6 +7,15 @@
 
 #include <fs/vfs/vfs.h>
 
+static bool image_buffer_size(int width, int height, size_t *bytes)
+{
+    if (bytes == NULL || width <= 0 || height <= 0) return false;
+    size_t pixels = (size_t)width * (size_t)height;
+    if (pixels / (size_t)width != (size_t)height || pixels > (~(size_t)0) / 4) return false;
+    *bytes = pixels * 4;
+    return true;
+}
+
 SHEET_BUFFER LCD_AlphaBlend(SHEET_BUFFER foreground_color, SHEET_BUFFER background_color, uint8_t alpha)
 {
     uint8_t       text_r   = foreground_color.r;
@@ -65,6 +74,8 @@ spin_t PPlk = SPIN_INIT;
 void PrintPicture_blend(SHEET_INFO *sht, SHEET *csheet, int x, int y, int ow, int oh, char *path)
 {
     spin_lock(&PPlk);
+    size_t output_bytes;
+    if (!image_buffer_size(ow, oh, &output_bytes)) { spin_unlock(&PPlk); return; }
     int        w, h, bpp;
     vfs_node_t v = vfs_open(path);
     if (!v)
@@ -93,7 +104,7 @@ void PrintPicture_blend(SHEET_INFO *sht, SHEET *csheet, int x, int y, int ow, in
         spin_unlock(&PPlk);
         return;
     }
-    uint8_t *b1 = (uint8_t *)malloc(ow * oh * 4);
+    uint8_t *b1 = (uint8_t *)malloc(output_bytes);
     if (!b1)
     {
         write_serial_fmt("PrintPic: output buffer allocate failed (%u bytes) for '%s' (ow=%d,oh=%d)\n",
@@ -139,6 +150,8 @@ void PrintPicture_blend(SHEET_INFO *sht, SHEET *csheet, int x, int y, int ow, in
  */
 void PrintPicture(SHEET_INFO *sht, SHEET *csheet, int x, int y, int ow, int oh, char *path)
 {
+    size_t output_bytes;
+    if (!image_buffer_size(ow, oh, &output_bytes)) return;
     int        w, h, bpp;
     vfs_node_t v = vfs_open(path);
     if (!v)
@@ -162,7 +175,7 @@ void PrintPicture(SHEET_INFO *sht, SHEET *csheet, int x, int y, int ow, int oh, 
         vfs_close(v);
         return;
     }
-    uint8_t *b1 = (uint8_t *)malloc(ow * oh * 4);
+    uint8_t *b1 = (uint8_t *)malloc(output_bytes);
     if (!b1)
     {
         write_serial_fmt("PrintPic: output buffer allocate failed (%u bytes) for '%s' (ow=%d,oh=%d)\n",
@@ -193,6 +206,9 @@ void PrintPicture(SHEET_INFO *sht, SHEET *csheet, int x, int y, int ow, int oh, 
 
 bool LoadPicture(SHEET_BUFFER *buffer, int ow, int oh, char *path)
 {
+    size_t output_bytes;
+    if (buffer == NULL || !image_buffer_size(ow, oh, &output_bytes)) return false;
+    (void)output_bytes;
     int        w, h, bpp;
     vfs_node_t v = vfs_open(path);
     if (!v)
@@ -224,6 +240,8 @@ bool LoadPicture(SHEET_BUFFER *buffer, int ow, int oh, char *path)
 
 void LoadPictureOgM(SHEET_BUFFER **buffer, char *path)
 {
+    if (buffer == NULL) return;
+    *buffer = NULL;
     int        w, h, bpp;
     vfs_node_t v = vfs_open(path);
     if (!v)
@@ -247,7 +265,15 @@ void LoadPictureOgM(SHEET_BUFFER **buffer, char *path)
         vfs_close(v);
         return;
     }
-    *buffer = (SHEET_BUFFER *)malloc((size_t)w * h * 4);
+    size_t output_bytes;
+    if (!image_buffer_size(w, h, &output_bytes))
+    {
+        stbi_image_free(b);
+        free(bf);
+        vfs_close(v);
+        return;
+    }
+    *buffer = (SHEET_BUFFER *)malloc(output_bytes);
     if (!*buffer)
     {
         write_serial_fmt("LoadPictureOgM: output buffer alloc failed (%u bytes) for '%s'\n",

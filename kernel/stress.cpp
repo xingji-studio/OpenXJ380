@@ -13,7 +13,6 @@
 #include <fs/partition.h>
 #include <fs/vfs/devfs.h>
 #include <fbdev.h>
-#include <fs/vfs/sys.h>
 #include <fs/vfs/vfs.h>
 #include <global_color.h>
 #include <graphics/GOP.hpp>

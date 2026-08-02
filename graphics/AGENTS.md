@@ -1,7 +1,7 @@
 # GRAPHICS KNOWLEDGE BASE
 
 ## OVERVIEW
-Built-in graphics/windowing subtree linked into `kernel.elf`. User apps reach this through xapi/syscalls; graphics code itself runs in kernel context.
+Built-in graphics/windowing subtree linked into `kernel.krl`. User apps reach this through xapi/syscalls; graphics code itself runs in kernel context.
 
 ## STRUCTURE
 ```

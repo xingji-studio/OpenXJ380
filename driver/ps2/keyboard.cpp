@@ -11,10 +11,6 @@ static uint8_t *kb_synth_head = kb_synth_buf;
 static uint8_t *kb_synth_tail = kb_synth_buf;
 static volatile uint32_t kb_synth_lock = 0;
 static bool kb_e0_prefix = false;
-static bool kb_win_r_down = false;
-static bool kb_win_d_down = false;
-static bool kb_win_space_down = false;
-static bool kb_alt_tab_down = false;
 static uint8_t kb_ps2_pressed_values[2][128];
 static uint8_t kb_usb_pressed_values[256];
 extern uint8_t keyboard_code[256];
@@ -35,23 +31,6 @@ extern uint8_t keyboard_code1[256];
 #define KB_USB_SPACE_USAGE 0x2c
 #define KB_USB_LEFT_GUI_USAGE 0xe3
 #define KB_USB_RIGHT_GUI_USAGE 0xe7
-
-enum keyboard_global_shortcut_key
-{
-    KeyboardGlobalShortcutNone,
-    KeyboardGlobalShortcutTab,
-    KeyboardGlobalShortcutRunDialog,
-    KeyboardGlobalShortcutShowDesktop,
-    KeyboardGlobalShortcutLauncher,
-    KeyboardGlobalShortcutWin,
-};
-
-enum keyboard_global_shortcut_action
-{
-    KeyboardGlobalActionRunDialog,
-    KeyboardGlobalActionShowDesktop,
-    KeyboardGlobalActionLauncher,
-};
 
 struct keyboard_usb_repeat_slot
 {
@@ -212,272 +191,15 @@ uint8_t keyboard_translate_event_value(uint8_t make_code, bool extended,
     return keyboard_translate_base_make_code(make_code, shift, caps);
 }
 
-#if 0 // GUI event routing is not part of the CLI kernel.
-static WINDOWLSP keyboard_target_window()
-{
-    return sht_found_win(xwmii, sht_img, ms_dec.sht_now);
-}
-
-extern "C" void keyboard_dispatch_key_message(uint64_t msg_type, uint8_t value)
-{
-    if (value == 0) {
-        return;
-    }
-
-    WINDOWLSP current_window = keyboard_target_window();
-    if (current_window == NULL) {
-        return;
-    }
-
-    process_text_input_box_key_event(ms_dec.sht_now, msg_type, value);
-    do_message(msg_type, NULL, value, current_window->WinMPf, current_window->w_task);
-}
-
-static void keyboard_update_modifier_state(uint8_t make_code, bool extended,
-                                           bool pressed)
-{
-    if (!extended)
-    {
-        switch (make_code)
-        {
-        case 0x2a:
-        case 0x36:
-            kb_fifo.shift = pressed;
-            return;
-        case 0x1d:
-            kb_fifo.ctrl = pressed;
-            return;
-        case 0x38:
-            kb_fifo.alt = pressed;
-            if (!pressed)
-            {
-                kb_alt_tab_down = false;
-                alt_tab_preview_commit(xwmii, sht_img);
-            }
-            return;
-        case 0x3a:
-            if (pressed) {
-                kb_fifo.caps = kb_fifo.caps ^ 1;
-            }
-            return;
-        default:
-            return;
-        }
-    }
-
-    switch (make_code)
-    {
-    case 0x1d:
-        kb_fifo.ctrl = pressed;
-        return;
-    case 0x38:
-        kb_fifo.alt = pressed;
-        if (!pressed)
-        {
-            kb_alt_tab_down = false;
-            alt_tab_preview_commit(xwmii, sht_img);
-        }
-        return;
-    case KB_PS2_LEFT_WIN_MAKE_CODE:
-    case KB_PS2_RIGHT_WIN_MAKE_CODE:
-        kb_fifo.win = pressed;
-        if (!pressed)
-        {
-            kb_win_r_down = false;
-            kb_win_d_down = false;
-            kb_win_space_down = false;
-        }
-        return;
-    default:
-        return;
-    }
-}
-
-static void keyboard_launch_run_dialog()
-{
-    create_user_process_from_file((char *)"/apps/system/elfrun.elf", NULL, NULL);
-}
-
-static void keyboard_launch_launcher()
-{
-    if (focus_window_by_exe_path(xwmii, sht_img, "/apps/system/launcher.elf"))
-    {
-        return;
-    }
-    create_user_process_singleton_from_file((char *)"/apps/system/launcher.elf", NULL, NULL);
-}
-
-static void keyboard_switch_window()
-{
-    alt_tab_preview_next(xwmii, sht_img);
-}
-
-static void keyboard_toggle_show_desktop()
-{
-    toggle_show_desktop(xwmii, sht_img);
-}
-
-static void keyboard_reset_win_shortcut_latches()
-{
-    kb_win_r_down = false;
-    kb_win_d_down = false;
-    kb_win_space_down = false;
-}
-
-static void keyboard_run_global_action(keyboard_global_shortcut_action action)
-{
-    switch (action)
-    {
-    case KeyboardGlobalActionRunDialog:
-        keyboard_launch_run_dialog();
-        return;
-    case KeyboardGlobalActionShowDesktop:
-        keyboard_toggle_show_desktop();
-        return;
-    case KeyboardGlobalActionLauncher:
-        keyboard_launch_launcher();
-        return;
-    default:
-        return;
-    }
-}
-
-static bool keyboard_handle_alt_tab_shortcut(bool pressed)
-{
-    if (pressed && kb_fifo.alt && !kb_alt_tab_down)
-    {
-        kb_alt_tab_down = true;
-        keyboard_switch_window();
-        return true;
-    }
-
-    if (!pressed) kb_alt_tab_down = false;
-    return kb_fifo.alt;
-}
-
-static bool keyboard_handle_win_shortcut(bool pressed, bool *down_flag,
-                                         keyboard_global_shortcut_action action)
-{
-    if (pressed && kb_fifo.win && !*down_flag)
-    {
-        *down_flag = true;
-        keyboard_run_global_action(action);
-        return true;
-    }
-
-    if (!pressed) *down_flag = false;
-    return kb_fifo.win;
-}
-
-static bool keyboard_handle_global_shortcut_key(keyboard_global_shortcut_key key, bool pressed)
-{
-    switch (key)
-    {
-    case KeyboardGlobalShortcutTab:
-        return keyboard_handle_alt_tab_shortcut(pressed);
-    case KeyboardGlobalShortcutRunDialog:
-        return keyboard_handle_win_shortcut(pressed, &kb_win_r_down, KeyboardGlobalActionRunDialog);
-    case KeyboardGlobalShortcutShowDesktop:
-        return keyboard_handle_win_shortcut(pressed, &kb_win_d_down, KeyboardGlobalActionShowDesktop);
-    case KeyboardGlobalShortcutLauncher:
-        return keyboard_handle_win_shortcut(pressed, &kb_win_space_down, KeyboardGlobalActionLauncher);
-    case KeyboardGlobalShortcutWin:
-        kb_fifo.win = pressed;
-        if (!pressed) keyboard_reset_win_shortcut_latches();
-        return true;
-    default:
-        return false;
-    }
-}
-
-static keyboard_global_shortcut_key keyboard_ps2_global_shortcut_key(uint8_t make_code, bool extended)
-{
-    if (extended)
-    {
-        switch (make_code)
-        {
-        case KB_PS2_LEFT_WIN_MAKE_CODE:
-        case KB_PS2_RIGHT_WIN_MAKE_CODE:
-            return KeyboardGlobalShortcutWin;
-        default:
-            return KeyboardGlobalShortcutNone;
-        }
-    }
-
-    switch (make_code)
-    {
-    case KB_PS2_TAB_MAKE_CODE:
-        return KeyboardGlobalShortcutTab;
-    case KB_PS2_R_MAKE_CODE:
-        return KeyboardGlobalShortcutRunDialog;
-    case KB_PS2_D_MAKE_CODE:
-        return KeyboardGlobalShortcutShowDesktop;
-    case KB_PS2_SPACE_MAKE_CODE:
-        return KeyboardGlobalShortcutLauncher;
-    default:
-        return KeyboardGlobalShortcutNone;
-    }
-}
-
-static keyboard_global_shortcut_key keyboard_usb_global_shortcut_key(uint8_t usage)
-{
-    switch (usage)
-    {
-    case KB_USB_TAB_USAGE:
-        return KeyboardGlobalShortcutTab;
-    case KB_USB_R_USAGE:
-        return KeyboardGlobalShortcutRunDialog;
-    case KB_USB_D_USAGE:
-        return KeyboardGlobalShortcutShowDesktop;
-    case KB_USB_SPACE_USAGE:
-        return KeyboardGlobalShortcutLauncher;
-    case KB_USB_LEFT_GUI_USAGE:
-    case KB_USB_RIGHT_GUI_USAGE:
-        return KeyboardGlobalShortcutWin;
-    default:
-        return KeyboardGlobalShortcutNone;
-    }
-}
-#else
-extern "C" void keyboard_dispatch_key_message(uint64_t msg_type, uint8_t value)
-{
-    (void)msg_type;
-    (void)value;
-}
-
 static void keyboard_update_modifier_state(uint8_t make_code, bool extended, bool pressed)
 {
-    (void)extended;
-    switch (make_code)
-    {
-    case 0x2a:
-    case 0x36: kb_fifo.shift = pressed; break;
-    case 0x1d: kb_fifo.ctrl = pressed; break;
-    case 0x38: kb_fifo.alt = pressed; break;
-    case 0x3a: if (pressed) kb_fifo.caps = !kb_fifo.caps; break;
-    default: break;
-    }
+    if (!extended && (make_code == 0x2a || make_code == 0x36)) kb_fifo.shift = pressed;
+    else if (make_code == 0x1d) kb_fifo.ctrl = pressed;
+    else if (make_code == 0x38) kb_fifo.alt = pressed;
+    else if (!extended && make_code == 0x3a && pressed) kb_fifo.caps = !kb_fifo.caps;
+    else if (extended && (make_code == KB_PS2_LEFT_WIN_MAKE_CODE || make_code == KB_PS2_RIGHT_WIN_MAKE_CODE))
+        kb_fifo.win = pressed;
 }
-
-static bool keyboard_handle_global_shortcut_key(keyboard_global_shortcut_key key, bool pressed)
-{
-    if (key == KeyboardGlobalShortcutWin) kb_fifo.win = pressed;
-    return false;
-}
-
-static keyboard_global_shortcut_key keyboard_ps2_global_shortcut_key(uint8_t make_code, bool extended)
-{
-    (void)make_code;
-    (void)extended;
-    return KeyboardGlobalShortcutNone;
-}
-
-static keyboard_global_shortcut_key keyboard_usb_global_shortcut_key(uint8_t usage)
-{
-    (void)usage;
-    return KeyboardGlobalShortcutNone;
-}
-#endif
 
 /*
     0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14,
@@ -521,13 +243,6 @@ extern "C" void c_keyboard_handler(void *regs_ptr, uint64_t error_code)
     bool key_release = !pressed;
     uint8_t make_code = pressed ? x : (uint8_t)(x & 0x7f);
 
-    if (keyboard_handle_global_shortcut_key(keyboard_ps2_global_shortcut_key(make_code, extended), pressed))
-    {
-        kb_e0_prefix = false;
-        send_eoi();
-        return;
-    }
-
     uint8_t event_value = 0;
     if (make_code < 128)
     {
@@ -557,11 +272,6 @@ extern "C" void c_keyboard_handler(void *regs_ptr, uint64_t error_code)
             kb_ps2_pressed_values[state_index][make_code] = 0;
         }
     }
-
-    keyboard_dispatch_key_message(
-        pressed ? MSG_KEYDOWN : MSG_KEYUP,
-        event_value
-    );
 
     keyboard_update_modifier_state(make_code, extended, pressed);
 
@@ -639,11 +349,9 @@ extern "C" void keyboard_usb_key_event(uint8_t usage, uint8_t value, uint8_t pre
 {
     keyboard_prepare_fifo();
     bool key_pressed = pressed != 0;
-    keyboard_global_shortcut_key shortcut_key = keyboard_usb_global_shortcut_key(usage);
-
-    if (shortcut_key == KeyboardGlobalShortcutWin)
+    if (usage == KB_USB_LEFT_GUI_USAGE || usage == KB_USB_RIGHT_GUI_USAGE)
     {
-        keyboard_handle_global_shortcut_key(shortcut_key, key_pressed);
+        kb_fifo.win = key_pressed;
         return;
     }
 
@@ -660,17 +368,7 @@ extern "C" void keyboard_usb_key_event(uint8_t usage, uint8_t value, uint8_t pre
         kb_fifo.alt = key_pressed;
         if (!key_pressed)
         {
-            kb_alt_tab_down = false;
         }
-    }
-
-    if (keyboard_handle_global_shortcut_key(shortcut_key, key_pressed))
-    {
-        if (!key_pressed)
-        {
-            kb_usb_pressed_values[usage] = 0;
-        }
-        return;
     }
 
     uint8_t event_value = value;
@@ -687,8 +385,6 @@ extern "C" void keyboard_usb_key_event(uint8_t usage, uint8_t value, uint8_t pre
     {
         kb_usb_pressed_values[usage] = 0;
     }
-
-    keyboard_dispatch_key_message(key_pressed ? MSG_KEYDOWN : MSG_KEYUP, event_value);
 
     kb_synth_lock_acquire();
     keyboard_usb_repeat_slot *free_slot = NULL;

@@ -7,10 +7,10 @@
 #include <fs/fatfs/fatfs.h>
 #include <fs/partition.h>
 #include <fs/vfs/devfs.h>
-#include <fs/vfs/sys.h>
 #include <fs/vfs/vfs.h>
 #include <krlibc.h>
 #include <mm/frame.h>
+#include <mm/uaccess.h>
 #include <pci/pci.h>
 #include <proto.hpp>
 #include <ps2/keyboard.h>
@@ -50,35 +50,45 @@ int check_input_waiting_status()
     return current->parent_group->xtttp_stc->wait_for_input ? 1 : 0;
 }
 
-void read_terminal_app_output_buffer(char *str)
+int read_terminal_app_output_buffer(char *str)
 {
     tcb_t current = get_current_task();
     if (str == NULL || current == NULL || current->parent_group == NULL || current->parent_group->xtttp_stc == NULL) {
-        return;
+        return -EFAULT;
     }
 
+    char output[1024];
+    memset(output, 0, sizeof(output));
     if (current->parent_group->xtttp_stc->output_lock)
     {
-        str[0] = '\0';
-        return;
+        return copy_to_user_pagedir(current->parent_group->pagedir, str, output, 1) ? 0 : -EFAULT;
     }
 
-    strncpy(str, current->parent_group->xtttp_stc->output, 1023);
-    str[1023] = '\0';
+    strncpy(output, current->parent_group->xtttp_stc->output, sizeof(output) - 1);
+    return copy_to_user_pagedir(current->parent_group->pagedir, str, output, sizeof(output)) ? 0 : -EFAULT;
 }
 
-void write_terminal_app_output_buffer(char *str)
+int write_terminal_app_output_buffer(const char *str)
 {
     tcb_t current = get_current_task();
+    if (str == NULL || current == NULL || current->parent_group == NULL || current->parent_group->xtttp_stc == NULL)
+        return -EFAULT;
+
     xtttp_dtt *xtttp = current->parent_group->xtttp_stc;
-    size_t cur = strlen(xtttp->input);
-    size_t len = strlen(str);
+    size_t cur = strnlen(xtttp->input, sizeof(xtttp->input));
     if (cur >= sizeof(xtttp->input)) cur = 0;
     size_t space = sizeof(xtttp->input) - cur - 1;
-    if (len > space) len = space;
-    if (len > 0) memcpy(xtttp->input + cur, str, len);
+    size_t len = 0;
+    while (len < space)
+    {
+        char ch;
+        if (!copy_from_user_pagedir(current->parent_group->pagedir, &ch, str + len, 1)) return -EFAULT;
+        if (ch == '\0') break;
+        xtttp->input[cur + len++] = ch;
+    }
     xtttp->input[cur + len] = '\0';
     current->parent_group->xtttp_stc->input_lock = true;
+    return 0;
 }
 
 void terminal_finish_app_output()
