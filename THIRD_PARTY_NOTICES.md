@@ -53,6 +53,16 @@ other shipped materials.
   - Compliance note: keep the upstream source and license text available when
     distributing builds that include this archive
 
+- `font/hankaku.bin`, `include/efi/fbc.h`, `boot/include/fbc.h`,
+  `include/graphics/GOP.hpp`
+  - Upstream: MikanOS by Yuuki Uchida (uchan-nos)
+  - License style: Apache-2.0
+  - See: `third_party/mikanos/LICENSE`, `third_party/mikanos/NOTICE`
+  - Compliance note: derived from MikanOS (`kernel/hankaku.txt`,
+    `kernel/frame_buffer_config.hpp`, `kernel/graphics.hpp`); upstream
+    attribution notices are retained in the file headers. Redistribution must
+    reproduce the Apache-2.0 text and notices.
+
 ## Locally rewritten code
 
 The following files were rewritten in-tree to remove ambiguous inherited

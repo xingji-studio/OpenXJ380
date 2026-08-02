@@ -1,5 +1,8 @@
-// 版权所有©XINGJI Studios 2017-2026 保留所有权利。
-// XJ380图像头文件
+// XJ380 pixel/writer helpers.
+// Derived from MikanOS kernel/graphics.hpp
+// (https://github.com/uchan-nos/mikanos), Copyright Yuuki Uchida, Apache-2.0.
+// See third_party/mikanos/LICENSE and THIRD_PARTY_NOTICES.md.
+// Modified by XINGJI Studios.
 // GOP.hpp
 #pragma once
 

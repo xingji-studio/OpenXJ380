@@ -12,6 +12,7 @@ binary distribution. The command-line image installs the repository notices at
 | lwIP | BSD-style | `kmod/netserver/lwip/` | `lwip.txt` |
 | GNU libc `elf.h` | LGPL-2.1-or-later | `include/elf.h` | `glibc-elf-h.txt` |
 | liballoc | Upstream license required | `liballoc-x86_64.a` origin | `liballoc.txt` |
+| MikanOS (font + framebuffer headers) | Apache-2.0 | `third_party/mikanos/LICENSE` | `mikanos-apache-2.0.txt` |
 | XJ380 project notices | Project notice | `THIRD_PARTY_NOTICES.md` | `THIRD_PARTY_NOTICES.md` |
 
 ## Retained Linux compatibility payload

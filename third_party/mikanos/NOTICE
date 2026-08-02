@@ -1,0 +1,24 @@
+MikanOS
+Copyright (C) 2020-2024 Yuuki Uchida (uchan-nos)
+Licensed under the Apache License, Version 2.0.
+Upstream: https://github.com/uchan-nos/mikanos
+
+XJ380 includes the following components derived from MikanOS:
+
+- font/hankaku.bin
+  Derived from kernel/hankaku.txt (8x16 bitmap font), converted with the
+  upstream makefont.py layout rules. Verified byte-identical to the upstream
+  conversion.
+
+- include/efi/fbc.h and boot/include/fbc.h
+  Derived from kernel/frame_buffer_config.hpp. The FrameBufferConfig struct
+  retains the upstream field names and order; enum PixelFormat values were
+  renamed locally (kRGBR/kBGRR).
+
+- include/graphics/GOP.hpp
+  Derived from kernel/graphics.hpp (PixelColor and the FrameBufferWriter
+  PixelAt/Write helpers).
+
+These files were modified by XINGJI Studios for use in XJ380. The upstream
+copyright and attribution notices are retained in the file headers and in
+THIRD_PARTY_NOTICES.md.
