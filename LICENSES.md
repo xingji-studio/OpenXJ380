@@ -10,8 +10,10 @@ binary distribution. The command-line image installs the repository notices at
 | --- | --- | --- | --- |
 | FatFs | ChaN permissive license | `driver/fs/fatfs/ff.cpp` | `fatfs.txt` |
 | lwIP | BSD-style | `kmod/netserver/lwip/` | `lwip.txt` |
-| Musl libc `elf.h` | MIT license | `include/elf.h` | `glibc-elf-h.txt` |
-| liballoc | MIT license | `liballoc-x86_64.a` origin | `liballoc.txt` |
+| musl ELF definitions | MIT | `include/elf.h`; `third_party/musl-elf` | `musl-elf.txt`; `third-party compliance bundle` |
+| Rust alloc/compiler_builtins archive | Apache-2.0 OR MIT | `liballoc-x86_64.a`; `third_party/rust-runtime` | `liballoc.txt`; `third-party compliance bundle` |
+| Linux UAPI ioctl definitions | GPL-2.0 WITH Linux-syscall-note | `include/ioctl.h`; `third_party/linux-uapi` | `third-party compliance bundle` |
+| libutf | MIT | `kernel/utflib.cpp`; `include/proto.hpp`; `third_party/libutf` | `third-party compliance bundle` |
 | XJ380 project notices | Project notice | `THIRD_PARTY_NOTICES.md` | `THIRD_PARTY_NOTICES.md` |
 | MikanOS hankaku | Apache-2.0 license | `font/hankaku.bin` `third_party/mikanos-hankaku/hankaku.txt` | `mikanos.txt` |
 

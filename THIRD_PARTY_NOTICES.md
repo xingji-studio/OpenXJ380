@@ -22,12 +22,13 @@ generates a distributable bundle at `out/compliance/third-party`.
 | Lexbor | Apache-2.0 | `third_party/lexbor/LICENSE` and `NOTICE` |
 | StardustUI | MIT | `frameworks/StardustUI/LICENSE` |
 | RapidJSON | MIT | embedded in `rapidjson.h` |
-| Rust alloc/compiler_builtins | Apache-2.0 OR MIT | `third_party/rust-runtime` |
+| Rust alloc/compiler_builtins | Apache-2.0 OR MIT | `third_party/rust-runtime/LICENSE-APACHE`; `third_party/rust-runtime/LICENSE-MIT`; `third_party/rust-runtime/SOURCE.md`; `licenses/liballoc.txt`; `liballoc-x86_64.a` |
 | BusyBox 1.31.1 | GPL-2.0-only | `third_party/busybox-source` |
 | MikanOS hankaku.bin | Apache-2.0 | `font/hankaku.bin` |
 | maple-font | SIL OPEN FONT LICENSE | `font/ttf/XJ380C.ttf` |
 | Source Han Sans font | SIL OPEN FONT LICENSE | `font/ttf/XJ380F.ttf` |
-| libutf | MIT | `kernel/utflib.cpp` |
+| libutf | MIT | `third_party/libutf/LICENSE`; `third_party/libutf/SOURCE.md`; `kernel/utflib.cpp`; `include/proto.hpp` |
+| Linux UAPI ioctl definitions | GPL-2.0 WITH Linux-syscall-note | `third_party/linux-uapi`; `include/ioctl.h` |
 
 The BusyBox bundle includes the complete upstream source archive, GPLv2 text,
 build configuration, compiler-compatibility patch, and rebuild instructions.

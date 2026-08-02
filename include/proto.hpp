@@ -84,7 +84,7 @@ void default_isr(struct X64_REGS *regs, uint64_t error_code);
 
 // graphics/window/windowm.cpp
 
-// lib/utflib.c
+// libutf declarations; see third_party/libutf/SOURCE.md.
 typedef int32_t Rune;
 #define UTFmax    6            /* maximum bytes per rune */
 #define Runeerror ((Rune) - 1) /* decoding error in utf */
