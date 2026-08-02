@@ -27,6 +27,7 @@ generates a distributable bundle at `out/compliance/third-party`.
 | MikanOS hankaku.bin | Apache-2.0 | `font/hankaku.bin` |
 | maple-font | SIL OPEN FONT LICENSE | `font/ttf/XJ380C.ttf` |
 | Source Han Sans font | SIL OPEN FONT LICENSE | `font/ttf/XJ380F.ttf` |
+| libutf | MIT | `kernel/utflib.cpp` |
 
 The BusyBox bundle includes the complete upstream source archive, GPLv2 text,
 build configuration, compiler-compatibility patch, and rebuild instructions.

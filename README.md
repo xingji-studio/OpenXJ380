@@ -44,9 +44,16 @@ third_party/           引入的第三方代码
 ```bash
 sudo apt update
 sudo apt install -y \
-    clang lld nasm ninja-build \
+    clang lld nasm ninja-build ming-w64 rustup \
     mtools gdisk dosfstools \
     qemu-system-x86 qemu-utils
+```
+
+配置rust工具链：
+
+```bash
+rustup default stable
+rustup target add x86_64-unknown-none
 ```
 
 构建依赖 `Python 3`、Clang/LLD、NASM 和 Ninja。生成镜像还需要 `mtools`、`gdisk` 与 `dosfstools`；运行镜像需要 QEMU。可通过生成后的 Ninja 目标检查本机工具链：
