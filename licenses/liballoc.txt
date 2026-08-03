@@ -1,9 +1,14 @@
-liballoc-x86_64.a is a prebuilt Rust no_std runtime archive containing Rust alloc
-and compiler_builtins objects. It is distributed under the Rust runtime
-license expression Apache-2.0 OR MIT. The corresponding license texts are stored
-in third_party/rust-runtime/LICENSE-APACHE and third_party/rust-runtime/LICENSE-MIT.
+liballoc-x86_64.a is a prebuilt Rust no_std runtime archive containing Rust alloc,
+compiler_builtins, and talc allocator objects. Rust alloc and compiler_builtins
+are distributed under Apache-2.0 OR MIT. talc is distributed under MIT.
+
+The corresponding license texts are stored in:
+- third_party/rust-runtime/LICENSE-APACHE
+- third_party/rust-runtime/LICENSE-MIT
+- third_party/talc/LICENSE.md
 
 Archive SHA-256:
 2137fa65410bfecc22371769f3557e8f342216254afe67ad72e76117d1446d08
 
-See third_party/rust-runtime/SOURCE.md for the provenance record.
+See third_party/rust-runtime/SOURCE.md and third_party/talc/SOURCE.md for the
+provenance records.

@@ -12,7 +12,6 @@
 #include <fs/fatfs/fatfs.h>
 #include <fs/partition.h>
 #include <fs/vfs/devfs.h>
-#include <fs/vfs/sys.h>
 #include <fs/vfs/vfs.h>
 #include <hda/hda.h>
 #include <hda/pcspk.h>
@@ -66,9 +65,42 @@ static const char *busybox_alias_applets[] = {
     "readlink","realpath","reset",    "rm",       "rmdir",    "route",    "sed",     "sh",
     "sleep",   "sort",    "stat",     "stty",     "sync",     "tail",     "tar",     "test",
     "top",     "touch",   "tr",       "true",     "tty",      "umount",   "uname",   "uniq",
-    "unzip",   "uptime",  "usleep",   "vi",       "wc",       "wget",     "which",   "whoami",
-    "xargs",   "xxd",     "xz",       "xzcat",    "zcat",     NULL,
+    "unzip",   "uptime",  "usleep",   "vi",       "wc",       "which",   "whoami",
+    "xargs",   "xxd",     "zcat",     NULL,
 };//暴力枚举这一块，好像只能这么做了
+  //Maybe we can try to load this applet when vfs inited.
+
+static void load_busybox_alias_applets()
+{
+    if (current_user == NULL) return;
+
+    char setfile_path[256];
+    memset(setfile_path, 0, 256);
+    strcat(setfile_path, "/etc/busybox/alias/applets.dat");
+    vfs_node_t vfp = vfs_open(setfile_path);
+    if (!vfp) return;
+    char tmp[1024];
+    if(vfp->size > sizeof(tmp)) goto cleanup;
+    vfs_read(vfp, tmp, 0, vfp->size);
+    char alias[8];
+    memset(alias, 0, 8);
+    int applet_index = 0, alias_index = 0;
+    for(int i = 0; tmp[i] != EOF, i++)
+    {
+	if(tmp[i] == ',')
+	{
+	    strcpy(busybox_alias_applets[applet_index], alias);
+	    applet_index ++;
+	    continue;
+	}
+	alias[alias_index] = tmp[i];
+	alias_index ++;
+    }
+    strcpy(busybox_alias_applets[applet_index], alias);
+
+cleanup:
+    vfs_close(v)
+}
 
 static const char *busybox_binary_path = "/apps/busybox";
 
@@ -209,17 +241,13 @@ void init_time()
     SettingsDataFileFormat sdff;
     memset(&sdff, 0, sizeof(sdff));
     size_t read_size = v->size < sizeof(sdff) ? (size_t)v->size : sizeof(sdff);
-    if (read_size == 0 || vfs_read(v, &sdff, 0, read_size) == -1)
-    {
-        vfs_close(v);
-        return;
-    }
-
+    if (read_size == 0 || vfs_read(v, &sdff, 0, read_size) == -1) goto cleanup;
     clock_hour_offset = sdff.ClockHourOffset;
 
     if (clock_hour_offset < 0)
         clock_hour_offset = 0;
 
+cleanup:
     vfs_close(v);
 }
 

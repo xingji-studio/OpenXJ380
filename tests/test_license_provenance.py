@@ -24,7 +24,10 @@ class LicenseProvenanceTests(unittest.TestCase):
         self.assertNotIn("GNU libc `elf.h`", root_licenses)
         self.assertFalse((ROOT / "licenses/glibc-elf-h.txt").exists())
         self.assertTrue((ROOT / "licenses/musl-elf.txt").is_file())
-        self.assertIn("c0ec617f48fb3e28a808c7d27e442496cbc51e0cf7d2e669440645d9a786b9e6", source_record)
+        self.assertIn(
+            "c0ec617f48fb3e28a808c7d27e442496cbc51e0cf7d2e669440645d9a786b9e6",
+            source_record,
+        )
         self.assertEqual(
             ["third_party/musl-elf/COPYRIGHT", "third_party/musl-elf/SOURCE.md"],
             components["musl-elf"]["license_files"],
@@ -71,9 +74,12 @@ class LicenseProvenanceTests(unittest.TestCase):
         self.assertNotIn("@ptr:", llist_header)
         self.assertNotIn("list_for_each_entry", llist_header)
 
-    def test_liballoc_record_matches_rust_runtime_archive(self) -> None:
+    def test_liballoc_record_matches_rust_runtime_and_talc_archive(self) -> None:
         liballoc_record = (ROOT / "licenses/liballoc.txt").read_text(encoding="utf-8")
         rust_source = (ROOT / "third_party/rust-runtime/SOURCE.md").read_text(encoding="utf-8")
+        talc_source = (ROOT / "third_party/talc/SOURCE.md").read_text(encoding="utf-8")
+        talc_license = (ROOT / "third_party/talc/LICENSE.md").read_text(encoding="utf-8")
+        symbols = subprocess.check_output(["nm", "-a", str(ROOT / "liballoc-x86_64.a")], text=True)
         manifest = json.loads(
             (ROOT / "third_party/compliance-manifest.json").read_text(encoding="utf-8")
         )
@@ -82,9 +88,20 @@ class LicenseProvenanceTests(unittest.TestCase):
         self.assertNotIn("plos-clan/liballoc", liballoc_record)
         self.assertIn("Rust alloc", liballoc_record)
         self.assertIn("compiler_builtins", liballoc_record)
+        self.assertIn("talc", liballoc_record)
+        self.assertIn("_RNvMs0_NtCs1PPGXRNTyC3_4talc4talc", symbols)
+        self.assertIn("Shaun Beautement", talc_license)
+        self.assertIn("SFBdragon/talc", talc_source)
+        self.assertIn("ad7bae44cec09e810d531b558499bef47ca4d17b", talc_source)
         self.assertIn("2137fa65410bfecc22371769f3557e8f342216254afe67ad72e76117d1446d08", rust_source)
         self.assertIn("third_party/rust-runtime/SOURCE.md", components["rust-runtime"]["license_files"])
         self.assertIn("liballoc-x86_64.a", components["rust-runtime"]["source_files"])
+        self.assertEqual("MIT", components["talc"]["license"])
+        self.assertEqual(
+            ["third_party/talc/LICENSE.md", "third_party/talc/SOURCE.md"],
+            components["talc"]["license_files"],
+        )
+        self.assertEqual(["liballoc-x86_64.a"], components["talc"]["source_files"])
 
     def test_compliance_bundle_contains_provenance_materials(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -111,6 +128,8 @@ class LicenseProvenanceTests(unittest.TestCase):
                 "licenses/linux-uapi/Linux-syscall-note",
                 "licenses/linux-uapi/SOURCE.md",
                 "licenses/rust-runtime/SOURCE.md",
+                "licenses/talc/LICENSE.md",
+                "licenses/talc/SOURCE.md",
             ):
                 self.assertTrue((destination / relative_path).is_file(), relative_path)
 
