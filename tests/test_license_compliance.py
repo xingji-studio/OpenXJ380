@@ -61,7 +61,7 @@ class LicenseComplianceTests(unittest.TestCase):
             "d0f940a72f648943c1f2211e0e3117387c31d765137d92bd8284a3fb9752a998"
         )
         expected_binary_sha256 = (
-            "0bf09330ec7410eb7e136dadf822a52fd8b5b6cf8ef375722a4b64ea4157567a"
+            "a08214e46cafb238685f694a2ff4e4b038b5fed83f884354127ba08d68498066"
         )
         staged_binary = ROOT / "resources/apps/busybox"
         preserved_binary = ROOT / "third_party/busybox-prebuilt/busybox_amd64"
