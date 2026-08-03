@@ -68,7 +68,7 @@ class LicenseComplianceTests(unittest.TestCase):
             "d0f940a72f648943c1f2211e0e3117387c31d765137d92bd8284a3fb9752a998"
         )
         expected_binary_sha256 = (
-            "0bf09330ec7410eb7e136dadf822a52fd8b5b6cf8ef375722a4b64ea4157567a"
+            "a08214e46cafb238685f694a2ff4e4b038b5fed83f884354127ba08d68498066"
         )
         staged_binary = ROOT / "resources/apps/busybox"
         preserved_binary = ROOT / "third_party/busybox-prebuilt/busybox_amd64"
@@ -95,53 +95,26 @@ class LicenseComplianceTests(unittest.TestCase):
 
         self.assertIn("KCONFIG_NOTIMESTAMP=1", build_script)
 
-    def test_libwebp_license_material_is_complete(self) -> None:
-        libwebp_root = ROOT / "user/browser/third_party/libwebp"
-        for name in ("COPYING", "PATENTS", "AUTHORS"):
-            self.assertTrue((libwebp_root / name).is_file(), name)
+    def test_mikanos_hankaku_source_material_is_complete(self) -> None:
+        source_root = ROOT / "third_party/mikanos-hankaku"
+        self.assertTrue((source_root / "LICENSE").is_file())
+        self.assertTrue((source_root / "SOURCE.md").is_file())
+        self.assertTrue((source_root / "hankaku.txt").is_file())
 
         manifest = json.loads(
             (ROOT / "third_party/compliance-manifest.json").read_text(encoding="utf-8")
         )
-        libwebp = next(component for component in manifest["components"] if component["slug"] == "libwebp")
+        components = {component["slug"]: component for component in manifest["components"]}
 
+        self.assertEqual("MikanOS hankaku font", components["mikanos-hankaku"]["name"])
         self.assertEqual(
-            [
-                "user/browser/third_party/libwebp/COPYING",
-                "user/browser/third_party/libwebp/PATENTS",
-                "user/browser/third_party/libwebp/AUTHORS",
-            ],
-            libwebp["license_files"],
+            ["third_party/mikanos-hankaku/LICENSE", "third_party/mikanos-hankaku/SOURCE.md"],
+            components["mikanos-hankaku"]["license_files"],
         )
-
-        notices = (ROOT / "THIRD_PARTY_NOTICES.md").read_text(encoding="utf-8")
-        self.assertIn("user/browser/third_party/libwebp/COPYING", notices)
-        self.assertIn("user/browser/third_party/libwebp/PATENTS", notices)
-        self.assertIn("user/browser/third_party/libwebp/AUTHORS", notices)
-
-    def test_xiaolai_font_license_material_is_complete(self) -> None:
-        font_path = ROOT / "frameworks/StardustUI/fonts/xiaolai.ttf"
-        license_path = ROOT / "frameworks/StardustUI/fonts/LICENSES.md"
-
-        self.assertTrue(font_path.is_file())
-        self.assertTrue(license_path.is_file())
-
-        license_text = license_path.read_text(encoding="utf-8")
-        self.assertIn("Xiaolai SC", license_text)
-        self.assertIn("Copyright © 2020 LXGW", license_text)
-        self.assertIn("SIL OPEN FONT LICENSE Version 1.1", license_text)
-
-        manifest = json.loads(
-            (ROOT / "third_party/compliance-manifest.json").read_text(encoding="utf-8")
+        self.assertIn(
+            "third_party/mikanos-hankaku/hankaku.txt", components["mikanos-hankaku"]["source_files"]
         )
-        xiaolai = next(component for component in manifest["components"] if component["slug"] == "xiaolai-font")
-        self.assertEqual("OFL-1.1", xiaolai["license"])
-        self.assertEqual(["frameworks/StardustUI/fonts/LICENSES.md"], xiaolai["license_files"])
-        self.assertEqual(["frameworks/StardustUI/fonts/xiaolai.ttf"], xiaolai["source_files"])
-
-        notices = (ROOT / "THIRD_PARTY_NOTICES.md").read_text(encoding="utf-8")
-        self.assertIn("Xiaolai SC font", notices)
-        self.assertIn("frameworks/StardustUI/fonts/LICENSES.md", notices)
+        self.assertTrue(components["mikanos-hankaku"]["bundle_source"])
 
     def test_third_party_manifest_references_existing_materials(self) -> None:
         manifest = json.loads(
