@@ -54,52 +54,39 @@ extern BOOT_CONFIG *EFI_BC;
 extern UserInfo *current_user;
 
 static const char *busybox_alias_applets[] = {
-    "[",       "[[",      "ash",      "awk",      "basename", "cat",      "chmod",   "chgrp",
-    "chown",   "clear",   "cmp",      "cp",       "cut",      "date",     "dd",      "df",
-    "dirname", "dmesg",   "du",       "echo",     "egrep",    "env",      "false",   "fgrep",
-    "find",    "free",    "grep",     "gunzip",   "gzip",     "head",     "hexdump", "hostname",
-    "id",      "ifconfig","install",  "ip",       "kill",     "killall",  "less",    "ln",
-    "ls",
-    "mkdir",   "more",    "mount",    "mv",       "nc",       "netstat",  "nslookup","od",
-    "pgrep",   "pidof",   "ping",     "pkill",    "printenv", "printf",   "ps",      "pwd",
-    "readlink","realpath","reset",    "rm",       "rmdir",    "route",    "sed",     "sh",
-    "sleep",   "sort",    "stat",     "stty",     "sync",     "tail",     "tar",     "test",
-    "top",     "touch",   "tr",       "true",     "tty",      "umount",   "uname",   "uniq",
-    "unzip",   "uptime",  "usleep",   "vi",       "wc",       "which",   "whoami",
-    "xargs",   "xxd",     "zcat",     NULL,
+,     NULL,
 };//暴力枚举这一块，好像只能这么做了
   //Maybe we can try to load this applet when vfs inited.
 
 static void load_busybox_alias_applets()
 {
-    if (current_user == NULL) return;
-
-    char setfile_path[256];
+    char setfile_path[32];
     memset(setfile_path, 0, 256);
     strcat(setfile_path, "/etc/busybox/alias/applets.dat");
     vfs_node_t vfp = vfs_open(setfile_path);
     if (!vfp) return;
-    char tmp[1024];
-    if(vfp->size > sizeof(tmp)) goto cleanup;
-    vfs_read(vfp, tmp, 0, vfp->size);
+    char buffer[768];
+    if(vfp->size > sizeof(buffer)) goto cleanup;
+    vfs_read(vfp, buffer, 0, vfp->size);
     char alias[8];
     memset(alias, 0, 8);
     int applet_index = 0, alias_index = 0;
-    for(int i = 0; tmp[i] != EOF, i++)
+    for(int i = 0; buffer[i] != EOF, i++)
     {
-	if(tmp[i] == ',')
+	if(buffer[i] == ',')
 	{
 	    strcpy(busybox_alias_applets[applet_index], alias);
 	    applet_index ++;
 	    continue;
 	}
-	alias[alias_index] = tmp[i];
+	alias[alias_index] = buffer[i];
 	alias_index ++;
     }
     strcpy(busybox_alias_applets[applet_index], alias);
+    busybox_alias_applets[alias_index + 1] = NULL;
 
 cleanup:
-    vfs_close(v)
+    vfs_close(vfp);
 }
 
 static const char *busybox_binary_path = "/apps/busybox";
@@ -119,6 +106,7 @@ static void setup_xbps_vfs_aliases()
 
 static void setup_busybox_vfs_aliases()
 {
+    load_busybox_alias_applets();
     const char *prefixes[] = {"/apps", "/bin", NULL};
     for (int p = 0; prefixes[p] != NULL; p++)
     {
