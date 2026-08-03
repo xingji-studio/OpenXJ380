@@ -11,11 +11,12 @@ binary distribution. The command-line image installs the repository notices at
 | FatFs | ChaN permissive license | `driver/fs/fatfs/ff.cpp` | `fatfs.txt` |
 | lwIP | BSD-style | `kmod/netserver/lwip/` | `lwip.txt` |
 | Musl libc `elf.h` | MIT license | `include/elf.h` | `glibc-elf-h.txt` |
-| liballoc | MIT license | `liballoc-x86_64.a` origin | `liballoc.txt` |
+| Rust alloc/compiler_builtins archive | Apache-2.0 OR MIT | `liballoc-x86_64.a`; `third_party/rust-runtime` | `liballoc.txt`; `third-party compliance bundle` |
+| talc allocator | MIT | `liballoc-x86_64.a`; `third_party/talc` | `third-party compliance bundle` |
 | XJ380 project notices | Project notice | `THIRD_PARTY_NOTICES.md` | `THIRD_PARTY_NOTICES.md` |
-| MikanOS hankaku | Apache-2.0 license | `font/hankaku.bin` `third_party/mikanos-hankaku/hankaku.txt` | `mikanos.txt` |
-| maple-font | OFL-1.1 | `font/ttf/LICENSES.md`; `font/ttf/XJ380C.ttf` | `third-party compliance bundle` |
-| Source Han Sans font | OFL-1.1 | `font/ttf/LICENSES.md`; `font/ttf/XJ380F.ttf` | `third-party compliance bundle` |
+| MikanOS hankaku font | Apache-2.0 | `third_party/mikanos-hankaku`; `font/hankaku.bin` | `third-party compliance bundle` |
+| maple-font | OFL-1.1 | `third_party/maple-font/LICENSE`; `font/ttf/LICENSES.md`; `font/ttf/XJ380C.ttf` | `third-party compliance bundle` |
+| Source Han Sans font | OFL-1.1 | `third_party/source-han-sans/LICENSE`; `font/ttf/LICENSES.md`; `font/ttf/XJ380F.ttf` | `third-party compliance bundle` |
 
 ## Retained Linux compatibility payload
 

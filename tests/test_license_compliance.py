@@ -61,7 +61,7 @@ class LicenseComplianceTests(unittest.TestCase):
             "d0f940a72f648943c1f2211e0e3117387c31d765137d92bd8284a3fb9752a998"
         )
         expected_binary_sha256 = (
-            "0bf09330ec7410eb7e136dadf822a52fd8b5b6cf8ef375722a4b64ea4157567a"
+            "a08214e46cafb238685f694a2ff4e4b038b5fed83f884354127ba08d68498066"
         )
         staged_binary = ROOT / "resources/apps/busybox"
         preserved_binary = ROOT / "third_party/busybox-prebuilt/busybox_amd64"
@@ -97,13 +97,35 @@ class LicenseComplianceTests(unittest.TestCase):
             (ROOT / "third_party/compliance-manifest.json").read_text(encoding="utf-8")
         )
         components = {component["slug"]: component for component in manifest["components"]}
-        for slug, source_file in (
-            ("maple-font", "font/ttf/XJ380C.ttf"),
-            ("source-han-sans", "font/ttf/XJ380F.ttf"),
-        ):
+        expected_font_components = {
+            "maple-font": ("third_party/maple-font/LICENSE", "font/ttf/XJ380C.ttf"),
+            "source-han-sans": ("third_party/source-han-sans/LICENSE", "font/ttf/XJ380F.ttf"),
+        }
+        for slug, (license_file, source_file) in expected_font_components.items():
             self.assertEqual("OFL-1.1", components[slug]["license"])
-            self.assertEqual(["font/ttf/LICENSES.md"], components[slug]["license_files"])
+            self.assertEqual([license_file, "font/ttf/LICENSES.md"], components[slug]["license_files"])
             self.assertEqual([source_file], components[slug]["source_files"])
+
+    def test_mikanos_hankaku_source_material_is_complete(self) -> None:
+        source_root = ROOT / "third_party/mikanos-hankaku"
+        self.assertTrue((source_root / "LICENSE").is_file())
+        self.assertTrue((source_root / "SOURCE.md").is_file())
+        self.assertTrue((source_root / "hankaku.txt").is_file())
+
+        manifest = json.loads(
+            (ROOT / "third_party/compliance-manifest.json").read_text(encoding="utf-8")
+        )
+        components = {component["slug"]: component for component in manifest["components"]}
+
+        self.assertEqual("MikanOS hankaku font", components["mikanos-hankaku"]["name"])
+        self.assertEqual(
+            ["third_party/mikanos-hankaku/LICENSE", "third_party/mikanos-hankaku/SOURCE.md"],
+            components["mikanos-hankaku"]["license_files"],
+        )
+        self.assertIn(
+            "third_party/mikanos-hankaku/hankaku.txt", components["mikanos-hankaku"]["source_files"]
+        )
+        self.assertTrue(components["mikanos-hankaku"]["bundle_source"])
 
     def test_third_party_manifest_references_existing_materials(self) -> None:
         manifest = json.loads(

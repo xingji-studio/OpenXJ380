@@ -271,70 +271,77 @@ char *strtok(char *str, const char *delim)
 
 int64_t strtol(const char *str, char **endptr, int base)
 {
-    const char *s;
-    uint64_t    acc;
-    char        c;
-    uint64_t    cutoff;
-    uint64_t    neg, any, cutlim;
-    s = str;
-    do
+    if (!str)
     {
-        c = *s++;
-    } while (isspace((unsigned char)c));
-    if (c == '-')
-    {
-        neg = 1;
-        c   = *s++;
+        if (endptr) { *endptr = NULL; }
+        return 0;
     }
-    else
-    {
-        neg = 0;
-        if (c == '+') c = *s++;
-    }
-    if ((base == 0 || base == 16) && c == '0' && (*s == 'x' || *s == 'X') &&
-        ((s[1] >= '0' && s[1] <= '9') || (s[1] >= 'A' && s[1] <= 'F') || (s[1] >= 'a' && s[1] <= 'f')))
-    {
-        c     = s[1];
-        s    += 2;
-        base  = 16;
-    }
-    if (base == 0) base = c == '0' ? 8 : 10;
-    acc = any = 0;
-    if (base < 2 || base > 36) goto noconv;
 
-    cutoff  = neg ? (unsigned long)-(LONG_MIN + LONG_MAX) + LONG_MAX : LONG_MAX;
-    cutlim  = cutoff % base;
-    cutoff /= base;
-    for (;; c = *s++)
+    const char *cursor = str;
+    while (isspace((unsigned char)*cursor))
     {
-        if (c >= '0' && c <= '9')
-            c -= '0';
-        else if (c >= 'A' && c <= 'Z')
-            c -= 'A' - 10;
-        else if (c >= 'a' && c <= 'z')
-            c -= 'a' - 10;
-        else
-            break;
-        if (c >= base) break;
-        if (any < 0 || acc > cutoff || (acc == cutoff && ((uint64_t)c) > cutlim))
-            any = -1;
-        else
+        cursor++;
+    }
+
+    bool negative = false;
+    if (*cursor == '-' || *cursor == '+')
+    {
+        negative = (*cursor == '-');
+        cursor++;
+    }
+
+    if (base != 0 && (base < 2 || base > 36))
+    {
+        if (endptr) { *endptr = (char *)str; }
+        return 0;
+    }
+
+    if ((base == 0 || base == 16) && cursor[0] == '0' && (cursor[1] == 'x' || cursor[1] == 'X'))
+    {
+        int first_hex = cursor[2];
+        bool has_hex_digit = (first_hex >= '0' && first_hex <= '9') || (first_hex >= 'A' && first_hex <= 'F') ||
+                             (first_hex >= 'a' && first_hex <= 'f');
+        if (has_hex_digit)
         {
-            any  = 1;
-            acc *= base;
-            acc += c;
+            cursor += 2;
+            base = 16;
         }
     }
-    if (any < 0) { acc = neg ? LONG_MIN : LONG_MAX; }
-    else if (!any)
+
+    if (base == 0) { base = (cursor[0] == '0') ? 8 : 10; }
+
+    const char *number_start = cursor;
+    uint64_t    value        = 0;
+    uint64_t    limit        = negative ? ((uint64_t)LONG_MAX + 1ULL) : (uint64_t)LONG_MAX;
+    bool        overflow     = false;
+
+    while (*cursor)
     {
-    noconv: {
+        int ch    = *cursor;
+        int digit = -1;
+
+        if (ch >= '0' && ch <= '9') { digit = ch - '0'; }
+        else if (ch >= 'A' && ch <= 'Z') { digit = ch - 'A' + 10; }
+        else if (ch >= 'a' && ch <= 'z') { digit = ch - 'a' + 10; }
+        else { break; }
+
+        if (digit >= base) { break; }
+        if (value > (limit - (uint64_t)digit) / (uint64_t)base) { overflow = true; }
+        else { value = value * (uint64_t)base + (uint64_t)digit; }
+        cursor++;
     }
+
+    if (cursor == number_start)
+    {
+        if (endptr) { *endptr = (char *)str; }
+        return 0;
     }
-    else if (neg)
-        acc = -acc;
-    if (endptr != NULL) *endptr = (char *)(any ? s - 1 : str);
-    return (acc);
+
+    if (endptr) { *endptr = (char *)cursor; }
+    if (overflow) { return negative ? LONG_MIN : LONG_MAX; }
+    if (!negative) { return (int64_t)value; }
+    if (value == (uint64_t)LONG_MAX + 1ULL) { return LONG_MIN; }
+    return -(int64_t)value;
 }
 EXPORT_SYMBOL(strtol);
 
@@ -510,94 +517,78 @@ int skip_atoi(const char **s)
  */
 size_t wnumber(Writer *writer, num_formatter_t fmter, num_fmt_type type) // NOLINT
 {
-    char         c = 0;
+    if (!writer || !writer->handler || fmter.base < 2 || fmter.base > 36) { return 0; }
+
     char         tmp[65];
-    int          sign      = 0;
-    const char  *digits    = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
-    int          i         = 0; // index for tmp
-    int64_t      size      = (int64_t)fmter.size;
-    int64_t      precision = (int64_t)fmter.precision;
-    size_t       base      = fmter.base;
-    WriteHandler write     = writer->handler;
-    size_t       result    = 0;
+    const char  *digits  = type.small ? "0123456789abcdefghijklmnopqrstuvwxyz"
+                                      : "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    WriteHandler write   = writer->handler;
+    size_t       result  = 0;
+    uint64_t     value   = (uint64_t)fmter.num;
+    char         sign    = 0;
+    char         prefix0 = 0;
+    char         prefix1 = 0;
 
-    if (type.small) digits = "0123456789abcdefghijklmnopqrstuvwxyz";
-    if (type.left) type.zeropad = false; // if left adjust, zero padding is not allowed
-    if (base < 2 || base > 36) return 0; // Invalid base
-
-    c = (type.zeropad) ? '0' : ' ';
-
-    /* Check sign */
     if (type.sign && (int64_t)fmter.num < 0)
     {
-        sign      = '-';
-        fmter.num = -(int64_t)fmter.num;
+        int64_t signed_value = (int64_t)fmter.num;
+        sign                 = '-';
+        value                = (uint64_t)(-(signed_value + 1)) + 1;
     }
     else if (type.plus) { sign = '+'; }
     else if (type.space) { sign = ' '; }
-    else { sign = 0; }
 
-    if (sign) size--;
-
-    /* Special like 0x, 0 */
     if (type.special)
     {
-        if (base == 16) { size -= 2; }
-        else if (base == 8) { size--; }
-    }
-
-    i = 0;
-    if (fmter.num == 0) { tmp[i++] = '0'; }
-    else
-    {
-        while (fmter.num != 0)
+        if (fmter.base == 8) { prefix0 = '0'; }
+        else if (fmter.base == 16)
         {
-            tmp[i++]  = digits[(uint64_t)fmter.num % (uint64_t)base];
-            fmter.num = (uint64_t)fmter.num / (uint64_t)fmter.base;
-        }
-    }
-    if (i > precision) precision = i; // precision = max(precision, i);
-    size -= precision;
-
-    /* If type no include LEFT or ZEROPAD */
-    if (!(type.zeropad || type.left))
-    {
-        /* Fill in the space */
-        while (size-- > 0)
-            write(writer, ' '), result++;
-    }
-
-    /* Write the sign */
-    if (sign) write(writer, (char)sign), result++;
-
-    /* Write the prefix */
-    if (type.special)
-    {
-        if (base == 8) { write(writer, '0'), result++; }
-        else if (base == 16)
-        {
-            write(writer, '0'), result++;
-            write(writer, digits[33]), result++; // 33 is 'x' or 'X'
+            prefix0 = '0';
+            prefix1 = type.small ? 'x' : 'X';
         }
     }
 
-    if (!(type.left))
+    size_t digit_count = 0;
+    do
     {
-        /* Write the padding */
-        while (size-- > 0)
-            write(writer, c), result++;
-    }
+        tmp[digit_count++] = digits[value % (uint64_t)fmter.base];
+        value /= (uint64_t)fmter.base;
+    } while (value != 0);
 
-    /* Write the zero padding */
-    while (i < precision--)
-        write(writer, '0'), result++;
-    /* Write the number */
-    while (i-- > 0)
-        write(writer, tmp[i]), result++;
+    size_t prefix_width      = (prefix0 != 0 ? 1 : 0) + (prefix1 != 0 ? 1 : 0);
+    size_t precision_width   = fmter.precision > digit_count ? fmter.precision : digit_count;
+    size_t precision_padding = precision_width - digit_count;
+    size_t content_width     = precision_width + prefix_width + (sign != 0 ? 1 : 0);
+    size_t field_padding     = fmter.size > content_width ? fmter.size - content_width : 0;
+    bool   zero_field        = type.zeropad && !type.left;
 
-    /* LEFT adjust */
-    while (size-- > 0)
+    while (!type.left && !zero_field && field_padding > 0)
+    {
+        field_padding--;
         write(writer, ' '), result++;
+    }
+
+    if (sign != 0) write(writer, sign), result++;
+    if (prefix0 != 0) write(writer, prefix0), result++;
+    if (prefix1 != 0) write(writer, prefix1), result++;
+
+    while (zero_field && field_padding > 0)
+    {
+        field_padding--;
+        write(writer, '0'), result++;
+    }
+    while (precision_padding > 0)
+    {
+        precision_padding--;
+        write(writer, '0'), result++;
+    }
+    while (digit_count-- > 0)
+        write(writer, tmp[digit_count]), result++;
+    while (type.left && field_padding > 0)
+    {
+        field_padding--;
+        write(writer, ' '), result++;
+    }
 
     return result;
 }
