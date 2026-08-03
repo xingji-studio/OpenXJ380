@@ -156,6 +156,7 @@
 // P3.1
 #define XAPI_OUTPUT    7381
 #define XAPI_INPUT     7382
+#define XAPI_INPUT_NO_ECHO 0x1
 
 #define XAPI_GETLINE   7418
 

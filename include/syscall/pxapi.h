@@ -82,6 +82,7 @@ typedef struct {
 // P3.1
 #define XAPI_OUTPUT    7381
 #define XAPI_INPUT     7382
+#define XAPI_INPUT_NO_ECHO 0x1
 
 #define XAPI_GETLINE   7418
 
@@ -291,7 +292,7 @@ typedef struct
 
 // Proto (XAPI Edition)
 void do_xapi_Output(char *str);
-void do_xapi_Input(char *str);
+int  do_xapi_Input(char *str, size_t capacity, uint64_t flags);
 char do_xapi_Getch();
 void do_xapi_Endline();
 void do_xapi_Printline(char *str);

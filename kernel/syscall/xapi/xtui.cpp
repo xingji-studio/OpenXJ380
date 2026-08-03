@@ -233,53 +233,80 @@ void do_xapi_Output(char *str)
     free(kstr);
 }
 
-void do_xapi_Input(char *str)
+int do_xapi_Input(char *str, size_t capacity, uint64_t flags)
 {
+    if (str == NULL) return -EFAULT;
+    if (capacity == 0 || capacity > XAPI_USER_STRING_MAX) return -EINVAL;
+    if ((flags & ~((uint64_t)XAPI_INPUT_NO_ECHO)) != 0) return -EINVAL;
+
     pcb_t front_p = get_current_task()->parent_group;
     while (true)
     {
         if (front_p == NULL || front_p == kernel_group)
         {
-            if (str == NULL) return;
             char input[XAPI_USER_STRING_MAX];
             size_t index = 0;
-            while (index < XAPI_USER_STRING_MAX - 1)
+            size_t discarded = 0;
+            while (true)
             {
                 uint8_t value = get_keyboard_input();
                 if (value == 0) { scheduler_yield(); continue; }
                 if (value == '\b')
                 {
-                    if (index > 0) { index--; write_serial_string("\b \b"); }
+                    if (discarded > 0)
+                    {
+                        discarded--;
+                    }
+                    else if (index > 0)
+                    {
+                        index--;
+                    }
+                    else continue;
+                    if ((flags & XAPI_INPUT_NO_ECHO) == 0) write_serial_string("\b \b");
                     continue;
                 }
                 if (value == '\n') { write_serial_string("\n"); break; }
                 if (value >= 32 && value < 127)
                 {
-                    input[index++] = (char)value;
-                    char echo[2] = {(char)value, '\0'};
-                    write_serial_string(echo);
+                    if (index < capacity - 1) input[index++] = (char)value;
+                    else if (discarded != (~(size_t)0)) discarded++;
+                    if ((flags & XAPI_INPUT_NO_ECHO) == 0)
+                    {
+                        char echo[2] = {(char)value, '\0'};
+                        write_serial_string(echo);
+                    }
                 }
             }
             input[index] = '\0';
-            copy_to_user_pagedir(xapi_current_pagedir(), str, input, index + 1);
-            return;
+            bool copied = copy_to_user_pagedir(xapi_current_pagedir(), str, input, index + 1);
+            if ((flags & XAPI_INPUT_NO_ECHO) != 0) memset(input, 0, sizeof(input));
+            return copied ? 0 : -EFAULT;
         }
         if (front_p->xtttp_stc->is_shell)
         {
-            // 等待命令行输入
+            front_p->xtttp_stc->input_flags = (uint32_t)flags;
             front_p->xtttp_stc->wait_for_input = true;
+            // 等待命令行输入
             while (true)
             {
                 if (front_p->xtttp_stc->input_lock) break;
                 scheduler_yield();
             }
             size_t input_len = p_xapi_strnlen(front_p->xtttp_stc->input, sizeof(front_p->xtttp_stc->input) - 1);
+            while (input_len > 0 && (front_p->xtttp_stc->input[input_len - 1] == '\n' ||
+                                     front_p->xtttp_stc->input[input_len - 1] == '\r'))
+                input_len--;
             front_p->xtttp_stc->input[input_len] = '\0';
-            copy_to_user_pagedir(xapi_current_pagedir(), str, front_p->xtttp_stc->input, input_len + 1);
+            if (input_len >= capacity) input_len = capacity - 1;
+            bool copied = copy_to_user_pagedir(xapi_current_pagedir(), str, front_p->xtttp_stc->input, input_len);
+            char terminator = '\0';
+            if (copied)
+                copied = copy_to_user_pagedir(xapi_current_pagedir(), str + input_len, &terminator, 1);
             memset(front_p->xtttp_stc->input, 0, sizeof(front_p->xtttp_stc->input));
             front_p->xtttp_stc->input_lock = false;
             front_p->xtttp_stc->wait_for_input = false;
-            return;
+            front_p->xtttp_stc->input_flags = 0;
+            return copied ? 0 : -EFAULT;
         }
         front_p = front_p->parent_task;
     }

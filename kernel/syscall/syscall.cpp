@@ -620,7 +620,9 @@ extern "C" uint64_t c_syscall_handler(struct X64_REGS *regs, uint64_t user_rsp)
 
     /* XJ380API XAPI Edition */
     case XAPI_OUTPUT: do_xapi_Output((char *)regs->rdi); break;
-    case XAPI_INPUT: do_xapi_Input((char *)regs->rdi); break;
+    case XAPI_INPUT:
+        regs->rax = (uint64_t)do_xapi_Input((char *)regs->rdi, (size_t)regs->rsi, regs->rdx);
+        break;
     case XAPI_GETCH: regs->rax = (uint64_t)do_xapi_Getch(); break;
     case XAPI_ENDLINE: do_xapi_Endline(); break;
     case XAPI_PRINTLINE: do_xapi_Printline((char *)regs->rdi); break;

@@ -84,6 +84,7 @@ void mark_terminal();
 void write_xttp_buffer(char *str);
 void read_xttp_buffer(char *str);
 bool check_read_xttp_buffer();
+bool terminal_input_no_echo();
 void terminal_app_mark_finish_output();
 
 void revert_path(char *path);

@@ -192,6 +192,21 @@ bool is_partition_used(struct GPT_DPTE *entry)
     }
     return false;
 }
+
+static bool partition_lba_range_is_valid(uint64_t starting_lba, uint64_t ending_lba, size_t sector_size,
+                                         size_t disk_size)
+{
+    if (sector_size == 0 || starting_lba > ending_lba) return false;
+
+    size_t disk_sectors = disk_size / sector_size;
+    if (disk_sectors == 0 || ending_lba >= disk_sectors) return false;
+    uint64_t size_max = (uint64_t)(~(size_t)0);
+    if (starting_lba > size_max || ending_lba > size_max) return false;
+
+    uint64_t sector_count = ending_lba - starting_lba + 1;
+    return sector_count <= size_max / sector_size;
+}
+
 static bool parse_gpt_partitions(vfs_node_t device, struct GPT_DPT *gpt, device_t disk, size_t vdisk_id)
 {
     if (memcmp(gpt->signature, "EFI PART", 8) != 0 || gpt->num_partition_entries == 0 ||
@@ -211,6 +226,11 @@ static bool parse_gpt_partitions(vfs_node_t device, struct GPT_DPT *gpt, device_
     size_t entries_offset = (size_t)gpt->partition_entry_lba * disk.sector_size;
     if (entries_offset > disk.size || dptes_size > disk.size - entries_offset) return false;
 
+    size_t disk_sectors = disk.size / disk.sector_size;
+    if (gpt->first_usable_lba == 0 || gpt->first_usable_lba > gpt->last_usable_lba ||
+        gpt->last_usable_lba >= disk_sectors)
+        return false;
+
     struct GPT_DPTE *dptes      = (struct GPT_DPTE *)malloc(dptes_size);
     if (!dptes) return false;
     memset(dptes, 0, dptes_size);
@@ -227,6 +247,14 @@ static bool parse_gpt_partitions(vfs_node_t device, struct GPT_DPT *gpt, device_
         struct GPT_DPTE *entry = (struct GPT_DPTE *)((uint8_t *)dptes + j * gpt->size_of_partition_entry);
         if (is_partition_used(entry))
         {
+            if (entry->starting_lba < gpt->first_usable_lba || entry->ending_lba > gpt->last_usable_lba ||
+                !partition_lba_range_is_valid(entry->starting_lba, entry->ending_lba, disk.sector_size, disk.size))
+            {
+                pr_warn("PART: ignoring invalid GPT entry %zu on %s (lba=%llu..%llu)\n", j, disk.drive_name,
+                        entry->starting_lba, entry->ending_lba);
+                continue;
+            }
+
             partition_t *partition  = &partitions[partition_num];
             partition->vdisk_id     = vdisk_id;
             partition->starting_lba = entry->starting_lba;
@@ -343,12 +371,24 @@ bool parser_block_device(vfs_node_t device, device_t disk, size_t vdisk_id)
             {
                 if (boot_sector->dpte[j].start_lba == 0 || boot_sector->dpte[j].sectors_limit == 0) continue;
                 if (partition_num >= MAX_PARTITIONS_NUM) break;
-                size_t       starting_lba = boot_sector->dpte[j].start_lba;
-                size_t       ending_lba   = boot_sector->dpte[j].sectors_limit;
+                uint64_t starting_lba = boot_sector->dpte[j].start_lba;
+                uint64_t sector_count = boot_sector->dpte[j].sectors_limit;
+                if (sector_count - 1 > __UINT64_MAX__ - starting_lba)
+                {
+                    pr_warn("PART: ignoring overflowing MBR entry %d on %s\n", j, disk.drive_name);
+                    continue;
+                }
+                uint64_t ending_lba = starting_lba + sector_count - 1;
+                if (!partition_lba_range_is_valid(starting_lba, ending_lba, disk.sector_size, disk.size))
+                {
+                    pr_warn("PART: ignoring invalid MBR entry %d on %s (lba=%llu..%llu)\n", j, disk.drive_name,
+                            starting_lba, ending_lba);
+                    continue;
+                }
                 partition_t *partition    = &partitions[partition_num];
                 partition->vdisk_id       = vdisk_id;
-                partition->starting_lba   = starting_lba;
-                partition->ending_lba     = ending_lba;
+                partition->starting_lba   = (size_t)starting_lba;
+                partition->ending_lba     = (size_t)ending_lba;
                 partition->type           = partition->MBR;
                 partition->sector_size    = disk.sector_size;
                 partition->is_used        = true;

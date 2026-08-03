@@ -28,6 +28,7 @@ void init_process_xtttp(pcb_t pcb)
     memset(pcb->xtttp_stc->output, 0, sizeof(char) * 1024);
     // pcb->xtttp_stc->output   = (char *)malloc(1024 * sizeof(char));
     memset(pcb->xtttp_stc->input, 0, sizeof(char) * 1024);
+    pcb->xtttp_stc->input_flags = 0;
 }
 
 int check_terminal_init_status()
@@ -47,7 +48,14 @@ void mark_process_is_terminal()
 int check_input_waiting_status()
 {
     tcb_t current = get_current_task();
-    return current->parent_group->xtttp_stc->wait_for_input ? 1 : 0;
+    if (current == NULL || current->parent_group == NULL || current->parent_group->xtttp_stc == NULL ||
+        !current->parent_group->xtttp_stc->wait_for_input)
+        return 0;
+
+    int status = XTTTP_INPUT_STATUS_WAITING;
+    if ((current->parent_group->xtttp_stc->input_flags & XAPI_INPUT_NO_ECHO) != 0)
+        status |= XTTTP_INPUT_STATUS_NO_ECHO;
+    return status;
 }
 
 int read_terminal_app_output_buffer(char *str)

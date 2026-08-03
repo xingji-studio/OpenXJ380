@@ -1,5 +1,8 @@
 #include "../xapi/include/x3api.h"
 
+#define XTTTP_INPUT_STATUS_WAITING 0x1
+#define XTTTP_INPUT_STATUS_NO_ECHO 0x2
+
 #define SXAH_SYSCALL_RETURN         128956723895689201      // syscall返回 
 #define SXAH_CREATE_KERNEL_TERMINAL 128956723895689202      // 创建内核态进程
 #define SXAH_CHECK_USER_PASSWORD    128956723895689203      // 检查用户密码
@@ -29,7 +32,12 @@ void read_xttp_buffer(char *str)
 
 bool check_read_xttp_buffer()
 {
-    return enter_syscall(SXAH_CHECK_INPUT_BUFFER, 0, 0, 0, 0, 0, 0);
+    return (enter_syscall(SXAH_CHECK_INPUT_BUFFER, 0, 0, 0, 0, 0, 0) & XTTTP_INPUT_STATUS_WAITING) != 0;
+}
+
+bool terminal_input_no_echo()
+{
+    return (enter_syscall(SXAH_CHECK_INPUT_BUFFER, 0, 0, 0, 0, 0, 0) & XTTTP_INPUT_STATUS_NO_ECHO) != 0;
 }
 
 void terminal_app_mark_finish_output()

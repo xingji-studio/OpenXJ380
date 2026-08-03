@@ -59,7 +59,7 @@ void terminal_child_putchar(char ch)
     char text[2] = {ch, '\0'};
     app_input_buffer[p_input_buffer++] = ch;
     app_input_buffer[p_input_buffer] = '\0';
-    ptt_console_sp(text);
+    if (!terminal_input_no_echo()) ptt_console_sp(text);
     reset_terminal_cursor_blink();
     show_terminal_cursor(false);
     xapi_RefreshWindow(handle);
@@ -112,6 +112,8 @@ void terminal_child_backspace()
 
     p_input_buffer--;
     app_input_buffer[p_input_buffer] = '\0';
+
+    if (terminal_input_no_echo()) return;
 
     hide_terminal_cursor(false);
     if (cur_x != 8) { cur_x -= 9; }
@@ -166,16 +168,17 @@ void tam_flush_buffer()
         char temp[256];
         strcpy(temp, char_buffer);
         int temp_pchb = p_chbuffer;
+        bool no_echo = terminal_input_no_echo();
 
         hide_terminal_cursor(false);
-        if (cur_x + temp_pchb * 9 >= TML_X - 8) { newline(); }
+        if (!no_echo && cur_x + temp_pchb * 9 >= TML_X - 8) { newline(); }
 
         p_chbuffer = 0;
-        xapi_DrawSWText(handle, cur_x, cur_y, temp, TERMINAL_TEXT_COLOR);
+        if (!no_echo) xapi_DrawSWText(handle, cur_x, cur_y, temp, TERMINAL_TEXT_COLOR);
 
         strcpy(&app_input_buffer[p_input_buffer], char_buffer);
         p_input_buffer += strlen(char_buffer);
-        cur_x += temp_pchb * 9;
+        if (!no_echo) cur_x += temp_pchb * 9;
         reset_terminal_cursor_blink();
         show_terminal_cursor(false);
         xapi_RefreshWindow(handle);
