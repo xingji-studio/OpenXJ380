@@ -61,11 +61,12 @@ static const char *busybox_alias_applets[] = {
 static void load_busybox_alias_applets()
 {
     char setfile_path[32];
-    memset(setfile_path, 0, 256);
+    memset(setfile_path, 0, 32);
     strcat(setfile_path, "/etc/busybox/alias/applets.dat");
     vfs_node_t vfp = vfs_open(setfile_path);
     if (!vfp) return;
     char buffer[768];
+    memset(buffer, 0, 768)
     if(vfp->size > sizeof(buffer)) goto cleanup;
     vfs_read(vfp, buffer, 0, vfp->size);
     char alias[8];
