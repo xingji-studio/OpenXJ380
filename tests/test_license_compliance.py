@@ -88,6 +88,25 @@ class LicenseComplianceTests(unittest.TestCase):
 
         self.assertIn("KCONFIG_NOTIMESTAMP=1", build_script)
 
+    def test_mikanos_hankaku_source_material_is_complete(self) -> None:
+        source_root = ROOT / "third_party/mikanos-hankaku"
+        self.assertTrue((source_root / "LICENSE").is_file())
+        self.assertTrue((source_root / "SOURCE.md").is_file())
+        self.assertTrue((source_root / "hankaku.txt").is_file())
+
+        manifest = json.loads(
+            (ROOT / "third_party/compliance-manifest.json").read_text(encoding="utf-8")
+        )
+        components = {component["slug"]: component for component in manifest["components"]}
+
+        self.assertEqual("MikanOS hankaku font", components["mikanos-hankaku"]["name"])
+        self.assertEqual(
+            ["third_party/mikanos-hankaku/LICENSE", "third_party/mikanos-hankaku/SOURCE.md"],
+            components["mikanos-hankaku"]["license_files"],
+        )
+        self.assertIn("third_party/mikanos-hankaku/hankaku.txt", components["mikanos-hankaku"]["source_files"])
+        self.assertTrue(components["mikanos-hankaku"]["bundle_source"])
+
     def test_third_party_manifest_references_existing_materials(self) -> None:
         manifest = json.loads(
             (ROOT / "third_party/compliance-manifest.json").read_text(encoding="utf-8")
