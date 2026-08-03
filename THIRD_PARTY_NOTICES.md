@@ -22,7 +22,8 @@ generates a distributable bundle at `out/compliance/third-party`.
 | Lexbor | Apache-2.0 | `third_party/lexbor/LICENSE` and `NOTICE` |
 | StardustUI | MIT | `frameworks/StardustUI/LICENSE` |
 | RapidJSON | MIT | embedded in `rapidjson.h` |
-| Rust alloc/compiler_builtins | Apache-2.0 OR MIT | `third_party/rust-runtime` |
+| Rust alloc/compiler_builtins | Apache-2.0 OR MIT | `third_party/rust-runtime/LICENSE-APACHE`; `third_party/rust-runtime/LICENSE-MIT`; `third_party/rust-runtime/SOURCE.md`; `licenses/liballoc.txt`; `liballoc-x86_64.a` |
+| talc allocator | MIT | `third_party/talc/LICENSE.md`; `third_party/talc/SOURCE.md`; `liballoc-x86_64.a` |
 | BusyBox 1.31.1 | GPL-2.0-only | `third_party/busybox-source` |
 | MikanOS hankaku font | Apache-2.0 | `third_party/mikanos-hankaku/LICENSE`; `third_party/mikanos-hankaku/SOURCE.md`; `third_party/mikanos-hankaku/hankaku.txt`; `font/hankaku.bin` |
 | maple-font | SIL OPEN FONT LICENSE | `font/ttf/XJ380C.ttf` |
