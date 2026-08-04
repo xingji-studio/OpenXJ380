@@ -139,10 +139,10 @@ DEBUG=0 SMP=2 SUDO=0 KVM=0 DISPLAY_BACKEND=gtk ninja -f build.ninja run
 
 ## Star History
 
-<a href="https://www.star-history.com/?repos=xingji-studio%2FOpenXJ380&type=timeline&legend=top-left">
+<a href="https://www.star-history.com/?repos=xingji-studio%2FOpenXJ380&type=date&legend=top-left">
  <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://www.star-history.com/?repos=xingji-studio%2FOpenXJ380&type=timeline&legend=top-left" />
-   <source media="(prefers-color-scheme: light)" srcset="https://www.star-history.com/?repos=xingji-studio%2FOpenXJ380&type=timeline&legend=top-left" />
-   <img alt="Star History Chart" src="https://www.star-history.com/?repos=xingji-studio%2FOpenXJ380&type=timeline&legend=top-left" />
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=xingji-studio/OpenXJ380&type=timeline&theme=dark&logscale&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=xingji-studio/OpenXJ380&type=timeline&logscale&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=xingji-studio/OpenXJ380&type=timeline&logscale&legend=top-left" />
  </picture>
 </a>
