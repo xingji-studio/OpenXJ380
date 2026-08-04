@@ -4,23 +4,14 @@
     {"name":"musl ELF definitions","slug":"musl-elf","license":"MIT","license_files":["third_party/musl-elf/COPYRIGHT"],"source_files":["include/elf.h","third_party/musl-elf/SOURCE.md"],"bundle_source":false},
     {"name":"lwIP","slug":"lwip","license":"BSD-3-Clause","license_files":["kmod/netserver/lwip/core/init.c"],"source_files":["kmod/netserver/lwip"],"bundle_source":false},
     {"name":"FatFs","slug":"fatfs","license":"BSD-style","license_files":["driver/fs/fatfs/ff.cpp"],"source_files":["driver/fs/fatfs"],"bundle_source":false},
-    {"name":"stb libraries","slug":"stb","license":"MIT OR Unlicense","license_files":["graphics/image/stbi.h"],"source_files":["graphics/image/stbi.h","graphics/image/stbir.h","font/ttf/stb_ttf.h","user/browser/third_party/stb"],"bundle_source":false},
     {"name":"dr_mp3","slug":"dr-mp3","license":"MIT-0 OR Unlicense","license_files":["include/dr_mp3.h"],"source_files":["include/dr_mp3.h"],"bundle_source":false},
-    {"name":"litehtml","slug":"litehtml","license":"BSD-3-Clause","license_files":["third_party/litehtml/LICENSE"],"source_files":["third_party/litehtml"],"bundle_source":false},
-    {"name":"Gumbo Parser","slug":"gumbo","license":"Apache-2.0","license_files":["third_party/litehtml/src/gumbo/LICENSE"],"source_files":["third_party/litehtml/src/gumbo"],"bundle_source":false},
     {"name":"libvterm","slug":"libvterm","license":"MIT","license_files":["third_party/libvterm/LICENSE"],"source_files":["third_party/libvterm"],"bundle_source":false},
-    {"name":"libwebp","slug":"libwebp","license":"BSD-3-Clause","license_files":["user/browser/third_party/libwebp/src/webp/types.h"],"source_files":["user/browser/third_party/libwebp"],"bundle_source":false},
-    {"name":"NanoSVG","slug":"nanosvg","license":"Zlib","license_files":["user/browser/third_party/nanosvg/nanosvg.h"],"source_files":["user/browser/third_party/nanosvg"],"bundle_source":false},
     {"name":"Mbed TLS","slug":"mbedtls","license":"Apache-2.0","license_files":["third_party/mbedtls-src/LICENSE","third_party/mbedtls-license-selection.json"],"source_files":["third_party/mbedtls-src"],"bundle_source":false},
     {"name":"Lexbor","slug":"lexbor","license":"Apache-2.0","license_files":["third_party/lexbor/LICENSE","third_party/lexbor/NOTICE"],"source_files":["third_party/lexbor"],"bundle_source":false},
-    {"name":"StardustUI","slug":"stardustui","license":"MIT","license_files":["frameworks/StardustUI/LICENSE"],"source_files":["frameworks/StardustUI"],"bundle_source":false},
-    {"name":"RapidJSON","slug":"rapidjson","license":"MIT","license_files":["frameworks/StardustUI/includes/rapidjson/rapidjson.h"],"source_files":["frameworks/StardustUI/includes/rapidjson"],"bundle_source":false},
     {"name":"Rust alloc and compiler_builtins","slug":"rust-runtime","license":"Apache-2.0 OR MIT","license_files":["third_party/rust-runtime/LICENSE-APACHE","third_party/rust-runtime/LICENSE-MIT","third_party/rust-runtime/SOURCE.md","licenses/liballoc.txt"],"source_files":["liballoc-x86_64.a"],"bundle_source":false},
     {"name":"talc allocator","slug":"talc","license":"MIT","license_files":["third_party/talc/LICENSE.md","third_party/talc/SOURCE.md"],"source_files":["liballoc-x86_64.a"],"bundle_source":false},
     {"name":"BusyBox","slug":"busybox","license":"GPL-2.0-only","license_files":["third_party/busybox-source/LICENSE"],"source_files":["third_party/busybox-source/busybox-1.31.1.tar.bz2","third_party/busybox-source/busybox-1.31.1.config","third_party/busybox-source/0001-date-use-clock-settime.patch","third_party/busybox-source/build.sh","third_party/busybox-source/BUILDING.md"],"bundle_source":true},
     {"name":"MikanOS hankaku font","slug":"mikanos-hankaku","license":"Apache-2.0","license_files":["third_party/mikanos-hankaku/LICENSE","third_party/mikanos-hankaku/SOURCE.md"],"source_files":["third_party/mikanos-hankaku/hankaku.txt","font/hankaku.bin"],"bundle_source":true},
-    {"name":"maple-font","slug":"maple-font","license":"OFL 1.1","license_files":["third_party/maple-font/LICENSE"],"source_files":["font/ttf/XJ380C.ttf"],"bundle_source":false},
-    {"name":"Source Han Sans font","slug":"source-han-sans","license":"OFL 1.1","license_files":["third_party/source-han-sans/LICENSE"],"source_files":["font/ttf/XJ380F.ttf"],"bundle_source":false},
     {"name":"libutf","slug":"libutf","license":"MIT","license_files":["third_party/libutf/LICENSE"],"source_files":["kernel/utflib.cpp"],"bundle_source":false}
   ]
 }
