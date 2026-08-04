@@ -55,46 +55,6 @@ static bool notify_pipe_write_handle_valid(pcb_t process, fd_file_handle **out_h
     return true;
 }
 
-void init_window_message(WINDOWLSP window, MsgPrcor func)
-{
-    if (window == NULL || window->w_task == NULL) return;
-
-    tcb_t current  = window->w_task;
-    window->WinMPf = func;
-
-    fd_file_handle *existing_handle = NULL;
-    if (current->message_pipe_read_fd >= 0 && current->message_pipe_write_fd >= 0 &&
-        message_pipe_write_handle_valid(current, &existing_handle))
-    {
-        return;
-    }
-
-    current->message_pipe_read_fd  = -1;
-    current->message_pipe_write_fd = -1;
-
-    int pipefd[2] = {-1, -1};
-    if ((int64_t)sys_pipe2(pipefd, 0, 0, 0, 0, 0, NULL) < 0)
-    {
-        write_serial_string("desktop: init_window_message pipe create failed\n");
-        return;
-    }
-
-    current->message_pipe_read_fd  = pipefd[0];
-    current->message_pipe_write_fd = pipefd[1];
-
-    size_t tid = create_message_thread((void *)(XJ380_PRIVATE_MESSAGE_REVERT_ADDRESS + XPSR_OFFEST),
-                                       "Window Message Thread", current->parent_group,
-                                       strdup(current->str_cwd), (uint64_t)pipefd[0]);
-    if ((int64_t)tid < 0)
-    {
-        sys_close(pipefd[0], 0, 0, 0, 0, 0, NULL);
-        sys_close(pipefd[1], 0, 0, 0, 0, 0, NULL);
-        current->message_pipe_read_fd  = -1;
-        current->message_pipe_write_fd = -1;
-        write_serial_string("desktop: init_window_message thread create failed\n");
-    }
-}
-
 bool init_notify_message(pcb_t process, uint64_t func)
 {
     if (process == NULL || func == 0) return false;
@@ -209,15 +169,7 @@ void do_message(uint64_t msg_type, uint64_t hData, uint64_t lData, MsgPrcor WinM
     if (WinMpf != NULL && ftask->message_pipe_write_fd >= 0)
     {
         fd_file_handle *handle = NULL;
-        if (!message_pipe_write_handle_valid(ftask, &handle))
-        {
-            WINDOWLSP window = mpf_found_win(WinMpf);
-            if (window != NULL && window->w_task == ftask)
-            {
-                init_window_message(window, WinMpf);
-            }
-            if (!message_pipe_write_handle_valid(ftask, &handle)) return;
-        }
+        if (!message_pipe_write_handle_valid(ftask, &handle)) return;
 
         MessageInfoFormat mif;
         mif.WinMpf   = WinMpf;

@@ -16,15 +16,12 @@
 #define BIG_USER_STACK    (CONFIG_USER_STACK_SIZE * 1UL)        // 用户栈大小，要对齐到页
 
 #include <ps2/keyboard.h>
+#include <efi/fbc.h>
 #include <stdarg.h>
 #include <stdint.h>
 
 #define close_interrupt disable_intr()
 #define open_interrupt  enable_intr()
-
-/*
- *   graphics
- */
 
 /*
  *
@@ -76,13 +73,6 @@ void default_isr(struct X64_REGS *regs, uint64_t error_code);
 #ifdef __cplusplus
 }
 #endif
-
-// graphics/sheet.cpp
-
-// graphics/window/theme.cpp
-
-
-// graphics/window/windowm.cpp
 
 // lib/utflib.c
 typedef int32_t Rune;
@@ -243,27 +233,6 @@ void keyboard_usb_key_event(uint8_t usage, uint8_t value, uint8_t pressed);
 }
 #endif
 
-// driver/ps2/mouse.cpp
-void mouse_init();
-void process_mouse_info();
-
-// uint8_t get_Mouse_output();
-bool mousedecode(uint8_t data);
-int  get_mouse_x();
-int  get_mouse_y();
-int  get_mouse_scroll();
-void set_mouse_position(int x, int y);
-void center_mouse_cursor();
-void draw_mouse(SHEET_INFO *sht, SHEET *csheet);
-void move_mouse(SHEET_INFO *sht, SHEET *csheet, int px, int py);
-#ifdef __cplusplus
-extern "C" {
-#endif
-void mouse_inject_report(int dx, int dy, uint8_t buttons, int wheel);
-#ifdef __cplusplus
-}
-#endif
-
 /*
  *
  *  kernel/task/
@@ -274,17 +243,6 @@ void mouse_inject_report(int dx, int dy, uint8_t buttons, int wheel);
 void create_user_thread_from_file(char *path, pcb_t pcb);
 int create_user_process_from_file(char *path, pcb_t pcb, char *argv[]);
 int create_user_process_singleton_from_file(char *path, pcb_t pcb, char *argv[]);
-void PrintPicture(SHEET_INFO *sht, SHEET *csheet, int x, int y, int ow, int oh, char *path);
-void PrintPicture_blend(SHEET_INFO *sht, SHEET *csheet, int x, int y, int ow, int oh, char *path);
-bool LoadPicture(SHEET_BUFFER *buffer, int ow, int oh, char *path);
-void LoadPictureOgM(SHEET_BUFFER **buffer, char *path);
-void GetPictureSize(int *w, int *h, char *path);
-void copy_buffer_by_id(SHEET_INFO *sht, SHEET *dst_sheet, SHEET_BUFFER *src, uint32_t dst_x, uint32_t dst_y,
-                       uint32_t width, uint32_t height);
-void copy_buffer_by_id_without_alpha(SHEET_INFO *sht, SHEET *dst_sheet, SHEET_BUFFER *src, uint32_t dst_x,
-                                     uint32_t dst_y, uint32_t width, uint32_t height);
-void copy_buffer_blend_by_id(SHEET_INFO *sht, SHEET *dst_sheet, SHEET_BUFFER *src, uint32_t dst_x, uint32_t dst_y,
-                             uint32_t width, uint32_t height);
 
 void backtrace(struct X64_REGS *regs);
 

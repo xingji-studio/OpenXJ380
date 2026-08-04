@@ -19,19 +19,6 @@ extern uint8_t keyboard_code1[256];
 #define KB_USB_REPEAT_SLOTS 6
 #define KB_USB_REPEAT_DELAY_NS 500000000ULL
 #define KB_USB_REPEAT_INTERVAL_NS 25000000ULL
-#define KB_PS2_TAB_MAKE_CODE 0x0f
-#define KB_PS2_R_MAKE_CODE 0x13
-#define KB_PS2_D_MAKE_CODE 0x20
-#define KB_PS2_SPACE_MAKE_CODE 0x39
-#define KB_PS2_LEFT_WIN_MAKE_CODE 0x5b
-#define KB_PS2_RIGHT_WIN_MAKE_CODE 0x5c
-#define KB_USB_TAB_USAGE 0x2b
-#define KB_USB_R_USAGE 0x15
-#define KB_USB_D_USAGE 0x07
-#define KB_USB_SPACE_USAGE 0x2c
-#define KB_USB_LEFT_GUI_USAGE 0xe3
-#define KB_USB_RIGHT_GUI_USAGE 0xe7
-
 struct keyboard_usb_repeat_slot
 {
     bool active;
@@ -191,14 +178,24 @@ uint8_t keyboard_translate_event_value(uint8_t make_code, bool extended,
     return keyboard_translate_base_make_code(make_code, shift, caps);
 }
 
+extern "C" void keyboard_dispatch_key_message(uint64_t msg_type, uint8_t value)
+{
+    (void)msg_type;
+    (void)value;
+}
+
 static void keyboard_update_modifier_state(uint8_t make_code, bool extended, bool pressed)
 {
-    if (!extended && (make_code == 0x2a || make_code == 0x36)) kb_fifo.shift = pressed;
-    else if (make_code == 0x1d) kb_fifo.ctrl = pressed;
-    else if (make_code == 0x38) kb_fifo.alt = pressed;
-    else if (!extended && make_code == 0x3a && pressed) kb_fifo.caps = !kb_fifo.caps;
-    else if (extended && (make_code == KB_PS2_LEFT_WIN_MAKE_CODE || make_code == KB_PS2_RIGHT_WIN_MAKE_CODE))
-        kb_fifo.win = pressed;
+    (void)extended;
+    switch (make_code)
+    {
+    case 0x2a:
+    case 0x36: kb_fifo.shift = pressed; break;
+    case 0x1d: kb_fifo.ctrl = pressed; break;
+    case 0x38: kb_fifo.alt = pressed; break;
+    case 0x3a: if (pressed) kb_fifo.caps = !kb_fifo.caps; break;
+    default: break;
+    }
 }
 
 /*
@@ -272,6 +269,11 @@ extern "C" void c_keyboard_handler(void *regs_ptr, uint64_t error_code)
             kb_ps2_pressed_values[state_index][make_code] = 0;
         }
     }
+
+    keyboard_dispatch_key_message(
+        pressed ? MSG_KEYDOWN : MSG_KEYUP,
+        event_value
+    );
 
     keyboard_update_modifier_state(make_code, extended, pressed);
 
@@ -349,12 +351,6 @@ extern "C" void keyboard_usb_key_event(uint8_t usage, uint8_t value, uint8_t pre
 {
     keyboard_prepare_fifo();
     bool key_pressed = pressed != 0;
-    if (usage == KB_USB_LEFT_GUI_USAGE || usage == KB_USB_RIGHT_GUI_USAGE)
-    {
-        kb_fifo.win = key_pressed;
-        return;
-    }
-
     if (value == KEY_SHIFT)
     {
         kb_fifo.shift = key_pressed;
@@ -366,9 +362,6 @@ extern "C" void keyboard_usb_key_event(uint8_t usage, uint8_t value, uint8_t pre
     else if (value == KEY_ALT)
     {
         kb_fifo.alt = key_pressed;
-        if (!key_pressed)
-        {
-        }
     }
 
     uint8_t event_value = value;
@@ -385,6 +378,8 @@ extern "C" void keyboard_usb_key_event(uint8_t usage, uint8_t value, uint8_t pre
     {
         kb_usb_pressed_values[usage] = 0;
     }
+
+    keyboard_dispatch_key_message(key_pressed ? MSG_KEYDOWN : MSG_KEYUP, event_value);
 
     kb_synth_lock_acquire();
     keyboard_usb_repeat_slot *free_slot = NULL;

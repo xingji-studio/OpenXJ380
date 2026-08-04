@@ -14,7 +14,6 @@
 #include <pci/pci.h>
 #include <proto.hpp>
 #include <ps2/keyboard.h>
-#include <ps2/mouse.h>
 #include <rtc.h>
 #include <stdint.h>
 #include <syscall/syscall.h>

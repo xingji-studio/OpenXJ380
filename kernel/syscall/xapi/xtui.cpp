@@ -158,71 +158,28 @@ void do_xapi_GetCurrentUser(uint64_t dst)
 
 uint64_t do_xapi_UserOobeRequired()
 {
-    return user_session_needs_oobe() ? 1 : 0;
+    return 0;
 }
 
 uint64_t do_xapi_UserList(uint64_t buffer, uint64_t max_count)
 {
-    if (buffer == 0) return (uint64_t)-EINVAL;
-    if (max_count > 128) max_count = 128;
-
-    UserInfo users[128];
-    memset(users, 0, sizeof(users));
-    int count = user_session_list(users, (int)max_count);
-    if (count < 0) return (uint64_t)count;
-
-    xapi_type_LoginUserInfo out[128];
-    memset(out, 0, sizeof(out));
-    for (int i = 0; i < count; i++)
-    {
-        strncpy(out[i].name, users[i].name, sizeof(out[i].name) - 1);
-        out[i].user_type = users[i].user_type;
-    }
-
-    if (count > 0 && !copy_to_user_pagedir(xapi_current_pagedir(), (void *)buffer, out,
-                                           sizeof(xapi_type_LoginUserInfo) * (size_t)count))
-    {
-        return (uint64_t)-EFAULT;
-    }
-    return (uint64_t)count;
+    (void)buffer;
+    (void)max_count;
+    return (uint64_t)-ENOSYS;
 }
 
 uint64_t do_xapi_UserLogin(uint64_t username, uint64_t password)
 {
-    char *kusername = NULL;
-    char *kpassword = NULL;
-    int ret = xapi_copy_string_from_user(&kusername, (const char *)username, sizeof(((UserInfo *)0)->name));
-    if (ret < 0) return (uint64_t)ret;
-    ret = xapi_copy_string_from_user(&kpassword, (const char *)password, sizeof(((UserInfo *)0)->password));
-    if (ret < 0)
-    {
-        free(kusername);
-        return (uint64_t)ret;
-    }
-
-    ret = user_session_login(kusername, kpassword);
-    free(kusername);
-    free(kpassword);
-    return (uint64_t)ret;
+    (void)username;
+    (void)password;
+    return (uint64_t)-ENOSYS;
 }
 
 uint64_t do_xapi_UserCreateFirst(uint64_t username, uint64_t password)
 {
-    char *kusername = NULL;
-    char *kpassword = NULL;
-    int ret = xapi_copy_string_from_user(&kusername, (const char *)username, sizeof(((UserInfo *)0)->name));
-    if (ret < 0) return (uint64_t)ret;
-    ret = xapi_copy_string_from_user(&kpassword, (const char *)password, sizeof(((UserInfo *)0)->password));
-    if (ret < 0)
-    {
-        free(kusername);
-        return (uint64_t)ret;
-    }
-
-    ret = user_session_create_first(kusername, kpassword);
-    free(kusername);
-    free(kpassword);
-    return (uint64_t)ret;
+    (void)username;
+    (void)password;
+    return (uint64_t)-ENOSYS;
 }
 
 void do_xapi_Output(char *str)

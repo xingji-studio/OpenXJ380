@@ -2,23 +2,7 @@
 
 #include <proto.hpp>
 
-struct WINDOW_HANDLE
-{
-    WINDOWLS *WindowNodePtr;
-    bool      dirty;
-    int       dirty_x1;
-    int       dirty_y1;
-    int       dirty_x2;
-    int       dirty_y2;
-};
-
-struct XWINDOW
-{
-    uint32_t width;
-    uint32_t height;
-    char    *title;
-    uint8_t  sets;
-};
+typedef void (*MsgPrcor)(uint64_t type, uint64_t hdata, uint64_t ldata);
 
 typedef  struct {
 	char	    filename[256];
@@ -298,63 +282,18 @@ void do_xapi_Endline();
 void do_xapi_Printline(char *str);
 void do_xapi_OutputSerial(char *str);
 void do_xapi_SearchFile(uint64_t path, uint64_t count, uint64_t dir);
-int do_xapi_CreateWindow(uint64_t handle, uint64_t xwin);
-int do_xapi_SetWindowTitle(uint64_t handle, uint64_t str);
-int do_xapi_CloseWindow(uint64_t handle);
-int do_xapi_SetIcon(uint64_t handle, uint64_t path);
-int do_xapi_GetWindowSize(uint64_t handle, uint64_t w, uint64_t h);
-int do_xapi_DrawPoint(uint64_t handle, uint32_t x, uint32_t y, uint32_t color);
-int do_xapi_DrawLine(uint64_t handle, uint32_t x1, uint32_t y1, uint32_t x2, uint32_t y2, uint32_t color);
-int do_xapi_DrawRect_fill(uint64_t handle, uint32_t x1, uint32_t y1, uint32_t x2, uint32_t y2, uint32_t color);
-int do_xapi_DrawRect(uint64_t handle, uint32_t x1, uint32_t y1, uint32_t x2, uint32_t y2, uint32_t color);
-// int do_xapi_DrawCircle_fill(uint64_t handle, uint32_t x, uint32_t y, uint32_t radius, uint32_t color);
-// int do_xapi_DrawCircle(uint64_t handle, uint32_t x, uint32_t y, uint32_t radius, uint32_t color);
-int do_xapi_DrawText(uint64_t handle, uint32_t x, uint32_t y, uint64_t str, uint32_t size, uint32_t color);
-int do_xapi_DrawTextl(uint64_t handle, uint64_t place, uint64_t str, uint32_t size, uint32_t color, uint64_t i_width);
-int do_xapi_DrawSWText(uint64_t handle, uint32_t x, uint32_t y, uint64_t str, uint32_t size, uint32_t color);
-void do_xapi_ReadBuffer(uint64_t handle, uint32_t x, uint32_t y, uint32_t width, uint32_t height, uint64_t buffer);
-void do_xapi_WriteBuffer(uint64_t handle, uint32_t x, uint32_t y, uint32_t width, uint32_t height, uint64_t buffer);
-void do_xapi_ReadBufferA(uint64_t handle, uint32_t x, uint32_t y, uint32_t width, uint32_t height, uint64_t buffer);
-void do_xapi_WriteBufferA(uint64_t handle, uint32_t x, uint32_t y, uint32_t width, uint32_t height, uint64_t buffer);
-int do_xapi_RefreshWindow(uint64_t handle);
-int do_xapi_SetMsgProc(uint64_t handle, uint64_t func);
 void do_xapi_GetSystemVersion(uint64_t str);
 uint64_t do_xapi_GetTime();
 void do_xapi_GetCurrentUser(uint64_t dst);
-void do_xapi_DrawBMP(uint64_t handle, uint32_t x, uint32_t y, uint32_t width, uint32_t height, uint64_t path);
-void do_xapi_DrawPNG(uint64_t handle, uint32_t x, uint32_t y, uint32_t width, uint32_t height, uint64_t path);
-void do_xapi_DrawPicture(uint64_t handle, uint32_t x, uint32_t y, uint32_t width, uint32_t height, uint64_t path);
-uint64_t do_xapi_LoadPicture(uint64_t buffer, uint32_t width, uint32_t height, uint64_t path);
-int  xapi_doDrawSvg(uint64_t handle, uint32_t x, uint32_t y, uint32_t width, uint64_t svg_text, uint64_t enable_trans);
-int  xapi_doDrawFA(uint64_t handle, uint32_t x, uint32_t y, uint32_t width, uint64_t name, uint64_t enable_trans);
 uint64_t do_xapi_ReadFile(struct X64_REGS *regs);
 uint64_t do_xapi_WriteFile(struct X64_REGS *regs);
 void do_xapi_Printf(char *str);
 void do_xapi_Sleep(uint64_t ms);
-void do_xapi_Button(uint64_t handle, uint64_t x, uint64_t y, uint64_t CRLid, uint64_t text);
-void do_xapi_ButtonEmp(uint64_t handle, uint64_t x, uint64_t y, uint64_t CRLid, uint64_t text);
-void do_xapi_DeleteButton(uint64_t handle, uint64_t CRLid);
-void do_xapi_PutSwitch(uint64_t handle, uint64_t x, uint64_t y, uint64_t status, uint64_t CRLid);
-void do_xapi_SetSwitch(uint64_t handle, uint64_t CRLid, uint64_t status);
-void do_xapi_DeleteSwitch(uint64_t handle, uint64_t CRLid);
-void do_xapi_PutVerticalScrollBar(uint64_t handle, uint64_t x, uint64_t y, uint64_t length, uint64_t thumb_length,
-                                  uint64_t CRLid);
-void do_xapi_PutHorizontalScrollBar(uint64_t handle, uint64_t x, uint64_t y, uint64_t length, uint64_t thumb_length,
-                                    uint64_t CRLid);
-void do_xapi_DeleteScrollBar(uint64_t handle, uint64_t CRLid);
-void do_xapi_SetScrollBarPosition(uint64_t handle, uint64_t CRLid, uint64_t position);
-uint64_t do_xapi_PutTextInputBox(uint64_t handle, uint64_t x, uint64_t y, uint64_t width, uint64_t text);
-uint64_t do_xapi_GetTextInputBox(uint64_t id, uint64_t text);
-uint64_t do_xapi_DeleteTextInputBox(uint64_t id);
 uint64_t do_xapi_OpenFile(uint64_t path);
 void do_xapi_CloseFile(uint64_t ptr);
-uint64_t do_xapi_FileDialog(uint64_t mode, uint64_t title, uint64_t initial_path, uint64_t out_path, uint64_t out_size);
 void do_xapi_Broken(char *info);
 void do_xapi_GetTimeX(uint64_t tt);
 uint64_t do_xapi_GetMemorySize();
-void do_xapi_RegisterRightButtonMenu(uint64_t handle, uint64_t items, uint64_t count);
-void do_xapi_DeleteRightButtonMenu(uint64_t handle);
-int do_xapi_RefreshPartWindow(uint64_t handle, uint32_t x1, uint32_t y1, uint32_t x2, uint32_t y2);
 void do_xapi_Run(char *path);
 uint64_t do_xapi_RunArgs(char *path, char **argv);
 uint64_t do_xapi_MapMemory(uint64_t ptr, uint64_t size, uint32_t flags);
@@ -386,7 +325,6 @@ void init_syscall();
 // Proto (XAPI Edition)
 void do_message(uint64_t msg_type, uint64_t hData, uint64_t lData, MsgPrcor WinMpf, tcb_t ftask);
 void init_message();
-void init_window_message(WINDOWLSP window, MsgPrcor func);
 bool init_notify_message(pcb_t process, uint64_t func);
 void message_thread(uint64_t arg);
 uint64_t message_ask(uint64_t msg_type_p, uint64_t hdatap, uint64_t ldatap, uint64_t funcp, uint64_t taskp);

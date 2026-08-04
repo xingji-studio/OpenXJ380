@@ -25,6 +25,7 @@
 #include <proto.hpp>
 #include <pty.h>
 #include <ps2/keyboard.h>
+#include <ps2/mouse.h>
 #include <rtc.h>
 #include <sb16.h>
 #include <syscall/signal.h>
@@ -53,7 +54,7 @@ extern BOOT_CONFIG *EFI_BC;
 
 extern UserInfo *current_user;
 
-static const char *busybox_alias_applets[] = {
+static char busybox_alias_applets[][16] = {
     "[",       "[[",      "ash",      "awk",      "basename", "cat",      "chmod",   "chgrp",
     "chown",   "clear",   "cmp",      "cp",       "cut",      "date",     "dd",      "df",
     "dirname", "dmesg",   "du",       "echo",     "egrep",    "env",      "false",   "fgrep",
@@ -65,9 +66,47 @@ static const char *busybox_alias_applets[] = {
     "readlink","realpath","reset",    "rm",       "rmdir",    "route",    "sed",     "sh",
     "sleep",   "sort",    "stat",     "stty",     "sync",     "tail",     "tar",     "test",
     "top",     "touch",   "tr",       "true",     "tty",      "umount",   "uname",   "uniq",
-    "unzip",   "uptime",  "usleep",   "vi",       "wc",       "wget",     "which",   "whoami",
-    "xargs",   "xxd",     "xz",       "xzcat",    "zcat",     NULL,
+    "unzip",   "uptime",  "usleep",   "vi",       "wc",       "which",   "whoami",
+    "xargs",   "xxd",     "zcat",     NULL,
 };//暴力枚举这一块，好像只能这么做了
+  //Maybe we can try to load this applet when vfs inited.
+
+static void load_busybox_alias_applets()
+{
+    if (current_user == NULL) return;
+
+    char setfile_path[256];
+    memset(setfile_path, 0, 256);
+    strcat(setfile_path, "/etc/busybox/alias/applets.dat");
+    vfs_node_t vfp = vfs_open(setfile_path);
+    if (!vfp) return;
+    char tmp[1024];
+    if (vfp->size >= sizeof(tmp))
+    {
+        vfs_close(vfp);
+        return;
+    }
+    vfs_read(vfp, tmp, 0, vfp->size);
+    char alias[8];
+    memset(alias, 0, 8);
+    int applet_index = 0, alias_index = 0;
+    const int applet_count = sizeof(busybox_alias_applets) / sizeof(busybox_alias_applets[0]);
+    for (uint64_t i = 0; i < vfp->size && applet_index < applet_count - 1; i++)
+    {
+        if (tmp[i] == ',')
+        {
+            strcpy(busybox_alias_applets[applet_index], alias);
+            applet_index++;
+            alias_index = 0;
+            memset(alias, 0, sizeof(alias));
+            continue;
+        }
+        if (alias_index < sizeof(alias) - 1) alias[alias_index++] = tmp[i];
+    }
+    if (alias_index > 0 && applet_index < applet_count - 1) strcpy(busybox_alias_applets[applet_index], alias);
+
+    vfs_close(vfp);
+}
 
 static const char *busybox_binary_path = "/apps/busybox";
 
@@ -89,7 +128,7 @@ static void setup_busybox_vfs_aliases()
     const char *prefixes[] = {"/apps", "/bin", NULL};
     for (int p = 0; prefixes[p] != NULL; p++)
     {
-        for (int i = 0; busybox_alias_applets[i] != NULL; i++)
+        for (int i = 0; busybox_alias_applets[i][0] != '\0'; i++)
         {
             char alias_path[128];
             snprintf(alias_path, sizeof(alias_path), "%s/%s", prefixes[p], busybox_alias_applets[i]);
@@ -140,53 +179,6 @@ void init_cpu()
         read_gsbase  = rdgsbase;
         write_gsbase = wrgsbase;
     }
-}
-
-typedef struct TimerWidgetsData
-{
-    SHEET_INFO *sht;
-    SHEET      *ct_sheet;
-    tm          time;
-    tm          old_time;
-    int         scdx;
-    uint8_t     flushing;
-    uint8_t     need_flush;
-} TimerWidgetsData;
-
-TimerWidgetsData *tw_data = NULL;
-
-bool have_full_screen_app = false;
-extern bool user_dock_owns_dock_sheet;
-
-int clock_hour_offset = 0;
-
-void init_time()
-{
-    if (current_user == NULL) return;
-
-    char setfile_path[256];
-    memset(setfile_path, 0, 256);
-    strcat(setfile_path, "/users/");
-    strcat(setfile_path, current_user->name);
-    strcat(setfile_path, "/settings.dat");
-    vfs_node_t v = vfs_open(setfile_path);
-    if (!v) return;
-
-    SettingsDataFileFormat sdff;
-    memset(&sdff, 0, sizeof(sdff));
-    size_t read_size = v->size < sizeof(sdff) ? (size_t)v->size : sizeof(sdff);
-    if (read_size == 0 || vfs_read(v, &sdff, 0, read_size) == -1)
-    {
-        vfs_close(v);
-        return;
-    }
-
-    clock_hour_offset = sdff.ClockHourOffset;
-
-    if (clock_hour_offset < 0)
-        clock_hour_offset = 0;
-
-    vfs_close(v);
 }
 
 static constexpr uint64_t KERNEL_HEAP_EXTEND_CHUNK = 64UL * 1024UL * 1024UL;
@@ -361,6 +353,7 @@ extern "C" void KernelMain(const FrameBufferConfig &fbc, EFI_SYSTEM_TABLE &Syste
     // sb16_init();
 
     keyboard_init();
+    mouse_init();
 
     disable_intr();
 
