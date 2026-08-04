@@ -10,12 +10,22 @@
 spin_t serial_lock;
 spin_t fmt_lock; // For write_serial_fmt
 
+static bool serial_prompt_active  = false;
+static bool serial_line_start     = true;
+static bool serial_restore_prompt = false;
+static bool serial_log_active     = false;
+static constexpr const char serial_shell_prompt[] = "xj380$ ";
+
 #define PORT 0x3f8 // COM1
 
 int init_serial()
 {
     serial_lock = SPIN_INIT;
     fmt_lock    = SPIN_INIT;
+    serial_prompt_active  = false;
+    serial_line_start     = true;
+    serial_restore_prompt = false;
+    serial_log_active     = false;
 
     outb(PORT + 1, 0x00); // Disable all interrupts
     outb(PORT + 3, 0x80); // Enable DLAB (set baud rate divisor)
@@ -53,6 +63,38 @@ void write_serial(char a)
     outb(PORT, a);
 }
 
+static void write_serial_string_unlocked(const char *str)
+{
+    while (*str)
+    {
+        char ch = *str++;
+        write_serial(ch);
+        serial_line_start = ch == '\n';
+    }
+}
+
+static bool is_serial_shell_prompt(const char *str)
+{
+    size_t index = 0;
+    while (serial_shell_prompt[index] != '\0' && str[index] == serial_shell_prompt[index]) index++;
+    return serial_shell_prompt[index] == '\0' && str[index] == '\0';
+}
+
+static bool serial_string_contains_newline(const char *str)
+{
+    while (*str)
+    {
+        if (*str++ == '\n') return true;
+    }
+    return false;
+}
+
+static void write_serial_output_unlocked(const char *str)
+{
+    console_write(str);
+    write_serial_string_unlocked(str);
+}
+
 void write_serial_string(const char *str)
 {
     if (str == NULL) {
@@ -60,11 +102,37 @@ void write_serial_string(const char *str)
     }
 
     spin_lock(&serial_lock);
-    console_write(str);
-    while (*str)
+    write_serial_output_unlocked(str);
+    if (is_serial_shell_prompt(str)) serial_prompt_active = true;
+    else if (serial_prompt_active && serial_string_contains_newline(str)) serial_prompt_active = false;
+    spin_unlock(&serial_lock);
+}
+
+static void serial_log_begin()
+{
+    spin_lock(&serial_lock);
+    serial_restore_prompt = serial_prompt_active;
+    if (serial_restore_prompt && !serial_line_start)
     {
-        write_serial(*str++);
+        write_serial_output_unlocked("\n");
     }
+    serial_prompt_active = false;
+    serial_log_active = true;
+}
+
+static void serial_log_end()
+{
+    if (serial_restore_prompt)
+    {
+        if (!serial_line_start)
+        {
+            write_serial_output_unlocked("\n");
+        }
+        write_serial_output_unlocked(serial_shell_prompt);
+        serial_prompt_active = true;
+    }
+    serial_restore_prompt = false;
+    serial_log_active = false;
     spin_unlock(&serial_lock);
 }
 
@@ -411,7 +479,8 @@ uint8_t serial_write_handler(Writer *writer, char ch)
     ++serial_write_buffer_index;
     if (serial_write_buffer_index >= SERIAL_WRITE_BUFFER_SIZE - 1) // 1 for '\0'
     {
-        write_serial_string(serial_write_buffer);
+        if (serial_log_active) write_serial_output_unlocked(serial_write_buffer);
+        else write_serial_string(serial_write_buffer);
         serial_write_buffer_index = 0;
     } // Flush buffer
     serial_write_buffer[serial_write_buffer_index] = '\0';
@@ -432,7 +501,8 @@ void serial_wprintf(const char *fmt, ...)
     // flush buffer
     if (serial_write_buffer_index > 0)
     {
-        write_serial_string(serial_write_buffer);
+        if (serial_log_active) write_serial_output_unlocked(serial_write_buffer);
+        else write_serial_string(serial_write_buffer);
         serial_write_buffer_index = 0;
     }
     va_end(args);
@@ -451,7 +521,8 @@ int write_serial_fmt(const char *fmt, ...)
     // flush buffer
     if (serial_write_buffer_index > 0)
     {
-        write_serial_string(serial_write_buffer);
+        if (serial_log_active) write_serial_output_unlocked(serial_write_buffer);
+        else write_serial_string(serial_write_buffer);
         serial_write_buffer_index = 0;
     }
     va_end(args);
@@ -464,7 +535,8 @@ int printk(const char *fmt, ...)
 {
     spin_lock(&fmt_lock);
 
-    write_serial_string("[XJ380 System Kernel][MESSAGE] ");
+    serial_log_begin();
+    write_serial_output_unlocked("[XJ380 System Kernel][MESSAGE] ");
 
     va_list args;
     va_start(args, fmt);
@@ -472,10 +544,11 @@ int printk(const char *fmt, ...)
     // flush buffer
     if (serial_write_buffer_index > 0)
     {
-        write_serial_string(serial_write_buffer);
+        write_serial_output_unlocked(serial_write_buffer);
         serial_write_buffer_index = 0;
     }
     va_end(args);
+    serial_log_end();
     spin_unlock(&fmt_lock);
     return 0;
 }
@@ -487,7 +560,8 @@ int pr_debug(const char *fmt, ...)
 {
     spin_lock(&fmt_lock);
 
-    write_serial_string("[XJ380 System Kernel][DEBUG] ");
+    serial_log_begin();
+    write_serial_output_unlocked("[XJ380 System Kernel][DEBUG] ");
 
     va_list args;
     va_start(args, fmt);
@@ -495,10 +569,11 @@ int pr_debug(const char *fmt, ...)
     // flush buffer
     if (serial_write_buffer_index > 0)
     {
-        write_serial_string(serial_write_buffer);
+        write_serial_output_unlocked(serial_write_buffer);
         serial_write_buffer_index = 0;
     }
     va_end(args);
+    serial_log_end();
     spin_unlock(&fmt_lock);
     return 0;
 }
@@ -509,7 +584,8 @@ int pr_warn(const char *fmt, ...)
 {
     spin_lock(&fmt_lock);
 
-    write_serial_string("[XJ380 System Kernel][WARNING] ");
+    serial_log_begin();
+    write_serial_output_unlocked("[XJ380 System Kernel][WARNING] ");
 
     va_list args;
     va_start(args, fmt);
@@ -517,10 +593,11 @@ int pr_warn(const char *fmt, ...)
     // flush buffer
     if (serial_write_buffer_index > 0)
     {
-        write_serial_string(serial_write_buffer);
+        write_serial_output_unlocked(serial_write_buffer);
         serial_write_buffer_index = 0;
     }
     va_end(args);
+    serial_log_end();
     spin_unlock(&fmt_lock);
     return 0;
 }
@@ -531,7 +608,8 @@ int pr_info(const char *fmt, ...)
 {
     spin_lock(&fmt_lock);
 
-    write_serial_string("[XJ380 System Kernel][INFO] ");
+    serial_log_begin();
+    write_serial_output_unlocked("[XJ380 System Kernel][INFO] ");
 
     va_list args;
     va_start(args, fmt);
@@ -539,10 +617,11 @@ int pr_info(const char *fmt, ...)
     // flush buffer
     if (serial_write_buffer_index > 0)
     {
-        write_serial_string(serial_write_buffer);
+        write_serial_output_unlocked(serial_write_buffer);
         serial_write_buffer_index = 0;
     }
     va_end(args);
+    serial_log_end();
     spin_unlock(&fmt_lock);
     return 0;
 }
@@ -553,7 +632,8 @@ int pr_notice(const char *fmt, ...)
 {
     spin_lock(&fmt_lock);
 
-    write_serial_string("[XJ380 System Kernel][NOTICE] ");
+    serial_log_begin();
+    write_serial_output_unlocked("[XJ380 System Kernel][NOTICE] ");
 
     va_list args;
     va_start(args, fmt);
@@ -561,10 +641,11 @@ int pr_notice(const char *fmt, ...)
     // flush buffer
     if (serial_write_buffer_index > 0)
     {
-        write_serial_string(serial_write_buffer);
+        write_serial_output_unlocked(serial_write_buffer);
         serial_write_buffer_index = 0;
     }
     va_end(args);
+    serial_log_end();
     spin_unlock(&fmt_lock);
     return 0;
 }
@@ -575,7 +656,8 @@ int pr_err(const char *fmt, ...)
 {
     spin_lock(&fmt_lock);
 
-    write_serial_string("[XJ380 System Kernel][ERROR] ");
+    serial_log_begin();
+    write_serial_output_unlocked("[XJ380 System Kernel][ERROR] ");
 
     va_list args;
     va_start(args, fmt);
@@ -583,10 +665,11 @@ int pr_err(const char *fmt, ...)
     // flush buffer
     if (serial_write_buffer_index > 0)
     {
-        write_serial_string(serial_write_buffer);
+        write_serial_output_unlocked(serial_write_buffer);
         serial_write_buffer_index = 0;
     }
     va_end(args);
+    serial_log_end();
     spin_unlock(&fmt_lock);
     return 0;
 }
