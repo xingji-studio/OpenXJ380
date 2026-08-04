@@ -6,6 +6,8 @@ OpenXJ380 是一个面向 x86_64 平台的独立操作系统项目。项目包�
 
 [贡献者名单](CONTRIBUTOR.md)
 
+2026 年 8 月 3 日起，本仓库不再提供官方原生GUI环境，有需求的可以看commit history，后面完善后会陆续推出相关模块。
+
 ## 特性概览
 
 - UEFI 引导与图形输出初始化。
@@ -134,3 +136,13 @@ DEBUG=0 SMP=2 SUDO=0 KVM=0 DISPLAY_BACKEND=gtk ninja -f build.ninja run
 本项目采用 [Apache License 2.0](LICENSE)。仓库包含多个第三方组件，其各自的许可和分发要求见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) 及对应源码目录。
 
 第三方组件所要求公开的许可证已存放在 /usr/share/doc/xj380 下。
+
+## Star History
+
+<a href="https://www.star-history.com/?repos=xingji-studio%2FOpenXJ380&type=date&legend=top-left">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=xingji-studio/OpenXJ380&type=timeline&theme=dark&logscale&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=xingji-studio/OpenXJ380&type=timeline&logscale&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=xingji-studio/OpenXJ380&type=timeline&logscale&legend=top-left" />
+ </picture>
+</a>

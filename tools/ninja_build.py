@@ -104,7 +104,7 @@ def stage_selfhost_user(root: Path) -> None:
     cp(ROOT / "include", root / "apps/include")
     cp(ROOT / "lib", root / "apps/lib")
     cp(ROOT / "liballoc-x86_64.a", root / "apps/liballoc-x86_64.a")
-    for rel in ("third_party/mbedtls-src", "third_party/litehtml", "third_party/libvterm"):
+    for rel in ("third_party/mbedtls-src", "third_party/libvterm"):
         cp(ROOT / rel, root / "apps/third_party")
     shell(f'find "{root / "apps/user"}" "{root / "apps/third_party"}" -type d -name .git -prune -exec rm -rf {{}} +')
 
@@ -299,18 +299,10 @@ def installer_root_stage() -> None:
         "apps",
         "apps/system",
         "apps/builtin",
-        "system/font",
-        "system/theme/skyglass",
-        "system/icon",
-        "system/resources/image",
         "tmp",
     ):
         mkdir(root / rel)
-    cp(ROOT / "out/installer.elf", root / "apps/installer.elf")
     cp(ROOT / "out/shell.elf", root / "apps/system/shell.elf")
-    cp(ROOT / "out/filedlg.elf", root / "apps/system/filedlg.elf")
-    copy_common_assets(root)
-    cp(ROOT / "resources/svg", root / "system/resources/svg")
     run(["python3", env("MAKE_PAK", "tools/make_pak.py"), str(root), env("INSTALLER_ROOT_PAK", "out/installer-root.pak")])
 
 
@@ -462,20 +454,6 @@ def size_report() -> None:
         "主要应用",
         [
             Path("out/shell.elf"),
-            Path("out/fmanager.elf"),
-            Path("out/ctrlmenu.elf"),
-            Path("out/xjver.elf"),
-            Path("out/elfrun.elf"),
-            Path("out/launcher.elf"),
-            Path("out/taskmgr.elf"),
-            Path("out/filedlg.elf"),
-            Path("out/installer.elf"),
-            Path("out/calc.elf"),
-            Path("out/texter.elf"),
-            Path("out/picturer.elf"),
-            Path("out/browser.elf"),
-            Path("out/httpget.elf"),
-            Path("out/nut.elf"),
             Path("out/busyterm.elf"),
             Path("out/bcms-sp.elf"),
         ],
@@ -537,38 +515,17 @@ def check_required_tool(
     return None
 
 
-def find_browser_builtins(clang: str | None = None) -> tuple[str | None, str]:
-    override = os.environ.get("BROWSER_BUILTINS")
-    if override:
-        if Path(override).is_file():
-            return override, "BROWSER_BUILTINS"
-        return None, f"BROWSER_BUILTINS points to a missing file: {override}"
-
-    clang_bin = clang or find_tool(["clang"])
-    if clang_bin:
-        runtime_dir = capture([clang_bin, "--print-runtime-dir"])
-        candidate = Path(runtime_dir) / "libclang_rt.builtins-x86_64.a" if runtime_dir else Path()
-        if candidate.is_file():
-            return str(candidate), "clang runtime dir"
-
-    matches = sorted(Path("/usr/lib/clang").glob("**/libclang_rt.builtins-x86_64.a"))
-    if matches:
-        return str(matches[-1]), "/usr/lib/clang"
-
-    return None, "libclang_rt.builtins-x86_64.a not found"
-
-
 def check_tools() -> None:
     missing: list[tuple[str, str, str]] = []
     prefix = env("COMPILER_PREFIX", "")
     print("XJ380 Ninja 构建工具检查")
     print("=" * 64)
 
-    clang = check_required_tool(missing, "clang", [env_tool("CC", prefix + "clang"), "clang"],
-                                "编译内核 C/ASM 和部分模块", "sudo apt install clang")
+    check_required_tool(missing, "clang", [env_tool("CC", prefix + "clang"), "clang"],
+                        "编译内核 C/ASM 和部分模块", "sudo apt install clang")
     check_required_tool(missing, "clang++", [env_tool("CPP", prefix + "clang++"), "clang++"],
                         "编译内核 C++ 和模块", "sudo apt install clang")
-    check_required_tool(missing, "g++", [env_tool("CXX", "g++"), "g++"], "编译用户态 C++ 和浏览器 hosted 对象",
+    check_required_tool(missing, "g++", [env_tool("CXX", "g++"), "g++"], "编译用户态 C++",
                         "sudo apt install g++")
     check_required_tool(missing, "ld", [env_tool("LD", prefix + "ld"), "ld"], "链接内核和用户态 ELF",
                         "sudo apt install binutils")
@@ -610,14 +567,6 @@ def check_tools() -> None:
             missing.append((f"rust target {rust_target}", "缺少 libcore/libcompiler_builtins",
                             f"rustup target add {rust_target}"))
 
-    builtins, builtins_source = find_browser_builtins(clang)
-    if builtins:
-        print(f"[OK]   libclang_rt.builtins       {builtins} ({builtins_source})")
-    else:
-        print(f"[缺失] libclang_rt.builtins       浏览器/httpget/nut 链接需要 compiler-rt builtins")
-        missing.append(("libclang_rt.builtins-x86_64.a", builtins_source,
-                        "sudo apt install clang；或设置 BROWSER_BUILTINS=/path/to/libclang_rt.builtins-x86_64.a"))
-
     if missing:
         print("\n缺失工具和建议安装命令：")
         for display, purpose, hint in missing:
@@ -650,16 +599,6 @@ def graph() -> None:
         print("未找到 graphviz dot，跳过 SVG。需要 SVG 可安装：sudo apt install graphviz")
 
 
-def browser_builtins() -> None:
-    builtins, reason = find_browser_builtins()
-    if builtins:
-        print(builtins)
-        return
-
-    print(f"Cannot find libclang_rt.builtins-x86_64.a: {reason}", file=sys.stderr)
-    raise SystemExit(1)
-
-
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("command")
@@ -684,7 +623,6 @@ def main() -> None:
         "size": size_report,
         "check-tools": check_tools,
         "graph": graph,
-        "browser-builtins": browser_builtins,
     }
     try:
         commands[args.command]()

@@ -2,7 +2,7 @@
 """Generate the Python-backed Ninja graph for XJ380.
 
 This file is intentionally more explicit than a normal packaged build project:
-XJ380 is freestanding, mixes kernel/user/kmod/browser/Rust outputs, and needs
+XJ380 is freestanding, mixes kernel/user/kmod/Rust outputs, and needs
 stable staged artifact names under out/.  Keep build behavior in this generator
 instead of hand-editing build.ninja, because build.ninja is regenerated.
 """
@@ -335,7 +335,7 @@ def root_objects(
     """Emit kernel/root object build edges and return their object paths."""
     # Root objects use the same source lists emitted in the generated FILES
     # section, so the readable list and the real build graph cannot drift.
-    n.comment("ROOT OBJECTS - kernel, built-in drivers, graphics, font, lib, optional built-in xhci")
+    n.comment("ROOT OBJECTS - kernel, built-in drivers, console font, lib, optional built-in xhci")
     config = Path("kernel/build_config.h")
     settings = Path("kernel/build_settings.h")
     objs: list[Path] = []
@@ -362,7 +362,11 @@ def xapi(n: Ninja) -> tuple[list[Path], Path, Path, Path]:
     """Emit the minimal syscall and process-entry runtime."""
     n.comment("XAPI RUNTIME - declarations remain public; only syscall and entry shims are built")
     xapi_headers = headers("user/xapi/include")
-    srcs = [ROOT / "user/xapi/arch/x86_64/crt0.S", ROOT / "user/xapi/libsys.cpp"]
+    srcs = [
+        ROOT / "user/xapi/arch/x86_64/crt0.S",
+        ROOT / "user/xapi/libsys.cpp",
+        ROOT / "user/xapi/xgui_stubs.cpp",
+    ]
     core_objs: list[Path] = []
     for src in srcs:
         rel_src = src.relative_to(ROOT / "user/xapi")
@@ -637,12 +641,7 @@ def main() -> None:
         asm_files.extend(find_files(base, (".S",)))
         c_files.extend(find_files(base, (".c",)))
         cpp_files.extend(find_files(base, (".cpp",)))
-    excluded_cli_sources = {
-        ROOT / "driver/fbdev.cpp",
-        ROOT / "driver/ps2/mouse.cpp",
-        ROOT / "kernel/syscall/xapi/xgui.cpp",
-    }
-    cpp_files = [p for p in cpp_files if p not in excluded_cli_sources]
+    cpp_files = [p for p in cpp_files if p != ROOT / "kernel/stress.cpp"]
     if builtin_xhci:
         cpp_files.extend(find_files("kmod/xhci", (".cpp",)))
     xapi_sources = [ROOT / "user/xapi/arch/x86_64/crt0.S", ROOT / "user/xapi/libsys.cpp"]
@@ -656,11 +655,8 @@ def main() -> None:
     n.var_list("XAPI_SOURCES", xapi_sources)
     n.var_list("XAPI_HEADERS", headers("user/xapi/include"))
     n.var_list("USER_HEADERS", headers("user/include"))
-    n.var_list("BROWSER_HEADERS", headers("user/browser"))
     n.var_list("BOOT_HEADERS", find_files("boot/include", (".h", ".hpp")))
     n.var_list("LIBVTERM_SOURCES", find_files("third_party/libvterm/src", (".c",), max_depth=1))
-    n.var_list("LITEHTML_SOURCES", find_files("third_party/litehtml/src", (".cpp",), max_depth=1))
-    n.var_list("GUMBO_SOURCES", find_files("third_party/litehtml/src/gumbo", (".c",), max_depth=1))
     n.var_list("KMOD_E1000_SOURCES", find_files("kmod/e1000", (".cpp",), max_depth=1))
     n.line()
     # Emit uppercase canonical flag variables first, then lowercase aliases for
@@ -681,10 +677,6 @@ def main() -> None:
     n.var("RUST_FLAGS", "$RUST_DIAGNOSTIC_COLOR --edition=2024 --target $rust_target --emit=obj --crate-type lib -C panic=abort -C no-redzone=yes $RUST_OPT_FLAG -C debuginfo=2 -C overflow-checks=off")
     n.var("MBEDTLS_CFLAGS", "-I ./user/include/mbed_compat -I ./third_party/mbedtls-src/include -DMBEDTLS_USER_CONFIG_FILE='\"mbed_compat/xj380_mbedtls_user_config.h\"'")
     n.var("MBEDTLS_CCFLAGS", "$DIAGNOSTIC_COLOR $OPT_FLAG -Wall -g -ffreestanding -fno-builtin -m64 -mstackrealign -std=c11 -fno-stack-protector -fno-strict-aliasing -fshort-wchar -nostdinc -I ./user/include/mbed_compat -I ./user/xapi/include -I ./user/include -I ./include -I ./third_party/mbedtls-src/include -DMBEDTLS_USER_CONFIG_FILE='\"mbed_compat/xj380_mbedtls_user_config.h\"' -DMBEDTLS_NO_UDBL_DIVISION -MMD -MP")
-    n.var("LITEHTML_INCLUDE_DIRS", "-I ./third_party/litehtml/include -I ./third_party/litehtml/include/litehtml -I ./third_party/litehtml/src -I ./third_party/litehtml/src/gumbo -I ./third_party/litehtml/src/gumbo/include -I ./third_party/litehtml/src/gumbo/include/gumbo")
-    n.var("WEBP_INCLUDE_DIRS", "-I ./user/browser/third_party/libwebp")
-    n.var("BROWSER_HOSTED_CXXFLAGS", "$DIAGNOSTIC_COLOR $OPT_FLAG -Wall -g -std=c++17 -m64 -mstackrealign -fno-stack-protector -fno-strict-aliasing -fno-threadsafe-statics -fno-use-cxa-atexit -ffunction-sections -fdata-sections -I ./user/browser $LITEHTML_INCLUDE_DIRS $WEBP_INCLUDE_DIRS -DLITEHTML_NO_THREADS -DLITEHTML_KEEP_GUMBO_OUTPUT -MMD -MP")
-    n.var("BROWSER_HOSTED_CFLAGS", "$DIAGNOSTIC_COLOR $OPT_FLAG -Wall -g -std=c11 -m64 -mstackrealign -fno-stack-protector -fno-strict-aliasing -ffunction-sections -fdata-sections $LITEHTML_INCLUDE_DIRS $WEBP_INCLUDE_DIRS -DNDEBUG -DHAVE_CONFIG_H -MMD -MP")
     n.var("LIBVTERM_CFLAGS", "$DIAGNOSTIC_COLOR $OPT_FLAG -Wall -g -ffreestanding -fno-builtin -m64 -mstackrealign -std=c99 -fno-stack-protector -fno-strict-aliasing -fshort-wchar -nostdinc -I ./user/xapi/include -I ./user/include -I ./third_party/libvterm/include -I ./third_party/libvterm/src -MMD -MP")
     n.var("KMOD_CXXFLAGS", "$DIAGNOSTIC_COLOR $OPT_FLAG -g -mno-red-zone -mstackrealign -nostdlib -ffreestanding -fno-builtin -m64 -fno-stack-protector -fno-exceptions -fno-strict-aliasing -fno-rtti -std=gnu++17 -fshort-wchar -nostdinc -fno-use-cxa-atexit -fno-threadsafe-statics -mno-80387 -Wno-int-to-pointer-cast -Wno-macro-redefined -Wno-c11-extensions -Wno-c99-extensions -Wno-gnu-statement-expression-from-macro-expansion -Wno-writable-strings -Wno-c++11-narrowing -fPIC -fvisibility=hidden -MMD -MP")
     n.var("NETSERVER_CFLAGS", "$DIAGNOSTIC_COLOR $OPT_FLAG -g -mno-red-zone -mstackrealign -nostdlib -ffreestanding -fno-builtin -m64 -fno-stack-protector -fno-exceptions -fno-strict-aliasing -std=gnu11 -fshort-wchar -nostdinc -mno-80387 -fPIC -fvisibility=hidden -MMD -MP -I./include -I./kmod/netserver/lwip/include -I./kmod/netserver")
@@ -702,19 +694,11 @@ def main() -> None:
     n.var("rust_user_flags", "$RUST_FLAGS")
     n.var("mbedtls_cflags", "$MBEDTLS_CFLAGS")
     n.var("mbedtls_ccflags", "$MBEDTLS_CCFLAGS")
-    n.var("browser_hosted_cxxflags", "$BROWSER_HOSTED_CXXFLAGS")
-    n.var("browser_hosted_cflags", "$BROWSER_HOSTED_CFLAGS")
     n.var("libvterm_cflags", "$LIBVTERM_CFLAGS")
     n.var("kmod_cxxflags", "$KMOD_CXXFLAGS")
     n.var("netserver_cflags", "$NETSERVER_CFLAGS")
     n.var("netserver_cxxflags", "$NETSERVER_CXXFLAGS")
     n.comment("Lowercase aliases above keep rule bodies compatible with older generated graphs.")
-    # Browser hosted objects need the toolchain's support libraries.  Record the
-    # resolved paths in build.ninja so failures are visible before link time.
-    n.var("browser_stdcpp", cmd_output(["g++", "-print-file-name=libstdc++.a"]))
-    n.var("browser_supcpp", cmd_output(["g++", "-print-file-name=libsupc++.a"]))
-    n.var("browser_libgcc", cmd_output(["g++", "-print-libgcc-file-name"]))
-    n.var("browser_libgcc_eh", cmd_output(["g++", "-print-file-name=libgcc_eh.a"]))
     n.var("host_gcc_triple", host_gcc_triple)
     n.line()
 
@@ -760,13 +744,6 @@ def main() -> None:
     n.rule("user_ld", "$user_ld -Ttext=0x200000 $in -o $out", log_desc("LD", "$out"))
     n.rule("host_cc", "mkdir -p $$(dirname $out) && $user_cc $diagnostic_color -O0 -g -Wall -Wextra $in -o $out", log_desc("HOSTLD", "$in"))
     n.rule("mbedtls_cc", "mkdir -p $$(dirname $out) && $user_cc $mbedtls_ccflags -MF $out.d -c $in -o $out", log_desc("CC", "$in -> $out"), depfile="$out.d")
-    n.rule("browser_builtins", "mkdir -p $$(dirname $out) && python3 tools/ninja_build.py browser-builtins > $out", log_desc("FIND", "browser builtins"))
-    n.rule("link_with_builtins", "$user_ld $ldflags $in $$(cat out/browser-builtins.path) -o $out", log_desc("LD", "$out"))
-    n.rule("browser_hosted_cxx", "mkdir -p $$(dirname $out) && $user_cxx $browser_hosted_cxxflags -MF $out.d -c $in -o $out", log_desc("CXX", "$in -> $out"), depfile="$out.d")
-    n.rule("litehtml_cxx", "mkdir -p $$(dirname $out) && $user_cxx $browser_hosted_cxxflags -fno-exceptions -MF $out.d -c $in -o $out", log_desc("CXX", "$in -> $out"), depfile="$out.d")
-    n.rule("litehtml_encodings_cxx", "mkdir -p $$(dirname $out) && $user_cxx $browser_hosted_cxxflags -fexceptions -MF $out.d -c $in -o $out", log_desc("CXX", "$in -> $out"), depfile="$out.d")
-    n.rule("browser_hosted_cc", "mkdir -p $$(dirname $out) && $user_cc $browser_hosted_cflags -MF $out.d -c $in -o $out", log_desc("CC", "$in -> $out"), depfile="$out.d")
-    n.rule("link_browser", "$user_ld -Ttext=0x200000 --gc-sections --wrap=free $in --start-group $browser_stdcpp $browser_supcpp $browser_libgcc_eh $browser_libgcc $$(cat out/browser-builtins.path) --end-group -o $out", log_desc("LD", "$out"))
     n.rule("libvterm_cc", "mkdir -p $$(dirname $out) && $user_cc $libvterm_cflags -MF $out.d -c $in -o $out", log_desc("CC", "$in -> $out"), depfile="$out.d")
     n.rule("kmod_e1000_cxx", "mkdir -p $$(dirname $out) && $cxx $kmod_cxxflags -I./include -MF $out.d -c $in -o $out", log_desc("CXX", "$in"), depfile="$out.d")
     n.rule("kmod_xhci_cxx", "mkdir -p $$(dirname $out) && $cxx $kmod_cxxflags -I./include -I./kmod/xhci -MF $out.d -c $in -o $out", log_desc("CXX", "$in"), depfile="$out.d")
