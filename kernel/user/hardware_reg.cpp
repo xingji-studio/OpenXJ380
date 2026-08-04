@@ -23,7 +23,6 @@
 #include <power.h>
 #include <proto.hpp>
 #include <ps2/keyboard.h>
-#include <ps2/mouse.h>
 #include <rtc.h>
 #include <sb16.h>
 #include <syscall/signal.h>

@@ -671,7 +671,7 @@ extern "C" uint64_t c_syscall_handler(struct X64_REGS *regs, uint64_t user_rsp)
     case XAPI_REMOVEDIR: sys_rmdir(regs->rdi, 0, 0, 0, 0, 0, regs); break;
     case XAPI_FLUSH_TIME: regs->rax = (uint64_t)-ENOSYS; break;
     case XAPI_GET_TASK_LIST: regs->rax = (uint64_t)-ENOSYS; break;
-    case XAPI_KILL_PROCESS: regs->rax = do_xapi_KillProcess(regs->rdi); break;
+    case XAPI_KILL_PROCESS: regs->rax = (uint64_t)-ENOSYS; break;
     case XAPI_USER_OOBE_REQUIRED: regs->rax = do_xapi_UserOobeRequired(); break;
     case XAPI_USER_LIST: regs->rax = do_xapi_UserList(regs->rdi, regs->rsi); break;
     case XAPI_USER_LOGIN: regs->rax = do_xapi_UserLogin(regs->rdi, regs->rsi); break;
