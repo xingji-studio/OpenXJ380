@@ -72,14 +72,14 @@ static void load_busybox_alias_applets()
     int applet_index = 0, alias_index = 0;
     for(int i = 0; buffer[i] != EOF, i++)
     {
-	if(buffer[i] == ',')
-	{
-	    strcpy(busybox_alias_applets[applet_index], alias);
-	    applet_index ++;
-	    continue;
-	}
-	alias[alias_index] = buffer[i];
-	alias_index ++;
+	    if(buffer[i] == ',')
+	    {
+	        strcpy(busybox_alias_applets[applet_index], alias);
+	        applet_index ++;
+	        continue;
+	    }
+	    alias[alias_index] = buffer[i];
+	    alias_index ++;
     }
     strcpy(busybox_alias_applets[applet_index], alias);
     busybox_alias_applets[alias_index + 1] = NULL;
