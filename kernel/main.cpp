@@ -444,6 +444,7 @@ extern "C" void KernelMain(const FrameBufferConfig &fbc, EFI_SYSTEM_TABLE &Syste
     } else {
         write_serial_string("AHCI: keeping conservative IO path on vmware/real hardware\n");
     }
+    user_session_use_login();
     create_user_process_from_file((char *)"/apps/system/shell.elf", NULL, NULL);
 
     // delay_s_hp(60);

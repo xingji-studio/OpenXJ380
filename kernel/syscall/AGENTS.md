@@ -8,7 +8,7 @@ Kernel/user boundary implementation. This subtree wires syscall entry, dispatch,
 |------|----------|-------|
 | Syscall CPU entry | `syscall.cpp` | Programs EFER/STAR/LSTAR/SYSCALL_MASK. |
 | Main syscall table/handlers | `sys.cpp` | Large dispatch surface; high-risk file. |
-| File syscalls | `fs.cpp`, `xapi/xfile.cpp` | VFS handles and user copy wrappers. |
+| File syscalls | `sys.cpp`, `xapi/xfile.cpp` | VFS handles and user copy wrappers. |
 | GUI/xapi bridge | `xapi/xgui.cpp` | Graphics/window xapi syscall layer. |
 | Signal behavior | `signal.cpp`, `include/syscall/signal.h` | User signal delivery/handling. |
 | ABI headers | `include/syscall/`, `user/xapi/include/` | Kernel/user contract. |

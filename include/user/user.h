@@ -50,6 +50,7 @@ int user_session_list(UserInfo *out, int max_count);
 int user_session_login(const char *username, const char *password);
 int user_session_create_first(const char *username, const char *password);
 void user_session_use_root();
+void user_session_use_login();
 
 extern UserInfo  root_user;
 extern UserInfo *current_user;

@@ -91,6 +91,7 @@ typedef struct dlhandle {
     // 动态段信息
     Elf64_Sym*      symtab;
     char*           strtab;
+    size_t          strtabsz;
     size_t          symtabsz;
     size_t          sym_count;
     Elf64_Dyn*      dynamic;

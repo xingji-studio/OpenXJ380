@@ -19,6 +19,7 @@
 #include <mutex.h>
 #include <math.hpp>
 #include <user/user.h>
+#include <rng.h>
 
 extern lock_queue *pcb_group_queue;
 
@@ -4701,27 +4702,11 @@ sys_(getrandom, void *buf, size_t buflen, uint64_t flags)
     uint8_t *bounce = (uint8_t *)malloc(bounce_len);
     if (bounce == NULL) return SYSCALL_FAULT_(ENOMEM);
 
-    tm tm;
-    time_read(&tm);
-    uint64_t seed = nanoTime() ^ ((uint64_t)mktime(&tm) << 32);
-    tcb_t task = get_current_task();
-    if (task != NULL)
-    {
-        seed ^= (uint64_t)task->tid;
-        if (task->parent_group != NULL) seed ^= ((uint64_t)task->parent_group->pid << 16);
-    }
-
     size_t written = 0;
     while (written < buflen)
     {
         size_t chunk = MIN(buflen - written, bounce_len);
-        for (size_t i = 0; i < chunk; i++)
-        {
-            seed ^= seed << 13;
-            seed ^= seed >> 7;
-            seed ^= seed << 17;
-            bounce[i] = (uint8_t)(seed & 0xffU);
-        }
+        get_random_bytes(bounce, chunk);
         if (!copy_to_user_pagedir(current_user_pagedir(), (uint8_t *)buf + written, bounce, chunk))
         {
             free(bounce);
