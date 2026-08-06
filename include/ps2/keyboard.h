@@ -2,8 +2,6 @@
 #ifndef _KEYBOARD_H_
 #    define _KEYBOARD_H_
 
-#    include <graphics/GOP.hpp>
-#    include <graphics/sheet.h>
 #    include <proto.hpp>
 
 #define KB_BUF_SIZE 128
