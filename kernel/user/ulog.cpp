@@ -8,14 +8,12 @@
 #include <fs/fatfs/fatfs.h>
 #include <fs/partition.h>
 #include <fs/vfs/devfs.h>
-#include <fs/vfs/sys.h>
 #include <fs/vfs/vfs.h>
 #include <krlibc.h>
 #include <mm/frame.h>
 #include <pci/pci.h>
 #include <proto.hpp>
 #include <ps2/keyboard.h>
-#include <ps2/mouse.h>
 #include <rtc.h>
 #include <stdint.h>
 #include <syscall/syscall.h>

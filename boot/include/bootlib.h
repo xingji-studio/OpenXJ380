@@ -63,7 +63,7 @@ UINT64 strcmp(char *from_str, char *cmp_str);
 
 UINT64 part_strcmp(char *from_str, char *cmp_str, UINT64 size);
 
-char *Hex2Char(unsigned long long hex);
+void write_serial_hex(UINT64 value);
 
-char *Dec2Char(unsigned long long dec);
+void write_serial_dec(UINT64 value);
 #endif // _BOOTLIB_H_

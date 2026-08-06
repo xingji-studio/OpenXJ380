@@ -10,7 +10,6 @@
 #include <fs/fatfs/fatfs.h>
 #include <fs/partition.h>
 #include <fs/vfs/devfs.h>
-#include <fs/vfs/sys.h>
 #include <fs/vfs/vfs.h>
 #include <hda/hda.h>
 #include <hda/pcspk.h>
@@ -23,7 +22,6 @@
 #include <power.h>
 #include <proto.hpp>
 #include <ps2/keyboard.h>
-#include <ps2/mouse.h>
 #include <rtc.h>
 #include <sb16.h>
 #include <syscall/signal.h>

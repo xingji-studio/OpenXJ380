@@ -62,7 +62,7 @@ class BusyBoxComplianceTests(unittest.TestCase):
             applets = subprocess.check_output([str(executable), "--list"], text=True).splitlines()
 
         kernel_main = (ROOT / "kernel/main.cpp").read_text(encoding="utf-8")
-        alias_table = kernel_main.split("busybox_alias_applets[] = {", 1)[1].split("};", 1)[0]
+        alias_table = kernel_main.split("busybox_alias_applets[][16] = {", 1)[1].split("};", 1)[0]
         for applet in ("wget", "lzma", "unlzma", "unxz", "xz", "xzcat"):
             self.assertNotIn(applet, applets)
             self.assertNotIn(f'"{applet}"', alias_table)

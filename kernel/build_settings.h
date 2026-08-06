@@ -96,7 +96,7 @@
 #endif
 
 #ifndef CONFIG_KERNEL_DEFAULT_USER_APP
-#define CONFIG_KERNEL_DEFAULT_USER_APP "/apps/browser.elf"
+#define CONFIG_KERNEL_DEFAULT_USER_APP "/apps/system/shell.elf"
 #endif
 
 #ifndef CONFIG_KERNEL_BOOT_LOGO
