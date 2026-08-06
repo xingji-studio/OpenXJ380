@@ -8,14 +8,12 @@
 #include <fs/fatfs/fatfs.h>
 #include <fs/partition.h>
 #include <fs/vfs/devfs.h>
-#include <fs/vfs/sys.h>
 #include <fs/vfs/vfs.h>
 #include <krlibc.h>
 #include <mm/frame.h>
 #include <pci/pci.h>
 #include <proto.hpp>
 #include <ps2/keyboard.h>
-#include <ps2/mouse.h>
 #include <rtc.h>
 #include <stdint.h>
 #include <syscall/syscall.h>
@@ -193,24 +191,46 @@ void runfile(char *path)
     strcat(runfile_setfile_path, "/runfile.dat");
     vfs_mkfile(runfile_setfile_path);
 
-    char  settings_file_buffer[sizeof(RunfileSettings_Item) * 1024];
     vfs_node_t settings_file_v = vfs_open(runfile_setfile_path);
     if (!settings_file_v) return;
-    vfs_read(settings_file_v, settings_file_buffer, 0, settings_file_v->size);
+    size_t settings_size = settings_file_v->size;
+    if (settings_size > sizeof(RunfileSettings_Format))
+    {
+        vfs_close(settings_file_v);
+        return;
+    }
 
-    RunfileSettings_Format *file_format = (RunfileSettings_Format *)settings_file_buffer;
+    RunfileSettings_Format *file_format = (RunfileSettings_Format *)calloc(1, sizeof(RunfileSettings_Format));
+    if (file_format == NULL)
+    {
+        vfs_close(settings_file_v);
+        return;
+    }
+    size_t bytes_read = vfs_read(settings_file_v, file_format, 0, settings_size);
+    vfs_close(settings_file_v);
+    if (bytes_read != settings_size)
+    {
+        free(file_format);
+        return;
+    }
+
     for (int i = 0; i < 1024; i++)
     {
-        if (strcmp(exname, file_format->items[i].exname) == 0)
+        RunfileSettings_Item *item = &file_format->items[i];
+        if (memchr(item->exname, '\0', sizeof(item->exname)) == NULL ||
+            memchr(item->runpath, '\0', sizeof(item->runpath)) == NULL)
+            continue;
+        if (strcmp(exname, item->exname) == 0)
         {
             // 是可执行文件
             char *argv[2]    = {path, NULL};
-            create_user_process_from_file(file_format->items[i].runpath, NULL, argv);
+            create_user_process_from_file(item->runpath, NULL, argv);
+            free(file_format);
             return;
         }
     }
 
-    vfs_close(settings_file_v);
+    free(file_format);
 }
 
 bool get_file_exname(char *name, char *exname)

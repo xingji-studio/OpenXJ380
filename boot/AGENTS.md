@@ -12,7 +12,7 @@ UEFI bootloader subtree. Builds `out/BOOTX64.efi`, gathers firmware state, loads
 | Boot LSP flags | `.clangd_template` | Separate include path: `${workspaceFolder}/boot/include`. |
 
 ## CONVENTIONS
-- Built by root `Makefile` with `x86_64-w64-mingw32-gcc` and `BOOT_C_FLAGS`.
+- Built by the generated Ninja graph with the boot-specific C flags emitted by `tools/gen_ninja.py`.
 - Entry symbol is forced with `-e efi_main`; PE/COFF subsystem is set with `-Wl,--subsystem,10`.
 - Boot code uses `-fshort-wchar`, `-nostdinc`, `-nostdlib`, and its own `boot/include` headers.
 - Global EFI handles (`ST`, `BS`, `GOP`, `SFSP`, `LIP`, `SPP`, `BAT`, `IM`) are established in `bootx64.c`; preserve setup order.
@@ -28,7 +28,9 @@ UEFI bootloader subtree. Builds `out/BOOTX64.efi`, gathers firmware state, loads
 
 ## BUILD / VERIFY
 ```bash
-make all -j"$(nproc)"
-make vdisk
+python3 tools/gen_ninja.py --out build.ninja
+ninja -f build.ninja all
+ninja -f build.ninja vdisk
 ```
-Inspect `out/BOOTX64.efi`; runtime validation requires booting the image via `make run` or `make justrun`.
+Inspect `out/BOOTX64.efi`; runtime validation requires booting the image via `ninja -f build.ninja run` or
+`ninja -f build.ninja justrun`.

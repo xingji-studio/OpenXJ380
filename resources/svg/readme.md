@@ -1,1 +1,0 @@
-这里的svg文件均来自[Font Awesome](https://fontawesome.com/)并在其LICENSE的要求下进行使用。

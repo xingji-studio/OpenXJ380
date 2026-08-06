@@ -8,7 +8,6 @@
 #include <fs/fatfs/fatfs.h>
 #include <fs/partition.h>
 #include <fs/vfs/devfs.h>
-#include <fs/vfs/sys.h>
 #include <fs/vfs/vfs.h>
 #include <krlibc.h>
 #include <mm/frame.h>
@@ -21,6 +20,7 @@
 #include <task/pcb.h>
 #include <user/user.h>
 #include <user/runfile.h>
+#include <cpu/lock.h>
 
 char *current_user_envp[100] = {
     ENVP_SYSTEM_VERSION,
@@ -143,346 +143,11 @@ static bool append_cmdline_arg(char *cmdline, size_t cmdline_size, char **cursor
     return true;
 }
 
-char password_layout_ball_bitmap[8][9] = {
-    "..####..",
-    ".######.",
-    "########",
-    "########",
-    "########",
-    "########",
-    ".######.",
-    "..####..",
-};
-
-static const int PASSWORD_BOX_X      = 128;
-static const int PASSWORD_BOX_Y      = 168;
-static const int PASSWORD_BOX_WIDTH  = 300;
-static const int PASSWORD_BOX_HEIGHT = 24;
-static const int PASSWORD_TEXT_X     = 136;
-static const int PASSWORD_TEXT_Y     = 176;
-static const int PASSWORD_SLOT_WIDTH = 16;
-static const int PASSWORD_MAX_INPUT  = 18;
-static const uint64_t PASSWORD_CURSOR_BLINK_NS = 500000000ULL;
-
-#if 0
-static void refresh_user_ui_now(int x1, int y1, int x2, int y2);
-static void refresh_user_fullscreen_now();
-static void draw_text_input_box(int x, int y, int width, const char *value, bool password, bool focused);
-
-static SHEET_BUFFER *oobe_shell_cache     = NULL;
-static uint32_t      oobe_shell_cache_w   = 0;
-static uint32_t      oobe_shell_cache_h   = 0;
-
-static void oobe_free_shell_cache()
-{
-    if (oobe_shell_cache != NULL)
-    {
-        free(oobe_shell_cache);
-        oobe_shell_cache = NULL;
-    }
-    oobe_shell_cache_w = 0;
-    oobe_shell_cache_h = 0;
-}
-static void oobe_draw_static_shell()
-{
-    draw_rect(sht_img, desktop_ct_sheet, 0, 0, sht_img->scrx - 1, sht_img->scry - 1, {0x0f, 0x4c, 0x9a, 0xff});
-    PrintPicture_blend(sht_img, desktop_ct_sheet, 0, 0, sht_img->scrx, sht_img->scry,
-                       "/system/resources/image/background3.png");
-
-    int panel_x = 64;
-    int title_y = 42;
-    int label_x = panel_x;
-
-    print_box_ttf(sht_img, desktop_ct_sheet, "欢迎使用 XJ380", WHITE, panel_x, title_y, 36);
-    print_box_ttf(sht_img, desktop_ct_sheet, "创建第一个管理员账户", WHITE, panel_x, title_y + 56, 16);
-    print_box_ttf(sht_img, desktop_ct_sheet, "用户名：", WHITE, label_x, 142, 14);
-    print_box_ttf(sht_img, desktop_ct_sheet, "密码：", WHITE, label_x, 192, 14);
-    print_box_ttf(sht_img, desktop_ct_sheet, "确认密码：", WHITE, label_x, 242, 14);
-
-    draw_rect(sht_img, desktop_ct_sheet, 224, 294, 374, 328, XINGJI_BLUE);
-    print_box_ttf(sht_img, desktop_ct_sheet, "创建账户", WHITE, 258, 302, 13);
-    print_box_ttf(sht_img, desktop_ct_sheet, "按制表键切换输入框，按回车键创建账户。", WHITE, panel_x, 350, 12);
-}
-
-static bool oobe_prepare_shell_cache()
-{
-    if (desktop_ct_sheet == NULL || desktop_ct_sheet->buffer == NULL) return false;
-
-    uint32_t screen_w = sht_img->scrx;
-    uint32_t screen_h = sht_img->scry;
-    size_t   bytes    = (size_t)screen_w * screen_h * sizeof(SHEET_BUFFER);
-
-    if (oobe_shell_cache != NULL && oobe_shell_cache_w == screen_w && oobe_shell_cache_h == screen_h) return true;
-
-    oobe_free_shell_cache();
-    oobe_shell_cache = (SHEET_BUFFER *)malloc(bytes);
-    if (oobe_shell_cache == NULL) return false;
-
-    oobe_draw_static_shell();
-    refresh_user_fullscreen_now();
-    memcpy(oobe_shell_cache, desktop_ct_sheet->buffer, bytes);
-    oobe_shell_cache_w = screen_w;
-    oobe_shell_cache_h = screen_h;
-    return true;
-}
-
-static void oobe_restore_rect(int x1, int y1, int x2, int y2)
-{
-    if (oobe_shell_cache == NULL || desktop_ct_sheet == NULL || desktop_ct_sheet->buffer == NULL) return;
-    if (x1 > x2)
-    {
-        int tmp = x1;
-        x1      = x2;
-        x2      = tmp;
-    }
-    if (y1 > y2)
-    {
-        int tmp = y1;
-        y1      = y2;
-        y2      = tmp;
-    }
-    if (x2 < 0 || y2 < 0) return;
-    if (x1 >= (int)oobe_shell_cache_w || y1 >= (int)oobe_shell_cache_h) return;
-    if (x1 < 0) x1 = 0;
-    if (y1 < 0) y1 = 0;
-    if (x2 >= (int)oobe_shell_cache_w) x2 = (int)oobe_shell_cache_w - 1;
-    if (y2 >= (int)oobe_shell_cache_h) y2 = (int)oobe_shell_cache_h - 1;
-    if (x1 > x2 || y1 > y2) return;
-
-    SHEET_BUFFER *dst = (SHEET_BUFFER *)desktop_ct_sheet->buffer;
-    size_t        row_bytes = (size_t)(x2 - x1 + 1) * sizeof(SHEET_BUFFER);
-    for (int y = y1; y <= y2; y++)
-    {
-        memcpy(&dst[(size_t)y * oobe_shell_cache_w + x1], &oobe_shell_cache[(size_t)y * oobe_shell_cache_w + x1],
-               row_bytes);
-    }
-}
-
-static void draw_oobe_dynamic_inputs(char username[64], char password[64], char confirm[64], int focus)
-{
-    int field_x = 224;
-    int field_w = 320;
-
-    oobe_restore_rect(field_x, 136, field_x + field_w, 264);
-    draw_text_input_box(field_x, 136, field_w, username, false, focus == 0);
-    draw_text_input_box(field_x, 186, field_w, password, true, focus == 1);
-    draw_text_input_box(field_x, 236, field_w, confirm, true, focus == 2);
-    refresh_user_ui_now(field_x, 136, field_x + field_w, 264);
-}
-
-static void draw_oobe_dynamic_message(const char *message)
-{
-    int panel_x = 64;
-    int message_x2 = (int)sht_img->scrx - panel_x - 1;
-    if (message_x2 < panel_x) message_x2 = panel_x;
-
-    oobe_restore_rect(panel_x, 340, message_x2, 370);
-    if (message != NULL && message[0] != '\0')
-    {
-        print_box_ttf(sht_img, desktop_ct_sheet, (char *)message, RED, panel_x, 350, 12);
-    }
-    else
-    {
-        print_box_ttf(sht_img, desktop_ct_sheet, "按制表键切换输入框，按回车键创建账户。", WHITE, panel_x, 350, 12);
-    }
-    refresh_user_ui_now(panel_x, 340, message_x2, 370);
-}
-
-static void draw_oobe_dynamic_frame(char username[64], char password[64], char confirm[64], int focus,
-                                    const char *message)
-{
-    int panel_x = 64;
-    int panel_y = 136;
-    int panel_x2 = (int)sht_img->scrx - panel_x - 1;
-    if (panel_x2 < panel_x) panel_x2 = panel_x;
-
-    oobe_restore_rect(panel_x, panel_y, panel_x2, 370);
-    draw_text_input_box(224, 136, 320, username, false, focus == 0);
-    draw_text_input_box(224, 186, 320, password, true, focus == 1);
-    draw_text_input_box(224, 236, 320, confirm, true, focus == 2);
-
-    if (message != NULL && message[0] != '\0')
-    {
-        print_box_ttf(sht_img, desktop_ct_sheet, (char *)message, RED, panel_x, 350, 12);
-    }
-    else
-    {
-        print_box_ttf(sht_img, desktop_ct_sheet, "按制表键切换输入框，按回车键创建账户。", WHITE, panel_x, 350, 12);
-    }
-    refresh_user_ui_now(panel_x, panel_y, panel_x2, 370);
-}
-
-static void draw_oobe_screen_full(char username[64], char password[64], char confirm[64], int focus,
-                                  const char *message)
-{
-    oobe_draw_static_shell();
-    draw_text_input_box(224, 136, 320, username, false, focus == 0);
-    draw_text_input_box(224, 186, 320, password, true, focus == 1);
-    draw_text_input_box(224, 236, 320, confirm, true, focus == 2);
-
-    if (message != NULL && message[0] != '\0')
-    {
-        print_box_ttf(sht_img, desktop_ct_sheet, (char *)message, RED, 64, 350, 12);
-    }
-    else
-    {
-        print_box_ttf(sht_img, desktop_ct_sheet, "按制表键切换输入框，按回车键创建账户。", WHITE, 64, 350, 12);
-    }
-
-    refresh_user_fullscreen_now();
-}
-
-static void refresh_user_ui_now(int x1, int y1, int x2, int y2)
-{
-    refresh_part_sheet(sht_img, x1, y1, x2, y2);
-    flush_sheet_damage_queue_now(sht_img);
-}
-
-static void refresh_user_fullscreen_now()
-{
-    refresh_sheet(sht_img);
-    flush_sheet_damage_queue_now(sht_img);
-}
-
-static void service_user_wait_loop()
-{
-    flush_sheet_damage_queue_now(sht_img);
-    __asm__ __volatile__("pause");
-}
-
-static void render_password_input(const char *input_password, int input_count, bool show_cursor)
-{
-    (void)input_password;
-
-    draw_rect(sht_img, desktop_ct_sheet, PASSWORD_BOX_X, PASSWORD_BOX_Y, PASSWORD_BOX_X + PASSWORD_BOX_WIDTH,
-              PASSWORD_BOX_Y + PASSWORD_BOX_HEIGHT, WHITE);
-
-    for (int i = 0; i < input_count; i++)
-    {
-        for (int y = 0; y < 8; y++)
-        {
-            for (int x = 0; x < 8; x++)
-            {
-                if (password_layout_ball_bitmap[y][x] == '#')
-                {
-                    draw_point(sht_img, desktop_ct_sheet, PASSWORD_TEXT_X + PASSWORD_SLOT_WIDTH * i + x,
-                               PASSWORD_TEXT_Y + y, BLACK);
-                }
-            }
-        }
-    }
-
-    if (show_cursor)
-    {
-        int cursor_x = PASSWORD_TEXT_X + PASSWORD_SLOT_WIDTH * input_count;
-        draw_rect(sht_img, desktop_ct_sheet, cursor_x, PASSWORD_BOX_Y + 4, cursor_x + 1, PASSWORD_BOX_Y + 20, BLACK);
-    }
-
-    refresh_user_ui_now(PASSWORD_BOX_X, PASSWORD_BOX_Y, PASSWORD_BOX_X + PASSWORD_BOX_WIDTH,
-                        PASSWORD_BOX_Y + PASSWORD_BOX_HEIGHT);
-}
-
-static void draw_text_input_box(int x, int y, int width, const char *value, bool password, bool focused)
-{
-    SHEET_BUFFER border = focused ? SHEET_BUFFER{0x00, 0xa2, 0xe8, 0xff}
-                                  : SHEET_BUFFER{0xe6, 0xe6, 0xe6, 0xff};
-    draw_rect(sht_img, desktop_ct_sheet, x, y, x + width, y + 28, WHITE);
-    draw_rect(sht_img, desktop_ct_sheet, x, y, x + width, y + 1, border);
-    draw_rect(sht_img, desktop_ct_sheet, x, y + 26, x + width, y + 28, border);
-    draw_rect(sht_img, desktop_ct_sheet, x, y, x + 1, y + 28, border);
-    draw_rect(sht_img, desktop_ct_sheet, x + width - 1, y, x + width, y + 28, border);
-
-    if (value == NULL) value = "";
-    if (password)
-    {
-        char bullets[64];
-        size_t len = strlen(value);
-        if (len >= sizeof(bullets)) len = sizeof(bullets) - 1;
-        for (size_t i = 0; i < len; i++) bullets[i] = '*';
-        bullets[len] = '\0';
-        print_box_ttf(sht_img, desktop_ct_sheet, bullets, BLACK, x + 8, y + 7, 12);
-    }
-    else
-    {
-        print_box_ttf(sht_img, desktop_ct_sheet, (char *)value, BLACK, x + 8, y + 7, 12);
-    }
-
-    if (focused)
-    {
-        int cursor_x = x + 8 + (int)strlen(value) * 8;
-        if (cursor_x > x + width - 12) cursor_x = x + width - 12;
-        draw_rect(sht_img, desktop_ct_sheet, cursor_x, y + 6, cursor_x + 1, y + 22, BLACK);
-    }
-}
-
-static void draw_oobe_screen(char username[64], char password[64], char confirm[64], int focus, const char *message)
-{
-    if (oobe_prepare_shell_cache())
-    {
-        draw_oobe_dynamic_inputs(username, password, confirm, focus);
-        draw_oobe_dynamic_message(message);
-        return;
-    }
-
-    draw_oobe_screen_full(username, password, confirm, focus, message);
-}
-
-static bool oobe_username_char_ok(char ch)
-{
-    return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
-           (ch >= '0' && ch <= '9') || ch == '_' || ch == '-' || ch == ' ';
-}
-
-static bool oobe_username_ok(const char *username)
-{
-    if (username == NULL || username[0] == '\0') return false;
-    if (username[0] == ' ') return false;
-    size_t len = strlen(username);
-    if (len == 0 || len >= sizeof(((UserInfo *)0)->name) || username[len - 1] == ' ') return false;
-    for (size_t i = 0; i < len; i++)
-    {
-        if (!oobe_username_char_ok(username[i])) return false;
-    }
-    return true;
-}
-
-static bool append_input_char(char *buf, size_t size, char ch)
-{
-    if (buf == NULL || size == 0) return false;
-    size_t len = strlen(buf);
-    if (len + 1 >= size) return false;
-    buf[len] = ch;
-    buf[len + 1] = '\0';
-    return true;
-}
-
-static void render_oobe_if_needed(bool need_render, bool shell_ready, char username[64], char password[64],
-                                  char confirm[64], int focus, const char *message)
-{
-    if (!need_render) return;
-    if (shell_ready)
-    {
-        draw_oobe_dynamic_frame(username, password, confirm, focus, message);
-    }
-    else
-    {
-        draw_oobe_screen_full(username, password, confirm, focus, message);
-    }
-}
-
-static void backspace_input_char(char *buf)
-{
-    if (buf == NULL) return;
-    size_t len = strlen(buf);
-    if (len == 0) return;
-    buf[len - 1] = '\0';
-}
-
-#endif
-
 static bool user_registry_login_entry_valid(const UserInfo *user)
 {
     if (user == NULL || user->name[0] == '\0') return false;
+    if (memchr(user->name, '\0', sizeof(user->name)) == NULL ||
+        memchr(user->password, '\0', sizeof(user->password)) == NULL) return false;
     if (user->user_type == XUT_Root || user->user_type == XUT_System) return false;
     if (user->user_type < XUT_Root || user->user_type > XUT_Custom) return false;
     for (const char *p = user->name; *p != '\0'; p++)
@@ -594,6 +259,15 @@ void user_session_use_root()
     set_current_user_from_info(&root_user);
 }
 
+void user_session_use_login()
+{
+    UserInfo login_user;
+    memset(&login_user, 0, sizeof(login_user));
+    strcpy(login_user.name, "Login");
+    login_user.user_type = XUT_Visitor;
+    set_current_user_from_info(&login_user);
+}
+
 bool user_session_needs_oobe()
 {
     UserRegisterList registry;
@@ -617,6 +291,7 @@ int user_session_list(UserInfo *out, int max_count)
         if (!user_registry_login_entry_valid(&registry.uinf[i])) continue;
         if (copied >= max_count) break;
         out[copied] = registry.uinf[i];
+        memset(out[copied].password, 0, sizeof(out[copied].password));
         copied++;
     }
     return copied;
@@ -625,6 +300,14 @@ int user_session_list(UserInfo *out, int max_count)
 int user_session_login(const char *username, const char *password)
 {
     if (username == NULL || password == NULL || username[0] == '\0') return -EINVAL;
+
+    static spin_t login_lock = SPIN_INIT;
+    static uint64_t retry_after_ns = 0;
+    static unsigned failed_attempts = 0;
+    spin_lock(&login_lock);
+    uint64_t now = nanoTime();
+    if (now < retry_after_ns) { spin_unlock(&login_lock); return -EAGAIN; }
+    spin_unlock(&login_lock);
 
     UserRegisterList registry;
     size_t           bytes_read = 0;
@@ -635,12 +318,28 @@ int user_session_login(const char *username, const char *password)
     {
         if (!user_registry_login_entry_valid(&registry.uinf[i])) continue;
         if (strcmp(username, registry.uinf[i].name) != 0) continue;
-        if (strcmp(password, registry.uinf[i].password) != 0) return -EACCES;
+        if (strcmp(password, registry.uinf[i].password) != 0)
+        {
+            spin_lock(&login_lock);
+            failed_attempts++;
+            uint64_t delay_seconds = 1ULL << min(failed_attempts, 5U);
+            retry_after_ns = now + delay_seconds * 1000000000ULL;
+            spin_unlock(&login_lock);
+            return -EACCES;
+        }
 
         set_current_user_from_info(&registry.uinf[i]);
+        spin_lock(&login_lock);
+        failed_attempts = 0;
+        retry_after_ns = 0;
+        spin_unlock(&login_lock);
         if (current_user != NULL) init_user_profile(current_user->name);
         return 0;
     }
+    spin_lock(&login_lock);
+    failed_attempts++;
+    retry_after_ns = now + (1ULL << min(failed_attempts, 5U)) * 1000000000ULL;
+    spin_unlock(&login_lock);
     return -ENOENT;
 }
 
@@ -656,7 +355,12 @@ int user_session_create_first(const char *username, const char *password)
 
     UserRegisterList registry;
     size_t           bytes_read = 0;
-    load_user_registry(&registry, &bytes_read);
+    bool registry_loaded = load_user_registry(&registry, &bytes_read);
+    vfs_node_t existing_registry = vfs_open("/system/config/usereg.dat");
+    bool registry_exists = existing_registry != NULL;
+    if (existing_registry != NULL) vfs_close(existing_registry);
+    if (registry_exists && (!registry_loaded || bytes_read != sizeof(UserRegisterList) ||
+                            registry.user_count < 1 || registry.user_count > 128)) return -EIO;
     if (!user_registry_needs_oobe(&registry, bytes_read))
     {
         if (user_registry_first_user_matches(&registry, username, password))
@@ -692,299 +396,8 @@ int user_session_create_first(const char *username, const char *password)
     return 0;
 }
 
-#if 0
-static bool run_oobe()
-{
-    char username[64];
-    char password[64];
-    char confirm[64];
-    memset(username, 0, sizeof(username));
-    memset(password, 0, sizeof(password));
-    memset(confirm, 0, sizeof(confirm));
-
-    int focus = 0;
-    const char *message = "";
-    bool shell_ready = oobe_prepare_shell_cache();
-    if (shell_ready)
-    {
-        draw_oobe_dynamic_frame(username, password, confirm, focus, message);
-    }
-    else
-    {
-        draw_oobe_screen_full(username, password, confirm, focus, message);
-    }
-
-    bool prev_mouse_left = ms_dec.left;
-
-    while (1)
-    {
-        service_user_wait_loop();
-        bool create_requested = false;
-        bool need_render      = false;
-        bool mouse_click      = ms_dec.left && !prev_mouse_left;
-        prev_mouse_left      = ms_dec.left;
-
-        if (mouse_click)
-        {
-            int mx = get_mouse_x();
-            int my = get_mouse_y();
-            int old_focus = focus;
-            if (mx >= 224 && mx <= 544 && my >= 136 && my <= 164) focus = 0;
-            else if (mx >= 224 && mx <= 544 && my >= 186 && my <= 214) focus = 1;
-            else if (mx >= 224 && mx <= 544 && my >= 236 && my <= 264) focus = 2;
-            else if (mx >= 224 && mx <= 374 && my >= 294 && my <= 328) create_requested = true;
-            if (!create_requested && focus != old_focus)
-            {
-                message = "";
-                need_render = true;
-            }
-        }
-
-        uint8_t k_input = create_requested ? 0 : get_keyboard_input();
-        if (k_input == 0 && !create_requested)
-        {
-            render_oobe_if_needed(need_render, shell_ready, username, password, confirm, focus, message);
-            continue;
-        }
-
-        if (k_input == KEY_TAB)
-        {
-            focus = (focus + 1) % 3;
-            message = "";
-            need_render = true;
-        }
-        else if (k_input == KEY_LEFT || k_input == KEY_RIGHT || k_input == KEY_UP || k_input == KEY_DOWN)
-        {
-            continue;
-        }
-        else if (k_input == '\n')
-        {
-            create_requested = true;
-        }
-        if (create_requested)
-        {
-            if (!oobe_username_ok(username))
-            {
-                message = "用户名只能使用英文、数字、空格、下划线和短横线。";
-            }
-            else if (password[0] == '\0')
-            {
-                message = "请输入密码。";
-            }
-            else if (strcmp(password, confirm) != 0)
-            {
-                message = "两次输入的密码不一致。";
-            }
-            else if (!write_first_user_registry(username, password) || !init_user_profile(username))
-            {
-                message = "创建账户失败，请检查磁盘。";
-            }
-            else
-            {
-                UserInfo info;
-                memset(&info, 0, sizeof(info));
-                strncpy(info.name, username, sizeof(info.name) - 1);
-                strncpy(info.password, password, sizeof(info.password) - 1);
-                info.user_type = XUT_Admin;
-                set_current_user_from_info(&info);
-                draw_rect(sht_img, desktop_ct_sheet, 0, 0, sht_img->scrx - 1, sht_img->scry - 1,
-                          {0x0f, 0x4c, 0x9a, 0xff});
-                print_box_ttf(sht_img, desktop_ct_sheet, "账户已创建，正在进入桌面。", WHITE, 64, 64, 18);
-                refresh_user_fullscreen_now();
-                oobe_free_shell_cache();
-                return true;
-            }
-            need_render = true;
-            render_oobe_if_needed(need_render, shell_ready, username, password, confirm, focus, message);
-            continue;
-        }
-        if (k_input == '\b')
-        {
-            if (focus == 0) backspace_input_char(username);
-            else if (focus == 1) backspace_input_char(password);
-            else backspace_input_char(confirm);
-            message = "";
-            need_render = true;
-            render_oobe_if_needed(need_render, shell_ready, username, password, confirm, focus, message);
-            continue;
-        }
-        if (k_input >= 32 && k_input < 127)
-        {
-            if (focus == 0)
-            {
-                if (oobe_username_char_ok((char)k_input))
-                {
-                    if (append_input_char(username, sizeof(username), (char)k_input))
-                    {
-                        message = "";
-                        need_render = true;
-                    }
-                }
-                else
-                {
-                    message = "用户名只能使用英文、数字、空格、下划线和短横线。";
-                    need_render = true;
-                }
-            }
-            else if (focus == 1)
-            {
-                if (append_input_char(password, sizeof(password), (char)k_input))
-                {
-                    message = "";
-                    need_render = true;
-                }
-            }
-            else
-            {
-                if (append_input_char(confirm, sizeof(confirm), (char)k_input))
-                {
-                    message = "";
-                    need_render = true;
-                }
-            }
-        }
-
-        render_oobe_if_needed(need_render, shell_ready, username, password, confirm, focus, message);
-    }
-}
-#endif
-
 void init_user()
 {
-#if 0
-    char user_reg_data_path[256];
-    memset(user_reg_data_path, 0, 256);
-    strcat(user_reg_data_path, "/system/config/usereg.dat");
-
-    char  urf_buffer[sizeof(UserRegisterList)];
-    memset(urf_buffer, 0, sizeof(urf_buffer));
-    vfs_node_t urd_v = vfs_open(user_reg_data_path);
-    size_t bytes_read = 0;
-    if (urd_v != NULL)
-    {
-        bytes_read = vfs_read(urd_v, urf_buffer, 0, sizeof(UserRegisterList));
-        vfs_close(urd_v);
-    }
-
-    UserRegisterList *urf_data = (UserRegisterList *)urf_buffer;
-    if (user_registry_needs_oobe(urf_data, bytes_read))
-    {
-        if (run_oobe()) return;
-        return;
-    }
-
-    int current_user_number = 1;
-
-    // 选择用户
-    draw_rect(sht_img, desktop_ct_sheet, 0, 0, sht_img->scrx - 1, sht_img->scry - 1, {0x3f, 0x48, 0xcc, 0xff});
-    PrintPicture_blend(sht_img, desktop_ct_sheet, 0, 0, sht_img->scrx, sht_img->scry, "/system/resources/image/background3.png");
-    print_box_ttf(sht_img, desktop_ct_sheet, "选择一个用户", WHITE, 64, 44, 40);
-
-    for (int i = 1; i < urf_data->user_count; i++)
-    {
-        // PrintPicture_blend(sht_img, desktop_ct_sheet, 64, 130 + (i - 1) * 50, 50, 50, "/system/icon/user.png");
-        xapi_drawFABySheet(sht_img, desktop_ct_sheet, 64, 132 + (i - 1) * 50, 38, "user", true);
-        print_box_ttf(sht_img, desktop_ct_sheet, urf_data->uinf[i].name, WHITE, 122, 138 + (i - 1) * 50, 16);
-    }
-
-    refresh_user_fullscreen_now();
-
-    while (1)
-    {
-        service_user_wait_loop();
-        if (ms_dec.left)
-        {
-            if (get_mouse_x() > 64 && get_mouse_y() > 130 && get_mouse_y() < 130 + (urf_data->user_count) * 50)
-            {
-                current_user_number = (get_mouse_y() - 130) / 50 + 1;
-                break;
-            }
-        }
-    }
-
-    // 登录
-    draw_rect(sht_img, desktop_ct_sheet, 0, 0, sht_img->scrx - 1, sht_img->scry - 1, {0x3f, 0x48, 0xcc, 0xff});
-    PrintPicture_blend(sht_img, desktop_ct_sheet, 0, 0, sht_img->scrx, sht_img->scry, "/system/resources/image/background3.png");
-    print_box_ttf(sht_img, desktop_ct_sheet, "登录", WHITE, 64, 44, 40);
-    print_box_ttf(sht_img, desktop_ct_sheet, "用户：", WHITE, 64, 130, 16);
-    print_box_ttf(sht_img, desktop_ct_sheet, "密码：", WHITE, 64, 164, 16);
-
-    draw_rect(sht_img, desktop_ct_sheet, PASSWORD_BOX_X, PASSWORD_BOX_Y, PASSWORD_BOX_X + PASSWORD_BOX_WIDTH,
-              PASSWORD_BOX_Y + PASSWORD_BOX_HEIGHT, WHITE);
-    print_box_ttf(sht_img, desktop_ct_sheet, urf_data->uinf[current_user_number].name, WHITE, 128, 130, 16);
-    PrintPicture_blend(sht_img, desktop_ct_sheet, 128 + 300 + 8, 168, 24, 24, "/system/icon/nextstep.png");
-
-    refresh_user_fullscreen_now();
-
-    int input_count = 0;
-    char input_password[64];
-    memset(input_password, 0, sizeof(input_password));
-    bool cursor_visible = true;
-    uint64_t last_cursor_toggle = nanoTime();
-    render_password_input(input_password, input_count, cursor_visible);
-    while (1)
-    {
-        service_user_wait_loop();
-        uint64_t now = nanoTime();
-        if (now - last_cursor_toggle >= PASSWORD_CURSOR_BLINK_NS)
-        {
-            cursor_visible = !cursor_visible;
-            last_cursor_toggle = now;
-            render_password_input(input_password, input_count, cursor_visible);
-        }
-
-        uint8_t k_input = get_keyboard_input();
-        if (k_input != '\b' && k_input != '\n' && k_input != NULL && k_input < 128 && input_count < PASSWORD_MAX_INPUT)
-        {
-            input_password[input_count] = k_input;
-            input_count++;
-            cursor_visible = true;
-            last_cursor_toggle = nanoTime();
-            render_password_input(input_password, input_count, cursor_visible);
-        }
-        else if (k_input == '\b')
-        {
-            if (input_count > 0)
-            {
-                input_count--;
-                input_password[input_count] = '\0';
-                cursor_visible = true;
-                last_cursor_toggle = nanoTime();
-                render_password_input(input_password, input_count, cursor_visible);
-            }
-        }
-        else if (k_input == '\n')
-        {
-            goto check_password;
-        }
-
-        if (ms_dec.left)
-        {
-            if (get_mouse_x() > 128 + 300 + 8 && get_mouse_y() > 168 && 
-                get_mouse_x() < 128 + 300 + 8 + 24 && get_mouse_y() < 168 + 24)
-            {
-                // 检查密码
-check_password:
-                input_password[input_count] = '\0';
-                if (strcmp(input_password, urf_data->uinf[current_user_number].password) == 0)
-                {
-                    break;
-                }
-                else
-                {
-                    print_box_ttf(sht_img, desktop_ct_sheet, "密码错误，请重试。", RED, 64, 200, 12);
-                    refresh_user_ui_now(64, 200, 220, 216);
-                    delay_ms(200);
-                }
-            }
-        }
-    }
-
-    set_current_user_from_info(&urf_data->uinf[current_user_number]);
-    if (current_user != NULL) init_user_profile(current_user->name);
-#else
-    user_session_use_root();
-#endif
 }
 
 void copy_args(char *dst[], char *src[], int n)
@@ -1133,6 +546,8 @@ static int load_user_elf_image(uint8_t *buf, uint64_t file_size, pcb_t group, co
     if (!elf_range_in_file(0, sizeof(Elf64_Ehdr), file_size) ||
         (*(uint32_t *)ehdr->e_ident != 0x464C457F) ||
         ehdr->e_phentsize != sizeof(Elf64_Phdr) ||
+        ehdr->e_phnum == 0 ||
+        ehdr->e_phnum > file_size / sizeof(Elf64_Phdr) ||
         !elf_range_in_file(ehdr->e_phoff, (uint64_t)ehdr->e_phnum * ehdr->e_phentsize, file_size))
     {
         write_serial_fmt("ELF load reject %s: size=%llu magic=%02x %02x %02x %02x type=%u machine=%u phoff=%llu phnum=%u phentsize=%u\n",
@@ -1160,6 +575,7 @@ static int load_user_elf_image(uint8_t *buf, uint64_t file_size, pcb_t group, co
     uint64_t load_bias = ehdr->e_type == ET_DYN ? dyn_base : 0;
     uint64_t load_start = ~0ULL;
     uint64_t load_end = 0;
+    bool entry_is_executable = false;
 
     for (int i = 0; i < ehdr->e_phnum; i++)
     {
@@ -1177,13 +593,23 @@ static int load_user_elf_image(uint8_t *buf, uint64_t file_size, pcb_t group, co
             return -ENOEXEC;
         }
 
+        if (phdrs[i].p_vaddr > ~0ULL - load_bias) return -ENOEXEC;
         uint64_t seg_start = load_bias + phdrs[i].p_vaddr;
+        if (phdrs[i].p_memsz == 0 || check_user_overflow(seg_start, phdrs[i].p_memsz) || seg_start < PAGE_SIZE)
+            return -ENOEXEC;
         uint64_t seg_end = seg_start + phdrs[i].p_memsz;
+        if ((phdrs[i].p_flags & PF_X) != 0 && ehdr->e_entry <= ~0ULL - load_bias)
+        {
+            uint64_t entry = load_bias + ehdr->e_entry;
+            if (entry >= seg_start && entry < seg_end) entry_is_executable = true;
+        }
         load_start = min(load_start, (uint64_t)PADDING_DOWN(seg_start, PAGE_SIZE));
         load_end = max(load_end, (uint64_t)PADDING_UP(seg_end, PAGE_SIZE));
     }
 
-    if (load_start == ~0ULL || load_end <= load_start)
+    static constexpr uint64_t MAX_USER_ELF_SPAN = 1ULL << 30;
+    if (load_start == ~0ULL || load_end <= load_start || load_end - load_start > MAX_USER_ELF_SPAN ||
+        check_user_overflow(load_start, load_end - load_start) || !entry_is_executable)
     {
         write_serial_fmt("ELF load reject %s: no loadable segments\n", name != NULL ? name : "(null)");
         return -ENOEXEC;
@@ -1264,13 +690,18 @@ uint64_t parse_elf_file(char *path, pcb_t group)
         return (uint64_t)ret;
     }
 
+    if (file_size < sizeof(Elf64_Ehdr))
+    {
+        free_file_image(buf, file_size);
+        write_serial_fmt("Parse ELF/EPF file failed. Reason: Truncated header: %s.\n", path);
+        return (uint64_t)-ENOEXEC;
+    }
     Elf64_Ehdr ehdr = *(Elf64_Ehdr *)buf;
 
     // 验证ELF/EPF魔数 (0x7F,'E','L','F') (0x24, 'E', 'P', 'F')
     if ((*(uint32_t *)ehdr.e_ident != 0x464C457F)     // ELF
         && (*(uint32_t *)ehdr.e_ident != 0x46504524)) // EPF
     {
-        free_file_image(buf, file_size);
         pr_warn("Parse ELF/EPF file failed.\n");
         write_serial_fmt("Reason:   Bad Format path=%s size=%llu magic=%02x %02x %02x %02x.\n",
                          path,
@@ -1279,6 +710,7 @@ uint64_t parse_elf_file(char *path, pcb_t group)
                          file_size > 1 ? buf[1] : 0,
                          file_size > 2 ? buf[2] : 0,
                          file_size > 3 ? buf[3] : 0);
+        free_file_image(buf, file_size);
         return NULL;
     }
 

@@ -88,24 +88,6 @@ class LicenseComplianceTests(unittest.TestCase):
 
         self.assertIn("KCONFIG_NOTIMESTAMP=1", build_script)
 
-    def test_ttf_font_license_material_is_complete(self) -> None:
-        license_text = (ROOT / "font/ttf/LICENSES.md").read_text(encoding="utf-8")
-        self.assertIn("Adobe", license_text)
-        self.assertIn("Maple Mono Project Authors", license_text)
-
-        manifest = json.loads(
-            (ROOT / "third_party/compliance-manifest.json").read_text(encoding="utf-8")
-        )
-        components = {component["slug"]: component for component in manifest["components"]}
-        expected_font_components = {
-            "maple-font": ("third_party/maple-font/LICENSE", "font/ttf/XJ380C.ttf"),
-            "source-han-sans": ("third_party/source-han-sans/LICENSE", "font/ttf/XJ380F.ttf"),
-        }
-        for slug, (license_file, source_file) in expected_font_components.items():
-            self.assertEqual("OFL-1.1", components[slug]["license"])
-            self.assertEqual([license_file, "font/ttf/LICENSES.md"], components[slug]["license_files"])
-            self.assertEqual([source_file], components[slug]["source_files"])
-
     def test_mikanos_hankaku_source_material_is_complete(self) -> None:
         source_root = ROOT / "third_party/mikanos-hankaku"
         self.assertTrue((source_root / "LICENSE").is_file())

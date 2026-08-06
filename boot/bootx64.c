@@ -1053,7 +1053,7 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, struct EFI_SYSTEM_TABLE *SystemTable
                                        GOP->Mode->Info->PixelsPerScanLine, GOP->Mode->Info->HorizontalResolution,
                                        GOP->Mode->Info->VerticalResolution, kRGBR};
     write_serial_string("Frame Buffer Phys Addr: ");
-    write_serial_string(Hex2Char((UINT64)(config.frame_buffer)));
+    write_serial_hex((UINT64)(config.frame_buffer));
     write_serial_string("\n");
 
     switch (GOP->Mode->Info->PixelFormat)
@@ -1103,10 +1103,10 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, struct EFI_SYSTEM_TABLE *SystemTable
             {
                 write_serial_string("ACPI Table Found Success.\n");
                 write_serial_string("ACPI Version: ");
-                write_serial_string(Dec2Char(AcpiRsdp->version));
+                write_serial_dec(AcpiRsdp->version);
                 write_serial_string("\n");
                 write_serial_string("XSDT Address: ");
-                write_serial_string(Hex2Char(AcpiRsdp->XsdtAddr));
+                write_serial_hex(AcpiRsdp->XsdtAddr);
                 write_serial_string("\n");
                 BootConfig->is_qemu = check_qemu(AcpiRsdp->OEMID);
 
@@ -1119,14 +1119,14 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, struct EFI_SYSTEM_TABLE *SystemTable
                 for (UINT64 j = 0; j < Entries; j++, AcpiTableEntryPtr++)
                 {
                     write_serial_string("SDT Entry ");
-                    write_serial_string(Dec2Char(j));
+                    write_serial_dec(j);
                     write_serial_string(":\n");
 
                     ACPI_TABLE_HEADER *AcpiSdtPointer =
                         (ACPI_TABLE_HEADER *)(*AcpiTableEntryPtr); // 指向其他SDT的表头的指针
 
                     write_serial_string("SDT Address: ");
-                    write_serial_string(Hex2Char((UINT64)(AcpiTableEntryPtr)));
+                    write_serial_hex((UINT64)(AcpiTableEntryPtr));
                     write_serial_string("\n");
                     write_serial_string(AcpiSdtPointer->sign);
                     write_serial_string("\n");

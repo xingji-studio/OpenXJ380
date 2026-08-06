@@ -1,3 +1,0 @@
-[submodule "third_party/ab_glyph_rasterizer/upstream"]
-	path = third_party/ab_glyph_rasterizer/upstream
-	url = https://github.com/alexheretic/ab-glyph.git

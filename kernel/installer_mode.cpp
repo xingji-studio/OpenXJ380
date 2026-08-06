@@ -152,8 +152,8 @@ void installer_launch_app()
             current_user->envc = root_user.envc;
         }
     }
-    int pid = create_user_process_from_file((char *)"/apps/installer.elf", NULL, NULL);
-    write_serial_fmt("installer: launch /apps/installer.elf pid=%d\n", pid);
+    int pid = create_user_process_from_file((char *)"/apps/system/shell.elf", NULL, NULL);
+    write_serial_fmt("installer: launch /apps/system/shell.elf pid=%d\n", pid);
 }
 
 const BOOT_CONFIG *installer_current_boot_config()
