@@ -16,6 +16,9 @@
 
 #pragma once
 
+#define XTTTP_INPUT_STATUS_WAITING 0x1
+#define XTTTP_INPUT_STATUS_NO_ECHO 0x2
+
 typedef struct 
 {
     bool  is_shell;
@@ -24,6 +27,7 @@ typedef struct
     bool  wait_for_getch;   // true  = waiting getch
     bool  wait_for_input;   // true  = waiting input (for console)
     char  char_for_getch;
+    uint32_t input_flags;
     char input[1024];
     char output[1024];
 } xtttp_dtt;
@@ -31,6 +35,6 @@ typedef struct
 int check_terminal_init_status();
 void mark_process_is_terminal();
 int check_input_waiting_status();
-void read_terminal_app_output_buffer(char *str);
-void write_terminal_app_output_buffer(char *str);
+int read_terminal_app_output_buffer(char *str);
+int write_terminal_app_output_buffer(const char *str);
 void terminal_finish_app_output();

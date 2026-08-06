@@ -21,6 +21,15 @@ int memcmp(const void *a_, const void *b_, size_t size)
     return 0;
 }
 
+void *memchr(const void *buffer, int value, size_t size)
+{
+    const unsigned char *bytes = (const unsigned char *)buffer;
+    unsigned char needle = (unsigned char)value;
+    for (size_t i = 0; i < size; ++i)
+        if (bytes[i] == needle) return (void *)(bytes + i);
+    return NULL;
+}
+
 void *memcpy(void *dest, const void *src, size_t n)
 {
     char       *d = (char *)(dest);
@@ -93,6 +102,7 @@ void *memset(void *dst, int val, size_t size)
 
 EXPORT_SYMBOL(memset);
 EXPORT_SYMBOL(memcmp);
+EXPORT_SYMBOL(memchr);
 
 char *strcpy(char *dest, const char *src)
 {
@@ -118,7 +128,16 @@ size_t strlen(const char *str)
     }
     return s - str;
 }
+
+size_t strnlen(const char *str, size_t maxlen)
+{
+    size_t length = 0;
+    if (str == NULL) return 0;
+    while (length < maxlen && str[length] != '\0') ++length;
+    return length;
+}
 EXPORT_SYMBOL(strlen);
+EXPORT_SYMBOL(strnlen);
 
 /**
  * 把字符串数字转成整数
