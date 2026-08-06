@@ -54,7 +54,7 @@ extern BOOT_CONFIG *EFI_BC;
 
 extern UserInfo *current_user;
 
-static const char *busybox_alias_applets[] = {};
+static char busybox_alias_applets[8][128] = {};
 
 static void load_busybox_alias_applets()
 {
@@ -64,13 +64,13 @@ static void load_busybox_alias_applets()
     vfs_node_t vfp = vfs_open(setfile_path);
     if (!vfp) return;
     char buffer[768];
-    memset(buffer, 0, 768)
+    memset(buffer, 0, 768);
     if(vfp->size > sizeof(buffer)) goto cleanup;
     vfs_read(vfp, buffer, 0, vfp->size);
     char alias[8];
     memset(alias, 0, 8);
     int applet_index = 0, alias_index = 0;
-    for(int i = 0; buffer[i] != EOF, i++)
+    for(int i = 0; buffer[i] != 0, i++)
     {
 	    if(buffer[i] == ',')
 	    {
