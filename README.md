@@ -6,13 +6,6 @@ OpenXJ380 是一个面向 x86_64 平台的独立操作系统项目。项目包�
 
 [贡献者名单](CONTRIBUTOR.md)
 
-## 项目文档
-
-- [架构与目录边界](docs/ARCHITECTURE.md)
-- [开发、测试与维护规范](docs/DEVELOPMENT.md)
-
-2026 年 8 月 3 日起，本仓库不再提供官方原生GUI环境，有需求的可以看commit history，后面完善后会陆续推出相关模块。
-
 ## 特性概览
 
 - UEFI 引导与图形输出初始化。
@@ -46,16 +39,9 @@ third_party/           引入的第三方代码
 ```bash
 sudo apt update
 sudo apt install -y \
-    clang lld nasm ninja-build ming-w64 rustup \
+    clang lld nasm ninja-build \
     mtools gdisk dosfstools \
-    qemu-system-x86 qemu-utils
-```
-
-配置rust工具链：
-
-```bash
-rustup default stable
-rustup target add x86_64-unknown-none
+    qemu-system-x86 qemu-utils ovmf
 ```
 
 构建依赖 `Python 3`、Clang/LLD、NASM 和 Ninja。生成镜像还需要 `mtools`、`gdisk` 与 `dosfstools`；运行镜像需要 QEMU。可通过生成后的 Ninja 目标检查本机工具链：
@@ -64,6 +50,9 @@ rustup target add x86_64-unknown-none
 python3 tools/gen_ninja.py --out build.ninja
 ninja -f build.ninja check.tools
 ```
+
+
+Rust no-std 目标库可通过 `RUST_TARGET_LIBDIR` 显式指定，避免构建图生成依赖开发者个人 rustup 路径。详细说明见 [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)。
 
 浏览器、`httpget` 和 `nut` 等目标需要 Clang 的 `libclang_rt.builtins-x86_64.a`。若工具检查未能自动找到该文件，请设置：
 
@@ -125,6 +114,8 @@ DEBUG=0 SMP=2 SUDO=0 KVM=0 DISPLAY_BACKEND=gtk ninja -f build.ninja run
 - `SUDO`：是否通过 `sudo` 启动需要权限的流程，默认 `1`。
 - `KVM`：是否启用 KVM，默认 `1`。
 - `DISPLAY_BACKEND`：QEMU 显示后端，默认 `gtk`。
+- `OVMF_FIRMWARE`：UEFI 固件路径。默认会查找常见发行版路径，例如
+  `/usr/share/edk2/x64/OVMF.4m.fd` 和 `/usr/share/OVMF/OVMF_CODE.fd`。
 
 ## 开发说明
 
@@ -133,6 +124,7 @@ DEBUG=0 SMP=2 SUDO=0 KVM=0 DISPLAY_BACKEND=gtk ninja -f build.ninja run
 - 用户态程序位于 `user/`，通过 `user/xapi/` 提供的运行时和 API 链接。
 - `third_party/`、`user/browser/third_party/` 和 `kmod/netserver/lwip/` 中的代码来自上游，除非进行有计划的上游同步，否则不要直接修改。
 - `kernel/build_config.h` 和 `.clangd` 是生成文件，不应手动维护。
+- 架构边界见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)，可复现构建和镜像资源说明见 [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)。
 
 版本信息目前需要同时更新 `tools/stage_image_base.sh` 与 `kernel/build_settings.h`。
 
@@ -141,13 +133,3 @@ DEBUG=0 SMP=2 SUDO=0 KVM=0 DISPLAY_BACKEND=gtk ninja -f build.ninja run
 本项目采用 [Apache License 2.0](LICENSE)。仓库包含多个第三方组件，其各自的许可和分发要求见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) 及对应源码目录。
 
 第三方组件所要求公开的许可证已存放在 /usr/share/doc/xj380 下。
-
-## Star History
-
-<a href="https://www.star-history.com/?repos=xingji-studio%2FOpenXJ380&type=date&legend=top-left">
- <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=xingji-studio/OpenXJ380&type=timeline&theme=dark&logscale&legend=top-left" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=xingji-studio/OpenXJ380&type=timeline&logscale&legend=top-left" />
-   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=xingji-studio/OpenXJ380&type=timeline&logscale&legend=top-left" />
- </picture>
-</a>
