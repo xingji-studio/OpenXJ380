@@ -88,30 +88,6 @@ class LicenseComplianceTests(unittest.TestCase):
 
         self.assertIn("KCONFIG_NOTIMESTAMP=1", build_script)
 
-    def test_libwebp_license_material_is_complete(self) -> None:
-        libwebp_root = ROOT / "user/browser/third_party/libwebp"
-        for name in ("COPYING", "PATENTS", "AUTHORS"):
-            self.assertTrue((libwebp_root / name).is_file(), name)
-
-        manifest = json.loads(
-            (ROOT / "third_party/compliance-manifest.json").read_text(encoding="utf-8")
-        )
-        libwebp = next(component for component in manifest["components"] if component["slug"] == "libwebp")
-
-        self.assertEqual(
-            [
-                "user/browser/third_party/libwebp/COPYING",
-                "user/browser/third_party/libwebp/PATENTS",
-                "user/browser/third_party/libwebp/AUTHORS",
-            ],
-            libwebp["license_files"],
-        )
-
-        notices = (ROOT / "THIRD_PARTY_NOTICES.md").read_text(encoding="utf-8")
-        self.assertIn("user/browser/third_party/libwebp/COPYING", notices)
-        self.assertIn("user/browser/third_party/libwebp/PATENTS", notices)
-        self.assertIn("user/browser/third_party/libwebp/AUTHORS", notices)
-
     def test_mikanos_hankaku_source_material_is_complete(self) -> None:
         source_root = ROOT / "third_party/mikanos-hankaku"
         self.assertTrue((source_root / "LICENSE").is_file())

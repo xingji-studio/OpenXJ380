@@ -62,14 +62,19 @@ static void scroll_screen()
     }
     for (uint32_t y = height - CHARACTER_HEIGHT; y < height; y++)
         for (uint32_t x = 0; x < width; x++) put_pixel(x, y, BACKGROUND);
-    g_row = g_rows - 1;
+    g_row = g_rows - 2;
 }
 
 static void new_line()
 {
     g_column = 0;
+    if (g_rows <= 1)
+    {
+        g_row = 0;
+        return;
+    }
     g_row++;
-    if (g_row >= g_rows) scroll_screen();
+    if (g_row >= g_rows - 1) scroll_screen();
 }
 
 static void draw_character(uint8_t character)

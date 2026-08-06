@@ -112,10 +112,12 @@ static inline void empty() {};
 #undef ULONG_MAX
 #define ULONG_MAX (LONG_MAX * 2UL + 1UL)
 int     memcmp(const void *a_, const void *b_, size_t size);
+void   *memchr(const void *buffer, int value, size_t size);
 void   *memcpy(void *dest, const void *src, size_t n);
 void   *memset(void *dst, int val, size_t size);
 char   *strcpy(char *dest, const char *src);
 size_t  strlen(const char *str);
+size_t  strnlen(const char *str, size_t maxlen);
 char   *strcat(char *dest, const char *src);
 char   *strchrnul(const char *s, int c);
 int     strncmp(const char *s1, const char *s2, size_t n);

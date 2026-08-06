@@ -11,7 +11,6 @@
 #include <elf.h>
 #include <errno.h>
 #include <fs/vfs/vfs.h>
-#include <graphics/window/window.h>
 #include <mm/lazyalloc.h>
 #include <mm/uaccess.h>
 #include <pctable/gdt.h>
@@ -75,8 +74,6 @@ static spin_t user_stack_build_lock = SPIN_INIT;
 extern spin_t scheduler_lock;
 extern void message_thread(uint64_t arg);
 extern uint64_t message_ask(uint64_t msg_type_p, uint64_t hdatap, uint64_t ldatap, uint64_t funcp, uint64_t taskp);
-extern XWM_INFO *xwmii;
-extern SHEET_INFO *sht_img;
 static void close_exec_file_descriptors(pcb_t process);
 static void close_process_file_table(pcb_t pcb);
 static bool fd_table_unref(pcb_t pcb);
@@ -252,11 +249,6 @@ void kill_proc(pcb_t pcb, int exit_code, bool is_zombie)
         return;
     }
 
-    if (xwmii != NULL && sht_img != NULL)
-    {
-        delete_process_windows(xwmii, sht_img, pcb);
-    }
-
     pcb->exit_code = exit_code;
 
     if (is_zombie)
@@ -310,11 +302,6 @@ bool kill_proc_deferred(pcb_t pcb, int exit_code)
         pcb->parent_task = kernel_group;
         pcb->ppid = kernel_group->pid;
         pcb->child_index = reaper_index;
-    }
-
-    if (xwmii != NULL && sht_img != NULL)
-    {
-        delete_process_windows(xwmii, sht_img, pcb);
     }
 
     pcb->exit_code = exit_code;
@@ -371,8 +358,6 @@ static char **copy_kernel_string_vector_owned(char **argv, size_t argc)
 void kill_proc0(pcb_t pcb)
 {
     procfs_on_exit_task(pcb);
-    toast_manager_mark_process_exit(pcb);
-
     spin_lock(&pcb->thread_queue->lock);
     queue_foreach(pcb->thread_queue, thread_node)
     {
