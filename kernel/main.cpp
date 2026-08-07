@@ -54,7 +54,7 @@ extern BOOT_CONFIG *EFI_BC;
 
 extern UserInfo *current_user;
 
-static char busybox_alias_applets[8][128] = {};
+static char busybox_alias_applets[128][8];
 
 static void load_busybox_alias_applets()
 {
@@ -72,17 +72,18 @@ static void load_busybox_alias_applets()
     int applet_index = 0, alias_index = 0;
     for(int i = 0; buffer[i] != 0, i++)
     {
-	    if(buffer[i] == ',')
+	    alias_index ++;
+	    if(buffer[i] =! ',')
 	    {
-	        strcpy(busybox_alias_applets[applet_index], alias);
-	        applet_index ++;
+	        alias[alias_index] = buffer[i];
 	        continue;
 	    }
-	    alias[alias_index] = buffer[i];
-	    alias_index ++;
+	    alias[alias_index] = '\0';
+	    strcpy(busybox_alias_applets[applet_index], alias);
+	    applet_index ++;
     }
     strcpy(busybox_alias_applets[applet_index], alias);
-    busybox_alias_applets[alias_index + 1] = NULL;
+    busybox_alias_applets[alias_index + 1][0] = '\0';
 
 cleanup:
     vfs_close(vfp);
@@ -107,7 +108,7 @@ static void setup_busybox_vfs_aliases()
 {
     load_busybox_alias_applets();
     const char *prefixes[] = {"/apps", "/bin", NULL};
-    for (int p = 0; prefixes[p] != NULL; p++)
+    for (int p = 0; prefixes[p][0] != '\0'; p++)
     {
         for (int i = 0; busybox_alias_applets[i][0] != '\0'; i++)
         {
