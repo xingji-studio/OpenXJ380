@@ -54,7 +54,7 @@ extern BOOT_CONFIG *EFI_BC;
 
 extern UserInfo *current_user;
 
-static char busybox_alias_applets[128][8];
+static char busybox_alias_applets[128][9];
 
 static void load_busybox_alias_applets()
 {
