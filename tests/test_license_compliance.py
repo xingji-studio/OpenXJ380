@@ -12,6 +12,27 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class LicenseComplianceTests(unittest.TestCase):
+    def test_project_license_and_fatfs_notice_are_present_and_exact(self) -> None:
+        project_license = (ROOT / "LICENSE").read_text(encoding="utf-8")
+        fatfs_notice = (ROOT / "licenses/fatfs.txt").read_text(encoding="utf-8")
+
+        self.assertIn("Apache License", project_license)
+        self.assertIn("Copyright (C) 2022, ChaN", fatfs_notice)
+        self.assertNotIn("Copyright (C) 2026, ChaN", fatfs_notice)
+
+    def test_image_staging_includes_project_license(self) -> None:
+        staging = (ROOT / "tools/ninja_build.py").read_text(encoding="utf-8")
+        self.assertIn('cp(ROOT / "LICENSE", destination / "LICENSE")', staging)
+
+    def test_lwip_notice_indexes_every_compiled_source(self) -> None:
+        generator = (ROOT / "tools/gen_ninja.py").read_text(encoding="utf-8")
+        notice = (ROOT / "licenses/lwip-notice-full.txt").read_text(encoding="utf-8")
+        items = generator.split("lwip_c = [", 1)[1].split("]", 1)[0]
+        compiled = [line.strip().strip('\",') for line in items.splitlines() if '"lwip/' in line]
+        self.assertTrue(compiled)
+        for item in compiled:
+            self.assertIn(f"kmod/netserver/{item}", notice)
+
     def test_elf_header_uses_declared_permissive_upstream(self) -> None:
         header = (ROOT / "include/elf.h").read_text(encoding="utf-8")
 
@@ -116,6 +137,17 @@ class LicenseComplianceTests(unittest.TestCase):
         )
         self.assertTrue(components["mikanos-hankaku"]["bundle_source"])
 
+    def test_mikanos_framebuffer_provenance_is_packaged(self) -> None:
+        manifest = json.loads(
+            (ROOT / "third_party/compliance-manifest.json").read_text(encoding="utf-8")
+        )
+        components = {component["slug"]: component for component in manifest["components"]}
+        framebuffer = components["mikanos-framebuffer"]
+
+        self.assertEqual("Apache-2.0 for derived portions", framebuffer["license"])
+        self.assertIn("include/efi/fbc.h", framebuffer["source_files"])
+        self.assertTrue(framebuffer["bundle_source"])
+
     def test_third_party_manifest_references_existing_materials(self) -> None:
         manifest = json.loads(
             (ROOT / "third_party/compliance-manifest.json").read_text(encoding="utf-8")
@@ -147,7 +179,11 @@ class LicenseComplianceTests(unittest.TestCase):
             )
 
             self.assertTrue((destination / "MANIFEST.json").is_file())
+            self.assertTrue((destination / "notices/LICENSE").is_file())
             self.assertTrue((destination / "notices/THIRD_PARTY_NOTICES.md").is_file())
+            self.assertTrue((destination / "licenses/lwip/lwip-notice-full.txt").is_file())
+            self.assertTrue((destination / "licenses/fatfs/fatfs.txt").is_file())
+            self.assertTrue((destination / "sources/mikanos-framebuffer/fbc.h").is_file())
             self.assertTrue(
                 (destination / "sources/busybox/busybox-1.31.1.tar.bz2").is_file()
             )
