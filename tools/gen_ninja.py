@@ -805,7 +805,9 @@ def main() -> None:
     compliance_manifest = json.loads((ROOT / compliance_manifest_path).read_text(encoding="utf-8"))
     compliance_inputs = [
         Path("tools/package_third_party.py"),
+        Path("tools/generate_lwip_notice.py"),
         compliance_manifest_path,
+        Path("LICENSE"),
         Path("THIRD_PARTY_NOTICES.md"),
     ]
     for component in compliance_manifest["components"]:

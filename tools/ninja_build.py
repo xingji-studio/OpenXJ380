@@ -214,6 +214,7 @@ def copy_modules(root: Path) -> None:
 def copy_license_material(root: Path, *, complete: bool) -> None:
     destination = root / "usr/share/doc/xj380/licenses"
     mkdir(destination)
+    cp(ROOT / "LICENSE", destination / "LICENSE")
     cp(ROOT / "LICENSES.md", destination / "LICENSES.md")
     cp(ROOT / "THIRD_PARTY_NOTICES.md", destination / "THIRD_PARTY_NOTICES.md")
     for license_file in sorted((ROOT / "licenses").glob("*.txt")):
