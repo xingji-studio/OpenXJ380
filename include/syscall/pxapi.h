@@ -80,7 +80,8 @@ typedef struct {
 #define XAPI_OPEN_FILE      7387
 #define XAPI_CLOSE_FILE     7388
 
-#define XAPI_SEARCH_FILE    7416
+#define XAPI_SEARCH_FILE       7416
+#define XAPI_SEARCH_FILE_FREEM 7471
 
 #define XAPI_MAKEDIR        7425
 #define XAPI_CREATE_FILE    7420
@@ -281,7 +282,8 @@ char do_xapi_Getch();
 void do_xapi_Endline();
 void do_xapi_Printline(char *str);
 void do_xapi_OutputSerial(char *str);
-void do_xapi_SearchFile(uint64_t path, uint64_t count, uint64_t dir);
+void do_xapi_SearchFile(uint64_t path, uint64_t count, XAPIT_DirNode **dir);
+void do_xapi_SearchFile_freem(XAPIT_DirNode *dir, int32_t count);
 void do_xapi_GetSystemVersion(uint64_t str);
 uint64_t do_xapi_GetTime();
 void do_xapi_GetCurrentUser(uint64_t dst);

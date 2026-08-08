@@ -631,7 +631,8 @@ extern "C" uint64_t c_syscall_handler(struct X64_REGS *regs, uint64_t user_rsp)
     case XAPI_OPEN_FILE: regs->rax = do_xapi_OpenFile(regs->rdi); break;
     case XAPI_CLOSE_FILE: do_xapi_CloseFile(regs->rdi); break;
     case XAPI_FILE_DIALOG: regs->rax = (uint64_t)-ENOSYS; break;
-    case XAPI_SEARCH_FILE: do_xapi_SearchFile(regs->rdi, regs->rsi, regs->rdx); break;
+    case XAPI_SEARCH_FILE: do_xapi_SearchFile(regs->rdi, regs->rsi, (XAPIT_DirNode **)regs->rdx); break;
+    case XAPI_SEARCH_FILE_FREEM: do_xapi_SearchFile_freem((XAPIT_DirNode *)regs->rdi, (int32_t)regs->rsi); break;
     case XAPI_MAKEDIR: regs->rax = (uint64_t)vfs_mkdir((char *)regs->rdi); break;
     case XAPI_CREATE_FILE: regs->rax = (uint64_t)sys_open((char *)regs->rdi, O_CREAT, 0644, 0, 0, 0, regs); break;
     case XAPI_DELETE_FILE: regs->rax = (uint64_t)sys_unlink(regs->rdi, 0, 0, 0, 0, 0, regs); break;
