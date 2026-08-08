@@ -170,7 +170,8 @@
 #define XAPI_OPEN_FILE      7387
 #define XAPI_CLOSE_FILE     7388
 
-#define XAPI_SEARCH_FILE    7416
+#define XAPI_SEARCH_FILE       7416
+#define XAPI_SEARCH_FILE_FREEM 7471
 
 #define XAPI_MAKEDIR        7425
 #define XAPI_CREATE_FILE    7420
