@@ -192,6 +192,21 @@ bool is_partition_used(struct GPT_DPTE *entry)
     }
     return false;
 }
+
+static bool partition_lba_range_is_valid(uint64_t starting_lba, uint64_t ending_lba, size_t sector_size,
+                                         size_t disk_size)
+{
+    if (sector_size == 0 || starting_lba > ending_lba) return false;
+
+    size_t disk_sectors = disk_size / sector_size;
+    if (disk_sectors == 0 || ending_lba >= disk_sectors) return false;
+    uint64_t size_max = (uint64_t)(~(size_t)0);
+    if (starting_lba > size_max || ending_lba > size_max) return false;
+
+    uint64_t sector_count = ending_lba - starting_lba + 1;
+    return sector_count <= size_max / sector_size;
+}
+
 static bool parse_gpt_partitions(vfs_node_t device, struct GPT_DPT *gpt, device_t disk, size_t vdisk_id)
 {
     if (memcmp(gpt->signature, "EFI PART", 8) != 0 || gpt->num_partition_entries == 0 ||
@@ -201,12 +216,26 @@ static bool parse_gpt_partitions(vfs_node_t device, struct GPT_DPT *gpt, device_
         return false;
     }
 
-    size_t           dptes_size = (size_t)gpt->num_partition_entries * gpt->size_of_partition_entry;
-    struct GPT_DPTE *dptes      = (struct GPT_DPTE *)malloc(dptes_size);
-    memset(dptes,0,dptes_size);
-    if (!dptes) return false;
+    if (partition_num >= MAX_PARTITIONS_NUM ||
+        gpt->num_partition_entries > MAX_PARTITIONS_NUM - partition_num ||
+        gpt->num_partition_entries > (~(size_t)0) / gpt->size_of_partition_entry ||
+        disk.sector_size == 0 || gpt->partition_entry_lba > (~(size_t)0) / disk.sector_size)
+        return false;
 
-    if (!partition_read_exact(device, disk, (uint8_t *)dptes, gpt->partition_entry_lba * disk.sector_size, dptes_size,
+    size_t dptes_size = (size_t)gpt->num_partition_entries * gpt->size_of_partition_entry;
+    size_t entries_offset = (size_t)gpt->partition_entry_lba * disk.sector_size;
+    if (entries_offset > disk.size || dptes_size > disk.size - entries_offset) return false;
+
+    size_t disk_sectors = disk.size / disk.sector_size;
+    if (gpt->first_usable_lba == 0 || gpt->first_usable_lba > gpt->last_usable_lba ||
+        gpt->last_usable_lba >= disk_sectors)
+        return false;
+
+    struct GPT_DPTE *dptes      = (struct GPT_DPTE *)malloc(dptes_size);
+    if (!dptes) return false;
+    memset(dptes, 0, dptes_size);
+
+    if (!partition_read_exact(device, disk, (uint8_t *)dptes, entries_offset, dptes_size,
                               "GPT entries"))
     {
         free(dptes);
@@ -218,6 +247,14 @@ static bool parse_gpt_partitions(vfs_node_t device, struct GPT_DPT *gpt, device_
         struct GPT_DPTE *entry = (struct GPT_DPTE *)((uint8_t *)dptes + j * gpt->size_of_partition_entry);
         if (is_partition_used(entry))
         {
+            if (entry->starting_lba < gpt->first_usable_lba || entry->ending_lba > gpt->last_usable_lba ||
+                !partition_lba_range_is_valid(entry->starting_lba, entry->ending_lba, disk.sector_size, disk.size))
+            {
+                pr_warn("PART: ignoring invalid GPT entry %zu on %s (lba=%llu..%llu)\n", j, disk.drive_name,
+                        entry->starting_lba, entry->ending_lba);
+                continue;
+            }
+
             partition_t *partition  = &partitions[partition_num];
             partition->vdisk_id     = vdisk_id;
             partition->starting_lba = entry->starting_lba;
@@ -242,9 +279,10 @@ static bool parse_gpt_partitions(vfs_node_t device, struct GPT_DPT *gpt, device_
 // Try GPT header directly at LBA1.
 static bool try_gpt_at_lba1(vfs_node_t device, device_t disk, size_t vdisk_id)
 {
+    if (disk.sector_size < sizeof(struct GPT_DPT) || disk.sector_size > (~(size_t)0) / 2) return false;
     struct GPT_DPT *gpt = (struct GPT_DPT *)malloc(disk.sector_size);
-    memset(gpt,0,disk.sector_size);
     if (!gpt) return false;
+    memset(gpt, 0, disk.sector_size);
 
     if (!partition_read_exact(device, disk, (uint8_t *)gpt, disk.sector_size, disk.sector_size, "GPT header"))
     {
@@ -266,7 +304,10 @@ static bool try_gpt_at_lba1(vfs_node_t device, device_t disk, size_t vdisk_id)
 }
 bool parser_block_device(vfs_node_t device, device_t disk, size_t vdisk_id)
 {
+    if (disk.sector_size < 512 || disk.sector_size > (~(size_t)0) / 4 || disk.size < disk.sector_size * 4)
+        return false;
     uint8_t *mbr = (uint8_t *)malloc(disk.sector_size * 4);
+    if (mbr == NULL) return false;
     memset(mbr,0,disk.sector_size*4);
     pr_info("PART: read %s sector_size=%zu size=0x%zx\n", disk.drive_name, disk.sector_size, disk.size);
     bool read_ok = false;
@@ -286,7 +327,7 @@ bool parser_block_device(vfs_node_t device, device_t disk, size_t vdisk_id)
         }
         delay_ms_hp(10);
     }
-    if (!read_ok) return false;
+    if (!read_ok) { free(mbr); return false; }
     // for(int i=0;i<disk.sector_size*4;i++)
     // {
     //     if(i%32==0 && i!=0)
@@ -307,7 +348,8 @@ bool parser_block_device(vfs_node_t device, device_t disk, size_t vdisk_id)
         if (part_type == 0xEE)
         {
             struct GPT_DPT *gpt = (struct GPT_DPT *)malloc(disk.sector_size);
-            memset(gpt,0,disk.sector_size);
+            if (gpt == NULL) { free(mbr); return false; }
+            memset(gpt, 0, disk.sector_size);
             if (!partition_read_exact(device, disk, gpt, 1 * disk.sector_size, disk.sector_size, "GPT header"))
             {
                 free(gpt);
@@ -317,50 +359,9 @@ bool parser_block_device(vfs_node_t device, device_t disk, size_t vdisk_id)
             pr_info("PART: GPT sig=%.8s rev=0x%x hdr=%u pe_lba=%llu entries=%u entry_size=%u\n",
                              gpt->signature, gpt->revision, gpt->header_size, gpt->partition_entry_lba,
                              gpt->num_partition_entries, gpt->size_of_partition_entry);
-            if (memcmp(gpt->signature, GPT_HEADER_SIGNATURE, 8) || gpt->num_partition_entries == 0 ||
-                gpt->partition_entry_lba == 0)
-            {
-                free(gpt);
-                return false;
-            }
-            char disk_uid[37];
-            format_guid(gpt->disk_guid, disk_uid);
-
-            size_t           dptes_size = gpt->num_partition_entries * gpt->size_of_partition_entry;
-            struct GPT_DPTE *dptes      = (struct GPT_DPTE *)malloc(dptes_size);
-            memset(dptes,0,dptes_size);
-            if (!partition_read_exact(device, disk, dptes, gpt->partition_entry_lba * disk.sector_size, dptes_size,
-                                      "GPT entries"))
-            {
-                free(dptes);
-                free(gpt);
-                free(mbr);
-                return false;
-            }
-            for (size_t j = 0; j < gpt->num_partition_entries; j++)
-            {
-                struct GPT_DPTE *entry = (struct GPT_DPTE *)((uint8_t *)dptes + j * gpt->size_of_partition_entry);
-                if (is_partition_used(entry))
-                {
-                    partition_t *partition  = &partitions[partition_num];
-                    partition->vdisk_id     = vdisk_id;
-                    partition->starting_lba = entry->starting_lba;
-                    partition->ending_lba   = entry->ending_lba;
-                    partition->type         = partition->GPT;
-                    partition->sector_size  = disk.sector_size;
-                    partition->is_used      = true;
-                    memcpy(partition->disk_guid, gpt->disk_guid, 16);
-                    memcpy(partition->partition_type_guid, entry->partition_type_guid, 16);
-                    memcpy(partition->unique_partition_guid, entry->unique_partition_guid, 16);
-                    memcpy(partition->partition_name, entry->partition_name, 36 * 2);
-                    partition_num++;
-                    char out[37];
-                    format_guid(entry->unique_partition_guid, out);
-                    pr_info("GPT Partition(%s) %zu GUID: %s\n", disk.drive_name, partition_num, out);
-                }
-            }
-            free(dptes);
+            bool parsed = parse_gpt_partitions(device, gpt, disk, vdisk_id);
             free(gpt);
+            if (!parsed) { free(mbr); return false; }
         }
         else
         {
@@ -369,12 +370,25 @@ bool parser_block_device(vfs_node_t device, device_t disk, size_t vdisk_id)
             for (int j = 0; j < MBR_MAX_PARTITION_NUM; j++)
             {
                 if (boot_sector->dpte[j].start_lba == 0 || boot_sector->dpte[j].sectors_limit == 0) continue;
-                size_t       starting_lba = boot_sector->dpte[j].start_lba;
-                size_t       ending_lba   = boot_sector->dpte[j].sectors_limit;
+                if (partition_num >= MAX_PARTITIONS_NUM) break;
+                uint64_t starting_lba = boot_sector->dpte[j].start_lba;
+                uint64_t sector_count = boot_sector->dpte[j].sectors_limit;
+                if (sector_count - 1 > __UINT64_MAX__ - starting_lba)
+                {
+                    pr_warn("PART: ignoring overflowing MBR entry %d on %s\n", j, disk.drive_name);
+                    continue;
+                }
+                uint64_t ending_lba = starting_lba + sector_count - 1;
+                if (!partition_lba_range_is_valid(starting_lba, ending_lba, disk.sector_size, disk.size))
+                {
+                    pr_warn("PART: ignoring invalid MBR entry %d on %s (lba=%llu..%llu)\n", j, disk.drive_name,
+                            starting_lba, ending_lba);
+                    continue;
+                }
                 partition_t *partition    = &partitions[partition_num];
                 partition->vdisk_id       = vdisk_id;
-                partition->starting_lba   = starting_lba;
-                partition->ending_lba     = ending_lba;
+                partition->starting_lba   = (size_t)starting_lba;
+                partition->ending_lba     = (size_t)ending_lba;
                 partition->type           = partition->MBR;
                 partition->sector_size    = disk.sector_size;
                 partition->is_used        = true;

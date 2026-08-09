@@ -8,7 +8,6 @@
 #include <fs/fatfs/fatfs.h>
 #include <fs/partition.h>
 #include <fs/vfs/devfs.h>
-#include <fs/vfs/sys.h>
 #include <fs/vfs/vfs.h>
 #include <hda/hda.h>
 #include <hda/pcspk.h>

@@ -669,7 +669,7 @@ uint64_t sys_brk(uint64_t brk);//SB
 sys_(mmap, uint64_t addr, size_t length, uint64_t prot, uint64_t flags, int fd,
          uint64_t offset);//sb
 sys_(mprotect, uint64_t addr, size_t length, uint64_t prot);
-sys_(munmap, uint64_t addr, size_t size);//fuck
+sys_(munmap, uint64_t addr, size_t size);
 
 sys_(mremap, uint64_t old_addr, uint64_t old_size, uint64_t new_size, uint64_t flags,
          uint64_t new_addr);//g

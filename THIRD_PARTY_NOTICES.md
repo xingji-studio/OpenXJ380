@@ -19,7 +19,8 @@ generates a distributable bundle at `out/compliance/third-party`.
 | talc allocator | MIT | `third_party/talc/LICENSE.md`; `third_party/talc/SOURCE.md`; `liballoc-x86_64.a` |
 | BusyBox 1.31.1 | GPL-2.0-only | `third_party/busybox-source` |
 | MikanOS hankaku font | Apache-2.0 | `third_party/mikanos-hankaku/LICENSE`; `third_party/mikanos-hankaku/SOURCE.md`; `third_party/mikanos-hankaku/hankaku.txt`; `font/hankaku.bin` |
-| libutf | MIT | `kernel/utflib.cpp` |
+| libutf | MIT | `third_party/libutf/LICENSE`; `third_party/libutf/SOURCE.md`; `kernel/utflib.cpp`; `include/proto.hpp` |
+| Linux UAPI ioctl definitions | GPL-2.0 WITH Linux-syscall-note | `third_party/linux-uapi`; `include/ioctl.h` |
 
 The BusyBox bundle includes the complete upstream source archive, GPLv2 text,
 build configuration, compiler-compatibility patch, and rebuild instructions.

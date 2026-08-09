@@ -6,6 +6,11 @@
 
 uint64_t kernel_modules_load_offset = 0;
 
+#define KERNEL_MOD_SPACE_START 0xffffffffb0000000ULL
+#define KERNEL_MOD_SPACE_END   0xffffffffc0000000ULL
+#define USER_SO_BASE_START     0x40000000ULL
+#define USER_SO_BASE_END       0x80000000ULL
+
 extern dlfunc_t __ksymtab_start[]; // .ksymtab section
 extern dlfunc_t __ksymtab_end[];
 size_t          dlfunc_count = 0;
@@ -219,6 +224,93 @@ bool elf_test_head(Elf64_Ehdr *ehdr) {
     return true;
 }
 
+static bool elf_file_range(uint64_t offset, uint64_t length, size_t file_size)
+{
+    return offset <= file_size && length <= file_size - offset;
+}
+
+static bool validate_shared_object(Elf64_Ehdr *ehdr, size_t file_size, uint64_t base_addr, bool is_kernel,
+                                   uint64_t *image_size)
+{
+    if (ehdr == NULL || file_size < sizeof(*ehdr) || !elf_test_head(ehdr) || ehdr->e_type != ET_DYN ||
+        ehdr->e_phnum == 0 || ehdr->e_phnum > file_size / sizeof(Elf64_Phdr) ||
+        !elf_file_range(ehdr->e_phoff, (uint64_t)ehdr->e_phnum * sizeof(Elf64_Phdr), file_size))
+        return false;
+
+    Elf64_Phdr *phdrs = (Elf64_Phdr *)((uint8_t *)ehdr + ehdr->e_phoff);
+    uint64_t min_addr = ~0ULL, max_addr = 0;
+    bool have_load = false, have_dynamic_terminator = false;
+    for (size_t i = 0; i < ehdr->e_phnum; ++i)
+    {
+        Elf64_Phdr *ph = &phdrs[i];
+        if (ph->p_type == PT_LOAD)
+        {
+            if (ph->p_filesz > ph->p_memsz || !elf_file_range(ph->p_offset, ph->p_filesz, file_size) ||
+                ph->p_vaddr > ~0ULL - base_addr || ph->p_memsz > ~0ULL - (base_addr + ph->p_vaddr))
+                return false;
+            uint64_t start = base_addr + ph->p_vaddr;
+            uint64_t end = start + ph->p_memsz;
+            min_addr = min(min_addr, (uint64_t)PADDING_DOWN(start, PAGE_SIZE));
+            max_addr = max(max_addr, (uint64_t)PADDING_UP(end, PAGE_SIZE));
+            have_load = true;
+        }
+        else if (ph->p_type == PT_DYNAMIC)
+        {
+            if (ph->p_filesz < sizeof(Elf64_Dyn) || ph->p_filesz % sizeof(Elf64_Dyn) != 0 ||
+                !elf_file_range(ph->p_offset, ph->p_filesz, file_size)) return false;
+            Elf64_Dyn *dyn = (Elf64_Dyn *)((uint8_t *)ehdr + ph->p_offset);
+            size_t count = ph->p_filesz / sizeof(Elf64_Dyn);
+            for (size_t j = 0; j < count; ++j)
+                if (dyn[j].d_tag == DT_NULL) { have_dynamic_terminator = true; break; }
+        }
+    }
+    if (!have_load || !have_dynamic_terminator || max_addr <= min_addr) return false;
+    for (size_t i = 0; i < ehdr->e_phnum; ++i)
+    {
+        if (phdrs[i].p_type != PT_DYNAMIC || phdrs[i].p_vaddr > ~0ULL - base_addr) continue;
+        uint64_t dynamic_start = base_addr + phdrs[i].p_vaddr;
+        bool contained = false;
+        for (size_t j = 0; j < ehdr->e_phnum; ++j)
+        {
+            if (phdrs[j].p_type != PT_LOAD || phdrs[j].p_vaddr > ~0ULL - base_addr) continue;
+            uint64_t load_start = base_addr + phdrs[j].p_vaddr;
+            if (phdrs[j].p_memsz > ~0ULL - load_start) continue;
+            uint64_t load_end = load_start + phdrs[j].p_memsz;
+            if (dynamic_start >= load_start && dynamic_start <= load_end &&
+                phdrs[i].p_memsz <= load_end - dynamic_start)
+            {
+                contained = true;
+                break;
+            }
+        }
+        if (!contained) return false;
+    }
+    if (is_kernel)
+    {
+        if (min_addr < KERNEL_MOD_SPACE_START || max_addr > KERNEL_MOD_SPACE_END) return false;
+    }
+    else if (min_addr < USER_SO_BASE_START || max_addr > USER_SO_BASE_END) return false;
+    if (min_addr < base_addr) return false;
+    *image_size = max_addr - base_addr;
+    return true;
+}
+
+static bool handle_range_loaded(dlhandle_t *handle, uint64_t address, size_t length)
+{
+    if (handle == NULL || handle->ehdr == NULL || length == 0 || address > ~0ULL - length) return false;
+    Elf64_Ehdr *ehdr = (Elf64_Ehdr *)handle->ehdr;
+    Elf64_Phdr *phdrs = (Elf64_Phdr *)((uint8_t *)ehdr + ehdr->e_phoff);
+    for (size_t i = 0; i < ehdr->e_phnum; ++i)
+    {
+        if (phdrs[i].p_type != PT_LOAD || phdrs[i].p_vaddr > ~0ULL - handle->base_addr) continue;
+        uint64_t start = handle->base_addr + phdrs[i].p_vaddr;
+        if (phdrs[i].p_memsz > ~0ULL - start) continue;
+        uint64_t end = start + phdrs[i].p_memsz;
+        if (address >= start && address + length <= end) return true;
+    }
+    return false;
+}
+
 void load_segment(Elf64_Phdr *phdr, void *elf, page_directory_t *directory, bool is_user,
                   uint64_t offset, uint64_t *load_start) {
     size_t hi = PADDING_UP(phdr->p_vaddr + phdr->p_memsz, 0x1000) + offset;
@@ -312,8 +404,6 @@ elf_start load_executor_elf(uint8_t *data, page_directory_t *dir, uint64_t offse
     return (elf_start)ehdr->e_entry;
 }
 
-#define KERNEL_MOD_SPACE_START 0xffffffffb0000000       // 内核模块加载起始地址
-#define KERNEL_MOD_SPACE_END   0xffffffffc0000000       // 内核模块加载结束地址
 
 // void dlinker_load(kernel_mode_t *kmod,cp_module_t *module) {
 //     if (module == NULL) return;
@@ -460,7 +550,7 @@ void module_setup() {
         }
         module_ls[module_count].data = data;
         module_ls[module_count].size = ch->size;
-        strcpy(module_ls[module_count].raw_name, buf);
+        snprintf(module_ls[module_count].raw_name, sizeof(module_ls[module_count].raw_name), "%s", buf);
         module_ls[module_count].is_use = true;
         write_serial_fmt("kmod: Module %s %s\n", module_ls[module_count].module_name, buf);
         module_count++;
@@ -541,17 +631,16 @@ extern dlfunc_t __ksymtab_start[]; // .ksymtab section
 extern dlfunc_t __ksymtab_end[];
 
 // 用户态动态库加载地址范围
-#define USER_SO_BASE_START  0x40000000  // 用户态 SO 起始地址
-#define USER_SO_BASE_END    0x80000000  // 用户态 SO 结束地址
 static uint64_t user_so_next_addr = USER_SO_BASE_START;
 
 // ==================== 辅助函数 ====================
 
 static void *dynamic_ptr(dlhandle_t *handle, Elf64_Xword ptr) {
-    if (ptr == 0) {
+    if (handle == NULL || ptr == 0 || ptr > ~0ULL - handle->base_addr) {
         return NULL;
     }
-    return (void *)(handle->base_addr + ptr);
+    uint64_t address = handle->base_addr + ptr;
+    return handle_range_loaded(handle, address, 1) ? (void *)address : NULL;
 }
 
 static bool symbol_is_defined(Elf64_Sym *sym) {
@@ -572,23 +661,26 @@ static bool symbol_is_exported(Elf64_Sym *sym) {
 
 static size_t dynsym_count_from_sysv_hash(dlhandle_t *handle, Elf64_Xword ptr) {
     uint32_t *hash = (uint32_t *)dynamic_ptr(handle, ptr);
-    if (hash == NULL) {
+    if (hash == NULL || !handle_range_loaded(handle, (uint64_t)hash, 2 * sizeof(uint32_t))) {
         return 0;
     }
-    return hash[1];
+    return hash[1] <= 65536 ? hash[1] : 0;
 }
 
 static size_t dynsym_count_from_gnu_hash(dlhandle_t *handle, Elf64_Xword ptr) {
     uint32_t *hash = (uint32_t *)dynamic_ptr(handle, ptr);
-    if (hash == NULL) {
+    if (hash == NULL || !handle_range_loaded(handle, (uint64_t)hash, 4 * sizeof(uint32_t))) {
         return 0;
     }
 
     uint32_t nbuckets   = hash[0];
     uint32_t symoffset  = hash[1];
     uint32_t bloom_size = hash[2];
+    if (nbuckets == 0 || nbuckets > 65536 || bloom_size == 0 || bloom_size > 65536) return 0;
     uint64_t *bloom     = (uint64_t *)(hash + 4);
     uint32_t *buckets   = (uint32_t *)(bloom + bloom_size);
+    if (!handle_range_loaded(handle, (uint64_t)bloom, (size_t)bloom_size * sizeof(uint64_t)) ||
+        !handle_range_loaded(handle, (uint64_t)buckets, (size_t)nbuckets * sizeof(uint32_t))) return 0;
     uint32_t *chains    = buckets + nbuckets;
     uint32_t max_sym    = symoffset;
 
@@ -597,7 +689,11 @@ static size_t dynsym_count_from_gnu_hash(dlhandle_t *handle, Elf64_Xword ptr) {
         if (sym == 0) {
             continue;
         }
-        while ((chains[sym - symoffset] & 1) == 0) {
+        if (sym < symoffset) return 0;
+        while (true) {
+            uint32_t *chain = &chains[sym - symoffset];
+            if (sym >= 65536 || !handle_range_loaded(handle, (uint64_t)chain, sizeof(*chain))) return 0;
+            if ((*chain & 1) != 0) break;
             sym++;
         }
         if (sym + 1 > max_sym) {
@@ -702,6 +798,8 @@ static void extract_exports_from_dynamic(dlhandle_t* handle, Elf64_Dyn* dyn) {
             handle->symtab = (Elf64_Sym*)dynamic_ptr(handle, entry->d_un.d_ptr);
         } else if (entry->d_tag == DT_STRTAB) {
             handle->strtab = (char*)dynamic_ptr(handle, entry->d_un.d_ptr);
+        } else if (entry->d_tag == DT_STRSZ) {
+            handle->strtabsz = entry->d_un.d_val;
         } else if (entry->d_tag == DT_SYMENT) {
             handle->symtabsz = entry->d_un.d_val;
         } else if (entry->d_tag == DT_HASH) {
@@ -718,14 +816,18 @@ static void extract_exports_from_dynamic(dlhandle_t* handle, Elf64_Dyn* dyn) {
     if (handle->symtabsz == 0) {
         handle->symtabsz = sizeof(Elf64_Sym);
     }
-    if (handle->symtab && handle->strtab && handle->sym_count) {
+    if (handle->symtab && handle->strtab && handle->strtabsz && handle->sym_count &&
+        handle->sym_count <= 65536 &&
+        handle_range_loaded(handle, (uint64_t)handle->symtab, handle->sym_count * sizeof(Elf64_Sym)) &&
+        handle_range_loaded(handle, (uint64_t)handle->strtab, handle->strtabsz)) {
         size_t num_symbols = handle->sym_count;
 
         // 计算导出符号数量
         size_t export_count = 0;
         for (size_t i = 0; i < num_symbols; i++) {
             Elf64_Sym* sym = &handle->symtab[i];
-            if (symbol_is_exported(sym)) {
+            if (symbol_is_exported(sym) && sym->st_name < handle->strtabsz &&
+                memchr(handle->strtab + sym->st_name, '\0', handle->strtabsz - sym->st_name) != NULL) {
                 export_count++;
             }
         }
@@ -736,7 +838,10 @@ static void extract_exports_from_dynamic(dlhandle_t* handle, Elf64_Dyn* dyn) {
         
         for (size_t i = 0; i < num_symbols; i++) {
             Elf64_Sym* sym = &handle->symtab[i];
-            if (symbol_is_exported(sym)) {
+            if (symbol_is_exported(sym) && sym->st_name < handle->strtabsz &&
+                memchr(handle->strtab + sym->st_name, '\0', handle->strtabsz - sym->st_name) != NULL &&
+                sym->st_value <= ~0ULL - handle->base_addr &&
+                handle_range_loaded(handle, handle->base_addr + sym->st_value, sym->st_size ? sym->st_size : 1)) {
                 char* sym_name = &handle->strtab[sym->st_name];
                 
                 handle->exports[handle->export_count].name = strdup(sym_name);
@@ -761,6 +866,7 @@ static bool resolve_dependencies(dlhandle_t* handle, Elf64_Dyn* dyn) {
     while (entry->d_tag != DT_NULL) {
         if (entry->d_tag == DT_NEEDED) {
             dep_count++;
+            if (dep_count > 64) return false;
         }
         entry++;
     }
@@ -775,6 +881,9 @@ static bool resolve_dependencies(dlhandle_t* handle, Elf64_Dyn* dyn) {
     entry = dyn;
     while (entry->d_tag != DT_NULL) {
         if (entry->d_tag == DT_NEEDED) {
+            if (handle->strtab == NULL || entry->d_un.d_val >= handle->strtabsz ||
+                memchr(handle->strtab + entry->d_un.d_val, '\0', handle->strtabsz - entry->d_un.d_val) == NULL)
+                return false;
             const char* lib_name = (char*)(handle->strtab + entry->d_un.d_val);
             write_serial_fmt("Loading dependency: %s for %s\n", lib_name, handle->path);
             
@@ -837,6 +946,9 @@ static void* resolve_relocation_symbol(dlhandle_t* handle, Elf64_Sym* sym) {
     }
 
     if (symbol_is_defined(sym)) {
+        if (sym->st_value > ~0ULL - handle->base_addr ||
+            !handle_range_loaded(handle, handle->base_addr + sym->st_value, sym->st_size ? sym->st_size : 1))
+            return NULL;
         unsigned char bind = ELF64_ST_BIND(sym->st_info);
         unsigned char vis  = ELF64_ST_VISIBILITY(sym->st_other);
         if (bind == STB_LOCAL || vis == STV_HIDDEN || vis == STV_INTERNAL || vis == STV_PROTECTED) {
@@ -844,7 +956,10 @@ static void* resolve_relocation_symbol(dlhandle_t* handle, Elf64_Sym* sym) {
         }
     }
 
-    const char *name = handle->strtab ? &handle->strtab[sym->st_name] : NULL;
+    const char *name = NULL;
+    if (handle->strtab != NULL && sym->st_name < handle->strtabsz &&
+        memchr(handle->strtab + sym->st_name, '\0', handle->strtabsz - sym->st_name) != NULL)
+        name = &handle->strtab[sym->st_name];
     if (name != NULL && name[0] != '\0') {
         void *addr = find_symbol_internal(name, handle);
         if (addr != NULL) {
@@ -990,7 +1105,7 @@ dlhandle_t* load_shared_object_internal(const char* path, int flags,
     
     // 3. 解析 ELF 头
     Elf64_Ehdr* ehdr = (Elf64_Ehdr*)file_data;
-    if (!elf_test_head(ehdr)) {
+    if (file_size < sizeof(Elf64_Ehdr) || !elf_test_head(ehdr)) {
         write_serial_fmt("Invalid ELF file: %s\n", path);
         dlinker_free_file_buffer(file_data, file_size);
         return NULL;
@@ -1024,6 +1139,14 @@ dlhandle_t* load_shared_object_internal(const char* path, int flags,
         }
         base_addr = user_so_next_addr;
     }
+
+    uint64_t validated_load_size = 0;
+    if (!validate_shared_object(ehdr, file_size, base_addr, is_kernel, &validated_load_size))
+    {
+        write_serial_fmt("Unsafe or malformed shared object: %s\n", path);
+        dlinker_free_file_buffer(file_data, file_size);
+        return NULL;
+    }
     
     // 6. 创建句柄
     dlhandle_t* handle = (dlhandle_t*)calloc(1, sizeof(dlhandle_t));
@@ -1047,12 +1170,16 @@ dlhandle_t* load_shared_object_internal(const char* path, int flags,
         dlinker_free_file_buffer(file_data, file_size);
         return NULL;
     }
+    if (load_size > validated_load_size) {
+        write_serial_fmt("Mapped size exceeds validated image: %s\n", path);
+        return NULL;
+    }
     
     // 8. 更新地址空间
     if (is_kernel) {
-        kernel_modules_load_offset += (load_size + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+        kernel_modules_load_offset += (validated_load_size + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
     } else {
-        user_so_next_addr += (load_size + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+        user_so_next_addr += (validated_load_size + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
     }
     
     // 9. 处理动态段
@@ -1077,10 +1204,13 @@ dlhandle_t* load_shared_object_internal(const char* path, int flags,
             char *rpath_str = NULL;
             char *runpath_str = NULL;
             while (rp->d_tag != DT_NULL) {
-                if (rp->d_tag == DT_RPATH)
-                    rpath_str = (char *)(handle->strtab + rp->d_un.d_val);
-                else if (rp->d_tag == DT_RUNPATH)
-                    runpath_str = (char *)(handle->strtab + rp->d_un.d_val);
+                if ((rp->d_tag == DT_RPATH || rp->d_tag == DT_RUNPATH) && handle->strtab != NULL &&
+                    rp->d_un.d_val < handle->strtabsz &&
+                    memchr(handle->strtab + rp->d_un.d_val, '\0', handle->strtabsz - rp->d_un.d_val) != NULL)
+                {
+                    if (rp->d_tag == DT_RPATH) rpath_str = handle->strtab + rp->d_un.d_val;
+                    else runpath_str = handle->strtab + rp->d_un.d_val;
+                }
                 rp++;
             }
             const char *search = runpath_str ? runpath_str : rpath_str;
@@ -1163,6 +1293,10 @@ bool process_dynamic_relocations(Elf64_Dyn* dyn, dlhandle_t* handle) {
         write_serial_fmt("Unsupported PLT relocation format: %d\n", pltrel_type);
         return false;
     }
+    if ((relasz % sizeof(Elf64_Rela)) != 0 || (pltrelsz % sizeof(Elf64_Rela)) != 0 ||
+        (relasz != 0 && (rela == NULL || !handle_range_loaded(handle, (uint64_t)rela, relasz))) ||
+        (pltrelsz != 0 && (jmprel == NULL || !handle_range_loaded(handle, (uint64_t)jmprel, pltrelsz))))
+        return false;
     
     // 处理普通重定位
     if (rela && relasz) {
@@ -1171,12 +1305,19 @@ bool process_dynamic_relocations(Elf64_Dyn* dyn, dlhandle_t* handle) {
             Elf64_Rela* r = &rela[i];
             uint32_t type = ELF64_R_TYPE(r->r_info);
             uint32_t sym_idx = ELF64_R_SYM(r->r_info);
+            if (r->r_offset > ~0ULL - handle->base_addr ||
+                (sym_idx != 0 && (handle->symtab == NULL || sym_idx >= handle->sym_count))) return false;
             uint64_t* target = (uint64_t*)(handle->base_addr + r->r_offset);
+            size_t target_size = (type == R_X86_64_PC32 || type == R_X86_64_PLT32 ||
+                                  type == R_X86_64_32 || type == R_X86_64_32S || type == R_X86_64_SIZE32)
+                                     ? sizeof(uint32_t) : sizeof(uint64_t);
             
             Elf64_Sym* sym = NULL;
             if (sym_idx && handle->symtab) {
                 sym = &handle->symtab[sym_idx];
             }
+            if (type == R_X86_64_COPY && sym != NULL) target_size = sym->st_size;
+            if (type != R_X86_64_NONE && !handle_range_loaded(handle, (uint64_t)target, target_size)) return false;
             
             switch (type) {
             case R_X86_64_NONE:
@@ -1272,7 +1413,10 @@ bool process_dynamic_relocations(Elf64_Dyn* dyn, dlhandle_t* handle) {
         for (size_t i = 0; i < jmprel_count; i++) {
             Elf64_Rela* r = &jmprel[i];
             uint32_t sym_idx = ELF64_R_SYM(r->r_info);
+            if (r->r_offset > ~0ULL - handle->base_addr || sym_idx == 0 || handle->symtab == NULL ||
+                sym_idx >= handle->sym_count) return false;
             uint64_t* target = (uint64_t*)(handle->base_addr + r->r_offset);
+            if (!handle_range_loaded(handle, (uint64_t)target, sizeof(uint64_t))) return false;
             
             if (sym_idx && handle->symtab) {
                 Elf64_Sym* sym = &handle->symtab[sym_idx];
@@ -1402,9 +1546,9 @@ void dlinker_load(kernel_mode_t* kmod, cp_module_t* module) {
     }
     
     // 查找初始化函数
-    Elf64_Ehdr* ehdr = (Elf64_Ehdr*)handle->ehdr;
-    void* entry = find_symbol_address("dlmain", ehdr, handle->base_addr);
-    if (!entry) entry = find_symbol_address("_dlmain", ehdr, handle->base_addr);
+    dlfunc_t *entry_symbol = find_export(handle, "dlmain");
+    if (!entry_symbol) entry_symbol = find_export(handle, "_dlmain");
+    void *entry = entry_symbol ? entry_symbol->addr : NULL;
     
     kmod->entry = (dlinit_t)entry;
     kmod->task_entry = NULL; // 由模块决定

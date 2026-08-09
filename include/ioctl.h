@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
+/* Source: Linux UAPI ioctl definitions; see third_party/linux-uapi/SOURCE.md. */
 #pragma once
 #include <krlibc.h>
 #define _IOC(a, b, c, d) (((a) << 30) | ((b) << 8) | (c) | ((d) << 16))

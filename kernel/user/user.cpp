@@ -8,7 +8,6 @@
 #include <fs/fatfs/fatfs.h>
 #include <fs/partition.h>
 #include <fs/vfs/devfs.h>
-#include <fs/vfs/sys.h>
 #include <fs/vfs/vfs.h>
 #include <krlibc.h>
 #include <mm/frame.h>
@@ -21,6 +20,7 @@
 #include <task/pcb.h>
 #include <user/user.h>
 #include <user/runfile.h>
+#include <cpu/lock.h>
 
 char *current_user_envp[100] = {
     ENVP_SYSTEM_VERSION,
@@ -143,9 +143,261 @@ static bool append_cmdline_arg(char *cmdline, size_t cmdline_size, char **cursor
     return true;
 }
 
+static bool user_registry_login_entry_valid(const UserInfo *user)
+{
+    if (user == NULL || user->name[0] == '\0') return false;
+    if (memchr(user->name, '\0', sizeof(user->name)) == NULL ||
+        memchr(user->password, '\0', sizeof(user->password)) == NULL) return false;
+    if (user->user_type == XUT_Root || user->user_type == XUT_System) return false;
+    if (user->user_type < XUT_Root || user->user_type > XUT_Custom) return false;
+    for (const char *p = user->name; *p != '\0'; p++)
+    {
+        if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+              (*p >= '0' && *p <= '9') || *p == '_' || *p == '-' || *p == ' '))
+            return false;
+    }
+    return true;
+}
+
+static bool user_registry_needs_oobe(UserRegisterList *urf_data, size_t bytes_read)
+{
+    if (urf_data == NULL) return true;
+    if (bytes_read < sizeof(UserRegisterList)) return true;
+    if (urf_data->user_count <= 1 || urf_data->user_count > 128) return true;
+    for (int i = 1; i < urf_data->user_count; i++)
+    {
+        if (user_registry_login_entry_valid(&urf_data->uinf[i])) return false;
+    }
+    return true;
+}
+
+static bool user_registry_has_real_user(const UserRegisterList *registry)
+{
+    if (registry == NULL || registry->user_count <= 1 || registry->user_count > 128) return false;
+    for (int i = 1; i < registry->user_count; i++)
+    {
+        if (user_registry_login_entry_valid(&registry->uinf[i])) return true;
+    }
+    return false;
+}
+
+static bool user_registry_first_user_matches(const UserRegisterList *registry, const char *username,
+                                             const char *password)
+{
+    if (registry == NULL || username == NULL || password == NULL) return false;
+    if (registry->user_count <= 1 || registry->user_count > 128) return false;
+
+    for (int i = 1; i < registry->user_count; i++)
+    {
+        if (!user_registry_login_entry_valid(&registry->uinf[i])) continue;
+        return strcmp(username, registry->uinf[i].name) == 0 && strcmp(password, registry->uinf[i].password) == 0;
+    }
+    return false;
+}
+
+static bool load_user_registry(UserRegisterList *registry, size_t *bytes_read)
+{
+    if (registry == NULL) return false;
+    memset(registry, 0, sizeof(UserRegisterList));
+    if (bytes_read != NULL) *bytes_read = 0;
+
+    vfs_node_t node = vfs_open("/system/config/usereg.dat");
+    if (node == NULL) return false;
+
+    size_t read_size = vfs_read(node, registry, 0, sizeof(UserRegisterList));
+    vfs_close(node);
+    if (bytes_read != NULL) *bytes_read = read_size;
+    return read_size >= sizeof(int);
+}
+
+static bool write_first_user_registry(const char *username, const char *password)
+{
+    if (username == NULL || password == NULL) return false;
+
+    vfs_mkdir("/system");
+    vfs_mkdir("/system/config");
+
+    vfs_node_t file = vfs_open("/system/config/usereg.dat");
+    if (file == NULL)
+    {
+        if (vfs_mkfile("/system/config/usereg.dat") != EOK) return false;
+        file = vfs_open("/system/config/usereg.dat");
+    }
+    if (file == NULL) return false;
+
+    UserRegisterList registry;
+    memset(&registry, 0, sizeof(registry));
+    registry.user_count = 2;
+    strcpy(registry.uinf[0].name, "Root");
+    strcpy(registry.uinf[0].password, "");
+    registry.uinf[0].user_type = XUT_Root;
+    strncpy(registry.uinf[1].name, username, sizeof(registry.uinf[1].name) - 1);
+    strncpy(registry.uinf[1].password, password, sizeof(registry.uinf[1].password) - 1);
+    registry.uinf[1].user_type = XUT_Admin;
+
+    vfs_resize(file, 0);
+    size_t wrote = vfs_write(file, &registry, 0, sizeof(registry));
+    vfs_close(file);
+    return wrote == sizeof(registry);
+}
+
+static void set_current_user_from_info(UserInfo *info)
+{
+    if (info == NULL) return;
+    if (current_user == NULL) current_user = (UserInfo *)malloc(sizeof(UserInfo));
+    if (current_user == NULL) return;
+    memset(current_user, 0, sizeof(UserInfo));
+    strcpy(current_user->name, info->name);
+    strcpy(current_user->password, info->password);
+    current_user->user_type = info->user_type;
+    current_user->envc      = 3;
+    current_user->envp      = current_user_envp;
+}
+
+void user_session_use_root()
+{
+    set_current_user_from_info(&root_user);
+}
+
+void user_session_use_login()
+{
+    UserInfo login_user;
+    memset(&login_user, 0, sizeof(login_user));
+    strcpy(login_user.name, "Login");
+    login_user.user_type = XUT_Visitor;
+    set_current_user_from_info(&login_user);
+}
+
+bool user_session_needs_oobe()
+{
+    UserRegisterList registry;
+    size_t           bytes_read = 0;
+    load_user_registry(&registry, &bytes_read);
+    return user_registry_needs_oobe(&registry, bytes_read);
+}
+
+int user_session_list(UserInfo *out, int max_count)
+{
+    if (out == NULL || max_count < 0) return -EINVAL;
+
+    UserRegisterList registry;
+    size_t           bytes_read = 0;
+    load_user_registry(&registry, &bytes_read);
+    if (user_registry_needs_oobe(&registry, bytes_read)) return 0;
+
+    int copied = 0;
+    for (int i = 1; i < registry.user_count && i < 128; i++)
+    {
+        if (!user_registry_login_entry_valid(&registry.uinf[i])) continue;
+        if (copied >= max_count) break;
+        out[copied] = registry.uinf[i];
+        memset(out[copied].password, 0, sizeof(out[copied].password));
+        copied++;
+    }
+    return copied;
+}
+
+int user_session_login(const char *username, const char *password)
+{
+    if (username == NULL || password == NULL || username[0] == '\0') return -EINVAL;
+
+    static spin_t login_lock = SPIN_INIT;
+    static uint64_t retry_after_ns = 0;
+    static unsigned failed_attempts = 0;
+    spin_lock(&login_lock);
+    uint64_t now = nanoTime();
+    if (now < retry_after_ns) { spin_unlock(&login_lock); return -EAGAIN; }
+    spin_unlock(&login_lock);
+
+    UserRegisterList registry;
+    size_t           bytes_read = 0;
+    load_user_registry(&registry, &bytes_read);
+    if (user_registry_needs_oobe(&registry, bytes_read)) return -ENOENT;
+
+    for (int i = 1; i < registry.user_count && i < 128; i++)
+    {
+        if (!user_registry_login_entry_valid(&registry.uinf[i])) continue;
+        if (strcmp(username, registry.uinf[i].name) != 0) continue;
+        if (strcmp(password, registry.uinf[i].password) != 0)
+        {
+            spin_lock(&login_lock);
+            failed_attempts++;
+            uint64_t delay_seconds = 1ULL << min(failed_attempts, 5U);
+            retry_after_ns = now + delay_seconds * 1000000000ULL;
+            spin_unlock(&login_lock);
+            return -EACCES;
+        }
+
+        set_current_user_from_info(&registry.uinf[i]);
+        spin_lock(&login_lock);
+        failed_attempts = 0;
+        retry_after_ns = 0;
+        spin_unlock(&login_lock);
+        if (current_user != NULL) init_user_profile(current_user->name);
+        return 0;
+    }
+    spin_lock(&login_lock);
+    failed_attempts++;
+    retry_after_ns = now + (1ULL << min(failed_attempts, 5U)) * 1000000000ULL;
+    spin_unlock(&login_lock);
+    return -ENOENT;
+}
+
+int user_session_create_first(const char *username, const char *password)
+{
+    if (username == NULL || username[0] == '\0' || password == NULL || password[0] == '\0') return -EINVAL;
+    for (const char *p = username; *p != '\0'; p++)
+    {
+        if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+              (*p >= '0' && *p <= '9') || *p == '_' || *p == '-' || *p == ' '))
+            return -EINVAL;
+    }
+
+    UserRegisterList registry;
+    size_t           bytes_read = 0;
+    bool registry_loaded = load_user_registry(&registry, &bytes_read);
+    vfs_node_t existing_registry = vfs_open("/system/config/usereg.dat");
+    bool registry_exists = existing_registry != NULL;
+    if (existing_registry != NULL) vfs_close(existing_registry);
+    if (registry_exists && (!registry_loaded || bytes_read != sizeof(UserRegisterList) ||
+                            registry.user_count < 1 || registry.user_count > 128)) return -EIO;
+    if (!user_registry_needs_oobe(&registry, bytes_read))
+    {
+        if (user_registry_first_user_matches(&registry, username, password))
+        {
+            UserInfo *first_user = NULL;
+            for (int i = 1; i < registry.user_count && i < 128; i++)
+            {
+                if (user_registry_login_entry_valid(&registry.uinf[i]))
+                {
+                    first_user = &registry.uinf[i];
+                    break;
+                }
+            }
+            if (first_user != NULL)
+            {
+                set_current_user_from_info(first_user);
+                if (current_user != NULL) init_user_profile(current_user->name);
+                return 0;
+            }
+        }
+        return -EEXIST;
+    }
+
+    if (user_registry_has_real_user(&registry)) return -EEXIST;
+    if (!write_first_user_registry(username, password) || !init_user_profile(username)) return -EIO;
+
+    UserInfo info;
+    memset(&info, 0, sizeof(info));
+    strncpy(info.name, username, sizeof(info.name) - 1);
+    strncpy(info.password, password, sizeof(info.password) - 1);
+    info.user_type = XUT_Admin;
+    set_current_user_from_info(&info);
+    return 0;
+}
+
 void init_user()
 {
-    current_user = &root_user;
 }
 
 void copy_args(char *dst[], char *src[], int n)
@@ -294,6 +546,8 @@ static int load_user_elf_image(uint8_t *buf, uint64_t file_size, pcb_t group, co
     if (!elf_range_in_file(0, sizeof(Elf64_Ehdr), file_size) ||
         (*(uint32_t *)ehdr->e_ident != 0x464C457F) ||
         ehdr->e_phentsize != sizeof(Elf64_Phdr) ||
+        ehdr->e_phnum == 0 ||
+        ehdr->e_phnum > file_size / sizeof(Elf64_Phdr) ||
         !elf_range_in_file(ehdr->e_phoff, (uint64_t)ehdr->e_phnum * ehdr->e_phentsize, file_size))
     {
         write_serial_fmt("ELF load reject %s: size=%llu magic=%02x %02x %02x %02x type=%u machine=%u phoff=%llu phnum=%u phentsize=%u\n",
@@ -321,6 +575,7 @@ static int load_user_elf_image(uint8_t *buf, uint64_t file_size, pcb_t group, co
     uint64_t load_bias = ehdr->e_type == ET_DYN ? dyn_base : 0;
     uint64_t load_start = ~0ULL;
     uint64_t load_end = 0;
+    bool entry_is_executable = false;
 
     for (int i = 0; i < ehdr->e_phnum; i++)
     {
@@ -338,13 +593,23 @@ static int load_user_elf_image(uint8_t *buf, uint64_t file_size, pcb_t group, co
             return -ENOEXEC;
         }
 
+        if (phdrs[i].p_vaddr > ~0ULL - load_bias) return -ENOEXEC;
         uint64_t seg_start = load_bias + phdrs[i].p_vaddr;
+        if (phdrs[i].p_memsz == 0 || check_user_overflow(seg_start, phdrs[i].p_memsz) || seg_start < PAGE_SIZE)
+            return -ENOEXEC;
         uint64_t seg_end = seg_start + phdrs[i].p_memsz;
+        if ((phdrs[i].p_flags & PF_X) != 0 && ehdr->e_entry <= ~0ULL - load_bias)
+        {
+            uint64_t entry = load_bias + ehdr->e_entry;
+            if (entry >= seg_start && entry < seg_end) entry_is_executable = true;
+        }
         load_start = min(load_start, (uint64_t)PADDING_DOWN(seg_start, PAGE_SIZE));
         load_end = max(load_end, (uint64_t)PADDING_UP(seg_end, PAGE_SIZE));
     }
 
-    if (load_start == ~0ULL || load_end <= load_start)
+    static constexpr uint64_t MAX_USER_ELF_SPAN = 1ULL << 30;
+    if (load_start == ~0ULL || load_end <= load_start || load_end - load_start > MAX_USER_ELF_SPAN ||
+        check_user_overflow(load_start, load_end - load_start) || !entry_is_executable)
     {
         write_serial_fmt("ELF load reject %s: no loadable segments\n", name != NULL ? name : "(null)");
         return -ENOEXEC;
@@ -425,13 +690,18 @@ uint64_t parse_elf_file(char *path, pcb_t group)
         return (uint64_t)ret;
     }
 
+    if (file_size < sizeof(Elf64_Ehdr))
+    {
+        free_file_image(buf, file_size);
+        write_serial_fmt("Parse ELF/EPF file failed. Reason: Truncated header: %s.\n", path);
+        return (uint64_t)-ENOEXEC;
+    }
     Elf64_Ehdr ehdr = *(Elf64_Ehdr *)buf;
 
     // 验证ELF/EPF魔数 (0x7F,'E','L','F') (0x24, 'E', 'P', 'F')
     if ((*(uint32_t *)ehdr.e_ident != 0x464C457F)     // ELF
         && (*(uint32_t *)ehdr.e_ident != 0x46504524)) // EPF
     {
-        free_file_image(buf, file_size);
         pr_warn("Parse ELF/EPF file failed.\n");
         write_serial_fmt("Reason:   Bad Format path=%s size=%llu magic=%02x %02x %02x %02x.\n",
                          path,
@@ -440,6 +710,7 @@ uint64_t parse_elf_file(char *path, pcb_t group)
                          file_size > 1 ? buf[1] : 0,
                          file_size > 2 ? buf[2] : 0,
                          file_size > 3 ? buf[3] : 0);
+        free_file_image(buf, file_size);
         return NULL;
     }
 

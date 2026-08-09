@@ -6,7 +6,6 @@
 #include <fs/fatfs/fatfs.h>
 #include <fs/partition.h>
 #include <fs/vfs/devfs.h>
-#include <fs/vfs/sys.h>
 #include <fs/vfs/vfs.h>
 #include <krlibc.h>
 #include <mm/frame.h>
@@ -234,73 +233,134 @@ unmap_only:
     unmap_page_range(pagedir, (uint64_t)fsptr, sizeof(XFILE));
 }
 
-void do_xapi_SearchFile(uint64_t path, uint64_t count, uint64_t dir)
+// x86-64 PTE bit 9 is software-available; mark mappings that this API may release.
+static constexpr uint64_t XAPI_SEARCH_FILE_PTE_FLAG = 1ULL << 9;
+
+void do_xapi_SearchFile(uint64_t path, uint64_t count, XAPIT_DirNode **dir)
 {
     page_directory_t *pagedir = xapi_current_pagedir();
-    uint32_t          fcount  = 0;
-    XAPIT_DirNode    *fdir    = (XAPIT_DirNode *)dir;
-    if (pagedir == NULL || count == 0 || fdir == NULL || path == 0) return;
-
-    copy_to_user_pagedir(pagedir, (void *)count, &fcount, sizeof(fcount));
+    int32_t           fcount  = 0;
+    XAPIT_DirNode    *fdir    = NULL;
+    if (pagedir == NULL || count == 0 || dir == NULL || path == 0) return;
+    if (!copy_to_user_pagedir(pagedir, (void *)count, &fcount, sizeof(fcount)) ||
+        !copy_to_user_pagedir(pagedir, dir, &fdir, sizeof(fdir)))
+        return;
 
     char *fpath = xfile_build_user_path(path);
     if (fpath == NULL)
     {
-        fcount = 404;
+        fcount = -1;
         copy_to_user_pagedir(pagedir, (void *)count, &fcount, sizeof(fcount));
         return;
     }
 
     vfs_node_t v = vfs_open(fpath);
-    if (!v)
+    if (!v || !(v->type & file_dir))
     {
-        fcount = 404;
+        fcount = -1;
         copy_to_user_pagedir(pagedir, (void *)count, &fcount, sizeof(fcount));
+        if (v != NULL) vfs_close(v);
         free(fpath);
         return;
     }
-    if (!(v->type & file_dir))
-    {
-        fcount = 404;
-        copy_to_user_pagedir(pagedir, (void *)count, &fcount, sizeof(fcount));
-        vfs_close(v);
-        free(fpath);
-        return;
-    }
+
+    uint32_t entry_capacity = 0;
     vfs_child_lock();
     for (list_t node = v->child; node != NULL; node = node->next)
     {
-        if (fcount >= 255)
+        vfs_node_t data = (vfs_node_t)node->data;
+        if (strcmp(data->name, "") != 0 && data->type != file_delete)
         {
-            fcount++;
-            copy_to_user_pagedir(pagedir, (void *)count, &fcount, sizeof(fcount));
-            vfs_child_unlock();
-            vfs_close(v);
-            free(fpath);
-            return;
-        }
-        void *data = node->data;
-        if (strcmp(((vfs_node_t)data)->name, "") != 0 && ((vfs_node_t)data)->type != file_delete)
-        {
-            XAPIT_DirNode entry;
-            memset(&entry, 0, sizeof(entry));
-            strncpy(entry.filename, ((vfs_node_t)data)->name, sizeof(entry.filename) - 1);
-            entry.length   = ((vfs_node_t)data)->size;
-            entry.filetype = ((vfs_node_t)data)->type == file_dir ? 1 : 0;
-            if (!copy_to_user_pagedir(pagedir, &fdir[fcount], &entry, sizeof(entry)))
+            if (entry_capacity == 0x7fffffffU)
             {
                 vfs_child_unlock();
                 vfs_close(v);
                 free(fpath);
                 return;
             }
-            fcount++;
+            entry_capacity++;
         }
+    }
+    vfs_child_unlock();
+
+    size_t entries_bytes = 0;
+    if (entry_capacity == 0 || !xapi_checked_mul_size(entry_capacity, sizeof(XAPIT_DirNode), &entries_bytes))
+    {
+        vfs_close(v);
+        free(fpath);
+        return;
+    }
+    XAPIT_DirNode *entries = (XAPIT_DirNode *)malloc(entries_bytes);
+    if (entries == NULL)
+    {
+        vfs_close(v);
+        free(fpath);
+        return;
+    }
+
+    fcount = 0;
+    vfs_child_lock();
+    for (list_t node = v->child; node != NULL && fcount < (int32_t)entry_capacity; node = node->next)
+    {
+        vfs_node_t data = (vfs_node_t)node->data;
+        if (strcmp(data->name, "") == 0 || data->type == file_delete) continue;
+        XAPIT_DirNode *entry = &entries[fcount++];
+        memset(entry, 0, sizeof(*entry));
+        strncpy(entry->filename, data->name, sizeof(entry->filename) - 1);
+        entry->length   = data->size;
+        entry->filetype = data->type == file_dir ? 1 : 0;
     }
     vfs_child_unlock();
     vfs_close(v);
     free(fpath);
-    copy_to_user_pagedir(pagedir, (void *)count, &fcount, sizeof(fcount));
+
+    if (fcount == 0 || !xapi_checked_mul_size(fcount, sizeof(XAPIT_DirNode), &entries_bytes))
+    {
+        free(entries);
+        return;
+    }
+
+    uint64_t user_address = page_alloc_random(pagedir, entries_bytes,
+                                              PTE_PRESENT | PTE_WRITEABLE | PTE_USER | PTE_NO_EXECUTE |
+                                                  XAPI_SEARCH_FILE_PTE_FLAG);
+    if (user_address == 0)
+    {
+        free(entries);
+        return;
+    }
+    fdir = (XAPIT_DirNode *)user_address;
+    if (!copy_to_user_pagedir(pagedir, fdir, entries, entries_bytes) ||
+        !copy_to_user_pagedir(pagedir, dir, &fdir, sizeof(fdir)) ||
+        !copy_to_user_pagedir(pagedir, (void *)count, &fcount, sizeof(fcount)))
+    {
+        unmap_page_range(pagedir, (uint64_t)fdir, entries_bytes);
+        fdir = NULL;
+        fcount = 0;
+        copy_to_user_pagedir(pagedir, dir, &fdir, sizeof(fdir));
+        copy_to_user_pagedir(pagedir, (void *)count, &fcount, sizeof(fcount));
+    }
+    free(entries);
+}
+
+void do_xapi_SearchFile_freem(XAPIT_DirNode *dir, int32_t count)
+{
+    page_directory_t *pagedir = xapi_current_pagedir();
+    if (pagedir == NULL || dir == NULL || count <= 0) return;
+
+    size_t bytes = 0;
+    if (!xapi_checked_mul_size((uint32_t)count, sizeof(XAPIT_DirNode), &bytes) ||
+        ((uint64_t)dir & (PAGE_SIZE - 1)) != 0 || check_user_overflow((uint64_t)dir, bytes))
+        return;
+
+    for (uint64_t address = (uint64_t)dir; address < (uint64_t)dir + bytes; address += PAGE_SIZE)
+    {
+        uint64_t flags = 0;
+        if (!page_table_get_flags(pagedir, address, &flags) ||
+            (flags & (PTE_PRESENT | PTE_USER | PTE_FRAME_ALLOCATED | XAPI_SEARCH_FILE_PTE_FLAG)) !=
+                (PTE_PRESENT | PTE_USER | PTE_FRAME_ALLOCATED | XAPI_SEARCH_FILE_PTE_FLAG))
+            return;
+    }
+    unmap_page_range(pagedir, (uint64_t)dir, bytes);
 }
 
 uint64_t do_xapi_ReadFile(struct X64_REGS *regs)

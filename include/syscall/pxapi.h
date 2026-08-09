@@ -21,7 +21,7 @@ typedef struct {
 // XJ380API XAPI Edition
 #define XAPI_OFFEST 380
 
-// 一些隐藏的API，不对外开放，严禁泄露！
+// Private extension syscall numbers. They are internal ABI, not a security boundary.
 #define SXAH_SYSCALL_RETURN         128956723895689201      // syscall返回
 #define SXAH_CREATE_KERNEL_TERMINAL 128956723895689202      // 创建内核态进程
 #define SXAH_CHECK_USER_PASSWORD    128956723895689203      // 检查用户密码
@@ -66,6 +66,7 @@ typedef struct {
 // P3.1
 #define XAPI_OUTPUT    7381
 #define XAPI_INPUT     7382
+#define XAPI_INPUT_NO_ECHO 0x1
 
 #define XAPI_GETLINE   7418
 
@@ -79,7 +80,8 @@ typedef struct {
 #define XAPI_OPEN_FILE      7387
 #define XAPI_CLOSE_FILE     7388
 
-#define XAPI_SEARCH_FILE    7416
+#define XAPI_SEARCH_FILE       7416
+#define XAPI_SEARCH_FILE_FREEM 7471
 
 #define XAPI_MAKEDIR        7425
 #define XAPI_CREATE_FILE    7420
@@ -275,12 +277,13 @@ typedef struct
 
 // Proto (XAPI Edition)
 void do_xapi_Output(char *str);
-void do_xapi_Input(char *str);
+int  do_xapi_Input(char *str, size_t capacity, uint64_t flags);
 char do_xapi_Getch();
 void do_xapi_Endline();
 void do_xapi_Printline(char *str);
 void do_xapi_OutputSerial(char *str);
-void do_xapi_SearchFile(uint64_t path, uint64_t count, uint64_t dir);
+void do_xapi_SearchFile(uint64_t path, uint64_t count, XAPIT_DirNode **dir);
+void do_xapi_SearchFile_freem(XAPIT_DirNode *dir, int32_t count);
 void do_xapi_GetSystemVersion(uint64_t str);
 uint64_t do_xapi_GetTime();
 void do_xapi_GetCurrentUser(uint64_t dst);
