@@ -26,7 +26,8 @@ jobs:
         run: |
           sudo apt update
           sudo apt install -y \
-            clang lld nasm ninja-build \
+            clang gcc-mingw-w64-x86-64 \
+            lld nasm ninja-build \
             mtools gdisk dosfstools \
             qemu-utils ovmf \
             python3
