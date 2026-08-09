@@ -48,6 +48,3 @@ jobs:
         uses: github/codeql-action/analyze@v4
         with:
           category: "/language:cpp"
-          queries: |
-            security-and-quality
-            security-extended
