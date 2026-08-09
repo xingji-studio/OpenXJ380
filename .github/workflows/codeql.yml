@@ -1,0 +1,49 @@
+
+name: "CodeQL Advanced"
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  schedule:
+    - cron: '0 3 * * 0'
+
+jobs:
+  analyze:
+    name: Analyze (C/C++)
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          submodules: true
+
+      - name: Install build dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y \
+            clang lld nasm ninja-build \
+            mtools gdisk dosfstools \
+            qemu-utils ovmf \
+            python3
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: cpp
+          build-mode: manual
+
+      - name: Generate Ninja build file
+        run: python3 tools/gen_ninja.py --out build.ninja
+
+      - name: Build the project (all targets)
+        run: ninja -f build.ninja all
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: "/language:cpp"
