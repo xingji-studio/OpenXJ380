@@ -30,9 +30,9 @@ extern uint64_t nanoTime();
 void delay_ns(uint64_t ns)
 {
     uint64_t old_t = nanoTime();
-    while (nanoTime() - old_t <= ns)
+    while (nanoTime() - old_t < ns)
     {
-        __asm__ volatile("nop");
+        continue;
     }
 }
 void delay_us_hp(uint64_t us)
