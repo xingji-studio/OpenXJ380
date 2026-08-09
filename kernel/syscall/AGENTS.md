@@ -29,4 +29,4 @@ Kernel/user boundary implementation. This subtree wires syscall entry, dispatch,
 - Avoid running clangd/clang-tidy blindly on `sys.cpp`; clangd has crashed on this file in this environment.
 
 ## VERIFY
-Build with `python3 tools/gen_ninja.py --out build.ninja && ninja -f build.ninja all`. For user-visible changes, run the relevant app/test surface (`sigtest.elf`, `posixdemo.elf`, `libctest.elf`, shell/browser) in QEMU.
+Build with `python3 tools/gen_ninja.py --out build.ninja && ninja -f build.ninja all`. For user-visible changes, run the CLI example in QEMU.

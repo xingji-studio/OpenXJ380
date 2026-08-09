@@ -126,16 +126,13 @@ def host_gcc_triple() -> str:
 
 
 def stage_selfhost_user(root: Path) -> None:
-    for rel in ("apps/user", "apps/include", "apps/lib", "apps/third_party", "apps/liballoc-x86_64.a"):
+    for rel in ("apps/user", "apps/include", "apps/lib", "apps/liballoc-x86_64.a"):
         rm_rf(root / rel)
-    mkdir(root / "apps/third_party")
     cp(ROOT / "user", root / "apps/user")
     cp(ROOT / "include", root / "apps/include")
     cp(ROOT / "lib", root / "apps/lib")
     cp(ROOT / "liballoc-x86_64.a", root / "apps/liballoc-x86_64.a")
-    for rel in ("third_party/mbedtls-src", "third_party/libvterm"):
-        cp(ROOT / rel, root / "apps/third_party")
-    shell(f'find "{root / "apps/user"}" "{root / "apps/third_party"}" -type d -name .git -prune -exec rm -rf {{}} +')
+    shell(f'find "{root / "apps/user"}" -type d -name .git -prune -exec rm -rf {{}} +')
 
 
 def stage_linux_compat(root: Path) -> None:
@@ -487,8 +484,6 @@ def size_report() -> None:
         "主要应用",
         [
             Path("out/shell.elf"),
-            Path("out/busyterm.elf"),
-            Path("out/bcms-sp.elf"),
         ],
     )
     print_size_group("内核模块", [Path("out/e1000.sys"), Path("out/netserver.sys"), Path("out/xhci.sys")])
