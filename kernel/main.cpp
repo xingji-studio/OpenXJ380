@@ -68,23 +68,24 @@ static void load_busybox_alias_applets()
     if(vfp->size > sizeof(buffer)) goto cleanup;
     vfs_read(vfp, buffer, 0, vfp->size);
     char alias[16];
-    memset(alias, 0, 8);
-    int applet_index = 0, alias_index = 0;
-    for(int i = 0; buffer[i] != 0, i++)
+    memset(alias, 0, 16);
+    int index = 0;
+    char * pBuf = buffer;
+    char * pAlias = busybox_alias_applets[index];
+    while(*pBuf != '\0')
     {
-	    alias_index ++;
-	    if(buffer[i] =! ',')
-	    {
-	        alias[alias_index] = buffer[i];
-	        continue;
-	    }
-	    alias[alias_index] = '\0';
-	    strcpy(busybox_alias_applets[applet_index], alias);
-	    applet_index ++;
+        if(*pBuf != ',')
+	{
+            *pAlias = *pBuf;
+	    pAlias ++;
+	    pBuf ++;
+	    continue;
+	}
+	*pAlias = '\0';
+	index ++;
+	pAlias = busybox_alias_applets[index];
+	pBuf ++;
     }
-    strcpy(busybox_alias_applets[applet_index], alias);
-    busybox_alias_applets[alias_index + 1][0] = '\0';
-
 cleanup:
     vfs_close(vfp);
 }
