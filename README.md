@@ -1,8 +1,10 @@
 # OpenXJ380
 
-OpenXJ380 是一个面向 x86_64 平台的独立操作系统项目。项目包含 UEFI 引导程序、单体内核、图形与窗口系统、用户态 ELF 应用、可加载内核模块，以及用于生成 FAT 磁盘镜像的构建和分发工具。
+OpenXJ380 是一个面向 x86_64 平台的独立操作系统项目。项目包含 UEFI 引导程序、单体内核、XAPI 用户态 API、一个命令行示例程序、可加载内核模块，以及用于生成 FAT 磁盘镜像的构建和分发工具。
 
-当前项目仍在积极开发中，适合对操作系统、内核、驱动、图形系统和低层用户态运行时感兴趣的开发者参与和研究。 
+当前项目仍在积极开发中，适合对操作系统、内核、驱动和低层用户态运行时感兴趣的开发者参与和研究。
+
+> GUI 状态：GUI 相关功能已于 2026-08-04 移除，原因是该实现尚不够成熟。当前项目不提供图形界面、窗口系统或 GUI 应用。
 
 [贡献者名单](CONTRIBUTOR.md)
 
@@ -11,8 +13,7 @@ OpenXJ380 是一个面向 x86_64 平台的独立操作系统项目。项目包�
 - UEFI 引导与图形输出初始化。
 - 面向 x86_64 的单体内核，内核入口为 `KernelMain`。
 - 内建驱动、文件系统、进程/线程、内存管理和系统调用基础设施。
-- 图形、字体、窗口管理与用户态图形 API。
-- 用户态 ELF 应用和 XAPI 运行时。
+- XAPI 用户态运行时与 API，以及一个命令行示例程序。
 - 可动态加载的内核模块，包括 E1000 网络、xHCI USB 和基于 lwIP 的网络服务。
 - 基于 Ninja 的构建图生成、磁盘镜像制作和 QEMU 运行流程。
 
@@ -22,11 +23,11 @@ OpenXJ380 是一个面向 x86_64 平台的独立操作系统项目。项目包�
 boot/                  UEFI 引导程序与 EFI 交接逻辑
 kernel/                内核核心子系统和启动入口
 driver/                链接到内核镜像的内建驱动
-graphics/、font/       图形、窗口与字体实现
+graphics/、font/       不参与当前构建的历史图形与字体代码
 include/               内核和模块共享的 ABI 头文件
 lib/                   基础支持代码
 kmod/                  可加载内核模块
-user/                  用户态应用、XAPI 运行时和浏览器
+user/                  XAPI 运行时/API 与一个命令行示例程序
 resources/             写入系统资源目录的文件
 Bf/                    可选的镜像/软件包静态资源（部分源码包不附带）
 third_party/           引入的第三方代码
@@ -54,12 +55,6 @@ ninja -f build.ninja check.tools
 
 Rust no-std 目标库可通过 `RUST_TARGET_LIBDIR` 显式指定，避免构建图生成依赖开发者个人 rustup 路径。详细说明见 [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)。
 
-浏览器、`httpget` 和 `nut` 等目标需要 Clang 的 `libclang_rt.builtins-x86_64.a`。若工具检查未能自动找到该文件，请设置：
-
-```bash
-export BROWSER_BUILTINS=/path/to/libclang_rt.builtins-x86_64.a
-```
-
 ## 构建
 
 构建图由 `tools/gen_ninja.py` 生成。首次构建或构建规则更新后，执行：
@@ -69,7 +64,7 @@ python3 tools/gen_ninja.py --out build.ninja
 ninja -f build.ninja all
 ```
 
-`all` 会构建 UEFI 引导程序、内核、XAPI、用户态应用和默认内核模块。产物位于 `out/`，包括 `BOOTX64.efi`、`kernel.krl`、用户态 ELF 文件和模块文件。
+`all` 会构建 UEFI 引导程序、内核、XAPI、命令行示例程序和默认内核模块。产物位于 `out/`，包括 `BOOTX64.efi`、`kernel.krl`、`shell.elf` 和模块文件。
 
 常用目标：
 
@@ -89,7 +84,7 @@ ninja -f build.ninja clean       # 删除构建产物
 ninja -f build.ninja vdisk
 ```
 
-该命令生成 `XJ380.img`，并将内核、模块、用户程序和资源按系统目录布局写入镜像。镜像制作通常需要写入分区和文件系统的权限；默认配置下，运行 QEMU 时也可能使用 `sudo`。
+该命令生成 `XJ380.img`，并将内核、模块、命令行示例程序和资源按系统目录布局写入镜像。镜像制作通常需要写入分区和文件系统的权限；默认配置下，运行 QEMU 时也可能使用 `sudo`。
 
 使用 QEMU 启动并在需要时自动创建镜像：
 
@@ -121,8 +116,8 @@ DEBUG=0 SMP=2 SUDO=0 KVM=0 DISPLAY_BACKEND=gtk ninja -f build.ninja run
 
 - 内核核心代码位于 `kernel/`；只有必须随内核启动的驱动才应放入 `driver/`。
 - 可选或可动态装载的功能应放入 `kmod/`，模块入口为 `dlmain`。
-- 用户态程序位于 `user/`，通过 `user/xapi/` 提供的运行时和 API 链接。
-- `third_party/`、`user/browser/third_party/` 和 `kmod/netserver/lwip/` 中的代码来自上游，除非进行有计划的上游同步，否则不要直接修改。
+- `user/` 仅保留 `user/xapi/` 提供的运行时/API 和 `cli_shell.cpp` 命令行示例；不再包含其他用户态应用或 GUI 实现。
+- `third_party/` 和 `kmod/netserver/lwip/` 中的代码来自上游，除非进行有计划的上游同步，否则不要直接修改。
 - `kernel/build_config.h` 和 `.clangd` 是生成文件，不应手动维护。
 - 架构边界见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)，可复现构建和镜像资源说明见 [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)。
 
