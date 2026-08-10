@@ -1,4 +1,5 @@
 #include <syscall/syscall.h>
+#include <syscall/perm.h>
 #include <proto.hpp>
 #include <fs/vfs/vfs.h>
 #include <fs/fatfs/fatfs.h>
@@ -214,6 +215,27 @@ static uint32_t current_uid()
 static uint32_t current_gid()
 {
     return user_gid(task_effective_user());
+}
+
+static bool current_is_root()
+{
+    return current_uid() == 0;
+}
+
+static bool node_change_permitted(vfs_node_t node, bool owner_change, bool group_change)
+{
+    if (node == NULL) return false;
+    /* Root bypasses the check entirely so the kernel can manage system files.
+     * Anything else requires the caller to be the file owner. There is no
+     * separate "no-op" path that lets an unprivileged, non-owning caller
+     * succeed; without that guard chmod/fchmod could rewrite the mode of any
+     * inode in the filesystem. The host-friendly implementation lives in
+     * include/syscall/perm.h so it can be unit-tested directly. */
+    return xj_node_change_permitted((xj_uid_t)current_uid(),
+                                    current_is_root() ? 1 : 0,
+                                    (xj_uid_t)node->owner,
+                                    owner_change ? 1 : 0,
+                                    group_change ? 1 : 0) != 0;
 }
 
 static void stamp_node_owner(vfs_node_t node)
@@ -718,18 +740,14 @@ next:
         free(normalized_path);
         return SYSCALL_FAULT_(ENODEV);
     }
-    if ((flags & O_TRUNC) && !(node->type & file_dir))
-    {
-        if (vfs_resize(node, 0) != VFS_STATUS_SUCCESS)
-        {
-            vfs_close(node);
-            free(normalized_path);
-            return SYSCALL_FAULT_(EIO);
-        }
-    }
 
     fd_file_handle *fd_handle = (fd_file_handle *)calloc(1, sizeof(fd_file_handle));
-    // not_null_assets(fd_handle, "sys_open: null alloc fd");
+    if (fd_handle == NULL)
+    {
+        vfs_close(node);
+        free(normalized_path);
+        return SYSCALL_FAULT_(ENOMEM);
+    }
     fd_handle->offset = flags & O_APPEND ? node->size : 0;
     fd_handle->node   = node;
     fd_handle->flags  = flags;
@@ -743,6 +761,20 @@ next:
         free(fd_handle);
         free(normalized_path);
         return SYSCALL_FAULT_(ENOENT);
+    }
+    /* Truncate only after the fd has been published, so a queue-full failure
+     * does not silently lose the existing file contents. */
+    if ((flags & O_TRUNC) && !(node->type & file_dir))
+    {
+        if (vfs_resize(node, 0) != VFS_STATUS_SUCCESS)
+        {
+            fd_file_handle *dropped =
+                (fd_file_handle *)queue_remove_at(get_current_task()->parent_group->file_open, index);
+            if (dropped != NULL) free(dropped);
+            vfs_close(node);
+            free(normalized_path);
+            return SYSCALL_FAULT_(EIO);
+        }
     }
     free(normalized_path);
     return index;
@@ -1509,14 +1541,23 @@ sys_(stat, char *fn, struct stat *buf)
 sys_(arch_prctl, uint64_t code, uint64_t addr)
 {
     tcb_t thread = get_current_task();
+    if (thread == NULL) return SYSCALL_FAULT_(ESRCH);
     switch (code)
     {
     case ARCH_SET_FS:
+        /* FS base is consumed by user-mode instructions. Reject non-canonical
+         * and kernel addresses before preserving it in the task context. */
+        if (addr > 0x00007fffffffffffULL || check_user_overflow(addr, 1))
+            return SYSCALL_FAULT_(EINVAL);
         thread->fs_base = addr;
         if (thread->parent_group != NULL && thread->parent_group->linux_abi && addr != 0) thread->fs = 0;
         write_fsbase(thread->fs_base);
         break;
-    case ARCH_GET_FS: return thread->fs_base;
+    case ARCH_GET_FS:
+        if (addr == 0 || !copy_to_user_pagedir(current_user_pagedir(), (void *)addr, &thread->fs_base,
+                                                sizeof(thread->fs_base)))
+            return SYSCALL_FAULT_(EFAULT);
+        break;
     // case ARCH_SET_GS:
     //     thread->gs_base = addr;
     //     write_gsbase(thread->gs_base);
@@ -4413,9 +4454,11 @@ sys_(renameat, int olddirfd, char *oldpath, int newdirfd, char *newpath)
         free(resolved_new);
         return 0;
     }
-    if (newnode) { vfs_delete(newnode); }
 
+    /* Defer the destination deletion until the rename has actually succeeded,
+     * otherwise a failed rename would silently lose the destination node. */
     uint64_t ret = vfs_rename(oldnode, resolved_new) == VFS_STATUS_SUCCESS ? 0 : SYSCALL_FAULT_(ENOENT);
+    if (ret == 0 && newnode) vfs_delete(newnode);
     vfs_close(oldnode);
     free(resolved_old);
     free(resolved_new);
@@ -4920,6 +4963,10 @@ sys_(chmod, char *path, uint64_t mode)
     free(resolved);
     if (node == NULL) return SYSCALL_FAULT_(ENOENT);
 
+    if (!node_change_permitted(node, false, false)) {
+        vfs_close(node);
+        return SYSCALL_FAULT_(EPERM);
+    }
     node->mode = (uint16_t)((node->mode & ~07777) | (mode & 07777));
     vfs_close(node);
     return 0;
@@ -4930,6 +4977,7 @@ sys_(fchmod, int fd, uint64_t mode)
     if (fd < 0) return SYSCALL_FAULT_(EBADF);
     fd_file_handle *handle = (fd_file_handle *)queue_get(get_current_task()->parent_group->file_open, fd);
     if (handle == NULL || handle->node == NULL) return SYSCALL_FAULT_(EBADF);
+    if (!node_change_permitted(handle->node, false, false)) return SYSCALL_FAULT_(EPERM);
     handle->node->mode = (uint16_t)((handle->node->mode & ~07777) | (mode & 07777));
     return 0;
 }
@@ -4951,6 +4999,9 @@ sys_(fchown, int fd, uint32_t owner, uint32_t group)
     if (fd < 0) return SYSCALL_FAULT_(EBADF);
     fd_file_handle *handle = (fd_file_handle *)queue_get(get_current_task()->parent_group->file_open, fd);
     if (handle == NULL || handle->node == NULL) return SYSCALL_FAULT_(EBADF);
+    if (!node_change_permitted(handle->node, owner != UINT32_MAX, group != UINT32_MAX)) {
+        return SYSCALL_FAULT_(EPERM);
+    }
     apply_node_owner(handle->node, owner, group);
     return 0;
 }
@@ -4967,6 +5018,10 @@ sys_(fchownat, int dirfd, char *pathname, uint32_t owner, uint32_t group, int fl
     free(resolved);
     if (node == NULL) return SYSCALL_FAULT_(ENOENT);
 
+    if (!node_change_permitted(node, owner != UINT32_MAX, group != UINT32_MAX)) {
+        vfs_close(node);
+        return SYSCALL_FAULT_(EPERM);
+    }
     apply_node_owner(node, owner, group);
     vfs_close(node);
     return 0;

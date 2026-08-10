@@ -46,6 +46,9 @@ struct PROCESSOR_INFO
     uint64_t            scheduler_ticks; // 当前时间片已运行的 tick 数
     uint64_t            syscall_user_rsp;
     uint64_t            syscall_user_rax;
+    page_directory_t    current_directory;
+    volatile bool       reschedule_pending;
+    volatile uint64_t   reschedule_generation;
 };
 
 struct XSK_SMP_INFO

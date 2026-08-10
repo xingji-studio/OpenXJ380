@@ -126,6 +126,7 @@ void page_map_range(page_directory_t *directory, uint64_t addr, uint64_t frame, 
  * @param flags 页表项标志位
  */
 void page_map_range_to_random(page_directory_t *directory, uint64_t addr, uint64_t length, uint64_t flags);
+bool page_map_range_to_random_checked(page_directory_t *directory, uint64_t addr, uint64_t length, uint64_t flags);
 
 /**
  * 克隆指定页表
@@ -162,6 +163,8 @@ void switch_process_page_directory(page_directory_t *dir);
  */
 uint64_t page_alloc_random(page_directory_t *directory, uint64_t length, uint64_t flags);
 uint64_t page_reserve_user_range(page_directory_t *directory, uint64_t length);
+struct lazy_address_space_owner;
+uint64_t page_reserve_user_range_owner(const struct lazy_address_space_owner *owner, uint64_t length);
 
 /**
  * 释放一段页映射 (未使用 alloc_frames 的页不可使用此方法取消映射)

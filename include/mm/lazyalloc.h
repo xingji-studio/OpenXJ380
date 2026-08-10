@@ -11,6 +11,11 @@ typedef struct mm_virtual_page {
     size_t   index;
 } mm_virtual_page_t;
 
+typedef struct lazy_address_space_owner {
+    page_directory_t *pagedir;
+    lock_queue *virt_queue;
+} lazy_address_space_owner_t;
+
 void *virt_copy(void *ptr); // fork 懒分配信息复制回调函数
 
 /**
@@ -20,6 +25,7 @@ void *virt_copy(void *ptr); // fork 懒分配信息复制回调函数
  * @return 0 代表成功, 否则分配失败
  */
 errno_t lazy_tryalloc(pcb_t pcb, uint64_t address);
+errno_t lazy_tryalloc_owner(const lazy_address_space_owner_t *owner, uint64_t address);
 
 /**
  * 解除一个进程的指定懒分配信息地址区间映射关系
@@ -28,6 +34,7 @@ errno_t lazy_tryalloc(pcb_t pcb, uint64_t address);
  * @param length 长度
  */
 void unmap_virtual_page(pcb_t process, uint64_t vaddr, size_t length);
+void unmap_virtual_page_owner(const lazy_address_space_owner_t *owner, uint64_t vaddr, size_t length);
 
 /**
  * 进程向懒分配器递交内存
@@ -39,9 +46,12 @@ void unmap_virtual_page(pcb_t process, uint64_t vaddr, size_t length);
  */
 bool lazy_infoalloc(pcb_t process, uint64_t vaddr, size_t length, uint64_t page_flags,
                     uint64_t flags);
+bool lazy_infoalloc_owner(const lazy_address_space_owner_t *owner, uint64_t vaddr, size_t length,
+                          uint64_t page_flags, uint64_t flags);
 
 /**
  * 释放指定进程的懒分配信息
  * @param process 释放进程
  */
 void lazy_free(pcb_t process);
+void lazy_free_owner(const lazy_address_space_owner_t *owner);

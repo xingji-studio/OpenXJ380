@@ -70,6 +70,7 @@ struct APIC_INFO
 #define LAPIC_REG_TIMER         0x320
 #define LAPIC_REG_SPURIOUS      0xf0
 #define LAPIC_REG_TIMER_DIV     0x3e0
+#define LAPIC_RESCHEDULE_VECTOR 0xf1
 
 #include <acpi/acpi.h>
 
@@ -120,6 +121,11 @@ typedef struct madt_hander       MadtHeader;
 typedef struct madt_local_apic   MadtLocalApic;
 typedef struct madt_x2_localapic MadtLocalX2apic;
 typedef struct madt_io_apic      MadtIOApic;
+
+void     lapic_write(uint32_t reg, uint64_t value);
+uint32_t lapic_read(uint32_t reg);
+uint64_t lapic_id();
+bool     lapic_send_fixed_ipi(uint32_t destination_lapic_id, uint8_t vector);
 
 #pragma pack(pop)
 

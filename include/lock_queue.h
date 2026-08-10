@@ -36,6 +36,7 @@ lock_queue *queue_init();
  */
 size_t queue_enqueue(lock_queue *q, void *data);
 size_t queue_enqueue_lowest(lock_queue *q, void *data);
+size_t queue_enqueue_locked(lock_queue *q, void *data);
 
 /**
  * 入队并返回节点句柄
@@ -61,6 +62,7 @@ size_t lock_queue_enqueue(lock_queue *q, void *data);
  * @return == NULL ? 找不到节点 : 被删除节点的句柄
  */
 void *queue_remove_at(lock_queue *q, size_t index);
+void *queue_remove_at_locked(lock_queue *q, size_t index);
 
 /**
  * 删除指定数据指针的节点

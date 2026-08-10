@@ -737,11 +737,18 @@ static size_t dynsym_count_from_sections(dlhandle_t *handle) {
     if (ehdr == NULL || ehdr->e_shoff == 0 || ehdr->e_shentsize != sizeof(Elf64_Shdr)) {
         return 0;
     }
+    if (ehdr->e_shnum == 0 || ehdr->e_shnum > 65536) return 0;
+    uint64_t table_size = (uint64_t)ehdr->e_shnum * (uint64_t)ehdr->e_shentsize;
+    if (ehdr->e_shoff > ~0ULL - table_size) return 0;
+    /* Section table must live inside a loaded PT_LOAD segment so we cannot
+     * dereference uninitialised kernel memory for malformed ET_DYN images. */
+    if (!handle_range_loaded(handle, (uint64_t)ehdr + ehdr->e_shoff, (size_t)table_size)) return 0;
 
     Elf64_Shdr *shdrs = (Elf64_Shdr *)((char *)ehdr + ehdr->e_shoff);
     for (int i = 0; i < ehdr->e_shnum; i++) {
         if (shdrs[i].sh_type == SHT_DYNSYM) {
             size_t ent = shdrs[i].sh_entsize ? shdrs[i].sh_entsize : sizeof(Elf64_Sym);
+            if (ent == 0 || ent > sizeof(Elf64_Sym)) return 0;
             return shdrs[i].sh_size / ent;
         }
     }
@@ -1013,6 +1020,24 @@ static void* resolve_relocation_symbol(dlhandle_t* handle, Elf64_Sym* sym) {
     return NULL;
 }
 
+static bool bounded_init_array(dlhandle_t *handle, void (**array)(void), uint64_t size_bytes,
+                                const char *tag_name) {
+    if (array == NULL || size_bytes == 0) return true;
+    /* Cap the array size so a malicious DT_*_ARRAYSZ cannot drag us out of
+     * the loaded segment and call into kernel memory. */
+    if (size_bytes > (uint64_t)1 * 1024 * 1024) {
+        write_serial_fmt("dlinker: %s size %llu exceeds cap, refusing\n", tag_name,
+                         (unsigned long long)size_bytes);
+        return false;
+    }
+    if (size_bytes < sizeof(void (*)(void))) return true;
+    if (!handle_range_loaded(handle, (uint64_t)array, (size_t)size_bytes)) {
+        write_serial_fmt("dlinker: %s points outside loaded segment, refusing\n", tag_name);
+        return false;
+    }
+    return true;
+}
+
 static bool call_dynamic_initializers(dlhandle_t* handle) {
     if (handle == NULL || handle->dynamic == NULL || handle->init_called) {
         return true;
@@ -1043,6 +1068,10 @@ static bool call_dynamic_initializers(dlhandle_t* handle) {
             break;
         }
     }
+
+    if (!bounded_init_array(handle, preinit_array, preinit_array_sz, "DT_PREINIT_ARRAY")) return false;
+    if (!bounded_init_array(handle, init_array, init_array_sz, "DT_INIT_ARRAY")) return false;
+    if (init_func != NULL && !handle_range_loaded(handle, (uint64_t)init_func, 1)) return false;
 
     for (size_t i = 0; preinit_array && i < preinit_array_sz / sizeof(void (*)(void)); i++) {
         if (preinit_array[i]) {
@@ -1084,6 +1113,9 @@ static void call_dynamic_finalizers(dlhandle_t* handle) {
             break;
         }
     }
+
+    if (!bounded_init_array(handle, fini_array, fini_array_sz, "DT_FINI_ARRAY")) return;
+    if (fini_func != NULL && !handle_range_loaded(handle, (uint64_t)fini_func, 1)) return;
 
     for (size_t i = fini_array_sz / sizeof(void (*)(void)); fini_array && i > 0; i--) {
         if (fini_array[i - 1]) {

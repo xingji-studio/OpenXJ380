@@ -58,6 +58,16 @@ typedef enum
     ZOMBIE  = 7,
 } TaskStatus;
 
+typedef enum
+{
+    EXEC_FREEZE_RUNNING = 0,
+    EXEC_FREEZE_REQUESTED,
+    EXEC_FREEZE_FROZEN,
+    EXEC_FREEZE_COMMITTING,
+} exec_freeze_state_t;
+
+#define EXEC_FREEZE_CPU_WORDS 4
+
 typedef struct
 {
     uint64_t r15;
@@ -91,6 +101,11 @@ struct process_control_block
     page_directory_t *pagedir;      // 页表目录
     pcb_t             parent_task;  // 父进程
     lock_queue       *thread_queue; // 线程队列
+    bool              exec_in_progress; // Protected by create_thread_lock.
+    exec_freeze_state_t exec_freeze_state;
+    uint64_t            exec_freeze_generation;
+    uint64_t            exec_freeze_target_mask[EXEC_FREEZE_CPU_WORDS];
+    uint64_t            exec_freeze_ack_mask[EXEC_FREEZE_CPU_WORDS];
     size_t            queue_index;  // 进程队列索引
     TaskStatus        status;       // 进程状态
 
@@ -121,6 +136,12 @@ struct process_control_block
     uint64_t    aux_base;
     uint64_t    aux_entry;
     uint64_t    aux_execfn;
+    uint64_t    prepared_user_stack;
+    uint64_t    prepared_user_stack_top;
+    uint64_t    prepared_user_rsp;
+    uint64_t    prepared_user_argv;
+    uint64_t    prepared_user_envp;
+    uint64_t    prepared_user_entry_rdx;
     bool        linux_abi;
     uint16_t    umask;
     vma_manager_t     vma_manager; // VMA 分配管理器
@@ -215,6 +236,11 @@ struct thread_control_block
     uint64_t eevdf_last_start;
 
     bool owns_user_stack;
+    bool uses_prepared_user_stack;
+    uint64_t prepared_user_rsp;
+    uint64_t prepared_user_argv;
+    uint64_t prepared_user_envp;
+    uint64_t prepared_user_entry_rdx;
 };
 
 extern pcb_t kernel_group;
@@ -227,7 +253,12 @@ tcb_t    get_current_task();
 uint64_t task_user_fs_selector(tcb_t task);
 size_t   create_kernel_thread(void *_start, void *args, char *name, pcb_t pcb);
 size_t   create_user_thread(void *_start, void *args, int argc, char *name, pcb_t pcb, char *cwd);
+size_t   create_user_thread_unpublished(void *_start, void *args, int argc, char *name, pcb_t pcb, char *cwd,
+                                        tcb_t *task_out);
+bool     publish_user_thread(tcb_t task);
 pcb_t    create_process_group(const char *name, pcb_t parent, page_directory_t *directory, char *cmdline);
+pcb_t    create_process_group_unpublished(const char *name, pcb_t parent, page_directory_t *directory, char *cmdline);
+bool     publish_process_group(pcb_t pcb);
 uint64_t process_fork(struct X64_REGS *reg, bool is_vfork, uint64_t user_stack, uint64_t clone_flags = 0,
                       int *parent_tid = NULL, int *child_tid = NULL);
 uint64_t thread_clone(struct X64_REGS *reg, uint64_t flags, uint64_t stack, int *parent_tid, int *child_tid,

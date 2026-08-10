@@ -11,6 +11,7 @@
 #include <fs/vfs/vfs.h>
 #include <krlibc.h>
 #include <mm/frame.h>
+#include <mm/uaccess.h>
 #include <pci/pci.h>
 #include <proto.hpp>
 #include <ps2/keyboard.h>
@@ -19,6 +20,7 @@
 #include <syscall/syscall.h>
 #include <task/pcb.h>
 #include <user/user.h>
+#include <user_image_candidate.h>
 #include <user/runfile.h>
 #include <cpu/lock.h>
 
@@ -537,10 +539,11 @@ static int find_elf_interpreter(uint8_t *buf, uint64_t file_size, char *interp, 
     return 0;
 }
 
-static int load_user_elf_image(uint8_t *buf, uint64_t file_size, pcb_t group, const char *name,
-                               uint64_t dyn_base, loaded_user_elf_t *out)
+static int load_user_elf_image(uint8_t *buf, uint64_t file_size, user_image_address_space_owner_t *owner,
+                               const char *name, uint64_t dyn_base, loaded_user_elf_t *out)
 {
-    if (buf == NULL || group == NULL || out == NULL) return -EINVAL;
+    if (buf == NULL || owner == NULL || owner->pagedir == NULL || owner->vma_manager == NULL || out == NULL)
+        return -EINVAL;
 
     Elf64_Ehdr *ehdr = (Elf64_Ehdr *)buf;
     if (!elf_range_in_file(0, sizeof(Elf64_Ehdr), file_size) ||
@@ -615,8 +618,9 @@ static int load_user_elf_image(uint8_t *buf, uint64_t file_size, pcb_t group, co
         return -ENOEXEC;
     }
 
-    page_map_range_to_random(group->pagedir, load_start, load_end - load_start,
-                             PTE_PRESENT | PTE_WRITEABLE | PTE_USER);
+    if (!page_map_range_to_random_checked(owner->pagedir, load_start, load_end - load_start,
+                                          PTE_PRESENT | PTE_WRITEABLE | PTE_USER))
+        return -ENOMEM;
     memset((void *)load_start, 0, load_end - load_start);
 
     uint64_t phdr_addr = 0;
@@ -654,7 +658,7 @@ static int load_user_elf_image(uint8_t *buf, uint64_t file_size, pcb_t group, co
         elf_vma->vm_flags |= VMA_READ | VMA_WRITE | VMA_EXEC;
         elf_vma->vm_type = VMA_TYPE_ANON;
         elf_vma->vm_name = strdup(name != NULL ? name : "elf");
-        vma_insert(&group->vma_manager, elf_vma);
+        vma_insert(owner->vma_manager, elf_vma);
     }
 
     out->map_start = load_start;
@@ -664,6 +668,81 @@ static int load_user_elf_image(uint8_t *buf, uint64_t file_size, pcb_t group, co
     out->phdr = phdr_addr;
     out->phent = ehdr->e_phentsize;
     out->phnum = ehdr->e_phnum;
+    return 0;
+}
+
+static int read_candidate_elf(const char *path, user_image_buffer_t *buffer)
+{
+    if (path == NULL || buffer == NULL || buffer->data != NULL) return -EINVAL;
+
+    vfs_node_t file = vfs_open(path);
+    if (file == NULL) return -ENOENT;
+
+    uint8_t *data = NULL;
+    uint64_t size = 0;
+    int result = read_vfs_file(file, &data, &size);
+    vfs_close(file);
+    if (result < 0) return result;
+
+    buffer->data = data;
+    buffer->size = size;
+    buffer->release = USER_IMAGE_BUFFER_RELEASE_FRAMES;
+    return 0;
+}
+
+int user_image_prepare_elf(user_image_candidate_context_t *candidate, const char *path)
+{
+    user_image_address_space_owner_t owner = {};
+    if (candidate == NULL || path == NULL || candidate->state != USER_IMAGE_PREPARING ||
+        candidate->main_elf.data != NULL || candidate->interpreter_elf.data != NULL ||
+        !user_image_candidate_address_space_owner(candidate, &owner))
+        return -EINVAL;
+
+    int result = read_candidate_elf(path, &candidate->main_elf);
+    if (result < 0) return result;
+    if (candidate->main_elf.size < sizeof(Elf64_Ehdr)) return -ENOEXEC;
+
+    char interpreter_path[256];
+    result = find_elf_interpreter((uint8_t *)candidate->main_elf.data, candidate->main_elf.size,
+                                  interpreter_path, sizeof(interpreter_path));
+    if (result < 0) return result;
+    if (interpreter_path[0] != '\0')
+    {
+        result = read_candidate_elf(interpreter_path, &candidate->interpreter_elf);
+        if (result < 0) return result;
+    }
+
+    bool interrupts_enabled = are_interrupts_enabled();
+    bool scheduler_enabled = is_scheduler;
+    if (!no_interrupt) close_interrupt;
+
+    page_directory_t *previous_directory = get_current_directory();
+    switch_page_directory(candidate->pagedir);
+
+    loaded_user_elf_t main_image = {};
+    result = load_user_elf_image((uint8_t *)candidate->main_elf.data, candidate->main_elf.size, &owner,
+                                 path, USER_DYN_MAIN_BASE, &main_image);
+    loaded_user_elf_t interpreter_image = {};
+    if (result == 0 && candidate->interpreter_elf.data != NULL)
+    {
+        result = load_user_elf_image((uint8_t *)candidate->interpreter_elf.data, candidate->interpreter_elf.size,
+                                     &owner, interpreter_path, USER_INTERP_BASE, &interpreter_image);
+    }
+
+    switch_page_directory(previous_directory);
+    restore_runtime_state(scheduler_enabled, interrupts_enabled);
+    if (result < 0) return result;
+
+    candidate->exe_path = strdup(path);
+    if (candidate->exe_path == NULL) return -ENOMEM;
+    candidate->entry = candidate->interpreter_elf.data != NULL ? interpreter_image.entry : main_image.entry;
+    candidate->aux_phdr = main_image.phdr;
+    candidate->aux_phent = main_image.phent;
+    candidate->aux_phnum = main_image.phnum;
+    candidate->aux_base = candidate->interpreter_elf.data != NULL ? interpreter_image.load_bias : 0;
+    candidate->aux_entry = main_image.entry;
+    candidate->linux_abi = candidate->interpreter_elf.data != NULL ||
+                           ((Elf64_Ehdr *)candidate->main_elf.data)->e_ident[EI_OSABI] == ELFOSABI_LINUX;
     return 0;
 }
 
@@ -754,12 +833,13 @@ uint64_t parse_elf_file(char *path, pcb_t group)
 
     loaded_user_elf_t main_elf;
     memset(&main_elf, 0, sizeof(main_elf));
-    ret = load_user_elf_image(buf, file_size, group, group->name, USER_DYN_MAIN_BASE, &main_elf);
+    user_image_address_space_owner_t owner = {group->pagedir, &group->vma_manager, group->virt_queue};
+    ret = load_user_elf_image(buf, file_size, &owner, group->name, USER_DYN_MAIN_BASE, &main_elf);
     loaded_user_elf_t interp_elf;
     memset(&interp_elf, 0, sizeof(interp_elf));
     if (ret == 0 && interp_buf != NULL)
     {
-        ret = load_user_elf_image(interp_buf, interp_size, group, interp_path, USER_INTERP_BASE, &interp_elf);
+        ret = load_user_elf_image(interp_buf, interp_size, &owner, interp_path, USER_INTERP_BASE, &interp_elf);
     }
 
     switch_page_directory(current_pagedir); // 恢复页表
@@ -876,6 +956,130 @@ static void free_process_argv(char **argv)
     free(argv);
 }
 
+static bool candidate_stack_push(user_image_candidate_context_t *candidate, uint64_t *stack, const void *data,
+                                 size_t length)
+{
+    if (candidate == NULL || stack == NULL || data == NULL || length == 0 || *stack < candidate->user_stack + length)
+        return false;
+    *stack -= length;
+    *stack &= ~0x7ULL;
+    lazy_address_space_owner_t owner = {candidate->pagedir, candidate->virt_queue};
+    uint64_t first_page = *stack & PAGE_MASK;
+    uint64_t last_page = (*stack + length - 1) & PAGE_MASK;
+    for (uint64_t page = first_page;; page += PAGE_SIZE)
+    {
+        if (translate_address(candidate->pagedir, page) == 0 && lazy_tryalloc_owner(&owner, page) != EOK) return false;
+        if (page == last_page) break;
+    }
+    return copy_to_user_pagedir(candidate->pagedir, (void *)*stack, data, length);
+}
+
+static int prepare_candidate_initial_stack(user_image_candidate_context_t *candidate, const UserInfo *user)
+{
+    if (candidate == NULL || candidate->state != USER_IMAGE_PREPARING || candidate->startup_storage == NULL)
+        return -EINVAL;
+
+    user_image_startup_storage_t *startup = (user_image_startup_storage_t *)candidate->startup_storage;
+    lazy_address_space_owner_t owner = {candidate->pagedir, candidate->virt_queue};
+    uint64_t stack_base = page_reserve_user_range_owner(&owner, BIG_USER_STACK);
+    if (stack_base == 0) return -ENOMEM;
+    candidate->user_stack = stack_base;
+    candidate->user_stack_top = stack_base + BIG_USER_STACK;
+
+    uint64_t stack = candidate->user_stack_top;
+    static constexpr size_t candidate_vector_limit = 256;
+    uint64_t argv_ptrs[candidate_vector_limit + 1] = {};
+    uint64_t envp_ptrs[candidate_vector_limit + 1] = {};
+    if (startup->argc > candidate_vector_limit || startup->envc > candidate_vector_limit) return -E2BIG;
+
+    const char platform[] = "x86_64";
+    if (!candidate_stack_push(candidate, &stack, candidate->process_name, strlen(candidate->process_name) + 1))
+        return -EFAULT;
+    candidate->aux_execfn = stack;
+    if (!candidate_stack_push(candidate, &stack, platform, sizeof(platform))) return -EFAULT;
+    uint64_t platform_ptr = stack;
+
+    for (size_t i = 0; i < startup->envc; ++i)
+    {
+        if (!candidate_stack_push(candidate, &stack, startup->envp[i], strlen(startup->envp[i]) + 1)) return -EFAULT;
+        envp_ptrs[i] = stack;
+    }
+    for (size_t i = 0; i < startup->argc; ++i)
+    {
+        if (!candidate_stack_push(candidate, &stack, startup->argv[i], strlen(startup->argv[i]) + 1)) return -EFAULT;
+        argv_ptrs[i] = stack;
+    }
+    if (startup->argc != 0) candidate->aux_execfn = argv_ptrs[0];
+
+    uint8_t random_bytes[16];
+    uint64_t seed = nanoTime() ^ (uint64_t)(uintptr_t)candidate ^ stack;
+    for (size_t i = 0; i < sizeof(random_bytes); ++i)
+    {
+        seed ^= seed >> 12;
+        seed ^= seed << 25;
+        seed ^= seed >> 27;
+        random_bytes[i] = (uint8_t)(seed >> ((i & 7U) * 8));
+    }
+    if (!candidate_stack_push(candidate, &stack, random_bytes, sizeof(random_bytes))) return -EFAULT;
+    uint64_t random_ptr = stack;
+
+    struct auxv_entry { uint64_t type; uint64_t value; } auxv[] = {
+        {AT_NULL, 0}, {AT_SECURE, 0}, {AT_EXECFN, candidate->aux_execfn}, {AT_CLKTCK, 100},
+        {AT_PLATFORM, platform_ptr}, {AT_HWCAP, 0}, {AT_EGID, user_gid(user)}, {AT_GID, user_gid(user)},
+        {AT_EUID, user_uid(user)}, {AT_UID, user_uid(user)}, {AT_FLAGS, 0}, {AT_BASE, candidate->aux_base},
+        {AT_RANDOM, random_ptr}, {AT_ENTRY, candidate->aux_entry ? candidate->aux_entry : candidate->entry},
+        {AT_PHNUM, candidate->aux_phnum}, {AT_PHENT, candidate->aux_phent}, {AT_PHDR, candidate->aux_phdr},
+        {AT_PAGESZ, PAGE_SIZE},
+    };
+    uint64_t total = sizeof(auxv) + (startup->envc + startup->argc + 3) * sizeof(uint64_t);
+    stack -= (stack - total) & 0xFULL;
+    for (size_t i = 0; i < sizeof(auxv) / sizeof(auxv[0]); ++i)
+        if (!candidate_stack_push(candidate, &stack, &auxv[i], sizeof(auxv[i]))) return -EFAULT;
+
+    uint64_t null_pointer = 0;
+    if (!candidate_stack_push(candidate, &stack, &null_pointer, sizeof(null_pointer)) ||
+        !candidate_stack_push(candidate, &stack, envp_ptrs, startup->envc * sizeof(uint64_t)))
+        return -EFAULT;
+    uint64_t envp_ptr = stack;
+    if (!candidate_stack_push(candidate, &stack, &null_pointer, sizeof(null_pointer)) ||
+        !candidate_stack_push(candidate, &stack, argv_ptrs, startup->argc * sizeof(uint64_t)))
+        return -EFAULT;
+    uint64_t argc = startup->argc;
+    if (!candidate_stack_push(candidate, &stack, &argc, sizeof(argc))) return -EFAULT;
+
+    startup->user_stack = candidate->user_stack = stack_base;
+    startup->user_stack_top = candidate->user_stack_top = stack_base + BIG_USER_STACK;
+    startup->initial_rsp = candidate->initial_rsp = stack;
+    startup->initial_argv = candidate->initial_argv = stack + sizeof(uint64_t);
+    startup->initial_envp = candidate->initial_envp = envp_ptr;
+    startup->entry_rdx = candidate->entry_rdx = candidate->linux_abi ? 0 : envp_ptr;
+    return 0;
+}
+
+int user_image_prepare_candidate(user_image_candidate_context_t *candidate, const char *path, const char *process_name,
+                                 char *argv[], char *envp[], size_t envc, const void *user_data)
+{
+    const UserInfo *user = (const UserInfo *)user_data;
+    if (candidate == NULL || path == NULL || process_name == NULL || user == NULL) return -EINVAL;
+
+    user_image_candidate_init(candidate);
+    user_image_candidate_begin(candidate);
+    candidate->pagedir = clone_page_directory(get_kernel_pagedir(), false);
+    candidate->virt_queue = queue_init();
+    if (candidate->pagedir == NULL || candidate->virt_queue == NULL)
+    {
+        user_image_abort(candidate);
+        return -ENOMEM;
+    }
+
+    int result = user_image_prepare_elf(candidate, path);
+    if (result == 0) result = user_image_prepare_startup(candidate, path, process_name, argv, envp, envc);
+    if (result == 0) result = prepare_candidate_initial_stack(candidate, user);
+    if (result == 0 && !user_image_candidate_mark_prepared(candidate)) result = -EINVAL;
+    if (result < 0) user_image_abort(candidate);
+    return result;
+}
+
 int create_user_process_from_file(char *path, pcb_t pcb, char *argv[])
 {
     if (path == NULL)
@@ -884,123 +1088,108 @@ int create_user_process_from_file(char *path, pcb_t pcb, char *argv[])
         return -EINVAL;
     }
 
-    char  process_name[32];
-    void *entry;
-    int   argc = 0;
+    char process_name[32];
 
     get_thread_name_from_filepath(path, process_name);
 
     write_serial_fmt("Creating User Process. Process Name: %s\n", process_name);
-    page_directory_t *new_directory = clone_page_directory(get_kernel_pagedir(), false);
-    if (new_directory == NULL)
+    user_image_candidate_context_t candidate;
+    UserInfo *user = current_user != NULL ? current_user : &root_user;
+    char **startup_envp = pcb != NULL && pcb->envp != NULL ? pcb->envp : user->envp;
+    size_t startup_envc = pcb != NULL && pcb->envp != NULL ? pcb->envc : user->envc;
+    int result = user_image_prepare_candidate(&candidate, path, process_name, argv, startup_envp, startup_envc, user);
+    if (result < 0)
     {
-        write_serial_fmt("Create User Process Failed. Reason: Cannot Clone Page Directory.\n");
-        return -ENOMEM;
-    }
-    pcb_t             group         = create_process_group(process_name, pcb, new_directory, (char *)"");
-    if (group == NULL)
-    {
-        free_page_directory(new_directory);
-        write_serial_fmt("Create User Process Failed. Reason: Cannot Create Process Group.\n");
-        return -ENOMEM;
-    }
-    group->exe_path = strdup(path);
-    if (group->exe_path == NULL)
-    {
-        write_serial_fmt("Create User Process Failed. Reason: Cannot Copy Exec Path.\n");
-        kill_proc(group, 0, false);
-        return -ENOMEM;
+        write_serial_fmt("Create User Process Failed. Reason: Cannot Prepare Candidate.\n");
+        return result;
     }
 
-    entry = (void *)parse_elf_file(path, group);
-
-    if (entry == NULL)
-    {
-        write_serial_fmt("Create User Process Failed. Reason: Cannot Open File.\n");
-        kill_proc(group, 0, false);
-        return -ENOENT;
-    }
-    if ((int64_t)entry < 0)
-    {
-        write_serial_fmt("Create User Process Failed. Reason: Exec Format Error.\n");
-        int ret = (int)(int64_t)entry;
-        kill_proc(group, 0, false);
-        return ret;
-    }
-
-    write_serial_fmt("Creating User Thread. Thread Name: %s\n", process_name);
-    char cmdline[PAGE_SIZE];
-    memset(cmdline, 0, sizeof(cmdline));
-    char *cmdline_ptr = cmdline;
-
-    if (argv != NULL)
-    {
-        for (int i = 0; argv[i]; i++)
-        {
-            write_serial_fmt("[busybox-debug] create_process argv[%d]=%s\n", i, argv[i]);
-            if (!append_cmdline_arg(cmdline, sizeof(cmdline), &cmdline_ptr, argv[i]))
-            {
-                write_serial_fmt("Create User Process Failed. Reason: Command Line Too Long.\n");
-                kill_proc(group, 0, false);
-                return -E2BIG;
-            }
-            argc++;
-        }
-    }
-    else if (group->linux_abi)
-    {
-        if (!append_cmdline_arg(cmdline, sizeof(cmdline), &cmdline_ptr, path))
-        {
-            write_serial_fmt("Create User Process Failed. Reason: Command Line Too Long.\n");
-            kill_proc(group, 0, false);
-            return -E2BIG;
-        }
-        argc++;
-    }
-    char **thread_argv = copy_process_argv(path, argv, argc);
-    if (argc > 0 && thread_argv == NULL)
-    {
-        write_serial_fmt("Create User Process Failed. Reason: Cannot Copy Argv.\n");
-        kill_proc(group, 0, false);
-        return -ENOMEM;
-    }
-
-    char *old_cmdline = group->cmdline;
-    group->cmdline    = strdup(cmdline);
-    write_serial_fmt("[busybox-debug] create_process cmdline=%s argc=%d linux_abi=%d\n",
-                     cmdline,
-                     argc,
-                     group->linux_abi);
-    if (group->cmdline == NULL)
-    {
-        group->cmdline = old_cmdline;
-        free_process_argv(thread_argv);
-        kill_proc(group, 0, false);
-        return -ENOMEM;
-    }
-    if (old_cmdline != NULL) free(old_cmdline);
-    group->argv = copy_process_argv(path, argv, argc);
-    if (argc > 0 && group->argv == NULL)
-    {
-        free_process_argv(thread_argv);
-        kill_proc(group, 0, false);
-        return -ENOMEM;
-    }
-    group->argc = argc;
-    group->linux_abi = true;
     char *cwd = getCwd(path);
     if (cwd == NULL)
     {
-        free_process_argv(thread_argv);
-        kill_proc(group, 0, false);
+        user_image_abort(&candidate);
         return -ENOMEM;
     }
+
+    /* The mapped images no longer need their file buffers after preparation. */
+    user_image_candidate_discard_elf_buffers(&candidate);
+
+    pcb_t group = create_process_group_unpublished(process_name, pcb, candidate.pagedir, (char *)"");
+    if (group == NULL)
+    {
+        free(cwd);
+        user_image_abort(&candidate);
+        write_serial_fmt("Create User Process Failed. Reason: Cannot Create Process Group.\n");
+        return -ENOMEM;
+    }
+
+    free(group->cmdline);
+    free_process_argv(group->envp);
+    queue_destroy(group->virt_queue);
+    group->cmdline = NULL;
+    group->envp = NULL;
+    group->virt_queue = NULL;
+
+    user_image_process_state_t image = {};
+    user_image_snapshot_t discarded_image;
+    user_image_snapshot_init(&discarded_image);
+    if (!user_image_commit_locked(&image, &candidate, &discarded_image))
+    {
+        free(cwd);
+        return -EINVAL;
+    }
+    user_image_retire_old(&discarded_image);
+
+    group->pagedir = image.pagedir;
+    group->vma_manager = image.vma_manager;
+    group->virt_queue = image.virt_queue;
+    group->exe_path = image.exe_path;
+    group->cmdline = image.cmdline;
+    group->argv = image.argv;
+    group->argc = image.argc;
+    group->envp = image.envp;
+    group->envc = image.envc;
+    group->aux_phdr = image.aux_phdr;
+    group->aux_phent = image.aux_phent;
+    group->aux_phnum = image.aux_phnum;
+    group->aux_base = image.aux_base;
+    group->aux_entry = image.aux_entry;
+    group->aux_execfn = image.aux_execfn;
+    group->prepared_user_stack = image.user_stack;
+    group->prepared_user_stack_top = image.user_stack_top;
+    group->prepared_user_rsp = image.initial_rsp;
+    group->prepared_user_argv = image.initial_argv;
+    group->prepared_user_envp = image.initial_envp;
+    group->prepared_user_entry_rdx = image.entry_rdx;
+    free(image.startup_storage);
+    group->linux_abi = image.linux_abi;
+    write_serial_fmt("Creating User Thread. Thread Name: %s\n", process_name);
     write_serial_fmt("CWD: %s\n", cwd);
-    size_t tid = create_user_thread(entry, thread_argv, argc, process_name, group, cwd);
+    char **thread_argv = copy_process_argv(path, group->argv, (int)group->argc);
+    if (group->argc != 0 && thread_argv == NULL)
+    {
+        free(cwd);
+        kill_proc0(group);
+        return -ENOMEM;
+    }
+
+    tcb_t new_task = NULL;
+    size_t tid = create_user_thread_unpublished((void *)image.entry, thread_argv, group->argc, process_name, group,
+                                                cwd, &new_task);
     if ((int64_t)tid < 0)
     {
-        kill_proc(group, 0, false);
+        kill_proc0(group);
         return (int)tid;
+    }
+    if (!publish_process_group(group))
+    {
+        kill_proc0(group);
+        return -ENOMEM;
+    }
+    if (!publish_user_thread(new_task))
+    {
+        kill_proc(group, 0, false);
+        return -ENOMEM;
     }
 
     return group->pid;

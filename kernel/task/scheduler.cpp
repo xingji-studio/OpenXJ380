@@ -37,6 +37,15 @@ tcb_t get_current_task()
 }
 EXPORT_SYMBOL(get_current_task);
 
+extern "C" void c_reschedule_ipi(registers_t *frame, uint64_t error_code)
+{
+    (void)frame;
+    (void)error_code;
+    PROCESSOR_INFO *cpu = get_current_cpu();
+    if (cpu != NULL) __atomic_store_n(&cpu->reschedule_pending, true, __ATOMIC_RELEASE);
+    send_eoi();
+}
+
 __attribute__((naked)) void save_registers()
 {
     __asm__ volatile(".intel_syntax noprefix\n\t"
@@ -175,6 +184,7 @@ static inline bool is_task_schedulable(tcb_t task, tcb_t current)
     if (task->status != RUNNING && task->status != START && task->status != CREATE) return false;
     if (task->task_level == TASK_IDLE_LEVEL) return false;
     if (task->parent_group == NULL) return false;
+    if (task->parent_group->exec_freeze_state != EXEC_FREEZE_RUNNING) return false;
     if (task->parent_group->status == DEATH || task->parent_group->status == FUTEX ||
         task->parent_group->status == OUT || task->parent_group->status == WAIT) {
         return false;
@@ -187,6 +197,7 @@ static inline bool is_current_task_runnable(tcb_t task)
     if (task == NULL) return false;
     if (task->status != RUNNING && task->status != START && task->status != CREATE) return false;
     if (task->parent_group == NULL) return false;
+    if (task->parent_group->exec_freeze_state != EXEC_FREEZE_RUNNING) return false;
     if (task->parent_group->status == DEATH || task->parent_group->status == FUTEX ||
         task->parent_group->status == OUT || task->parent_group->status == WAIT) {
         return false;
@@ -311,6 +322,19 @@ static void mark_task_dispatched(tcb_t task, uint64_t now)
     task->eevdf_last_start = now;
 }
 
+static void acknowledge_process_freeze(PROCESSOR_INFO *cpu, tcb_t previous, tcb_t next)
+{
+    if (cpu == NULL || previous == NULL || previous->parent_group == NULL || next == NULL ||
+        next->parent_group == previous->parent_group || previous->parent_group->exec_freeze_state != EXEC_FREEZE_REQUESTED)
+        return;
+
+    size_t cpu_index = (size_t)(cpu - &xsi->pcr_inf[0]);
+    if (cpu_index >= MAX_CPU_NUM) return;
+    size_t word = cpu_index / 64;
+    uint64_t bit = 1ULL << (cpu_index % 64);
+    __atomic_fetch_or(&previous->parent_group->exec_freeze_ack_mask[word], bit, __ATOMIC_RELEASE);
+}
+
 tcb_t select_next_task_safe()
 {
     struct PROCESSOR_INFO *cpu = get_current_cpu();
@@ -391,10 +415,11 @@ extern "C" registers_t *timer_handle(registers_t *reg)
     }
 
     PROCESSOR_INFO *cpu = get_current_cpu();
+    bool reschedule_requested = __atomic_exchange_n(&cpu->reschedule_pending, false, __ATOMIC_ACQ_REL);
     if (likely(current->status == RUNNING && current->task_level != TASK_IDLE_LEVEL)) {
         cpu->scheduler_ticks++;
         charge_current_eevdf_runtime(current, EEVDF_TICK_NS);
-        if (cpu->scheduler_ticks < TIME_SLICE) {
+        if (!reschedule_requested && cpu->scheduler_ticks < TIME_SLICE) {
             send_eoi();
             return reg;
         }
@@ -437,6 +462,7 @@ extern "C" registers_t *timer_handle(registers_t *reg)
             cpu->scheduler_ticks = 0;
             change_proccess(reg, current, best);
             cpu->current_task = best;
+            acknowledge_process_freeze(cpu, current, best);
         } else {
             // 如果上下文无效，不切换并恢复状态
             current->status = RUNNING;

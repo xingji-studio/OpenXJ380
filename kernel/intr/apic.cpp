@@ -63,6 +63,19 @@ uint64_t lapic_id()
     return (lapic_read(LAPIC_REG_ID) >> 24);
 }
 
+bool lapic_send_fixed_ipi(uint32_t destination_lapic_id, uint8_t vector)
+{
+    if (ApicInfo.x2Apic)
+    {
+        lapic_write(LAPIC_REG_ICR0, ((uint64_t)destination_lapic_id << 32) | vector);
+        return true;
+    }
+
+    lapic_write(LAPIC_REG_ICR1, (uint64_t)destination_lapic_id << 24);
+    lapic_write(LAPIC_REG_ICR0, vector);
+    return true;
+}
+
 static void ioapic_write(uint32_t reg, uint32_t value)
 {
     mmio_write32(ApicInfo.ioApicAddr, reg);

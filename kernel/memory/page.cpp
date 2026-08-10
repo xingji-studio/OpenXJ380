@@ -8,6 +8,7 @@
 #include <mm/page.h>
 #include <mm/uaccess.h>
 #include <proto.hpp>
+#include <smp/smp.h>
 #include <task/pcb.h>
 #include <task/scheduler.h>
 #include <stdint.h>
@@ -15,7 +16,7 @@
 spin_t page_lock;
 
 page_directory_t  kernel_page_dir;
-page_directory_t *current_directory = NULL;
+page_directory_t *bootstrap_current_directory = NULL;
 
 extern bool     no_interrupt;
 extern uint64_t memory_size;
@@ -77,7 +78,8 @@ static pcb_t find_process_by_pagedir(page_directory_t *directory)
     return ret;
 }
 
-static uint64_t find_free_user_range(page_directory_t *directory, uint64_t start, uint64_t length)
+static uint64_t find_free_user_range(page_directory_t *directory, uint64_t start, uint64_t length,
+                                     lock_queue *reservation_queue = NULL)
 {
     if (directory == NULL || length == 0) return 0;
 
@@ -96,10 +98,11 @@ static uint64_t find_free_user_range(page_directory_t *directory, uint64_t start
             candidate += PAGE_SIZE;
             continue;
         }
-        if (owner != NULL && owner->virt_queue != NULL)
+        lock_queue *virt_queue = reservation_queue != NULL ? reservation_queue : (owner != NULL ? owner->virt_queue : NULL);
+        if (virt_queue != NULL)
         {
-            spin_lock(&owner->virt_queue->lock);
-            queue_foreach(owner->virt_queue, node)
+            spin_lock(&virt_queue->lock);
+            queue_foreach(virt_queue, node)
             {
                 mm_virtual_page_t *vpage = (mm_virtual_page_t *)node->data;
                 if (vpage == NULL) continue;
@@ -112,7 +115,7 @@ static uint64_t find_free_user_range(page_directory_t *directory, uint64_t start
                     break;
                 }
             }
-            spin_unlock(&owner->virt_queue->lock);
+            spin_unlock(&virt_queue->lock);
             if (occupied) continue;
         }
         for (uint64_t offset = 0; offset < aligned_length; offset += PAGE_SIZE)
@@ -606,12 +609,20 @@ page_directory_t *get_kernel_pagedir()
 
 extern volatile bool is_scheduler;
 
-page_directory_t gdc_temp_pdt;
-
 page_directory_t *get_current_directory()
 {
-    gdc_temp_pdt.table = (page_table_t *)phys_to_virt(get_cr3());
-    return &gdc_temp_pdt;
+    PROCESSOR_INFO *cpu = get_current_cpu();
+    if (cpu != NULL)
+    {
+        cpu->current_directory.table = (page_table_t *)phys_to_virt(get_cr3());
+        return &cpu->current_directory;
+    }
+    /* No per-CPU slot yet: this only happens before SMP bootstrap when the
+     * kernel still owns CR3. Returning a static struct avoids the historical
+     * shared mutable global, which another CPU could clobber mid-use. */
+    static page_directory_t bootstrap_directory;
+    bootstrap_directory.table = (page_table_t *)phys_to_virt(get_cr3());
+    return &bootstrap_directory;
 }
 
 EXPORT_SYMBOL(get_current_directory);
@@ -716,7 +727,10 @@ page_directory_t *clone_page_directory(page_directory_t *dir, bool all_copy)
 {
     spin_lock(&page_lock);
     page_directory_t *new_directory = (page_directory_t *)(malloc(sizeof(page_directory_t)));
-    if (new_directory == NULL) return NULL;
+    if (new_directory == NULL) {
+        spin_unlock(&page_lock);
+        return NULL;
+    }
     new_directory->table = copy_page_table_recursive(dir->table, 4, all_copy, false);
     if (!all_copy) memcpy((uint64_t *)new_directory->table + 256, (uint64_t *)dir->table + 256, PAGE_SIZE / 2);
     spin_unlock(&page_lock);
@@ -816,7 +830,9 @@ void switch_page_directory(page_directory_t *dir)
     // if (cpu->ready) {
     //     cpu->directory = dir;
     // } else {
-    current_directory = dir;
+    PROCESSOR_INFO *cpu = get_current_cpu();
+    if (cpu != NULL) cpu->current_directory = *dir;
+    else bootstrap_current_directory = dir;
     // }
     page_table_t *physical_table = (page_table_t *)(virt_to_phys((uint64_t)((page_table_t *)((uint64_t)dir->table))));
     // write_serial_string("Switch Page Directory:\nPhysAddr:");
@@ -871,6 +887,7 @@ uint64_t page_reserve_user_range(page_directory_t *directory, uint64_t length)
     if (aligned_length == 0) return 0;
 
     pcb_t owner = find_process_by_pagedir(directory);
+    uint64_t saved_mmap_start = owner != NULL ? owner->mmap_start : USER_MMAP_START;
     uint64_t start = (owner != NULL && owner->mmap_start >= USER_MMAP_START) ? owner->mmap_start : USER_MMAP_START;
     uint64_t addr = find_free_user_range(directory, start, aligned_length);
     if (addr == 0 && start != USER_MMAP_START)
@@ -883,21 +900,61 @@ uint64_t page_reserve_user_range(page_directory_t *directory, uint64_t length)
     if (owner != NULL &&
         !lazy_infoalloc(owner, addr, aligned_length, PTE_USER | PTE_PRESENT | PTE_WRITEABLE | PTE_NO_EXECUTE, 0))
     {
+        /* Roll mmap_start back so a failure does not silently consume the
+         * user mmap window and leave the reservation in an inconsistent
+         * state. */
+        owner->mmap_start = saved_mmap_start;
         return 0;
     }
     return addr;
 }
 
+uint64_t page_reserve_user_range_owner(const lazy_address_space_owner_t *owner, uint64_t length)
+{
+    if (owner == NULL || owner->pagedir == NULL || owner->virt_queue == NULL || length == 0) return 0;
+    uint64_t aligned_length = page_align_up(length);
+    if (aligned_length == 0) return 0;
+    spin_lock(&page_lock);
+    uint64_t addr = find_free_user_range(owner->pagedir, USER_MMAP_START, aligned_length, owner->virt_queue);
+    bool reserved = addr != 0 && lazy_infoalloc_owner(owner, addr, aligned_length,
+                                                       PTE_USER | PTE_PRESENT | PTE_WRITEABLE | PTE_NO_EXECUTE, 0);
+    spin_unlock(&page_lock);
+    return reserved ? addr : 0;
+}
+
 void page_map_range_to_random(page_directory_t *directory, uint64_t addr, uint64_t length, uint64_t flags)
 {
-    for (uint64_t i = 0; i < length; i += 0x1000)
+    uint64_t mapped = 0;
+    for (; mapped < length; mapped += 0x1000)
     {
-        uint64_t var = (uint64_t)addr + i;
+        uint64_t var = (uint64_t)addr + mapped;
         uint64_t frame = alloc_frames(1);
-        if (frame == 0) continue;
+        if (frame == 0)
+        {
+            unmap_page_range(directory, addr, mapped);
+            return;
+        }
         memset((void *)phys_to_virt(frame), 0, PAGE_SIZE);
         page_map_to(directory, var, frame, flags | PTE_FRAME_ALLOCATED);
     }
+}
+
+bool page_map_range_to_random_checked(page_directory_t *directory, uint64_t addr, uint64_t length, uint64_t flags)
+{
+    if (directory == NULL || length == 0) return false;
+    uint64_t mapped = 0;
+    for (; mapped < length; mapped += PAGE_SIZE)
+    {
+        uint64_t frame = alloc_frames(1);
+        if (frame == 0)
+        {
+            unmap_page_range(directory, addr, mapped);
+            return false;
+        }
+        memset((void *)phys_to_virt(frame), 0, PAGE_SIZE);
+        page_map_to(directory, addr + mapped, frame, flags | PTE_FRAME_ALLOCATED);
+    }
+    return true;
 }
 
 void page_map_range_to(page_directory_t *directory, uint64_t frame, uint64_t length, uint64_t flags)
@@ -986,7 +1043,7 @@ void switch_xsk_page_directory()
     free(new_directory);
     switch_page_directory(&kernel_page_dir);
     double_fault_page = get_cr3();
-    current_directory = &kernel_page_dir;
+    bootstrap_current_directory = &kernel_page_dir;
 }
 
 void page_setup()
@@ -994,7 +1051,7 @@ void page_setup()
     page_table_t *kernel_page_table = (page_table_t *)phys_to_virt(get_cr3());
     kernel_page_dir                 = (page_directory_t){.table = kernel_page_table};
     double_fault_page               = get_cr3();
-    current_directory               = &kernel_page_dir;
+    bootstrap_current_directory     = &kernel_page_dir;
 }
 
 EXPORT_SYMBOL(page_map_range);

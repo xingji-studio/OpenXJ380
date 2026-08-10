@@ -40,6 +40,7 @@ void virtualization_exception();
 
 void keyboard_handler();
 void mouse_handler();
+void reschedule_ipi_handler();
 
 void syscall_handler();
 

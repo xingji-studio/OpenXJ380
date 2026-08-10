@@ -121,6 +121,28 @@ size_t queue_enqueue(lock_queue *q, void *data)
     return new_node->index;
 }
 
+/* Caller must already hold q->lock. This avoids re-entrant spinlock acquires
+ * inside the lazy allocator, which used to deadlock the boot path. */
+size_t queue_enqueue_locked(lock_queue *q, void *data)
+{
+    if (q == NULL) return (size_t)-1;
+    lock_node *new_node = (lock_node *)malloc(sizeof(lock_node));
+    if (!new_node) return (size_t)-1;
+
+    new_node->data = data;
+    new_node->next = NULL;
+    new_node->prev = NULL;
+
+    if (q->next_index == (size_t)-1)
+    {
+        free(new_node);
+        return (size_t)-1;
+    }
+    new_node->index = q->next_index++;
+    queue_append_node(q, new_node);
+    return new_node->index;
+}
+
 size_t queue_enqueue_lowest(lock_queue *q, void *data)
 {
     if (q == NULL) return (size_t)-1;
@@ -254,6 +276,18 @@ void *queue_remove_at(lock_queue *q, size_t index)
         current  = current->next;
     }
     spin_unlock(&q->lock);
+    return NULL;
+}
+
+/* Caller must already hold q->lock. Used by the lazy allocator so that we do
+ * not re-enter the spinlock when we already serialise against the queue. */
+void *queue_remove_at_locked(lock_queue *q, size_t index)
+{
+    if (q == NULL) return NULL;
+    for (lock_node *current = q->head; current != NULL; current = current->next)
+    {
+        if (current->index == index) return queue_remove_locked(q, current);
+    }
     return NULL;
 }
 

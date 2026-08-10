@@ -531,6 +531,7 @@ def main() -> None:
     n.var("ld", os.environ.get("LD", os.environ.get("COMPILER_PREFIX", "") + "ld"))
     n.var("objc", os.environ.get("OBJC", os.environ.get("COMPILER_PREFIX", "") + "objcopy"))
     n.var("host_cc", os.environ.get("HOST_CC", "cc"))
+    n.var("host_cxx", os.environ.get("HOST_CXX", "c++"))
     n.var("user_cc", os.environ.get("CC", os.environ.get("COMPILER_PREFIX", "") + "clang"))
     n.var("user_cxx", os.environ.get("CXX", "g++"))
     n.var("user_ld", os.environ.get("LD", "ld"))
@@ -646,6 +647,14 @@ def main() -> None:
     n.rule("xapi_headcon", "mkdir -p $$(dirname $out) && $user_cc $diagnostic_color $opt -Wall -g -ffreestanding -fno-builtin -m64 -mstackrealign -std=c++11 -fno-stack-protector -fno-strict-aliasing -fshort-wchar -nostdinc -I ./user/xapi/include -Wno-write-strings -MMD -MP -MF $out.d -c $in -o $out", log_desc("CXX", "constart.cpp"), depfile="$out.d")
     n.rule("user_ld", "$user_ld -Ttext=0x200000 $in -o $out", log_desc("LD", "$out"))
     n.rule("host_cc", "mkdir -p $$(dirname $out) && $user_cc $diagnostic_color -O0 -g -Wall -Wextra $in -o $out", log_desc("HOSTLD", "$in"))
+    n.rule(
+        "host_cxx_test",
+        "mkdir -p $$(dirname $out) && $host_cxx -std=c++17 -O2 -Wall -Wextra $host_test_cxxflags "
+        "-idirafter ./include $in -o $out.tmp && $out.tmp && mv $out.tmp $out",
+        log_desc("CHECK", "$out"),
+    )
+    n.rule("mbedtls_cc", "mkdir -p $$(dirname $out) && $user_cc $mbedtls_ccflags -MF $out.d -c $in -o $out", log_desc("CC", "$in -> $out"), depfile="$out.d")
+    n.rule("libvterm_cc", "mkdir -p $$(dirname $out) && $user_cc $libvterm_cflags -MF $out.d -c $in -o $out", log_desc("CC", "$in -> $out"), depfile="$out.d")
     n.rule("kmod_e1000_cxx", "mkdir -p $$(dirname $out) && $cxx $kmod_cxxflags -I./include -MF $out.d -c $in -o $out", log_desc("CXX", "$in"), depfile="$out.d")
     n.rule("kmod_xhci_cxx", "mkdir -p $$(dirname $out) && $cxx $kmod_cxxflags -I./include -I./kmod/xhci -MF $out.d -c $in -o $out", log_desc("CXX", "$in"), depfile="$out.d")
     n.rule("netserver_cc", "mkdir -p $$(dirname $out) && $cc $netserver_cflags -MF $out.d -c $in -o $out", log_desc("CC", "$in"), depfile="$out.d")
@@ -697,6 +706,14 @@ def main() -> None:
     n.build("out/BOOTX64.efi", "boot", ["boot/bootx64.c", "boot/bootlib.c"], implicit=find_files("boot/include", (".h",)))
     n.build("font/hankaku.o", "objcopy_bin", "font/hankaku.bin", variables={"bin_input": "./font/hankaku.bin"})
     n.build("out/kernel.krl", "kernel_link", kernel_objs + [Path("font/hankaku.o"), Path("liballoc-x86_64.a")], implicit=["linker.ld"])
+    user_image_candidate_test = Path("out/tests/user_image_candidate_test")
+    n.build(
+        user_image_candidate_test,
+        "host_cxx_test",
+        ["tests/user_image_candidate_test.cpp", "kernel/user_image_candidate.cpp"],
+        implicit=["include/user_image_candidate.h"],
+        variables={"host_test_cxxflags": "-std=gnu++17 -I./include -DXJ380_CANDIDATE_HOST_TEST"},
+    )
     compliance_bundle = Path("out/compliance/third-party/MANIFEST.json")
     compliance_manifest_path = Path("third_party/compliance-manifest.json")
     compliance_manifest = json.loads((ROOT / compliance_manifest_path).read_text(encoding="utf-8"))
@@ -727,10 +744,11 @@ def main() -> None:
     kmod_targets = kmods(n)
 
     n.comment("PHONY TARGETS - compatibility names for common build workflows")
-    all_deps = [Path("out/BOOTX64.efi"), Path("out/kernel.krl"), compliance_bundle] + user_targets + kmod_targets
+    all_deps = [Path("out/BOOTX64.efi"), Path("out/kernel.krl"), compliance_bundle, user_image_candidate_test] + user_targets + kmod_targets
     phony(n, "all", all_deps)
     phony(n, "build_xapi", core_objs + [constart_obj, xapi_liballoc])
     phony(n, "kmods", kmod_targets)
+    phony(n, "test.user-image-candidate", [user_image_candidate_test])
 
     n.comment("IMAGE AND UTILITY TARGETS - delegate staging/run helpers to tools/ninja_build.py")
     # Image creation, QEMU launch, formatting, and graph reporting stay in the

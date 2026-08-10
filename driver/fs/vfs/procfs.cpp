@@ -1,5 +1,7 @@
 #define ALL_IMPLEMENTATION
 #include <procfs.h>
+#include <stdarg.h>
+#include <stdint.h>
 #include <efi/boot.h>
 #include <errno.h>
 #include <task/pcb.h>
@@ -373,6 +375,77 @@ const char *get_vma_permissions(vma_t *vma) {
     return perms;
 }
 
+static int procfs_maps_grow(char **buf, size_t *capacity, size_t needed)
+{
+    size_t new_capacity = *capacity;
+    while (new_capacity < needed)
+    {
+        if (new_capacity > __UINT64_MAX__ / 2) return -1;
+        new_capacity *= 2;
+    }
+    char *resized = (char *)realloc(*buf, new_capacity);
+    if (resized == NULL) return -1;
+    *buf       = resized;
+    *capacity  = new_capacity;
+    return 0;
+}
+
+/* Format into a heap-allocated scratch buffer, doubling it until the result
+ * fits without truncation. The kernel build does not provide vsnprintf, so we
+ * use snprintf with an explicit va_copy for both the probe and the final
+ * write. Returns the number of bytes written (excluding the trailing NUL) or
+ * -1 on allocation failure. */
+static int procfs_maps_format(char **out, const char *format, va_list args)
+{
+    size_t capacity = 256;
+    char  *buffer   = (char *)malloc(capacity);
+    if (buffer == NULL) return -1;
+    for (int attempt = 0; attempt < 8; ++attempt)
+    {
+        va_list probe_args;
+        va_copy(probe_args, args);
+        int written = snprintf(buffer, capacity, format, probe_args);
+        va_end(probe_args);
+        if (written < 0 || (size_t)written < capacity) {
+            *out = buffer;
+            return written < 0 ? -1 : written;
+        }
+        if (capacity > __UINT64_MAX__ / 2) {
+            free(buffer);
+            return -1;
+        }
+        capacity *= 2;
+        char *resized = (char *)realloc(buffer, capacity);
+        if (resized == NULL) {
+            free(buffer);
+            return -1;
+        }
+        buffer = resized;
+    }
+    free(buffer);
+    return -1;
+}
+
+static int procfs_maps_append(char **buf, size_t *capacity, size_t *offset, const char *format, ...)
+{
+    va_list args;
+    va_start(args, format);
+
+    char *piece = NULL;
+    int   needed = procfs_maps_format(&piece, format, args);
+    va_end(args);
+    if (needed < 0) return -1;
+
+    if (procfs_maps_grow(buf, capacity, *offset + (size_t)needed + 1) != 0) {
+        free(piece);
+        return -1;
+    }
+    memcpy(*buf + *offset, piece, (size_t)needed + 1);
+    *offset += (size_t)needed;
+    free(piece);
+    return 0;
+}
+
 char *proc_gen_maps_file(pcb_t task, size_t *content_len) {
     vma_t *vma = task->vma_manager.vma_list;
 
@@ -388,32 +461,21 @@ char *proc_gen_maps_file(pcb_t task, size_t *content_len) {
             if (fd_handle != NULL) node = fd_handle->node;
         }
 
-        int len = sprintf(buf + offset, "%012lx-%012lx %s %08lx %02x:%02x %lu", vma->vm_start,
-                          vma->vm_end, get_vma_permissions(vma), (unsigned long)vma->vm_offset, 0,
-                          0, node ? node->inode : 0);
-
-        if (offset + len > ctn_len) {
-            ctn_len = (offset + len + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
-            buf     = (char*)realloc(buf, ctn_len);
-        }
-        offset += len;
+        if (procfs_maps_append(&buf, &ctn_len, &offset,
+                               "%012lx-%012lx %s %08lx %02x:%02x %lu",
+                               vma->vm_start, vma->vm_end, get_vma_permissions(vma),
+                               (unsigned long)vma->vm_offset, 0, 0,
+                               node ? node->inode : 0) != 0)
+            break;
 
         const char *pathname = vma->vm_name;
         if (pathname && strlen(pathname) > 0) {
-            len = sprintf(buf + offset, "%*s%s", 15, "", pathname);
-            if (offset + len > ctn_len) {
-                ctn_len = (offset + len + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
-                buf     = (char*)realloc(buf, ctn_len);
-            }
-            offset += len;
+            if (procfs_maps_append(&buf, &ctn_len, &offset, "%*s%s", 15, "", pathname) != 0)
+                break;
         }
 
-        len = sprintf(buf + offset, "\n");
-        if (offset + len > ctn_len) {
-            ctn_len = (offset + len + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
-            buf     = (char*)realloc(buf, ctn_len);
-        }
-        offset += len;
+        if (procfs_maps_append(&buf, &ctn_len, &offset, "\n") != 0)
+            break;
 
         vma = vma->vm_next;
     }
@@ -886,15 +948,18 @@ size_t procfs_readlink(vfs_node_t node, void *addr, size_t offset, size_t size) 
             fd_file_handle *fh = (fd_file_handle *)queue_get(handle->task->file_open, fdnum);
             if (fh == NULL || fh->node == NULL) return VFS_STATUS_FAILED;
             char target[256];
+            int written = -1;
             if (fh->node->type & file_pipe)
-                sprintf(target, "pipe:[%llu]", (unsigned long long)fh->node->inode);
+                written = snprintf(target, sizeof(target), "pipe:[%llu]", (unsigned long long)fh->node->inode);
             else if (fh->node->type & file_socket)
-                sprintf(target, "socket:[%llu]", (unsigned long long)fh->node->inode);
+                written = snprintf(target, sizeof(target), "socket:[%llu]", (unsigned long long)fh->node->inode);
             else if (fh->node->name && fh->node->name[0])
-                sprintf(target, "/%s", fh->node->name);
+                written = snprintf(target, sizeof(target), "/%s", fh->node->name);
             else
-                sprintf(target, "anon_inode:[%llu]", (unsigned long long)fh->node->inode);
-            return procfs_copy_content(addr, offset, size, target, strlen(target));
+                written = snprintf(target, sizeof(target), "anon_inode:[%llu]", (unsigned long long)fh->node->inode);
+            if (written < 0) return VFS_STATUS_FAILED;
+            size_t total = (size_t)written < sizeof(target) ? (size_t)written : sizeof(target) - 1;
+            return procfs_copy_content(addr, offset, size, target, total);
         }
     }
 

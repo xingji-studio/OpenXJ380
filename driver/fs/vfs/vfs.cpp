@@ -254,13 +254,23 @@ err:
 }
 
 errno_t vfs_link(const char *name, const char *target_name) {
+    if (name == NULL || target_name == NULL || name[0] != '/') return -EINVAL;
+    /* Strip the leading slash so the rest of the parser treats the body as
+     * a relative path. Reject the degenerate "/" case explicitly so the
+     * pointer decrement below cannot underflow the allocated buffer. */
+    if (name[1] == '\0') return -ENOENT;
     vfs_node_t current = rootdir;
     char      *path    = strdup(name + 1);
 
     char *save_ptr = path;
-    char *filename = path + strlen(path);
+    size_t path_len = strlen(path);
+    if (path_len == 0) {
+        free(path);
+        return -ENOENT;
+    }
+    char *filename = path + path_len;
 
-    while (*--filename != '/' && filename != path) {}
+    while (filename > path && *--filename != '/') {}
     if (filename != path) {
         *filename++ = '\0';
     } else {
@@ -307,13 +317,20 @@ err:
 }
 
 errno_t vfs_symlink(const char *name, const char *target_name) {
+    if (name == NULL || target_name == NULL || name[0] != '/') return -EINVAL;
+    if (name[1] == '\0') return -ENOENT;
     vfs_node_t current = rootdir;
     char      *path    = strdup(name + 1);
 
     char *save_ptr = path;
-    char *filename = path + strlen(path);
+    size_t path_len = strlen(path);
+    if (path_len == 0) {
+        free(path);
+        return -ENOENT;
+    }
+    char *filename = path + path_len;
 
-    while (*--filename != '/' && filename != path) {}
+    while (filename > path && *--filename != '/') {}
     if (filename != path) {
         *filename++ = '\0';
     } else {
