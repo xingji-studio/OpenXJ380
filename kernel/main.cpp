@@ -81,12 +81,13 @@ static void load_busybox_alias_applets()
     vfs_node_t vfp = vfs_open(setfile_path);
     if (!vfp) return;
     char tmp[1024];
+    int applet_index = 0, alias_index = 0;
+    const int applet_count = sizeof(busybox_alias_applets) / sizeof(busybox_alias_applets[0]);
     if (vfp->size >= sizeof(tmp)) goto cleanup;
     vfs_read(vfp, tmp, 0, vfp->size);
     char alias[8];
     memset(alias, 0, 8);
-    int applet_index = 0, alias_index = 0;
-    const int applet_count = sizeof(busybox_alias_applets) / sizeof(busybox_alias_applets[0]);
+
     for (uint64_t i = 0; i < vfp->size && applet_index < applet_count - 1; i++)
     {
         if (tmp[i] == ',')
