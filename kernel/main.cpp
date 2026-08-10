@@ -81,11 +81,7 @@ static void load_busybox_alias_applets()
     vfs_node_t vfp = vfs_open(setfile_path);
     if (!vfp) return;
     char tmp[1024];
-    if (vfp->size >= sizeof(tmp))
-    {
-        vfs_close(vfp);
-        return;
-    }
+    if (vfp->size >= sizeof(tmp)) goto cleanup;
     vfs_read(vfp, tmp, 0, vfp->size);
     char alias[8];
     memset(alias, 0, 8);
@@ -105,6 +101,7 @@ static void load_busybox_alias_applets()
     }
     if (alias_index > 0 && applet_index < applet_count - 1) strcpy(busybox_alias_applets[applet_index], alias);
 
+cleanup:
     vfs_close(vfp);
 }
 
