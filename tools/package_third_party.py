@@ -5,6 +5,7 @@ import argparse
 import hashlib
 import json
 import shutil
+import subprocess
 from pathlib import Path
 from typing import TypedDict
 
@@ -47,6 +48,7 @@ def copy_material(relative: str, destination: Path) -> list[dict[str, str]]:
 
 
 def package(output: Path) -> None:
+    subprocess.run(["python3", str(ROOT / "tools/generate_lwip_notice.py"), "--write-repository"], cwd=ROOT, check=True)
     manifest: ComplianceManifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
     if output.exists():
         shutil.rmtree(output)
@@ -67,6 +69,7 @@ def package(output: Path) -> None:
         records.append(record)
     notices = output / "notices"
     notices.mkdir()
+    shutil.copy2(ROOT / "LICENSE", notices / "LICENSE")
     shutil.copy2(ROOT / "THIRD_PARTY_NOTICES.md", notices / "THIRD_PARTY_NOTICES.md")
     (output / "MANIFEST.json").write_text(
         json.dumps({"schema_version": manifest["schema_version"], "components": records}, indent=2) + "\n",

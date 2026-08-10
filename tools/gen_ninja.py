@@ -360,7 +360,7 @@ def root_objects(
     return objs
 
 
-def xapi(n: Ninja) -> tuple[list[Path], Path, Path, Path]:
+def xapi(n: Ninja) -> tuple[list[Path], Path, Path]:
     """Emit the minimal syscall and process-entry runtime."""
     n.comment("XAPI RUNTIME - declarations remain public; only syscall and entry shims are built")
     xapi_headers = headers("user/xapi/include")
@@ -378,10 +378,9 @@ def xapi(n: Ninja) -> tuple[list[Path], Path, Path, Path]:
         core_objs.append(obj)
     constart_obj = Path("out/xapi/constart.cpp.o")
     n.build(constart_obj, "xapi_headcon", "user/xapi/constart.cpp", implicit=xapi_headers)
-    start_obj = constart_obj
     liballoc = Path("out/xapi/liballoc-x86_64.a")
     n.build(liballoc, "copy", "liballoc-x86_64.a")
-    return core_objs, start_obj, constart_obj, liballoc
+    return core_objs, constart_obj, liballoc
 
 
 def user_compile(n: Ninja, out: Path, src: str, flags: str, implicit: list[Path]) -> Path:
@@ -391,101 +390,9 @@ def user_compile(n: Ninja, out: Path, src: str, flags: str, implicit: list[Path]
     return out
 
 
-def user_compile_c(n: Ninja, out: Path, src: str, flags: str, implicit: list[Path]) -> Path:
-    n.build(out, "user_cc_custom", src, implicit=implicit, variables={"cflags": flags})
-    return out
-
-
-def user_simple_app(
-    n: Ninja,
-    name: str,
-    src: str,
-    core_objs: list[Path],
-    liballoc: Path,
-    implicit: list[Path],
-    *,
-    console: bool = False,
-    c_source: bool = False,
-) -> Path:
-    """Emit the common one-source userland app compile/link pattern."""
-    target = Path(f"out/{name}")
-    obj = Path(f"out/{name}.o")
-    # C-only compatibility targets need a C11 compile line; C++ apps use the
-    # shared USER_CFLAGS emitted in the generated FLAGS section.
-    if c_source:
-        cflags = f"$diagnostic_color {opt_flag()} -Wall -g -ffreestanding -fno-builtin -m64 -mstackrealign -std=c11 -fno-stack-protector -fno-strict-aliasing -fshort-wchar -nostdinc -I ./user/xapi/include -MMD -MP"
-        user_compile_c(n, obj, src, cflags, implicit)
-    else:
-        user_compile(n, obj, src, "$user_cflags", implicit)
-    # GUI apps get start.cpp through core selection; console-style apps keep
-    # constart.cpp and intentionally avoid the GUI process startup path.
-    if c_source:
-        xobjs = core_objs
-    elif console:
-        xobjs = core_objs
-    else:
-        xobjs = core_objs + [Path("out/xapi/start.cpp.o")]
-    n.build(target, "user_ld", xobjs + [liballoc, obj], variables={"message": log_desc("LD", target.as_posix())})
-    return target
-
-
-def grouped_cpp_app(
-    n: Ninja,
-    name: str,
-    sources: list[str],
-    obj_prefix: str,
-    core_objs: list[Path],
-    liballoc: Path,
-    implicit: list[Path],
-    *,
-    extra_implicit: list[Path] | None = None,
-) -> Path:
-    """Emit a multi-source C++ GUI app and keep its objects grouped."""
-    # Multi-file GUI apps keep object files under out/<obj_prefix>/ so files
-    # with common names can coexist and the generated graph stays easy to scan.
-    objs: list[Path] = []
-    for src in sources:
-        src_path = Path(src)
-        obj = Path("out") / obj_prefix / src_path.name.replace(".cpp", ".o")
-        user_compile(n, obj, f"user/{src}", "$user_cflags", implicit + (extra_implicit or []))
-        objs.append(obj)
-    target = Path(f"out/{name}.elf")
-    n.build(target, "user_ld", core_objs + [Path("out/xapi/start.cpp.o"), liballoc] + objs, variables={"message": log_desc("LD", target.as_posix())})
-    return target
-
-
-def rust_gui_app(
-    n: Ninja,
-    name: str,
-    source: str,
-    object_path: Path,
-    core_objs: list[Path],
-    start_obj: Path,
-    liballoc: Path,
-    rust_libs: list[Path],
-    *,
-    extra_inputs: list[Path] | None = None,
-    link_inputs: list[Path] | None = None,
-) -> Path:
-    """Emit a no_std Rust GUI app and link it through the userland ELF path."""
-    # extra_inputs are rebuild dependencies for rustc; link_inputs are native
-    # objects that must be passed to ld.  Keeping them separate prevents header
-    # style Rust files from being linked as if they were object files.
-    n.build(object_path, "rust_user", source, implicit=extra_inputs)
-    target = Path(f"out/{name}.elf")
-    n.build(
-        target,
-        "user_ld",
-        core_objs + [start_obj, liballoc, object_path] + (link_inputs or []) + rust_libs,
-        variables={"message": log_desc("LD", target.as_posix())},
-    )
-    return target
-
-
-def user_apps(n: Ninja, core_objs: list[Path], start_obj: Path, constart_obj: Path, liballoc: Path, rust_libs: list[Path]) -> list[Path]:
-    """Emit the framebuffer command-line shell."""
-    del start_obj, liballoc, rust_libs
-    n.comment("USER APPS - command-line shell")
+def user_apps(n: Ninja, core_objs: list[Path], constart_obj: Path) -> list[Path]:
+    """Emit the sole user-space example program."""
+    n.comment("USER APPS - command-line example")
     shell_obj = Path("out/cli_shell.o")
     user_compile(n, shell_obj, "user/cli_shell.cpp", "$user_cflags", headers("user/xapi/include"))
     target = Path("out/shell.elf")
@@ -658,9 +565,7 @@ def main() -> None:
     n.var_list("HEADER_FILES", headers("include"))
     n.var_list("XAPI_SOURCES", xapi_sources)
     n.var_list("XAPI_HEADERS", headers("user/xapi/include"))
-    n.var_list("USER_HEADERS", headers("user/include"))
     n.var_list("BOOT_HEADERS", find_files("boot/include", (".h", ".hpp")))
-    n.var_list("LIBVTERM_SOURCES", find_files("third_party/libvterm/src", (".c",), max_depth=1))
     n.var_list("KMOD_E1000_SOURCES", find_files("kmod/e1000", (".cpp",), max_depth=1))
     n.line()
     # Emit uppercase canonical flag variables first, then lowercase aliases for
@@ -677,11 +582,8 @@ def main() -> None:
     n.var("C_FLAGS", "$DIAGNOSTIC_COLOR $OPT_FLAG -g -mno-red-zone -mstackrealign -nostdlib -ffreestanding -fno-builtin -m64 -fno-stack-protector -fno-exceptions -fno-strict-aliasing -std=c11 -fshort-wchar -nostdinc -mno-80387 -I./include -MMD -MP")
     n.var("CPP_FLAGS", "$DIAGNOSTIC_COLOR $OPT_FLAG -g -mno-red-zone -mstackrealign -nostdlib -ffreestanding -fno-builtin -m64 -fno-stack-protector -fno-exceptions -fno-strict-aliasing -fno-rtti -std=gnu++17 -fshort-wchar -nostdinc -fno-use-cxa-atexit -fno-threadsafe-statics -mno-80387 -Wno-int-to-pointer-cast -Wno-macro-redefined -Wno-c11-extensions -Wno-c99-extensions -Wno-gnu-statement-expression-from-macro-expansion -I./include -Wno-writable-strings -Wno-c++11-narrowing -MMD -MP" + cpp_extra)
     n.var("BOOT_C_FLAGS", "$DIAGNOSTIC_COLOR -g -I ./boot/include -Wextra -e efi_main -nostdinc -nostdlib -fno-builtin -Wl,--subsystem,10 -fshort-wchar")
-    n.var("USER_CFLAGS", "$DIAGNOSTIC_COLOR $OPT_FLAG -Wall -g -ffreestanding -fno-builtin -m64 -mstackrealign -std=c++11 -fno-stack-protector -fno-exceptions -fno-strict-aliasing -fshort-wchar -nostdinc -I ./user/xapi/include -I ./user/include -I ./include -Wno-write-strings -MMD -MP")
+    n.var("USER_CFLAGS", "$DIAGNOSTIC_COLOR $OPT_FLAG -Wall -g -ffreestanding -fno-builtin -m64 -mstackrealign -std=c++11 -fno-stack-protector -fno-exceptions -fno-strict-aliasing -fshort-wchar -nostdinc -I ./user/xapi/include -I ./include -Wno-write-strings -MMD -MP")
     n.var("RUST_FLAGS", "$RUST_DIAGNOSTIC_COLOR --edition=2024 --target $rust_target --emit=obj --crate-type lib -C panic=abort -C no-redzone=yes $RUST_OPT_FLAG -C debuginfo=2 -C overflow-checks=off")
-    n.var("MBEDTLS_CFLAGS", "-I ./user/include/mbed_compat -I ./third_party/mbedtls-src/include -DMBEDTLS_USER_CONFIG_FILE='\"mbed_compat/xj380_mbedtls_user_config.h\"'")
-    n.var("MBEDTLS_CCFLAGS", "$DIAGNOSTIC_COLOR $OPT_FLAG -Wall -g -ffreestanding -fno-builtin -m64 -mstackrealign -std=c11 -fno-stack-protector -fno-strict-aliasing -fshort-wchar -nostdinc -I ./user/include/mbed_compat -I ./user/xapi/include -I ./user/include -I ./include -I ./third_party/mbedtls-src/include -DMBEDTLS_USER_CONFIG_FILE='\"mbed_compat/xj380_mbedtls_user_config.h\"' -DMBEDTLS_NO_UDBL_DIVISION -MMD -MP")
-    n.var("LIBVTERM_CFLAGS", "$DIAGNOSTIC_COLOR $OPT_FLAG -Wall -g -ffreestanding -fno-builtin -m64 -mstackrealign -std=c99 -fno-stack-protector -fno-strict-aliasing -fshort-wchar -nostdinc -I ./user/xapi/include -I ./user/include -I ./third_party/libvterm/include -I ./third_party/libvterm/src -MMD -MP")
     n.var("KMOD_CXXFLAGS", "$DIAGNOSTIC_COLOR $OPT_FLAG -g -mno-red-zone -mstackrealign -nostdlib -ffreestanding -fno-builtin -m64 -fno-stack-protector -fno-exceptions -fno-strict-aliasing -fno-rtti -std=gnu++17 -fshort-wchar -nostdinc -fno-use-cxa-atexit -fno-threadsafe-statics -mno-80387 -Wno-int-to-pointer-cast -Wno-macro-redefined -Wno-c11-extensions -Wno-c99-extensions -Wno-gnu-statement-expression-from-macro-expansion -Wno-writable-strings -Wno-c++11-narrowing -fPIC -fvisibility=hidden -MMD -MP")
     n.var("NETSERVER_CFLAGS", "$DIAGNOSTIC_COLOR $OPT_FLAG -g -mno-red-zone -mstackrealign -nostdlib -ffreestanding -fno-builtin -m64 -fno-stack-protector -fno-exceptions -fno-strict-aliasing -std=gnu11 -fshort-wchar -nostdinc -mno-80387 -fPIC -fvisibility=hidden -MMD -MP -I./include -I./kmod/netserver/lwip/include -I./kmod/netserver")
     n.var("NETSERVER_CXXFLAGS", "$KMOD_CXXFLAGS -MMD -MP -I./include -I./kmod/netserver/lwip/include -I./kmod/netserver")
@@ -696,9 +598,6 @@ def main() -> None:
     n.var("boot_c_flags", "$BOOT_C_FLAGS")
     n.var("user_cflags", "$USER_CFLAGS")
     n.var("rust_user_flags", "$RUST_FLAGS")
-    n.var("mbedtls_cflags", "$MBEDTLS_CFLAGS")
-    n.var("mbedtls_ccflags", "$MBEDTLS_CCFLAGS")
-    n.var("libvterm_cflags", "$LIBVTERM_CFLAGS")
     n.var("kmod_cxxflags", "$KMOD_CXXFLAGS")
     n.var("netserver_cflags", "$NETSERVER_CFLAGS")
     n.var("netserver_cxxflags", "$NETSERVER_CXXFLAGS")
@@ -747,8 +646,6 @@ def main() -> None:
     n.rule("xapi_headcon", "mkdir -p $$(dirname $out) && $user_cc $diagnostic_color $opt -Wall -g -ffreestanding -fno-builtin -m64 -mstackrealign -std=c++11 -fno-stack-protector -fno-strict-aliasing -fshort-wchar -nostdinc -I ./user/xapi/include -Wno-write-strings -MMD -MP -MF $out.d -c $in -o $out", log_desc("CXX", "constart.cpp"), depfile="$out.d")
     n.rule("user_ld", "$user_ld -Ttext=0x200000 $in -o $out", log_desc("LD", "$out"))
     n.rule("host_cc", "mkdir -p $$(dirname $out) && $user_cc $diagnostic_color -O0 -g -Wall -Wextra $in -o $out", log_desc("HOSTLD", "$in"))
-    n.rule("mbedtls_cc", "mkdir -p $$(dirname $out) && $user_cc $mbedtls_ccflags -MF $out.d -c $in -o $out", log_desc("CC", "$in -> $out"), depfile="$out.d")
-    n.rule("libvterm_cc", "mkdir -p $$(dirname $out) && $user_cc $libvterm_cflags -MF $out.d -c $in -o $out", log_desc("CC", "$in -> $out"), depfile="$out.d")
     n.rule("kmod_e1000_cxx", "mkdir -p $$(dirname $out) && $cxx $kmod_cxxflags -I./include -MF $out.d -c $in -o $out", log_desc("CXX", "$in"), depfile="$out.d")
     n.rule("kmod_xhci_cxx", "mkdir -p $$(dirname $out) && $cxx $kmod_cxxflags -I./include -I./kmod/xhci -MF $out.d -c $in -o $out", log_desc("CXX", "$in"), depfile="$out.d")
     n.rule("netserver_cc", "mkdir -p $$(dirname $out) && $cc $netserver_cflags -MF $out.d -c $in -o $out", log_desc("CC", "$in"), depfile="$out.d")
@@ -805,7 +702,9 @@ def main() -> None:
     compliance_manifest = json.loads((ROOT / compliance_manifest_path).read_text(encoding="utf-8"))
     compliance_inputs = [
         Path("tools/package_third_party.py"),
+        Path("tools/generate_lwip_notice.py"),
         compliance_manifest_path,
+        Path("LICENSE"),
         Path("THIRD_PARTY_NOTICES.md"),
     ]
     for component in compliance_manifest["components"]:
@@ -823,14 +722,14 @@ def main() -> None:
     )
 
     n.comment("USERLAND AND KMODS - first-class ELF/module outputs")
-    core_objs, start_obj, constart_obj, xapi_liballoc = xapi(n)
-    user_targets = user_apps(n, core_objs, start_obj, constart_obj, xapi_liballoc, rust_libs)
+    core_objs, constart_obj, xapi_liballoc = xapi(n)
+    user_targets = user_apps(n, core_objs, constart_obj)
     kmod_targets = kmods(n)
 
     n.comment("PHONY TARGETS - compatibility names for common build workflows")
     all_deps = [Path("out/BOOTX64.efi"), Path("out/kernel.krl"), compliance_bundle] + user_targets + kmod_targets
     phony(n, "all", all_deps)
-    phony(n, "build_xapi", core_objs + [start_obj, constart_obj, xapi_liballoc])
+    phony(n, "build_xapi", core_objs + [constart_obj, xapi_liballoc])
     phony(n, "kmods", kmod_targets)
 
     n.comment("IMAGE AND UTILITY TARGETS - delegate staging/run helpers to tools/ninja_build.py")

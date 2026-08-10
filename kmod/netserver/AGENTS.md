@@ -35,4 +35,4 @@ kmod/netserver/
 - Do not assume chained pbuf support where lwIP ZEP code asserts `p->next == NULL`.
 
 ## VERIFY
-Build `python3 tools/gen_ninja.py --out build.ninja && ninja -f build.ninja out/netserver.sys` or `ninja -f build.ninja all`. Runtime changes require booting with modules enabled and exercising `netcfg`, `httpget`, `browser`, or socket-using apps.
+Build `python3 tools/gen_ninja.py --out build.ninja && ninja -f build.ninja out/netserver.sys` or `ninja -f build.ninja all`. Runtime changes require booting with modules enabled and exercising a socket-using test workload.

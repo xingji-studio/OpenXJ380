@@ -56,3 +56,6 @@ build.ninja
 XJ380/
 
 venv/
+
+# Local audit notes
+/docs/LICENSE_AUDIT_2026-08-08.md
