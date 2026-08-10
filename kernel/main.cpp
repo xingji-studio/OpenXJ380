@@ -58,6 +58,7 @@ static char busybox_alias_applets[128][16];
 
 static void load_busybox_alias_applets()
 {
+    memset(busybox_alias_applets, 0, 2048);
     char setfile_path[32];
     memset(setfile_path, 0, 32);
     strcat(setfile_path, "/etc/busybox/alias/applets.dat");
@@ -109,7 +110,7 @@ static void setup_busybox_vfs_aliases()
 {
     load_busybox_alias_applets();
     const char *prefixes[] = {"/apps", "/bin", NULL};
-    for (int p = 0; prefixes[p][0] != '\0'; p++)
+    for (int p = 0; prefixes[p] != NULL; p++)
     {
         for (int i = 0; busybox_alias_applets[i][0] != '\0'; i++)
         {
