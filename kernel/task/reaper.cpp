@@ -35,7 +35,8 @@ static pcb_t find_reapable_child(pcb_t parent)
     for (lock_node *node = parent->child_pcb->head; node != NULL; node = node->next)
     {
         pcb_t child = (pcb_t)node->data;
-        if (child != NULL && child->status == DEATH && !process_is_current_on_any_cpu(child))
+        if (child != NULL && !child->is_initial_program && child->status == DEATH &&
+            !process_is_current_on_any_cpu(child))
         {
             target = child;
             break;

@@ -206,8 +206,6 @@
 #define XAPI_SEND_APP_MSG   7429
 #define XAPI_SLEEP          7430
 
-#define XAPI_RUN            7439
-#define XAPI_RUN_ARGS       7451
 #define XAPI_USER_OOBE_REQUIRED 7452
 #define XAPI_USER_LIST          7453
 #define XAPI_USER_LOGIN         7454

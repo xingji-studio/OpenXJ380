@@ -467,7 +467,7 @@ def kmods(n: Ninja) -> list[Path]:
 
     # xhci can be linked into the kernel when BUILTIN_XHCI=1, but the module
     # artifact is still generated for staging/testing parity.
-    n.comment("KMOD: xhci USB stack module artifact")
+    n.comment("KMOD: xhci USB stack module")
     xhci_objs: list[Path] = []
     for name in ("usb_core.cpp", "usb_hub.cpp", "usb_msc.cpp", "xhci.cpp"):
         src = Path("kmod/xhci") / name
@@ -511,7 +511,7 @@ def main() -> None:
     args = parser.parse_args()
 
     # Environment knobs keep the same defaults as the historical build.
-    builtin_xhci = os.environ.get("BUILTIN_XHCI", "1") == "1"
+    builtin_xhci = os.environ.get("BUILTIN_XHCI", "0") == "1"
     cpp_extra = " -DXHCI_BUILTIN" if builtin_xhci else ""
     host_gcc = os.environ.get("HOST_GCC", "gcc")
     host_gcc_triple = cmd_output([host_gcc, "-dumpmachine"])
@@ -628,7 +628,7 @@ def main() -> None:
     n.rule("root_as", "mkdir -p $$(dirname $out) && $cc -mcmodel=large $asm_flags -MF $out.d -c $in -o $out", log_desc("ASM", "$in -> $out"), depfile="$out.d")
     n.rule("root_cc", "mkdir -p $$(dirname $out) && $cc -fno-pic -fno-pie -mcmodel=large $c_flags -MF $out.d -c $in -o $out", log_desc("CC", "$in -> $out"), depfile="$out.d")
     n.rule("root_cxx", "mkdir -p $$(dirname $out) && $cxx -fno-pic -fno-pie -mcmodel=large $cpp_flags -MF $out.d -c $in -o $out", log_desc("CXX", "$in -> $out"), depfile="$out.d")
-    n.rule("gen_config", "tmp=$out.tmp; { echo '#pragma once'; echo '#define CONFIG_KERNEL_BUSYBOX_ALIASES '$${KERNEL_BUSYBOX_ALIASES:-1}; echo '#define CONFIG_KERNEL_BUILTIN_XHCI '$${BUILTIN_XHCI:-1}; } > $$tmp; if ! cmp -s $$tmp $out; then mv $$tmp $out; else rm -f $$tmp; fi", log_desc("GEN", "$out"))
+    n.rule("gen_config", "tmp=$out.tmp; { echo '#pragma once'; echo '#define CONFIG_KERNEL_BUILTIN_XHCI '$${BUILTIN_XHCI:-0}; } > $$tmp; if ! cmp -s $$tmp $out; then mv $$tmp $out; else rm -f $$tmp; fi", log_desc("GEN", "$out"))
     n.rule("boot", "mkdir -p $$(dirname $out) && x86_64-w64-mingw32-gcc $boot_c_flags -o $out boot/bootx64.c boot/bootlib.c", log_desc("BOOT", "$out"))
     n.rule("objcopy_bin", "mkdir -p $$(dirname $out) && $objc -I binary -O elf64-x86-64 $bin_input $out", log_desc("OBJCOPY", "$bin_input"))
     n.rule(
@@ -756,7 +756,7 @@ def main() -> None:
     # edges.  Ninja still tracks their visible target names here.
     # License files are copied during staging.  Make staging targets depend on
     # an always-dirty phony input so an existing image is refreshed on every
-    # request, including `complete`, rather than being skipped by Ninja.
+    # request rather than being skipped by Ninja.
     n.build("always_stage_licenses", "phony", use_default_order_only=False)
     image_deps = all_deps + manifest_inputs + ["always_stage_licenses"]
     n.build(
@@ -765,37 +765,9 @@ def main() -> None:
         image_deps,
         variables={"cmd": "vdisk", "desc": log_desc("VDISK", "XJ380.img"), "pool": "console"},
     )
-    n.build(
-        "complete",
-        "python_cmd",
-        image_deps,
-        variables={"cmd": "complete", "desc": log_desc("VDISK", "complete XJ380.img"), "pool": "console"},
-    )
-    n.build(
-        ["installer.system.stage", "out/system-payload.pak"],
-        "python_cmd",
-        image_deps,
-        variables={"cmd": "installer-system-stage", "desc": log_desc("STAGE", "installer system")},
-    )
-    n.build(
-        ["installer.root.stage", "out/installer-root.pak"],
-        "python_cmd",
-        all_deps,
-        variables={"cmd": "installer-root-stage", "desc": log_desc("STAGE", "installer root")},
-    )
-    n.build(
-        ["installer.iso", "XJ380-installer.iso"],
-        "python_cmd",
-        ["installer.system.stage", "installer.root.stage"],
-        variables={"cmd": "installer-iso", "desc": log_desc("ISO", "XJ380-installer.iso")},
-    )
     n.build(["vmdk", "XJ380.vmdk"], "python_cmd", ["vdisk"], variables={"cmd": "vmdk", "desc": log_desc("VMDK", "XJ380.vmdk")})
     n.build("run", "python_cmd", ["vdisk"], variables={"cmd": "run", "desc": log_desc("RUN", "QEMU"), "pool": "console"})
     n.build("justrun", "python_cmd", variables={"cmd": "run", "desc": log_desc("RUN", "QEMU"), "pool": "console"})
-    n.build("prepare", "python_cmd", variables={"cmd": "prepare", "desc": log_desc("PREP", "root")})
-    n.build("installer.prepare", "python_cmd", variables={"cmd": "installer-prepare", "desc": log_desc("PREP", "installer root")})
-    n.build("stage.selfhost-user", "python_cmd", variables={"cmd": "stage-selfhost-user", "desc": log_desc("STAGE", "selfhost user")})
-    n.build("stage.linux-compat", "python_cmd", variables={"cmd": "stage-linux-compat", "desc": log_desc("STAGE", "linux compat")})
     n.build("format", "python_cmd", variables={"cmd": "format", "desc": log_desc("FMT", "sources")})
     n.build("check", "python_cmd", variables={"cmd": "check", "desc": log_desc("CHECK", "sources")})
     n.build("gen.clangd", "python_cmd", variables={"cmd": "gen-clangd", "desc": log_desc("GEN", "clangd")})

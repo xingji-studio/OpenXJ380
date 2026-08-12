@@ -37,8 +37,6 @@ pcb_t         kernel_group    = NULL;
 
 uint64_t task_user_fs_selector(tcb_t task)
 {
-    if (task != NULL && task->parent_group != NULL && task->parent_group->linux_abi && task->fs_base != 0)
-        return 0;
     return task != NULL ? task->fs : 0;
 }
 
@@ -910,8 +908,7 @@ static void switch_task_to_user_mode(tcb_t task)
     }
     char **argv = task->uses_prepared_user_stack ? (char **)task->prepared_user_argv
                                                  : (char **)(rsp + sizeof(uint64_t));
-    uint64_t entry_rdx = task->uses_prepared_user_stack ? task->prepared_user_entry_rdx
-                                                        : (task->parent_group->linux_abi ? 0 : ep);
+    uint64_t entry_rdx = task->uses_prepared_user_stack ? task->prepared_user_entry_rdx : ep;
 
     task->context0.rflags = 0x202;
     task->context0.rsp    = rsp;
@@ -1259,15 +1256,6 @@ static int rewrite_shebang_exec(vfs_node_t *node, char **norm_path, char ***argv
         return -ENOENT;
     }
 
-    if (get_current_task() != NULL && get_current_task()->parent_group != NULL &&
-        get_current_task()->parent_group->linux_abi)
-    {
-        write_serial_fmt("[busybox-debug] shebang %s -> %s argc=%llu\n",
-                         *norm_path,
-                         interp,
-                         (unsigned long long)out_i);
-    }
-
     vfs_close(*node);
     *node = interp_node;
     free(*norm_path);
@@ -1528,13 +1516,6 @@ uint64_t process_execve(char *path, char **argv, char **envp)
         return (uint64_t)-ENOMEM;
     }
     vfs_node_t node      = vfs_open(norm_path);
-    if (process != NULL && process->linux_abi)
-    {
-        write_serial_fmt("[busybox-debug] execve request path=%s argv0=%s open=%s\n",
-                         norm_path,
-                         (kargv != NULL && kargv[0] != NULL) ? kargv[0] : "(null)",
-                         node == NULL ? "miss" : "hit");
-    }
     if (node == NULL)
     {
         free(norm_path);
@@ -1705,7 +1686,6 @@ uint64_t process_execve(char *path, char **argv, char **envp)
     process->brk_end = USER_BRK_END;
     process->brk_current = USER_BRK_START;
     process->mmap_start = USER_MMAP_START;
-    process->linux_abi = new_process_image.linux_abi;
     process->vfork = false;
     strncpy(process->name, new_process_name, sizeof(process->name) - 1);
     strncpy(current_task->name, new_process_name, sizeof(current_task->name) - 1);
@@ -2017,7 +1997,6 @@ uint64_t process_fork(struct X64_REGS *reg, bool is_vfork, uint64_t user_stack, 
     new_pcb->status     = START;
     new_pcb->vfork      = is_vfork;
     new_pcb->ppid       = current_pcb->pid;
-    new_pcb->linux_abi  = current_pcb->linux_abi;
     new_pcb->load_start = current_pcb->load_start;
     new_pcb->aux_phdr   = current_pcb->aux_phdr;
     new_pcb->aux_phent  = current_pcb->aux_phent;

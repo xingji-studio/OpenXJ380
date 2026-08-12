@@ -12,7 +12,7 @@ Several security properties cannot be completed safely as a small compatibility 
 2. Kernel modules are parser-hardened but unsigned. Loading an attacker-controlled valid `.sys` is still arbitrary ring-0 execution by design.
 3. On CPUs without `RDSEED`/`RDRAND`, RNG initialization has no formal entropy-readiness guarantee.
 4. TLS/chat code is outside the current CLI build and still needs a proper entropy callback and authenticated peer protocol before re-enablement.
-5. BusyBox/libvterm and other vendored components need an inventory-driven upgrade and compatibility pass.
+5. libvterm and other vendored components need an inventory-driven upgrade and compatibility pass.
 6. The new parser boundaries need continuous fuzz regression, not only host mirrors of the old vulnerable snippets.
 
 ## Proposed work

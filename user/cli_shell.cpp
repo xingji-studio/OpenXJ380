@@ -11,20 +11,6 @@ static bool equals(const char *left, const char *right)
     return *left == *right;
 }
 
-static bool copy(char *target, size_t capacity, const char *source)
-{
-    if (target == nullptr || source == nullptr || capacity == 0) return false;
-
-    size_t index = 0;
-    while (source[index] != '\0' && index < capacity - 1)
-    {
-        target[index] = source[index];
-        index++;
-    }
-    target[index] = '\0';
-    return source[index] == '\0';
-}
-
 static void read_line(char *buffer, size_t capacity, uint64_t flags = 0)
 {
     if (buffer == nullptr || capacity == 0) return;
@@ -63,22 +49,6 @@ static bool authenticate()
     }
 }
 
-static int split(char *line, char **arguments, int capacity)
-{
-    int count = 0;
-    char *cursor = line;
-    while (*cursor != '\0' && count < capacity - 1)
-    {
-        while (*cursor == ' ') cursor++;
-        if (*cursor == '\0') break;
-        arguments[count++] = cursor;
-        while (*cursor != '\0' && *cursor != ' ') cursor++;
-        if (*cursor != '\0') *cursor++ = '\0';
-    }
-    arguments[count] = nullptr;
-    return count;
-}
-
 extern "C" int main(int argc, char *argv[], char *envp[])
 {
     (void)argc;
@@ -96,18 +66,6 @@ extern "C" int main(int argc, char *argv[], char *envp[])
         if (equals(line, "exit")) return 0;
         if (equals(line, "clear")) { output("\033[2J\033[H"); continue; }
 
-        char *arguments[16];
-        if (split(line, arguments, 16) == 0) continue;
-        char path[256];
-        copy(path, sizeof(path), "/apps/");
-        char *end = path;
-        while (*end != '\0') end++;
-        if (!copy(end, sizeof(path) - (size_t)(end - path), arguments[0]))
-        {
-            output("command name too long\n");
-            continue;
-        }
-        int64_t result = (int64_t)enter_syscall(XAPI_RUN_ARGS, (uint64_t)path, (uint64_t)arguments, 0, 0, 0, 0);
-        if (result < 0) output("command not found\n");
+        output("external commands are disabled\n");
     }
 }

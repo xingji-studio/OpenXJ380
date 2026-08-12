@@ -50,7 +50,6 @@ typedef struct user_image_startup_storage {
     uint64_t initial_argv;
     uint64_t initial_envp;
     uint64_t entry_rdx;
-    bool linux_abi;
 } user_image_startup_storage_t;
 
 typedef struct user_image_address_space_owner {
@@ -67,7 +66,6 @@ typedef struct user_image_candidate_context {
     lock_queue *virt_queue;
     void *startup_storage;
     user_image_buffer_t main_elf;
-    user_image_buffer_t interpreter_elf;
     char *exe_path;
     char *cmdline;
     char **argv;
@@ -88,7 +86,6 @@ typedef struct user_image_candidate_context {
     uint64_t initial_argv;
     uint64_t initial_envp;
     uint64_t entry_rdx;
-    bool linux_abi;
 } user_image_candidate_context_t;
 
 typedef struct user_image_process_state {
@@ -97,7 +94,6 @@ typedef struct user_image_process_state {
     lock_queue *virt_queue;
     void *startup_storage;
     user_image_buffer_t main_elf;
-    user_image_buffer_t interpreter_elf;
     char *exe_path;
     char *cmdline;
     char **argv;
@@ -117,7 +113,6 @@ typedef struct user_image_process_state {
     uint64_t initial_argv;
     uint64_t initial_envp;
     uint64_t entry_rdx;
-    bool linux_abi;
 } user_image_process_state_t;
 
 typedef struct user_image_snapshot {

@@ -85,7 +85,6 @@ static void clear_process_image(user_image_process_state_t *image)
     if (image == NULL) return;
     free(image->startup_storage);
     clear_buffer(&image->main_elf);
-    clear_buffer(&image->interpreter_elf);
     clear_vector(&image->argv);
     clear_vector(&image->envp);
     free(image->exe_path);
@@ -111,7 +110,6 @@ static void move_candidate(user_image_process_state_t *destination, user_image_c
     destination->virt_queue = source->virt_queue;
     destination->startup_storage = source->startup_storage;
     destination->main_elf = source->main_elf;
-    destination->interpreter_elf = source->interpreter_elf;
     destination->exe_path = source->exe_path;
     destination->cmdline = source->cmdline;
     destination->argv = source->argv;
@@ -131,7 +129,6 @@ static void move_candidate(user_image_process_state_t *destination, user_image_c
     destination->initial_argv = source->initial_argv;
     destination->initial_envp = source->initial_envp;
     destination->entry_rdx = source->entry_rdx;
-    destination->linux_abi = source->linux_abi;
 }
 
 void user_image_candidate_init(user_image_candidate_context_t *candidate)
@@ -256,7 +253,6 @@ void user_image_candidate_discard_elf_buffers(user_image_candidate_context_t *ca
     if (candidate == NULL || (candidate->state != USER_IMAGE_PREPARING && candidate->state != USER_IMAGE_PREPARED))
         return;
     clear_buffer(&candidate->main_elf);
-    clear_buffer(&candidate->interpreter_elf);
 }
 
 void user_image_abort(user_image_candidate_context_t *candidate)

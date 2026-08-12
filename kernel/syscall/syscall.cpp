@@ -33,143 +33,6 @@ sys_(utimensat, int dirfd, char *pathname, const struct timespec *times, int fla
 sys_(utimes, char *filename, const struct timeval *times);
 sys_(close_range, uint32_t first, uint32_t last, uint32_t flags);
 
-static const char *debug_syscall_name(uint64_t nr)
-{
-    switch (nr)
-    {
-    case SYS_READ: return "read";
-    case SYS_WRITE: return "write";
-    case SYS_OPEN: return "open";
-    case SYS_CLOSE: return "close";
-    case SYS_FSTAT: return "fstat";
-    case SYS_IOCTL: return "ioctl";
-    case SYS_PREAD64: return "pread64";
-    case SYS_PWRITE64: return "pwrite64";
-    case SYS_POLL: return "poll";
-    case SYS_LSEEK: return "lseek";
-    case SYS_MMAP: return "mmap";
-    case SYS_MPROTECT: return "mprotect";
-    case SYS_MUNMAP: return "munmap";
-    case SYS_BRK: return "brk";
-    case SYS_MADVISE: return "madvise";
-    case SYS_RT_SIGACTION: return "rt_sigaction";
-    case SYS_RT_SIGPROCMASK: return "rt_sigprocmask";
-    case SYS_ACCESS: return "access";
-    case SYS_PIPE: return "pipe";
-    case SYS_DUP3: return "dup3";
-    case SYS_SELECT: return "select";
-    case SYS_NANOSLEEP: return "nanosleep";
-    case SYS_GETPID: return "getpid";
-    case SYS_SOCKET: return "socket";
-    case SYS_CONNECT: return "connect";
-    case SYS_SENDTO: return "sendto";
-    case SYS_RECVFROM: return "recvfrom";
-    case SYS_SENDMSG: return "sendmsg";
-    case SYS_RECVMSG: return "recvmsg";
-    case SYS_GETSOCKNAME: return "getsockname";
-    case SYS_GETPEERNAME: return "getpeername";
-    case SYS_SETSOCKOPT: return "setsockopt";
-    case SYS_GETSOCKOPT: return "getsockopt";
-    case SYS_SOCKETPAIR: return "socketpair";
-    case SYS_CLONE: return "clone";
-    case SYS_FORK: return "fork";
-    case SYS_VFORK: return "vfork";
-    case SYS_EXECVE: return "execve";
-    case SYS_EXIT: return "exit";
-    case SYS_WAIT4: return "wait4";
-    case SYS_UNAME: return "uname";
-    case SYS_FCNTL: return "fcntl";
-    case SYS_FLOCK: return "flock";
-    case SYS_SYNC: return "sync";
-    case SYS_FSYNC: return "fsync";
-    case SYS_FDATASYNC: return "fdatasync";
-    case SYS_SYNC_FILE_RANGE: return "sync_file_range";
-    case SYS_SYSINFO: return "sysinfo";
-    case SYS_SETUID: return "setuid";
-    case SYS_SETGID: return "setgid";
-    case SYS_SETGROUPS: return "setgroups";
-    case SYS_SETRESUID: return "setresuid";
-    case SYS_GETRESUID: return "getresuid";
-    case SYS_SETRESGID: return "setresgid";
-    case SYS_GETRESGID: return "getresgid";
-    case SYS_SETFSUID: return "setfsuid";
-    case SYS_SETFSGID: return "setfsgid";
-    case SYS_CAPGET: return "capget";
-    case SYS_CAPSET: return "capset";
-    case SYS_GETPGRP: return "getpgrp";
-    case SYS_SETSID: return "setsid";
-    case SYS_GETSID: return "getsid";
-    case SYS_GETCWD: return "getcwd";
-    case SYS_CHDIR: return "chdir";
-    case SYS_FCHDIR: return "fchdir";
-    case SYS_GETTIMEOFDAY: return "gettimeofday";
-    case SYS_GETDENTS64: return "getdents64";
-    case SYS_RENAME: return "rename";
-    case SYS_RMDIR: return "rmdir";
-    case SYS_UNLINK: return "unlink";
-    case SYS_STATFS: return "statfs";
-    case SYS_MKDIRAT: return "mkdirat";
-    case SYS_RENAMEAT: return "renameat";
-    case SYS_LINKAT: return "linkat";
-    case SYS_SYMLINKAT: return "symlinkat";
-    case SYS_CLOCK_GETTIME: return "clock_gettime";
-    case SYS_CLOCK_NANOSLEEP: return "clock_nanosleep";
-    case SYS_EXIT_GROUP: return "exit_group";
-    case SYS_UTIMES: return "utimes";
-    case SYS_OPENAT: return "openat";
-    case SYS_NEWFSTATAT: return "newfstatat";
-    case SXAH_INSTALLER_ENUM_DISKS: return "sxah_installer_enum_disks";
-    case SXAH_INSTALLER_START: return "sxah_installer_start";
-    case SXAH_INSTALLER_PROGRESS: return "sxah_installer_progress";
-    case SXAH_INSTALLER_PRECHECK: return "sxah_installer_precheck";
-    case SXAH_INSTALLER_START_EX: return "sxah_installer_start_ex";
-    case SXAH_INSTALLER_RESCUE: return "sxah_installer_rescue";
-    case SXAH_INSTALLER_LOG: return "sxah_installer_log";
-    case SXAH_INSTALLER_START_OPTIONS: return "sxah_installer_start_options";
-    case SXAH_INSTALLER_PRECHECK_OPTIONS: return "sxah_installer_precheck_options";
-    case SYS_READLINKAT: return "readlinkat";
-    case SYS_PSELECT6: return "pselect6";
-    case SYS_PIPE2: return "pipe2";
-    case SYS_FTRUNCATE: return "ftruncate";
-    case SYS_FSTATFS: return "fstatfs";
-    case SYS_PRLIMIT64: return "prlimit64";
-    case SYS_SENDMMSG: return "sendmmsg";
-    case SYS_GETRANDOM: return "getrandom";
-    case SYS_FUTEX: return "futex";
-    case SYS_EPOLL_CREATE: return "epoll_create";
-    case SYS_EPOLL_WAIT: return "epoll_wait";
-    case SYS_EPOLL_CTL: return "epoll_ctl";
-    case SYS_EPOLL_PWAIT: return "epoll_pwait";
-    case SYS_EPOLL_CREATE1: return "epoll_create1";
-    case SYS_PRCTL: return "prctl";
-    case SYS_ARCH_PRCTL: return "arch_prctl";
-    case SYS_CHROOT: return "chroot";
-    case SYS_FLISTXATTR: return "flistxattr";
-    case SYS_SET_TID_ADDRESS: return "set_tid_address";
-    case SYS_FADVISE64: return "fadvise64";
-    case SYS_COPY_FILE_RANGE: return "copy_file_range";
-    case SYS_SET_ROBUST_LIST: return "set_robust_list";
-    case SYS_RSEQ: return "rseq";
-    case SYS_CLONE3: return "clone3";
-    case SYS_CLOSE_RANGE: return "close_range";
-    default: return "?";
-    }
-}
-
-static bool debug_trace_xbps_task()
-{
-    tcb_t task = get_current_task();
-    if (task == NULL || task->parent_group == NULL || !task->parent_group->linux_abi) return false;
-    return strstr(task->name, "xbps") != NULL || strstr(task->parent_group->name, "xbps") != NULL;
-}
-
-static bool debug_trace_grep_task()
-{
-    tcb_t task = get_current_task();
-    if (task == NULL || task->parent_group == NULL || !task->parent_group->linux_abi) return false;
-    return strstr(task->name, "grep") != NULL || strstr(task->parent_group->name, "grep") != NULL;
-}
-
 void init_syscall()
 {
     uint64_t efer;
@@ -232,20 +95,6 @@ extern "C" uint64_t c_syscall_handler(struct X64_REGS *regs, uint64_t user_rsp)
     }
 
     uint64_t syscall_number = regs->rax;
-    bool trace_grep = debug_trace_grep_task();
-    if (trace_grep)
-    {
-        write_serial_fmt("[DEBUG-grep-syscall] enter task=%s nr=%llu(%s) args=%llx,%llx,%llx,%llx,%llx rip=%llx\n",
-                         syscall_task != NULL ? syscall_task->name : "?",
-                         syscall_number,
-                         debug_syscall_name(syscall_number),
-                         regs->rdi,
-                         regs->rsi,
-                         regs->rdx,
-                         regs->r10,
-                         regs->r8,
-                         regs->rip);
-    }
 
     switch (syscall_number)
     {
@@ -668,8 +517,6 @@ extern "C" uint64_t c_syscall_handler(struct X64_REGS *regs, uint64_t user_rsp)
     case XAPI_GET_CPU_MODEL: get_cpu_name((char *)regs->rdi); break;
     case XAPI_GET_MEMORY_SIZE: regs->rax = do_xapi_GetMemorySize(); break;
     case XAPI_SEND_APP_MSG: regs->rax = do_xapi_SendAppMessage((char *)regs->rdi, (char *)regs->rsi); break;
-    case XAPI_RUN: do_xapi_Run((char *)regs->rdi); break;
-    case XAPI_RUN_ARGS: regs->rax = do_xapi_RunArgs((char *)regs->rdi, (char **)regs->rsi); break;
     case XAPI_MAP_MEMORY: regs->rax = do_xapi_MapMemory(regs->rdi, regs->rsi, regs->rdx); break;
     case XAPI_REMOVEDIR: sys_rmdir(regs->rdi, 0, 0, 0, 0, 0, regs); break;
     case XAPI_FLUSH_TIME: regs->rax = (uint64_t)-ENOSYS; break;
@@ -711,29 +558,6 @@ extern "C" uint64_t c_syscall_handler(struct X64_REGS *regs, uint64_t user_rsp)
         write_serial_dec(syscall_number);
         write_serial_string("\n");
         break;
-    }
-    if (debug_trace_xbps_task() && (int64_t)regs->rax < 0)
-    {
-        tcb_t task = get_current_task();
-        write_serial_fmt("[DEBUG-xbps-syscall] task=%s nr=%llu(%s) args=%llx,%llx,%llx,%llx,%llx ret=%lld\n",
-                         task != NULL ? task->name : "?",
-                         syscall_number,
-                         debug_syscall_name(syscall_number),
-                         regs->rdi,
-                         regs->rsi,
-                         regs->rdx,
-                         regs->r10,
-                         regs->r8,
-                         (long long)regs->rax);
-    }
-    if (trace_grep)
-    {
-        tcb_t task = get_current_task();
-        write_serial_fmt("[DEBUG-grep-syscall] ret task=%s nr=%llu(%s) ret=%lld\n",
-                         task != NULL ? task->name : "?",
-                         syscall_number,
-                         debug_syscall_name(syscall_number),
-                         (long long)regs->rax);
     }
     signal_deliver_pending(regs);
     tcb_t return_task = get_current_task();

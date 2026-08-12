@@ -1293,13 +1293,6 @@ static size_t stdin_read(int drive, uint8_t *buffer, size_t number, size_t lba) 
 
     if (!is_sti) close_interrupt;
 
-    pcb_t process = get_current_task() ? get_current_task()->parent_group : NULL;
-    if (process != NULL && process->linux_abi) {
-        // write_serial_fmt("[] stdin_read requested=%llu ret=%llu\n",
-        //                  (unsigned long long)number,
-        //                  (unsigned long long)i);
-    }
-
     return i;
 }
 

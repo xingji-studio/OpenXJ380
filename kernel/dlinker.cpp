@@ -623,6 +623,19 @@ void load_all_kernel_module() {
     }
 }
 
+bool kernel_module_loaded(const char *module_name)
+{
+    if (module_name == NULL) return false;
+
+    for (size_t i = 0; i < MAX_KERNEL_MODULE; ++i)
+    {
+        kernel_mode_t *kmod = kmods[i];
+        if (kmod == NULL || kmod->module == NULL) continue;
+        if (strcmp(kmod->module->module_name, module_name) == 0) return kmod->loaded;
+    }
+    return false;
+}
+
 
 
 
@@ -1621,8 +1634,11 @@ void dlinker_load(kernel_mode_t* kmod, cp_module_t* module) {
     }
     
     kmod->module = module;
-    write_serial_fmt("Loaded kernel module: %s at 0x%llx\n", 
-                     module->module_name, handle->base_addr);
+    kmod->loaded = kmod->entry != NULL && kmod->entry_exit_code == 0;
+    if (kmod->loaded)
+        write_serial_fmt("Loaded kernel module: %s at 0x%llx\n", module->module_name, handle->base_addr);
+    else
+        write_serial_fmt("Kernel module failed: %s exit=%d\n", module->module_name, kmod->entry_exit_code);
 }
 
 void dlinker_init() {

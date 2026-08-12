@@ -21,13 +21,6 @@ OVMF_FIRMWARE_CANDIDATES = (
     Path("/usr/share/ovmf/OVMF.fd"),
 )
 
-XBPS_BOOTSTRAP_BASE = (
-    "base-minimal bash dash coreutils findutils sed grep gawk diffutils gzip tar "
-    "bzip2 util-linux ncurses tzdata which fastfetch gcc binutils make strace "
-    "inetutils bind-utils curl"
-)
-
-
 def env(name: str, default: str) -> str:
     value = os.environ.get(name)
     return default if value is None else value
@@ -121,77 +114,10 @@ def stage_base(root: Path) -> None:
     run(["sh", "tools/stage_image_base.sh", str(root)])
 
 
-def host_gcc_triple() -> str:
-    return capture([env("HOST_GCC", "gcc"), "-dumpmachine"])
-
-
-def stage_selfhost_user(root: Path) -> None:
-    for rel in ("apps/user", "apps/include", "apps/lib", "apps/liballoc-x86_64.a"):
-        rm_rf(root / rel)
-    cp(ROOT / "user", root / "apps/user")
-    cp(ROOT / "include", root / "apps/include")
-    cp(ROOT / "lib", root / "apps/lib")
-    cp(ROOT / "liballoc-x86_64.a", root / "apps/liballoc-x86_64.a")
-    shell(f'find "{root / "apps/user"}" -type d -name .git -prune -exec rm -rf {{}} +')
-
-
-def stage_linux_compat(root: Path) -> None:
-    stage_selfhost_user(root)
-    triple = host_gcc_triple()
-    cp("/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2", root / "lib64/ld-linux-x86-64.so.2")
-    cp(ROOT / "resources/musl/ld-musl-x86_64.so.1", root / "lib/ld-musl-x86_64.so.1")
-    cp(ROOT / "resources/musl/libc.so", root / "lib/libc.so")
-    cp(ROOT / "resources/musl/libc.musl-x86_64.so.1", root / "lib/libc.musl-x86_64.so.1")
-    cp(ROOT / "resources/musl/libgcc_s.so.1", root / "lib/libgcc_s.so.1")
-    if triple:
-        cp(f"/lib/{triple}/libc.so.6", root / "lib64/libc.so.6")
-
-    if env_bool("IMAGE_BUSYBOX", "1"):
-        cp(env("APP_BUSYBOX", "resources/apps/busybox"), root / "apps/busybox")
-    if (ROOT / "lolcat_100.0.1-3_all.deb").exists():
-        cp(ROOT / "lolcat_100.0.1-3_all.deb", root / "apps/lolcat.deb")
-    cp(env("APP_FASTFETCH", "resources/apps/fastfetch"), root / "apps/fastfetch")
-
-    stage_env = {
-        "IMAGE_TOOLCHAIN": env("IMAGE_TOOLCHAIN", "clang"),
-        "HOST_GCC": env("HOST_GCC", "gcc"),
-        "HOST_CLANG": env("HOST_CLANG", "clang"),
-        "HOST_CLANGXX": env("HOST_CLANGXX", "clang++"),
-        "HOST_LLVM_AR": env("HOST_LLVM_AR", "llvm-ar"),
-        "HOST_LLVM_RANLIB": env("HOST_LLVM_RANLIB", "llvm-ranlib"),
-        "STAGE_ELF_DEPS": env("STAGE_ELF_DEPS", "tools/stage_elf_deps.sh"),
-    }
-    run(["sh", env("STAGE_IMAGE_TOOLCHAIN", "tools/stage_image_toolchain.sh"), str(root)], env_extra=stage_env)
-    run([env("STAGE_ELF_DEPS", "tools/stage_elf_deps.sh"), str(root), env("APP_FASTFETCH", "resources/apps/fastfetch")])
-
-    package_manager = env("IMAGE_PACKAGE_MANAGER", "xbps")
-    if package_manager == "xbps":
-        run(
-            ["sh", env("STAGE_IMAGE_XBPS", "tools/stage_image_xbps.sh"), str(root)],
-            env_extra={
-                "IMAGE_BUSYBOX": env("IMAGE_BUSYBOX", "1"),
-                "APP_BUSYBOX": env("APP_BUSYBOX", "resources/apps/busybox"),
-                "STAGE_ELF_DEPS": env("STAGE_ELF_DEPS", "tools/stage_elf_deps.sh"),
-            },
-        )
-        if env("XBPS_BOOTSTRAP", XBPS_BOOTSTRAP_BASE):
-            prepared = Path(env("XBPS_PREPARE_ROOT", "Bf/xbps-root"))
-            if not (prepared / "var/db/xbps").is_dir():
-                print(f"missing prepared xbps root: {prepared}", file=sys.stderr)
-                print("run: ninja prepare", file=sys.stderr)
-                raise SystemExit(1)
-            run(
-                ["sh", env("STAGE_PREPARED_ROOT", "tools/stage_prepared_root.sh"), str(prepared), str(root)],
-                env_extra={"IMAGE_BUSYBOX": env("IMAGE_BUSYBOX", "1")},
-            )
-    elif package_manager != "none":
-        print(f"unsupported IMAGE_PACKAGE_MANAGER={package_manager} (expected xbps or none)", file=sys.stderr)
-        raise SystemExit(1)
-
-
 def copy_system_apps(root: Path) -> None:
     system = root / "apps/system"
     cp(ROOT / "out/shell.elf", system)
+    cp(ROOT / "resources/system/config/init.conf", root / "system/config/init.conf")
 
 
 def copy_common_assets(root: Path) -> None:
@@ -199,44 +125,19 @@ def copy_common_assets(root: Path) -> None:
 
 
 def copy_modules(root: Path) -> None:
-    builtin_xhci = env_bool("BUILTIN_XHCI", "1")
     for sys_file in sorted((ROOT / "out").glob("*.sys")):
         rm_rf(root / "mod" / f"{sys_file.stem}.km")
-        if builtin_xhci and sys_file.name == "xhci.sys":
-            rm_rf(root / "mod" / sys_file.name)
-            continue
         cp(sys_file, root / "mod")
 
 
-def copy_license_material(root: Path, *, complete: bool) -> None:
-    destination = root / "usr/share/doc/xj380/licenses"
+def copy_license_material(root: Path) -> None:
+    destination = root / "system/licenses"
     mkdir(destination)
     cp(ROOT / "LICENSE", destination / "LICENSE")
     cp(ROOT / "LICENSES.md", destination / "LICENSES.md")
     cp(ROOT / "THIRD_PARTY_NOTICES.md", destination / "THIRD_PARTY_NOTICES.md")
     for license_file in sorted((ROOT / "licenses").glob("*.txt")):
         cp(license_file, destination / license_file.name)
-
-    if not complete:
-        return
-
-    external_root = Path(env("COMPLETE_LICENSES", "licenses/complete"))
-    required = ("musl", "gcc-runtime", "glibc-runtime", "busybox", "fastfetch", "xbps", "void-packages")
-    missing = [name for name in required if not (ROOT / external_root / name).is_dir()]
-    if missing:
-        raise RuntimeError(
-            "complete image license material is missing under "
-            f"{external_root}: {', '.join(missing)}; set COMPLETE_LICENSES to the resolved source directory"
-        )
-    for name in required:
-        cp(ROOT / external_root / name, destination / name)
-
-    # Package-manager installs expose their notices below /usr/share/licenses.
-    # Preserve them with the resolved XBPS material instead of flattening them.
-    system_licenses = root / "usr/share/licenses"
-    if system_licenses.is_dir():
-        shell(f'cp -a "{system_licenses}"/. "{destination / "xbps"}"/')
-
 
 def fix_links(root: Path) -> None:
     shell(f'find "{root}" -xtype l -delete')
@@ -247,53 +148,19 @@ def fix_links(root: Path) -> None:
     )
 
 
-def stage_full_system(root: Path, *, include_linux_compat: bool) -> None:
+def stage_full_system(root: Path) -> None:
     stage_base(root)
     cp(ROOT / "out/BOOTX64.efi", root / "EFI/BOOT")
     cp(ROOT / "out/kernel.krl", root / "system")
     copy_system_apps(root)
-    if include_linux_compat:
-        stage_linux_compat(root)
     copy_common_assets(root)
     copy_modules(root)
-    copy_license_material(root, complete=include_linux_compat)
-    mkdir(root / "system/licenses")
+    copy_license_material(root)
     cp(ROOT / "out/compliance/third-party", root / "system/licenses/third-party")
     fix_links(root)
 
 
-def prepare() -> None:
-    if env("IMAGE_PACKAGE_MANAGER", "xbps") == "xbps" and env("XBPS_BOOTSTRAP", XBPS_BOOTSTRAP_BASE):
-        root = Path(env("XBPS_PREPARE_ROOT", "Bf/xbps-root"))
-        marker = root / ".xj380-bootstrap-complete"
-        chmod_rw(root)
-        rm_rf(root)
-        run(
-            ["sh", env("STAGE_XBPS_BOOTSTRAP", "tools/stage_xbps_bootstrap.sh"), str(root)],
-            env_extra={
-                "IMAGE_BUSYBOX": env("IMAGE_BUSYBOX", "1"),
-                "XBPS_BOOTSTRAP": env("XBPS_BOOTSTRAP", XBPS_BOOTSTRAP_BASE),
-                "XBPS_BOOTSTRAP_BASE": env("XBPS_BOOTSTRAP_BASE", XBPS_BOOTSTRAP_BASE),
-                "BF_DIR": env("BF_DIR", "Bf"),
-            },
-        )
-        marker.touch()
-    else:
-        print(f"Nothing to prepare for IMAGE_PACKAGE_MANAGER={env('IMAGE_PACKAGE_MANAGER', 'xbps')}")
-
-
-def installer_prepare() -> None:
-    if env("IMAGE_PACKAGE_MANAGER", "xbps") != "xbps" or not env("XBPS_BOOTSTRAP", XBPS_BOOTSTRAP_BASE):
-        return
-    root = Path(env("XBPS_PREPARE_ROOT", "Bf/xbps-root"))
-    marker = root / ".xj380-bootstrap-complete"
-    if marker.is_file() or (root / "usr/bin/gcc").is_file():
-        return
-    print(f"Preparing installer xbps root: {root}")
-    prepare()
-
-
-def vdisk(*, complete: bool) -> None:
+def vdisk() -> None:
     image = ROOT / "XJ380.img"
     image.unlink(missing_ok=True)
     vdisk_root = Path(env("VDISK_ROOT", f"/tmp/xj380-vdisk-{os.getuid()}/XJ380"))
@@ -305,46 +172,9 @@ def vdisk(*, complete: bool) -> None:
         f'{sudo + " " if sudo else ""}mkfs.vfat -F 32 --offset 2048 -S 512 '
         f'XJ380.img $(( {env("VDISK_FAT_MIB", "3072")} * 1024 ))'
     )
-    stage_full_system(vdisk_root, include_linux_compat=complete)
+    stage_full_system(vdisk_root)
     shell(f'mcopy -o -s -i XJ380.img@@$((2048*512)) "{vdisk_root}"/* ::')
     reset_dir(vdisk_root, explain_fix=True)
-
-
-def installer_system_stage() -> None:
-    installer_prepare()
-    root = Path(env("INSTALLER_SYSTEM_ROOT", f"/tmp/xj380-installer-{os.getuid()}/system-root"))
-    reset_dir(root)
-    stage_full_system(root, include_linux_compat=True)
-    run(["python3", env("MAKE_PAK", "tools/make_pak.py"), str(root), env("INSTALLER_SYSTEM_PAK", "out/system-payload.pak")])
-
-
-def installer_root_stage() -> None:
-    root = Path(env("INSTALLER_ROOT", f"/tmp/xj380-installer-{os.getuid()}/installer-root"))
-    reset_dir(root)
-    for rel in (
-        "apps",
-        "apps/system",
-        "apps/builtin",
-        "tmp",
-    ):
-        mkdir(root / rel)
-    cp(ROOT / "out/shell.elf", root / "apps/system/shell.elf")
-    run(["python3", env("MAKE_PAK", "tools/make_pak.py"), str(root), env("INSTALLER_ROOT_PAK", "out/installer-root.pak")])
-
-
-def installer_iso() -> None:
-    (ROOT / "XJ380-installer.iso").unlink(missing_ok=True)
-    run(
-        [
-            "sh",
-            env("MAKE_INSTALLER_ISO", "tools/make_installer_iso.sh"),
-            env("INSTALLER_ISO_ROOT", f"/tmp/xj380-installer-{os.getuid()}/iso-root"),
-            "out/BOOTX64.efi",
-            "out/kernel.krl",
-            env("INSTALLER_ROOT_PAK", "out/installer-root.pak"),
-            env("INSTALLER_SYSTEM_PAK", "out/system-payload.pak"),
-        ]
-    )
 
 
 def vmdk() -> None:
@@ -493,9 +323,6 @@ def size_report() -> None:
         [
             Path("XJ380.img"),
             Path("XJ380.vmdk"),
-            Path("XJ380-installer.iso"),
-            Path("out/system-payload.pak"),
-            Path("out/installer-root.pak"),
         ],
     )
 
@@ -568,7 +395,7 @@ def check_tools() -> None:
                                 "编译 Rust no_std 用户态应用", "rustup toolchain install stable")
     check_required_tool(missing, "x86_64-w64-mingw32-gcc", ["x86_64-w64-mingw32-gcc"], "编译 UEFI bootloader",
                         "sudo apt install gcc-mingw-w64-x86-64")
-    check_required_tool(missing, "python3", ["python3"], "生成 Ninja 和打包 installer payload",
+    check_required_tool(missing, "python3", ["python3"], "生成 Ninja 和镜像工具",
                         "sudo apt install python3")
     check_required_tool(missing, "ninja", ["ninja", "ninja-build"], "执行 Ninja 构建",
                         "sudo apt install ninja-build")
@@ -576,7 +403,7 @@ def check_tools() -> None:
     check_required_tool(missing, "sgdisk", ["sgdisk"], "创建 GPT/EFI 分区", "sudo apt install gdisk")
     check_required_tool(missing, "mkfs.vfat", ["mkfs.vfat"], "格式化 FAT32 EFI 分区",
                         "sudo apt install dosfstools")
-    check_required_tool(missing, "qemu-system-x86_64", ["qemu-system-x86_64"], "运行 XJ380 / installer",
+    check_required_tool(missing, "qemu-system-x86_64", ["qemu-system-x86_64"], "运行 XJ380",
                         "sudo apt install qemu-system-x86")
     check_required_tool(missing, "qemu-img", ["qemu-img"], "生成 VMDK 镜像", "sudo apt install qemu-utils")
     check_required_tool(missing, "xorriso", ["xorriso"], "生成 UEFI 安装 ISO", "sudo apt install xorriso")
@@ -616,7 +443,7 @@ def graph() -> None:
     out_dir = ROOT / "out"
     out_dir.mkdir(parents=True, exist_ok=True)
     dot_path = out_dir / "build-graph.dot"
-    targets = env("NINJA_GRAPH_TARGETS", "all vdisk installer.iso").split()
+    targets = env("NINJA_GRAPH_TARGETS", "all vdisk").split()
     with dot_path.open("w", encoding="utf-8") as f:
         subprocess.run([ninja, "-t", "graph", *targets], cwd=str(ROOT), stdout=f, check=True)
 
@@ -636,15 +463,7 @@ def main() -> None:
     args = parser.parse_args()
 
     commands = {
-        "prepare": prepare,
-        "installer-prepare": installer_prepare,
-        "stage-selfhost-user": lambda: stage_selfhost_user(Path(env("VDISK_ROOT", f"/tmp/xj380-vdisk-{os.getuid()}/XJ380"))),
-        "stage-linux-compat": lambda: stage_linux_compat(Path(env("VDISK_ROOT", f"/tmp/xj380-vdisk-{os.getuid()}/XJ380"))),
-        "vdisk": lambda: vdisk(complete=False),
-        "complete": lambda: vdisk(complete=True),
-        "installer-system-stage": installer_system_stage,
-        "installer-root-stage": installer_root_stage,
-        "installer-iso": installer_iso,
+        "vdisk": vdisk,
         "vmdk": vmdk,
         "run": run_qemu,
         "clean": clean,

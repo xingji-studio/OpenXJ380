@@ -19,8 +19,8 @@ XJ380/
 ├── kmod/                 # Loadable kernel modules -> out/*.sys -> image /mod
 ├── user/                 # XAPI runtime/API plus one CLI example
 ├── third_party/          # Vendored upstream source drops; avoid local edits
-├── Bf/                   # Host-independent staging resources for image/xbps
-├── tools/                # Image/rootfs/toolchain/xbps staging scripts
+├── Bf/                   # Host-independent staging resources
+├── tools/                # Image/rootfs/toolchain staging scripts
 └── resources/            # Files copied into /system/resources
 ```
 
@@ -99,4 +99,4 @@ ninja -f build.ninja prepare
 - `ninja vdisk` may need privileged `sgdisk`, `mkfs.vfat`, and `mcopy`; temporary root defaults under `/tmp/xj380-vdisk-$(id -u)/XJ380`.
 - Main artifacts: `out/`, `XJ380.img`, optional `XJ380.vmdk`, `serial.log`, generated `.clangd`, generated `kernel/build_config.h`.
 - Version strings live in both `tools/stage_image_base.sh` and `kernel/build_settings.h`.
-- `tools/check_line_endings.sh` rejects CRLF in `tools/*.sh` and `Bf/xbps-triggers/*`.
+- `tools/check_line_endings.sh` rejects CRLF in `tools/*.sh`.

@@ -38,7 +38,7 @@ cd /mnt/c/Users/mnsjt/OpenXJ380
 # 1. 生成构建图（构建图不允许手改，修改需改 tools/gen_ninja.py）
 python3 tools/gen_ninja.py --out build.ninja
 
-# 2. 全量编译（boot/kernel/xapi/user/kmod/busybox 等）
+# 2. 全量编译（boot/kernel/xapi/user/kmod 等）
 ninja -f build.ninja all -j 24
 ```
 
@@ -49,7 +49,7 @@ ninja -f build.ninja all -j 24
 | `out/kernel.krl` | 内核镜像（kernel + 内建驱动 + 字体） |
 | `out/BOOTX64.efi` | UEFI 启动器 |
 | `out/*.sys` | 可加载内核模块（xhci、e1000、netserver） |
-| `out/apps/*` | 用户 ELF 程序 / busybox |
+| `out/shell.elf` | XAPI shell 用户 ELF 程序 |
 
 可选检查：`ninja -f build.ninja check`（单元测试与构建图自检）。
 

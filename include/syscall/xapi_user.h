@@ -8,7 +8,6 @@
 static constexpr size_t XAPI_USER_STRING_MAX = 4096UL;
 static constexpr size_t XAPI_USER_PATH_MAX   = 4096UL;
 static constexpr size_t XAPI_IO_BOUNCE_BYTES = 0x10000UL;
-static constexpr size_t XAPI_RUN_ARG_MAX     = 128UL;
 
 static inline page_directory_t *xapi_current_pagedir()
 {

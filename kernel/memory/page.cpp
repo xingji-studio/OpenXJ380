@@ -457,6 +457,7 @@ err:;
         ulog_err("Page Fault (0x0000000e)");
         if (current_task != NULL && current_task->parent_group != NULL)
         {
+            current_task->parent_group->abnormal_exit = true;
             kill_proc(current_task->parent_group, 128 + 11, true);
             enable_scheduler();
             open_interrupt;

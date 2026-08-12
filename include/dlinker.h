@@ -61,6 +61,7 @@ typedef struct kernel_mode {
     dlinit_t     entry;
     dlinit_t     task_entry;
     int          entry_exit_code;
+    bool         loaded;
 } kernel_mode_t;
 
 /**
@@ -79,6 +80,7 @@ void dlinker_init();
 void load_all_kernel_module();
 
 void start_all_kernel_module();
+bool kernel_module_loaded(const char *module_name);
 
 void module_setup();
 // 动态库句柄

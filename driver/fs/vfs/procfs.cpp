@@ -568,7 +568,7 @@ char *proc_gen_stat_file(pcb_t task, size_t *content_len) {
     uint64_t kstkesp = main_thread ? main_thread->kernel_stack : 0;
     uint64_t ksteip = main_thread ? main_thread->context0.rip : 0;
     uint32_t processor = main_thread ? (uint32_t)main_thread->cpu_id : 0;
-    uint32_t flags = task->linux_abi ? 0x00400000u : 0;
+    uint32_t flags = 0;
     int exit_signal = task->status == ZOMBIE ? SIGCHLD : 0;
     int priority = task->task_level == TASK_KERNEL_LEVEL ? 5 : 6;
     size_t num_threads = task->thread_queue ? task->thread_queue->size : 0;

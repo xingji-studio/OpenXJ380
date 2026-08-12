@@ -116,8 +116,6 @@ typedef struct {
 #define XAPI_SEND_APP_MSG   7429
 #define XAPI_SLEEP          7430
 
-#define XAPI_RUN            7439
-#define XAPI_RUN_ARGS       7451
 #define XAPI_USER_OOBE_REQUIRED 7452
 #define XAPI_USER_LIST          7453
 #define XAPI_USER_LOGIN         7454
@@ -296,8 +294,6 @@ void do_xapi_CloseFile(uint64_t ptr);
 void do_xapi_Broken(char *info);
 void do_xapi_GetTimeX(uint64_t tt);
 uint64_t do_xapi_GetMemorySize();
-void do_xapi_Run(char *path);
-uint64_t do_xapi_RunArgs(char *path, char **argv);
 uint64_t do_xapi_MapMemory(uint64_t ptr, uint64_t size, uint32_t flags);
 void do_xapi_FlushTime();
 uint64_t do_xapi_GetTaskList(uint64_t buffer, uint64_t max_count);

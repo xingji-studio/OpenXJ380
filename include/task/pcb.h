@@ -108,6 +108,8 @@ struct process_control_block
     uint64_t            exec_freeze_ack_mask[EXEC_FREEZE_CPU_WORDS];
     size_t            queue_index;  // 进程队列索引
     TaskStatus        status;       // 进程状态
+    bool              is_initial_program;
+    bool              abnormal_exit;
 
     lock_queue       *ipc_queue;   // 进程消息队列
 
@@ -142,7 +144,6 @@ struct process_control_block
     uint64_t    prepared_user_argv;
     uint64_t    prepared_user_envp;
     uint64_t    prepared_user_entry_rdx;
-    bool        linux_abi;
     uint16_t    umask;
     vma_manager_t     vma_manager; // VMA 分配管理器
     vfs_node_t        procfs_node; // 进程私有 procfs 文件句柄

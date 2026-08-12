@@ -200,94 +200,125 @@ EXPORT_SYMBOL(OpenXJ380Socket_UnregisterSyscallHook);
 extern bool allow_to_flush;
 extern void ahci_set_accel(bool enabled);
 extern bool ahci_is_qemu_environment();
+EFI_SYSTEM_TABLE *EFI_ST;
 extern BOOT_CONFIG *EFI_BC;
 
 extern UserInfo *current_user;
 
-static char busybox_alias_applets[][16] = {
-    "[",       "[[",      "ash",      "awk",      "basename", "cat",      "chmod",   "chgrp",
-    "chown",   "clear",   "cmp",      "cp",       "cut",      "date",     "dd",      "df",
-    "dirname", "dmesg",   "du",       "echo",     "egrep",    "env",      "false",   "fgrep",
-    "find",    "free",    "grep",     "gunzip",   "gzip",     "head",     "hexdump", "hostname",
-    "id",      "ifconfig","install",  "ip",       "kill",     "killall",  "less",    "ln",
-    "ls",
-    "mkdir",   "more",    "mount",    "mv",       "nc",       "netstat",  "nslookup","od",
-    "pgrep",   "pidof",   "ping",     "pkill",    "printenv", "printf",   "ps",      "pwd",
-    "readlink","realpath","reset",    "rm",       "rmdir",    "route",    "sed",     "sh",
-    "sleep",   "sort",    "stat",     "stty",     "sync",     "tail",     "tar",     "test",
-    "top",     "touch",   "tr",       "true",     "tty",      "umount",   "uname",   "uniq",
-    "unzip",   "uptime",  "usleep",   "vi",       "wc",       "which",   "whoami",
-    "xargs",   "xxd",     "zcat",     NULL,
-};//暴力枚举这一块，好像只能这么做了
-  //Maybe we can try to load this applet when vfs inited.
+static constexpr size_t INIT_CONFIG_MAX_BYTES = 4096;
+static constexpr size_t INIT_CONFIG_MAX_MODULES = 16;
 
-static void load_busybox_alias_applets()
+struct initial_program_config
 {
-    if (current_user == NULL) return;
+    char path[256];
+    char required_modules[INIT_CONFIG_MAX_MODULES][32];
+    size_t required_module_count;
+};
 
-    char setfile_path[256];
-    memset(setfile_path, 0, 256);
-    strcat(setfile_path, "/etc/busybox/alias/applets.dat");
-    vfs_node_t vfp = vfs_open(setfile_path);
-    if (!vfp) return;
-    char tmp[1024];
-    if (vfp->size >= sizeof(tmp))
+static bool init_config_module_name_valid(const char *name)
+{
+    if (name == NULL || name[0] == '\0') return false;
+    for (const char *cursor = name; *cursor != '\0'; ++cursor)
     {
-        vfs_close(vfp);
-        return;
+        if (!((*cursor >= 'a' && *cursor <= 'z') || (*cursor >= 'A' && *cursor <= 'Z') ||
+              (*cursor >= '0' && *cursor <= '9') || *cursor == '_' || *cursor == '-'))
+            return false;
     }
-    vfs_read(vfp, tmp, 0, vfp->size);
-    char alias[8];
-    memset(alias, 0, 8);
-    int applet_index = 0, alias_index = 0;
-    const int applet_count = sizeof(busybox_alias_applets) / sizeof(busybox_alias_applets[0]);
-    for (uint64_t i = 0; i < vfp->size && applet_index < applet_count - 1; i++)
-    {
-        if (tmp[i] == ',')
-        {
-            strcpy(busybox_alias_applets[applet_index], alias);
-            applet_index++;
-            alias_index = 0;
-            memset(alias, 0, sizeof(alias));
-            continue;
-        }
-        if (alias_index < sizeof(alias) - 1) alias[alias_index++] = tmp[i];
-    }
-    if (alias_index > 0 && applet_index < applet_count - 1) strcpy(busybox_alias_applets[applet_index], alias);
-
-    vfs_close(vfp);
+    return true;
 }
 
-static const char *busybox_binary_path = "/apps/busybox";
-
-static void setup_xbps_vfs_aliases()
+static char *init_config_trim(char *value)
 {
-    static const char *xbps_void_key_alias =
-        "/var/db/xbps/keys/60:ae:0c:d6:f0:95:17:80:bc:93:46:7a:89:af:a3:2d.plist";
-    static const char *xbps_void_key_target =
-        "/var/db/xbps/keys/60_ae_0c_d6_f0_95_17_80_bc_93_46_7a_89_af_a3_2d.plist";
-
-    if (vfs_register_alias(xbps_void_key_alias, xbps_void_key_target) == EOK)
-    {
-        write_serial_fmt("[xbps-debug] key alias %s -> %s\n", xbps_void_key_alias, xbps_void_key_target);
-    }
+    while (*value == ' ' || *value == '\t' || *value == '\r') ++value;
+    char *end = value + strlen(value);
+    while (end != value && (end[-1] == ' ' || end[-1] == '\t' || end[-1] == '\r')) --end;
+    *end = '\0';
+    return value;
 }
 
-static void setup_busybox_vfs_aliases()
+static bool load_initial_program_config(initial_program_config *config, const char **error)
 {
-    const char *prefixes[] = {"/apps", "/bin", NULL};
-    for (int p = 0; prefixes[p] != NULL; p++)
+    if (config == NULL || error == NULL) return false;
+    memset(config, 0, sizeof(*config));
+    *error = "invalid configuration state";
+
+    vfs_node_t file = vfs_open("/system/config/init.conf");
+    if (file == NULL) { *error = "missing /system/config/init.conf"; return false; }
+    if (file->size == 0 || file->size >= INIT_CONFIG_MAX_BYTES)
     {
-        for (int i = 0; busybox_alias_applets[i][0] != '\0'; i++)
+        vfs_close(file);
+        *error = "invalid init.conf size";
+        return false;
+    }
+
+    char content[INIT_CONFIG_MAX_BYTES];
+    size_t read = vfs_read(file, content, 0, file->size);
+    vfs_close(file);
+    if (read != file->size) { *error = "failed to read init.conf"; return false; }
+    content[read] = '\0';
+
+    bool have_init = false;
+    for (char *line = content; line != NULL;)
+    {
+        char *next = strchr(line, '\n');
+        if (next != NULL) *next++ = '\0';
+        char *comment = strchr(line, '#');
+        if (comment != NULL) *comment = '\0';
+        char *entry = init_config_trim(line);
+        if (entry[0] != '\0')
         {
-            char alias_path[128];
-            snprintf(alias_path, sizeof(alias_path), "%s/%s", prefixes[p], busybox_alias_applets[i]);
-            if (vfs_register_alias(alias_path, busybox_binary_path) == EOK)
+            char *equals = strchr(entry, '=');
+            if (equals == NULL || strchr(equals + 1, '=') != NULL)
             {
-                write_serial_fmt("[busybox-debug] busybox alias %s -> %s\n", alias_path, busybox_binary_path);
+                *error = "malformed init.conf entry";
+                return false;
+            }
+            *equals = '\0';
+            char *key = init_config_trim(entry);
+            char *value = init_config_trim(equals + 1);
+            if (value[0] == '\0') { *error = "empty init.conf value"; return false; }
+
+            if (strcmp(key, "init") == 0)
+            {
+                if (have_init || value[0] != '/') { *error = "invalid init program path"; return false; }
+                for (const char *cursor = value; *cursor != '\0'; ++cursor)
+                    if (*cursor == ' ' || *cursor == '\t') { *error = "invalid init program path"; return false; }
+                if (strlen(value) >= sizeof(config->path)) { *error = "init program path too long"; return false; }
+                strcpy(config->path, value);
+                have_init = true;
+            }
+            else if (strcmp(key, "require_module") == 0)
+            {
+                if (!init_config_module_name_valid(value) || config->required_module_count == INIT_CONFIG_MAX_MODULES)
+                {
+                    *error = "invalid required module";
+                    return false;
+                }
+                for (size_t i = 0; i < config->required_module_count; ++i)
+                    if (strcmp(config->required_modules[i], value) == 0)
+                    {
+                        *error = "duplicate required module";
+                        return false;
+                    }
+                strcpy(config->required_modules[config->required_module_count++], value);
+            }
+            else
+            {
+                *error = "unknown init.conf key";
+                return false;
             }
         }
+        line = next;
     }
+
+    if (!have_init) { *error = "missing init program"; return false; }
+    return true;
+}
+
+[[noreturn]] static void shutdown_boot_failure(const char *reason)
+{
+    write_serial_fmt("BOOT: initial program startup failed: %s\n", reason);
+    power_shutdown(EFI_ST, EFI_BC);
 }
 
 void init_cpu()
@@ -422,7 +453,6 @@ extern int      procfs_setup();
 extern int      dnsfs_setup();
 extern int      nmfs_setup();
 extern int      tmpfs_setup();
-EFI_SYSTEM_TABLE *EFI_ST;
 BOOT_CONFIG *EFI_BC;
 static BOOT_CONFIG g_kernel_boot_config;
 
@@ -549,12 +579,10 @@ extern "C" void KernelMain(const FrameBufferConfig &fbc, EFI_SYSTEM_TABLE &Syste
     xhci_start_workers();
 #endif
 
-    bool installer_mode = false;
     mount_root();
-#if CONFIG_KERNEL_BUSYBOX_ALIASES
-    setup_busybox_vfs_aliases();
-#endif
-    setup_xbps_vfs_aliases();
+    initial_program_config initial_program = {};
+    const char *initial_program_error = NULL;
+    if (!load_initial_program_config(&initial_program, &initial_program_error)) shutdown_boot_failure(initial_program_error);
     if (!installer_root_is_tmpfs_ready()) tmpfs_setup();
     pipefs_setup();
     pty_init();
@@ -578,6 +606,15 @@ extern "C" void KernelMain(const FrameBufferConfig &fbc, EFI_SYSTEM_TABLE &Syste
         write_serial_string("BOOT: kernel modules skipped by boot menu\n");
     }
 
+    for (size_t i = 0; i < initial_program.required_module_count; ++i)
+    {
+        if (!kernel_module_loaded(initial_program.required_modules[i]))
+        {
+            write_serial_fmt("BOOT: required module unavailable: %s\n", initial_program.required_modules[i]);
+            shutdown_boot_failure("required module unavailable");
+        }
+    }
+
     while (true)
     {
         __asm__ volatile("pause");
@@ -598,7 +635,12 @@ extern "C" void KernelMain(const FrameBufferConfig &fbc, EFI_SYSTEM_TABLE &Syste
         write_serial_string("AHCI: keeping conservative IO path on vmware/real hardware\n");
     }
     user_session_use_login();
-    create_user_process_from_file((char *)CONFIG_KERNEL_DEFAULT_USER_APP, NULL, NULL);
+    int initial_program_pid = create_user_process_from_file(initial_program.path, NULL, NULL);
+    if (initial_program_pid < 0) shutdown_boot_failure("failed to create configured initial program");
+
+    pcb_t initial_program_pcb = found_pcb(initial_program_pid);
+    if (initial_program_pcb == NULL) shutdown_boot_failure("configured initial program was not published");
+    initial_program_pcb->is_initial_program = true;
 
     // delay_s_hp(60);
 
@@ -625,6 +667,16 @@ extern "C" void KernelMain(const FrameBufferConfig &fbc, EFI_SYSTEM_TABLE &Syste
         {
             enable_intr();
             enable_scheduler();
+        }
+
+        if (initial_program_pcb->status == ZOMBIE || initial_program_pcb->status == DEATH ||
+            initial_program_pcb->status == OUT)
+        {
+            write_serial_fmt("BOOT: initial program pid=%d %s exit=%d; shutting down\n",
+                             initial_program_pid,
+                             initial_program_pcb->abnormal_exit ? "terminated abnormally" : "exited",
+                             initial_program_pcb->exit_code);
+            power_shutdown(EFI_ST, EFI_BC);
         }
 
         __asm__ __volatile__("pause");

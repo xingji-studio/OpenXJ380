@@ -5,7 +5,6 @@
 #include <string.h>
 
 static size_t freed_directories;
-static size_t freed_frame_buffers;
 
 extern "C" void free_page_directory(page_directory_t *directory)
 {
@@ -21,7 +20,6 @@ extern "C" void vma_manager_exit_cleanup(vma_manager_t *manager)
 extern "C" void user_image_candidate_free_frames(void *buffer, size_t size)
 {
     (void)size;
-    freed_frame_buffers++;
     free(buffer);
 }
 
@@ -46,9 +44,6 @@ int main()
     candidate.virt_queue = (lock_queue *)calloc(1, sizeof(lock_queue));
     candidate.main_elf.data = malloc(8);
     candidate.main_elf.size = 8;
-    candidate.interpreter_elf.data = malloc(4);
-    candidate.interpreter_elf.size = 4;
-    candidate.interpreter_elf.release = USER_IMAGE_BUFFER_RELEASE_FRAMES;
     candidate.cmdline = copy_string("new");
     candidate.exe_path = copy_string("/new");
     user_image_address_space_owner_t owner = {};
@@ -94,11 +89,8 @@ int main()
     user_image_candidate_context_t aborted;
     user_image_candidate_init(&aborted);
     user_image_candidate_begin(&aborted);
-    aborted.interpreter_elf.data = malloc(4);
-    aborted.interpreter_elf.size = 4;
-    aborted.interpreter_elf.release = USER_IMAGE_BUFFER_RELEASE_FRAMES;
     user_image_abort(&aborted);
-    assert(aborted.state == USER_IMAGE_ABORTED && freed_frame_buffers == 1);
+    assert(aborted.state == USER_IMAGE_ABORTED);
 
     free(process.cmdline);
     free(process.exe_path);

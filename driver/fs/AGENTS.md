@@ -28,7 +28,7 @@ driver/fs/
 
 ## ANTI-PATTERNS
 - Do not dereference user pointers in filesystem syscalls; copy at the syscall boundary first.
-- Do not change path tokenization or alias behavior without checking shell, browser, xbps, busybox aliases, and image layout.
+- Do not change path tokenization or alias behavior without checking the shell and image layout.
 - Do not treat FATFS code as ordinary first-party style cleanup territory.
 - Do not add pseudo-filesystem globals without considering scheduler/locking and process lifetime.
 

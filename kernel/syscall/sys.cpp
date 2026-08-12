@@ -73,13 +73,6 @@ static bool add_u64_i64(uint64_t base, int64_t offset, uint64_t *out)
     return true;
 }
 
-static bool trace_xbps_wait_task()
-{
-    tcb_t task = get_current_task();
-    if (task == NULL || task->parent_group == NULL || !task->parent_group->linux_abi) return false;
-    return strstr(task->name, "xbps") != NULL || strstr(task->parent_group->name, "xbps") != NULL;
-}
-
 static size_t bounded_strlen(const char *str, size_t max_len)
 {
     if (str == NULL) return 0;
@@ -265,12 +258,6 @@ static uint64_t lstat_kernel_path(const char *path, struct stat *out)
     return ret;
 }
 
-static bool busybox_debug_current_linux_abi()
-{
-    tcb_t task = get_current_task();
-    return task != NULL && task->parent_group != NULL && task->parent_group->linux_abi;
-}
-
 static uint64_t copy_stat_to_user(struct stat *user_stat, const struct stat *kstat)
 {
     if (user_stat == NULL || kstat == NULL) return SYSCALL_FAULT_(EINVAL);
@@ -382,33 +369,6 @@ static int64_t write_from_user_buffer(fd_file_handle *handle, const uint8_t *buf
     free(bounce);
     if (!socket_mode) vfs_update(handle->node);
     return (int64_t)total;
-}
-
-static bool trace_xbps_task()
-{
-    tcb_t task = get_current_task();
-    if (task == NULL || task->parent_group == NULL || !task->parent_group->linux_abi) return false;
-    return strstr(task->name, "xbps") != NULL || strstr(task->parent_group->name, "xbps") != NULL;
-}
-
-static void mirror_linux_output_to_serial(const char *tag, const uint8_t *buffer, size_t size)
-{
-    static constexpr size_t OUTPUT_SERIAL_CHUNK = 256;
-    if (buffer == NULL || size == 0) return;
-
-    tcb_t task = get_current_task();
-    if (task == NULL || task->parent_group == NULL || !task->parent_group->linux_abi) return;
-
-    char bounce[OUTPUT_SERIAL_CHUNK + 1];
-    size_t total = 0;
-    while (total < size)
-    {
-        size_t chunk = MIN(size - total, OUTPUT_SERIAL_CHUNK);
-        if (!copy_from_user_pagedir(task->parent_group->pagedir, bounce, buffer + total, chunk)) break;
-        bounce[chunk] = '\0';
-        write_serial_fmt("[%s %s] %s", tag, task->name, bounce);
-        total += chunk;
-    }
 }
 
 static size_t ioctl_arg_size(int request)
@@ -662,16 +622,6 @@ static uint64_t wait4_reap_child(pcb_t parent, pcb_t child, int *status)
     }
 
     wait4_discard_exit_message(parent, child_pid);
-    if (trace_xbps_wait_task())
-    {
-        write_serial_fmt("[DEBUG-xbps-wait] reap parent=%s pid=%llu child=%s child_pid=%llu exit=%d status=%d\n",
-                         parent->name,
-                         (unsigned long long)parent->pid,
-                         child->name,
-                         (unsigned long long)child_pid,
-                         child->exit_code,
-                         child->status);
-    }
     kill_proc(child, child->exit_code, false);
     return child_pid;
 }
@@ -695,6 +645,7 @@ sys_(exit, int exit_code)
     }
     else
     {
+        exit_process->abnormal_exit = false;
         kill_proc(exit_process, exit_code, true);
     }
     open_interrupt;
@@ -869,15 +820,8 @@ sys_(close_range, uint32_t first, uint32_t last, uint32_t flags)
 
 sys_(write, int fd, uint8_t *buffer, size_t size)
 {
-    pcb_t process = get_current_task()->parent_group;
-    if (process != NULL && process->linux_abi)
-    {
-        // write_serial_fmt("[busybox-debug] sys_write fd=%d size=%llu\n", fd, (unsigned long long)size);
-    }
     if (unlikely(fd < 0 || buffer == NULL)) return SYSCALL_FAULT_(EINVAL);
     if (unlikely(size == 0)) return 0;
-    if (fd == 2) mirror_linux_output_to_serial("stderr", buffer, size);
-    else if (fd == 1 && trace_xbps_task()) mirror_linux_output_to_serial("stdout", buffer, size);
     fd_file_handle *handle = (fd_file_handle *)queue_get(get_current_task()->parent_group->file_open, fd);
     if (!handle) return SYSCALL_FAULT_(EBADF);
     if (handle->node->type & file_socket)
@@ -893,11 +837,6 @@ sys_(write, int fd, uint8_t *buffer, size_t size)
 
 sys_(read, int fd, uint8_t *buffer, size_t size)
 {
-    pcb_t process = get_current_task()->parent_group;
-    if (process != NULL && process->linux_abi)
-    {
-        // write_serial_fmt("[busybox-debug] sys_read fd=%d size=%llu\n", fd, (unsigned long long)size);
-    }
     if (unlikely(fd < 0 || buffer == NULL)) return SYSCALL_FAULT_(EINVAL);
     if (unlikely(size == 0)) return 0;
     fd_file_handle *handle = (fd_file_handle *)queue_get(get_current_task()->parent_group->file_open, fd);
@@ -1357,29 +1296,16 @@ sys_(wait4, unsigned long pid_value, int *status, int options, void *rusage)
 
     pcb_t parent = get_current_task()->parent_group;
     long  pid    = (long)(int32_t)(uint32_t)pid_value;
-    bool  trace  = trace_xbps_wait_task();
     (void)rusage;
     if (parent == NULL || parent->child_pcb == NULL) return SYSCALL_FAULT_(ECHILD);
     if ((options & ~(LINUX_WNOHANG | LINUX_WUNTRACED | LINUX_WCONTINUED)) != 0) return SYSCALL_FAULT_(EINVAL);
     if (pid < -1 || pid == 0) return SYSCALL_FAULT_(EINVAL);
     if (wait4_find_child(parent, pid) == NULL) return SYSCALL_FAULT_(ECHILD);
 
-    if (trace)
-    {
-        write_serial_fmt("[DEBUG-xbps-wait] enter parent=%s parent_pid=%llu wait_pid=%ld options=0x%x children=%llu ipc=%llu\n",
-                         parent->name,
-                         (unsigned long long)parent->pid,
-                         pid,
-                         options,
-                         (unsigned long long)parent->child_pcb->size,
-                         parent->ipc_queue != NULL ? (unsigned long long)parent->ipc_queue->size : 0ULL);
-    }
-
     pcb_t zombie = wait4_find_zombie_child(parent, pid);
     if (zombie != NULL) return wait4_reap_child(parent, zombie, status);
     if (options & LINUX_WNOHANG) return 0;
 
-    uint64_t spins = 0;
     while (true)
     {
         zombie = wait4_find_zombie_child(parent, pid);
@@ -1390,16 +1316,6 @@ sys_(wait4, unsigned long pid_value, int *status, int options, void *rusage)
         ipc_message_t message = wait4_pop_exit_message(parent, pid, false);
         if (message == NULL)
         {
-            if (trace && (spins == 1000 || spins == 10000 || spins == 100000))
-            {
-                write_serial_fmt("[DEBUG-xbps-wait] waiting parent=%s wait_pid=%ld children=%llu ipc=%llu spins=%llu\n",
-                                 parent->name,
-                                 pid,
-                                 (unsigned long long)parent->child_pcb->size,
-                                 parent->ipc_queue != NULL ? (unsigned long long)parent->ipc_queue->size : 0ULL,
-                                 (unsigned long long)spins);
-            }
-            spins++;
             __asm__ volatile("pause");
             scheduler_yield();
             continue;
@@ -1408,14 +1324,6 @@ sys_(wait4, unsigned long pid_value, int *status, int options, void *rusage)
         int exit_code = (int)message->data[0] | ((int)message->data[1] << 8) | ((int)message->data[2] << 16) |
                         ((int)message->data[3] << 24);
         int child_pid = message->pid;
-        if (trace)
-        {
-            write_serial_fmt("[DEBUG-xbps-wait] got-msg parent=%s wait_pid=%ld child_pid=%d exit=%d\n",
-                             parent->name,
-                             pid,
-                             child_pid,
-                             exit_code);
-        }
         free(message);
 
         pcb_t child = wait4_find_child(parent, child_pid);
@@ -1550,7 +1458,6 @@ sys_(arch_prctl, uint64_t code, uint64_t addr)
         if (addr > 0x00007fffffffffffULL || check_user_overflow(addr, 1))
             return SYSCALL_FAULT_(EINVAL);
         thread->fs_base = addr;
-        if (thread->parent_group != NULL && thread->parent_group->linux_abi && addr != 0) thread->fs = 0;
         write_fsbase(thread->fs_base);
         break;
     case ARCH_GET_FS:
@@ -1698,14 +1605,6 @@ sys_(clock_nanosleep, int clockid, int flags, const struct timespec *request, st
 
 sys_(ioctl, int fd, int options, void *arg2)
 {
-    pcb_t process = get_current_task()->parent_group;
-    if (process != NULL && process->linux_abi)
-    {
-        // write_serial_fmt("[busybox-debug] sys_ioctl fd=%d req=0x%x arg=0x%llx\n",
-        //                  fd,
-        //                  options,
-        //                  (unsigned long long)(uintptr_t)arg2);
-    }
     if (unlikely(fd < 0)) return SYSCALL_FAULT_(EINVAL);
     fd_file_handle *handle =  (fd_file_handle*)queue_get(get_current_task()->parent_group->file_open, fd);
     if (handle == NULL) return SYSCALL_FAULT_(EBADF);
@@ -1745,14 +1644,6 @@ sys_(ioctl, int fd, int options, void *arg2)
         }
         int ret = socket_apply_flags(handle->node, handle->node->flags);
         if (arg_size > 0) free(karg);
-        if (trace_xbps_task())
-        {
-            write_serial_fmt("[DEBUG-xbps-syscall] ioctl FIONBIO fd=%d value=%d flags=0x%llx ret=%d\n",
-                             fd,
-                             nonblock,
-                             (unsigned long long)handle->node->flags,
-                             ret);
-        }
         return ret < 0 ? SYSCALL_FAULT_(-ret) : 0;
     }
 
@@ -1764,10 +1655,6 @@ sys_(ioctl, int fd, int options, void *arg2)
         return SYSCALL_FAULT_(EFAULT);
     }
     if (arg_size > 0) free(karg);
-    if (process != NULL && process->linux_abi)
-    {
-        // write_serial_fmt("[busybox-debug] sys_ioctl ret=%d\n", ret);
-    }
     return ret;
 }
 
@@ -2575,6 +2462,7 @@ sys_(exit_group, int exit_code)
     pcb_t exit_process = get_current_task()->parent_group;
     write_serial_fmt("task: Process %s exit with code %d.\n", exit_process->name, exit_code);
     close_interrupt;//applets 已经走到这个
+    exit_process->abnormal_exit = false;
     kill_proc(exit_process, exit_code,
               true); // 子进程调用，is_zombie = true，不能在child_pcb中删除当前进程
     open_interrupt;
@@ -3935,10 +3823,6 @@ sys_(access, char *filename)
 
     struct stat buf;
     uint64_t stat_ret = stat_kernel_path(path, &buf);
-    if (busybox_debug_current_linux_abi())
-    {
-        write_serial_fmt("[busybox-debug] access path=%s ret=%lld\n", path, (long long)stat_ret);
-    }
     free(path);
     return stat_ret;
 }
@@ -3957,15 +3841,6 @@ sys_(faccessat)
 
     struct stat buf;
     uint64_t ret = stat_kernel_path(resolved, &buf);
-    if (busybox_debug_current_linux_abi())
-    {
-        write_serial_fmt("[busybox-debug] faccessat dirfd=%d path=%s mode=0x%llx ret=%lld\n",
-                         dirfd,
-                         resolved,
-                         (unsigned long long)mode,
-                         (long long)ret);
-    }
-
     free(resolved);
 
     return ret;
@@ -3987,16 +3862,6 @@ sys_(faccessat2)
 
     struct stat buf;
     uint64_t ret = stat_kernel_path(resolved, &buf);
-    if (busybox_debug_current_linux_abi())
-    {
-        write_serial_fmt("[busybox-debug] faccessat2 dirfd=%llu path=%s mode=0x%llx flags=0x%llx ret=%lld\n",
-                         (unsigned long long)dirfd,
-                         resolved,
-                         (unsigned long long)mode,
-                         (unsigned long long)flag,
-                         (long long)ret);
-    }
-
     free(resolved);
 
     return ret;
@@ -4953,13 +4818,6 @@ sys_(chmod, char *path, uint64_t mode)
     if (path_ret < 0) return SYSCALL_FAULT_((int)-path_ret);
 
     vfs_node_t node = vfs_open(resolved);
-    if (busybox_debug_current_linux_abi())
-    {
-        write_serial_fmt("[busybox-debug] chmod path=%s mode=0%llo open=%s\n",
-                         resolved,
-                         (unsigned long long)(mode & 07777),
-                         node != NULL ? "hit" : "miss");
-    }
     free(resolved);
     if (node == NULL) return SYSCALL_FAULT_(ENOENT);
 
@@ -5036,15 +4894,6 @@ sys_(fchmodat, int dirfd, char *pathname, uint64_t mode, int flags)
     if (path_ret < 0) return SYSCALL_FAULT_((int)-path_ret);
 
     vfs_node_t node = vfs_open(resolved);
-    if (busybox_debug_current_linux_abi())
-    {
-        write_serial_fmt("[busybox-debug] fchmodat dirfd=%d path=%s mode=0%llo flags=0x%x open=%s\n",
-                         dirfd,
-                         resolved,
-                         (unsigned long long)(mode & 07777),
-                         flags,
-                         node != NULL ? "hit" : "miss");
-    }
     free(resolved);
     if (node == NULL) return SYSCALL_FAULT_(ENOENT);
 

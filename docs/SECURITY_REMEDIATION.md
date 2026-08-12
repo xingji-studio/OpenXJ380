@@ -22,7 +22,7 @@ This document records the remediation performed against the supplied host-side P
 - Module loading still has no signature/trust policy. Parser hardening reduces memory-corruption exposure, but untrusted kernel modules remain equivalent to arbitrary kernel code.
 - The ChaCha20 fallback on CPUs without hardware entropy still mixes timing and address state; a boot entropy readiness model and additional device/interrupt entropy are required before claiming cryptographic guarantees on those machines.
 - Userland TLS/chat entropy and peer authentication from PoC item 10 are not in the current CLI build graph and remain to be redesigned before enabling those applications.
-- Vendored BusyBox/libvterm and other dependency findings require version inventory, upgrade selection and compatibility testing. No dependency CVE is marked fixed by this patch.
+- Vendored libvterm and other dependency findings require version inventory, upgrade selection and compatibility testing. No dependency CVE is marked fixed by this patch.
 - The in-tree font validator remains the boundary for the mitigated stb_truetype issue. Direct callers must not bypass it.
 - ELF and image changes need sustained ASAN/UBSAN/libFuzzer coverage in CI; the supplied PoCs are mirrors of the old logic, not end-to-end kernel tests.
 

@@ -198,6 +198,7 @@ bool signal_deliver_pending(struct X64_REGS *regs)
             task->status = FUTEX;
             return false;
         }
+        task->parent_group->abnormal_exit = true;
         kill_proc(task->parent_group, 128 + sig, true);
         open_interrupt;
         while (true) __asm__ volatile("hlt");

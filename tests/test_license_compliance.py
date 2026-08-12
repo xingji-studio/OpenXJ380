@@ -82,40 +82,6 @@ class LicenseComplianceTests(unittest.TestCase):
             "Apache-2.0 OR GPL-2.0-or-later", selection["upstream_license_expression"]
         )
 
-    def test_busybox_corresponding_source_bundle_is_complete(self) -> None:
-        source_dir = ROOT / "third_party/busybox-source"
-        archive = source_dir / "busybox-1.31.1.tar.bz2"
-        expected_source_sha256 = (
-            "d0f940a72f648943c1f2211e0e3117387c31d765137d92bd8284a3fb9752a998"
-        )
-        expected_binary_sha256 = (
-            "a08214e46cafb238685f694a2ff4e4b038b5fed83f884354127ba08d68498066"
-        )
-        staged_binary = ROOT / "resources/apps/busybox"
-        preserved_binary = ROOT / "third_party/busybox-prebuilt/busybox_amd64"
-
-        self.assertTrue(archive.is_file())
-        self.assertTrue((source_dir / "LICENSE").is_file())
-        self.assertTrue((source_dir / "busybox-1.31.1.config").is_file())
-        self.assertEqual(
-            expected_source_sha256,
-            subprocess.check_output(["sha256sum", str(archive)], text=True).split()[0],
-        )
-        for binary in (staged_binary, preserved_binary):
-            self.assertEqual(
-                expected_binary_sha256,
-                subprocess.check_output(["sha256sum", str(binary)], text=True).split()[0],
-            )
-        self.assertEqual(staged_binary.read_bytes(), preserved_binary.read_bytes())
-        subprocess.run(["bzip2", "-t", str(archive)], check=True)
-
-    def test_busybox_build_disables_volatile_timestamp(self) -> None:
-        build_script = (
-            ROOT / "third_party/busybox-source/build.sh"
-        ).read_text(encoding="utf-8")
-
-        self.assertIn("KCONFIG_NOTIMESTAMP=1", build_script)
-
     def test_mikanos_hankaku_source_material_is_complete(self) -> None:
         source_root = ROOT / "third_party/mikanos-hankaku"
         self.assertTrue((source_root / "LICENSE").is_file())
@@ -154,7 +120,7 @@ class LicenseComplianceTests(unittest.TestCase):
         )
         components = manifest["components"]
 
-        self.assertGreaterEqual(len(components), 12)
+        self.assertGreaterEqual(len(components), 11)
         for component in components:
             for key in ("license_files", "source_files"):
                 for relative_path in component[key]:
@@ -184,9 +150,6 @@ class LicenseComplianceTests(unittest.TestCase):
             self.assertTrue((destination / "licenses/lwip/lwip-notice-full.txt").is_file())
             self.assertTrue((destination / "licenses/fatfs/fatfs.txt").is_file())
             self.assertTrue((destination / "sources/mikanos-framebuffer/fbc.h").is_file())
-            self.assertTrue(
-                (destination / "sources/busybox/busybox-1.31.1.tar.bz2").is_file()
-            )
 
     def test_compliance_build_edge_tracks_packaged_materials(self) -> None:
         build_graph = (ROOT / "build.ninja").read_text(encoding="utf-8")
@@ -196,8 +159,6 @@ class LicenseComplianceTests(unittest.TestCase):
             if line.startswith("build out/compliance/third-party/MANIFEST.json:")
         )
 
-        self.assertIn("third_party/busybox-source/build.sh", edge)
-        self.assertIn("third_party/busybox-source/LICENSE", edge)
 
     def test_system_staging_replaces_legacy_module_extension(self) -> None:
         ninja_build = importlib.import_module("tools.ninja_build")

@@ -467,7 +467,6 @@ void *aligned_malloc(size_t size, size_t alignment)
 }
 
 #define USER_DYN_MAIN_BASE 0x0000000040000000UL
-#define USER_INTERP_BASE   0x0000000060000000UL
 
 typedef struct loaded_user_elf
 {
@@ -514,29 +513,6 @@ static int read_vfs_file(vfs_node_t file, uint8_t **out, uint64_t *out_size)
 static bool elf_range_in_file(uint64_t offset, uint64_t size, uint64_t file_size)
 {
     return offset <= file_size && size <= file_size - offset;
-}
-
-static int find_elf_interpreter(uint8_t *buf, uint64_t file_size, char *interp, size_t interp_size)
-{
-    if (buf == NULL || interp == NULL || interp_size == 0) return -EINVAL;
-    interp[0] = '\0';
-
-    Elf64_Ehdr *ehdr = (Elf64_Ehdr *)buf;
-    if (!elf_range_in_file(ehdr->e_phoff, (uint64_t)ehdr->e_phnum * ehdr->e_phentsize, file_size)) return -ENOEXEC;
-
-    Elf64_Phdr *phdrs = (Elf64_Phdr *)(buf + ehdr->e_phoff);
-    for (int i = 0; i < ehdr->e_phnum; i++)
-    {
-        if (phdrs[i].p_type != PT_INTERP) continue;
-        if (phdrs[i].p_filesz == 0 || phdrs[i].p_filesz >= interp_size) return -ENAMETOOLONG;
-        if (!elf_range_in_file(phdrs[i].p_offset, phdrs[i].p_filesz, file_size)) return -ENOEXEC;
-
-        memcpy(interp, buf + phdrs[i].p_offset, phdrs[i].p_filesz);
-        interp[phdrs[i].p_filesz] = '\0';
-        return 0;
-    }
-
-    return 0;
 }
 
 static int load_user_elf_image(uint8_t *buf, uint64_t file_size, user_image_address_space_owner_t *owner,
@@ -694,23 +670,12 @@ int user_image_prepare_elf(user_image_candidate_context_t *candidate, const char
 {
     user_image_address_space_owner_t owner = {};
     if (candidate == NULL || path == NULL || candidate->state != USER_IMAGE_PREPARING ||
-        candidate->main_elf.data != NULL || candidate->interpreter_elf.data != NULL ||
-        !user_image_candidate_address_space_owner(candidate, &owner))
+        candidate->main_elf.data != NULL || !user_image_candidate_address_space_owner(candidate, &owner))
         return -EINVAL;
 
     int result = read_candidate_elf(path, &candidate->main_elf);
     if (result < 0) return result;
     if (candidate->main_elf.size < sizeof(Elf64_Ehdr)) return -ENOEXEC;
-
-    char interpreter_path[256];
-    result = find_elf_interpreter((uint8_t *)candidate->main_elf.data, candidate->main_elf.size,
-                                  interpreter_path, sizeof(interpreter_path));
-    if (result < 0) return result;
-    if (interpreter_path[0] != '\0')
-    {
-        result = read_candidate_elf(interpreter_path, &candidate->interpreter_elf);
-        if (result < 0) return result;
-    }
 
     bool interrupts_enabled = are_interrupts_enabled();
     bool scheduler_enabled = is_scheduler;
@@ -722,27 +687,18 @@ int user_image_prepare_elf(user_image_candidate_context_t *candidate, const char
     loaded_user_elf_t main_image = {};
     result = load_user_elf_image((uint8_t *)candidate->main_elf.data, candidate->main_elf.size, &owner,
                                  path, USER_DYN_MAIN_BASE, &main_image);
-    loaded_user_elf_t interpreter_image = {};
-    if (result == 0 && candidate->interpreter_elf.data != NULL)
-    {
-        result = load_user_elf_image((uint8_t *)candidate->interpreter_elf.data, candidate->interpreter_elf.size,
-                                     &owner, interpreter_path, USER_INTERP_BASE, &interpreter_image);
-    }
-
     switch_page_directory(previous_directory);
     restore_runtime_state(scheduler_enabled, interrupts_enabled);
     if (result < 0) return result;
 
     candidate->exe_path = strdup(path);
     if (candidate->exe_path == NULL) return -ENOMEM;
-    candidate->entry = candidate->interpreter_elf.data != NULL ? interpreter_image.entry : main_image.entry;
+    candidate->entry = main_image.entry;
     candidate->aux_phdr = main_image.phdr;
     candidate->aux_phent = main_image.phent;
     candidate->aux_phnum = main_image.phnum;
-    candidate->aux_base = candidate->interpreter_elf.data != NULL ? interpreter_image.load_bias : 0;
+    candidate->aux_base = 0;
     candidate->aux_entry = main_image.entry;
-    candidate->linux_abi = candidate->interpreter_elf.data != NULL ||
-                           ((Elf64_Ehdr *)candidate->main_elf.data)->e_ident[EI_OSABI] == ELFOSABI_LINUX;
     return 0;
 }
 
@@ -793,36 +749,6 @@ uint64_t parse_elf_file(char *path, pcb_t group)
         return NULL;
     }
 
-    char interp_path[256];
-    ret = find_elf_interpreter(buf, file_size, interp_path, sizeof(interp_path));
-    if (ret < 0)
-    {
-        free_file_image(buf, file_size);
-        write_serial_fmt("Parse ELF file failed. Reason: Bad PT_INTERP in %s, ret=%d\n", path, ret);
-        return (uint64_t)ret;
-    }
-
-    uint8_t *interp_buf = NULL;
-    uint64_t interp_size = 0;
-    if (interp_path[0] != '\0')
-    {
-        vfs_node_t interp_file = vfs_open(interp_path);
-        if (interp_file == NULL)
-        {
-            free_file_image(buf, file_size);
-            write_serial_fmt("Parse ELF file failed. Reason: Interpreter not found: %s\n", interp_path);
-            return (uint64_t)-ENOENT;
-        }
-        ret = read_vfs_file(interp_file, &interp_buf, &interp_size);
-        vfs_close(interp_file);
-        if (ret < 0)
-        {
-            free_file_image(buf, file_size);
-            write_serial_fmt("Parse ELF file failed. Reason: Cannot read interpreter %s, ret=%d\n", interp_path, ret);
-            return (uint64_t)ret;
-        }
-    }
-
     bool is_sti                = are_interrupts_enabled();
     bool was_scheduler_enabled = is_scheduler;
     if (!no_interrupt) close_interrupt;
@@ -835,48 +761,30 @@ uint64_t parse_elf_file(char *path, pcb_t group)
     memset(&main_elf, 0, sizeof(main_elf));
     user_image_address_space_owner_t owner = {group->pagedir, &group->vma_manager, group->virt_queue};
     ret = load_user_elf_image(buf, file_size, &owner, group->name, USER_DYN_MAIN_BASE, &main_elf);
-    loaded_user_elf_t interp_elf;
-    memset(&interp_elf, 0, sizeof(interp_elf));
-    if (ret == 0 && interp_buf != NULL)
-    {
-        ret = load_user_elf_image(interp_buf, interp_size, &owner, interp_path, USER_INTERP_BASE, &interp_elf);
-    }
-
     switch_page_directory(current_pagedir); // 恢复页表
     restore_runtime_state(was_scheduler_enabled, is_sti);
 
     if (ret < 0)
     {
-        free_file_image(interp_buf, interp_size);
         free_file_image(buf, file_size);
-        write_serial_fmt("Parse ELF file failed. Reason: Cannot map ELF %s, ret=%d\n",
-                         interp_buf != NULL ? interp_path : path, ret);
+        write_serial_fmt("Parse ELF file failed. Reason: Cannot map ELF %s, ret=%d\n", path, ret);
         return (uint64_t)ret;
     }
 
-    group->linux_abi = interp_buf != NULL || ehdr.e_ident[EI_OSABI] == ELFOSABI_LINUX;
     group->load_start = main_elf.map_start;
     group->aux_phdr = main_elf.phdr;
     group->aux_phent = main_elf.phent;
     group->aux_phnum = main_elf.phnum;
-    group->aux_base = interp_buf != NULL ? interp_elf.load_bias : 0;
+    group->aux_base = 0;
     group->aux_entry = main_elf.entry;
     group->aux_execfn = 0;
     group->elf_file = NULL;
     group->elf_size = file_size;
 
-    uint64_t entry = interp_buf != NULL ? interp_elf.entry : main_elf.entry;
-    if (interp_buf != NULL)
-    {
-        write_serial_fmt("ELF interpreter: %s base=0x%llx entry=0x%llx main_entry=0x%llx\n",
-                         interp_path, interp_elf.load_bias, interp_elf.entry, main_elf.entry);
-    }
-
-    free_file_image(interp_buf, interp_size);
     free_file_image(buf, file_size);
 
     // 设置程序入口点
-    return entry;
+    return main_elf.entry;
 }//超进化吧，宝可梦
 
 void getFileDirectory(const char *path, char *result)
@@ -1052,7 +960,7 @@ static int prepare_candidate_initial_stack(user_image_candidate_context_t *candi
     startup->initial_rsp = candidate->initial_rsp = stack;
     startup->initial_argv = candidate->initial_argv = stack + sizeof(uint64_t);
     startup->initial_envp = candidate->initial_envp = envp_ptr;
-    startup->entry_rdx = candidate->entry_rdx = candidate->linux_abi ? 0 : envp_ptr;
+    startup->entry_rdx = candidate->entry_rdx = envp_ptr;
     return 0;
 }
 
@@ -1162,7 +1070,6 @@ int create_user_process_from_file(char *path, pcb_t pcb, char *argv[])
     group->prepared_user_envp = image.initial_envp;
     group->prepared_user_entry_rdx = image.entry_rdx;
     free(image.startup_storage);
-    group->linux_abi = image.linux_abi;
     write_serial_fmt("Creating User Thread. Thread Name: %s\n", process_name);
     write_serial_fmt("CWD: %s\n", cwd);
     char **thread_argv = copy_process_argv(path, group->argv, (int)group->argc);
