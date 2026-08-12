@@ -21,6 +21,7 @@ OpenXJ380 是一个面向 x86_64 平台的独立操作系统项目。项目包�
 
 ```text
 boot/                  UEFI 引导程序与 EFI 交接逻辑
+etc/                   系统级配置文件
 kernel/                内核核心子系统和启动入口
 driver/                链接到内核镜像的内建驱动
 graphics/、font/       不参与当前构建的历史图形与字体代码
