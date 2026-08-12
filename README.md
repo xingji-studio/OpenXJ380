@@ -1,6 +1,6 @@
 # OpenXJ380
 
-OpenXJ380 是一个面向 x86_64 平台的独立操作系统项目。项目包含 UEFI 引导程序、单体内核、XAPI 用户态 API、一个命令行示例程序、可加载内核模块，以及用于生成 FAT 磁盘镜像的构建和分发工具。
+OpenXJ380 是一个面向 x86_64 平台的独立操作系统内核项目。项目包含 UEFI 引导程序、单体内核、XAPI 用户态 API、一个命令行示例程序、可加载内核模块，以及用于生成 FAT 磁盘镜像的构建和分发工具。
 
 当前项目仍在积极开发中，适合对操作系统、内核、驱动和低层用户态运行时感兴趣的开发者参与和研究。
 
@@ -15,7 +15,32 @@ OpenXJ380 是一个面向 x86_64 平台的独立操作系统项目。项目包�
 - 内建驱动、文件系统、进程/线程、内存管理和系统调用基础设施。
 - XAPI 用户态运行时与 API，以及一个命令行示例程序。
 - 可动态加载的内核模块，包括 E1000 网络、xHCI USB 和基于 lwIP 的网络服务。
+- 面向可加载模块的产品扩展接口（OpenXJ380 Socket ABI）：键鼠中断钩子、帧缓冲配置、电源动作与系统调用钩子。
+- 支持通过编译宏关闭内置图形、控制台与输入输出，构建无头（headless）内核。
 - 基于 Ninja 的构建图生成、磁盘镜像制作和 QEMU 运行流程。
+
+## 产品扩展接口（OpenXJ380 Socket ABI）
+
+内核通过 `include/openxj380/` 下的头文件向可加载模块（`.sys`）开放一组产品级扩展接口（Socket ABI）。接口符号经 `EXPORT_SYMBOL` 导出，模块通过内核动态链接器解析调用。
+
+- 键鼠扩展接口（`include/openxj380/socket.h`）：
+  - `OpenXJ380Socket_RegisterMouseHook` / `OpenXJ380Socket_UnregisterMouseHook`
+  - `OpenXJ380Socket_RegisterKeyboardHook` / `OpenXJ380Socket_UnregisterKeyboardHook`
+  - 注册后，内核会在每个键鼠中断事件上回调钩子（`OpenXJ380Socket_MouseInterrupte` / `OpenXJ380Socket_KeyboardInterrupt`）。事件信息由 `OpenXJ380MouseInterruptInfo` / `OpenXJ380KeyboardInterruptInfo` 结构体承载，包含来源（PS/2、USB）、路由、按钮/滚轮增量、坐标、键值与 Shift/Ctrl/Alt/Win/Caps 等修饰键状态。控制器 I/O 与中断应答仍由内核持有，模块只能读取事件，不能从可加载模块操作控制器寄存器。
+  - `OpenXJ380Socket_FramebufferConfig` 返回帧缓冲配置指针。
+  - `OpenXJ380Socket_PowerAction` 触发重启或关机（`XPOWER_REBOOT` / `XPOWER_SHUTDOWN`）。
+- 系统调用钩子（`include/openxj380/syscall.h`）：`OpenXJ380Socket_RegisterSyscallHook` / `OpenXJ380Socket_UnregisterSyscallHook` / `OpenXJ380Socket_DispatchSyscall`，可在系统调用分发路径上拦截或扩展。
+- 内核动态链接器同时支持解析 C++ 修饰符号名与 `EXPORT_SYMBOL_OBJECT` 导出的对象。
+
+## 无头构建（关闭内置输入输出）
+
+内核支持编译宏 `OPENXJ380CONFIG_CLEAR_RUN`，用于关闭内置图形、控制台与输入输出。将该宏加入内核及内置驱动的编译选项（例如向 `CPP_FLAGS`/`C_FLAGS` 追加 `-DOPENXJ380CONFIG_CLEAR_RUN`）后，`include/openxj380/config.h` 会将以下宏置 1：
+
+- `OPENXJ380_GUI_DISABLED`：禁用系统调用钩子等 GUI 相关能力。
+- `OPENXJ380_CONSOLE_DISABLED`：`console_init` / `console_write` 变为空操作。
+- `OPENXJ380_INPUT_OUTPUT_DISABLED`：关闭内置输入输出，包括 PS/2 键盘鼠标初始化、串口输出、XHCI/USB 初始化、HDA 音频与 XAPI 输入输出（`Input` / `Output` / `Getch` 等），并跳过模块自动装载。
+
+关闭内置输入输出后，键鼠事件仍会通过上述 Socket ABI 钩子转发给可加载模块，由产品层自行处理输入。
 
 ## 目录结构
 

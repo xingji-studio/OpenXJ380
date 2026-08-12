@@ -19,6 +19,9 @@
 #include <mm/alloc/alloc.h>
 #include <mm/frame.h>
 #include <nvme/nvme.h>
+#include <openxj380/config.h>
+#include <openxj380/socket.h>
+#include <openxj380/syscall.h>
 #include <pci/pci.h>
 #include <pipe.h>
 #include <power.h>
@@ -29,6 +32,7 @@
 #include <rtc.h>
 #include <sb16.h>
 #include <syscall/signal.h>
+#include <syscall/pxapi.h>
 #include <syscall/syscall.h>
 #include <task/pcb.h>
 #include <user/runfile.h>
@@ -46,6 +50,152 @@ extern XSK_SMP_INFO *xsi;
 uint64_t *saved_mtrrs;
 void     *temp_stack[MAX_CPU_NUM];
 bool      no_interrupt = false;
+
+static OpenXJ380MouseInterruptHook g_openxj380_mouse_hook = NULL;
+static OpenXJ380KeyboardInterruptHook g_openxj380_keyboard_hook = NULL;
+static OpenXJ380SyscallHook g_openxj380_syscall_hook = NULL;
+extern EFI_SYSTEM_TABLE *EFI_ST;
+extern BOOT_CONFIG *EFI_BC;
+
+extern "C" int OpenXJ380Socket_RegisterMouseHook(OpenXJ380MouseInterruptHook hook)
+{
+#if !OPENXJ380_INPUT_OUTPUT_DISABLED
+    if (hook == NULL) return -1;
+    OpenXJ380MouseInterruptHook expected = NULL;
+    return __atomic_compare_exchange_n(&g_openxj380_mouse_hook, &expected, hook, false, __ATOMIC_RELEASE,
+                                       __ATOMIC_RELAXED)
+               ? 0
+               : -1;
+#else
+    (void)hook;
+    return -1;
+#endif
+}
+
+extern "C" int OpenXJ380Socket_RegisterKeyboardHook(OpenXJ380KeyboardInterruptHook hook)
+{
+#if !OPENXJ380_INPUT_OUTPUT_DISABLED
+    if (hook == NULL) return -1;
+    OpenXJ380KeyboardInterruptHook expected = NULL;
+    return __atomic_compare_exchange_n(&g_openxj380_keyboard_hook, &expected, hook, false, __ATOMIC_RELEASE,
+                                       __ATOMIC_RELAXED)
+               ? 0
+               : -1;
+#else
+    (void)hook;
+    return -1;
+#endif
+}
+
+extern "C" void OpenXJ380Socket_UnregisterMouseHook(OpenXJ380MouseInterruptHook hook)
+{
+#if !OPENXJ380_INPUT_OUTPUT_DISABLED
+    OpenXJ380MouseInterruptHook expected = hook;
+    __atomic_compare_exchange_n(&g_openxj380_mouse_hook, &expected, NULL, false, __ATOMIC_RELEASE, __ATOMIC_RELAXED);
+#else
+    (void)hook;
+#endif
+}
+
+extern "C" void OpenXJ380Socket_UnregisterKeyboardHook(OpenXJ380KeyboardInterruptHook hook)
+{
+#if !OPENXJ380_INPUT_OUTPUT_DISABLED
+    OpenXJ380KeyboardInterruptHook expected = hook;
+    __atomic_compare_exchange_n(&g_openxj380_keyboard_hook, &expected, NULL, false, __ATOMIC_RELEASE,
+                                __ATOMIC_RELAXED);
+#else
+    (void)hook;
+#endif
+}
+
+extern "C" bool OpenXJ380Socket_MouseInterrupte(const OpenXJ380MouseInterruptInfo *event)
+{
+#if !OPENXJ380_INPUT_OUTPUT_DISABLED
+    OpenXJ380MouseInterruptHook hook = __atomic_load_n(&g_openxj380_mouse_hook, __ATOMIC_ACQUIRE);
+    return hook != NULL && event != NULL && hook(event);
+#else
+    (void)event;
+    return false;
+#endif
+}
+
+extern "C" bool OpenXJ380Socket_KeyboardInterrupt(const OpenXJ380KeyboardInterruptInfo *event)
+{
+#if !OPENXJ380_INPUT_OUTPUT_DISABLED
+    OpenXJ380KeyboardInterruptHook hook = __atomic_load_n(&g_openxj380_keyboard_hook, __ATOMIC_ACQUIRE);
+    return hook != NULL && event != NULL && hook(event);
+#else
+    (void)event;
+    return false;
+#endif
+}
+
+extern "C" const void *OpenXJ380Socket_FramebufferConfig()
+{
+    return fbc_addr;
+}
+
+extern "C" uint64_t OpenXJ380Socket_PowerAction(uint64_t action)
+{
+#if OPENXJ380_INPUT_OUTPUT_DISABLED
+    (void)action;
+    return (uint64_t)-1;
+#else
+    if (EFI_ST == NULL || EFI_BC == NULL) return (uint64_t)-1;
+    if (action == XPOWER_REBOOT) power_reboot(EFI_ST, EFI_BC);
+    if (action == XPOWER_SHUTDOWN) power_shutdown(EFI_ST, EFI_BC);
+    return (uint64_t)-1;
+#endif
+}
+
+extern "C" int OpenXJ380Socket_RegisterSyscallHook(OpenXJ380SyscallHook hook)
+{
+#if !OPENXJ380_GUI_DISABLED
+    if (hook == NULL) return -1;
+    OpenXJ380SyscallHook expected = NULL;
+    return __atomic_compare_exchange_n(&g_openxj380_syscall_hook, &expected, hook, false, __ATOMIC_RELEASE,
+                                       __ATOMIC_RELAXED)
+               ? 0
+               : -1;
+#else
+    (void)hook;
+    return -1;
+#endif
+}
+
+extern "C" void OpenXJ380Socket_UnregisterSyscallHook(OpenXJ380SyscallHook hook)
+{
+#if !OPENXJ380_GUI_DISABLED
+    OpenXJ380SyscallHook expected = hook;
+    __atomic_compare_exchange_n(&g_openxj380_syscall_hook, &expected, NULL, false, __ATOMIC_RELEASE,
+                                __ATOMIC_RELAXED);
+#else
+    (void)hook;
+#endif
+}
+
+extern "C" bool OpenXJ380Socket_DispatchSyscall(uint64_t syscall_number, struct X64_REGS *regs)
+{
+#if !OPENXJ380_GUI_DISABLED
+    OpenXJ380SyscallHook hook = __atomic_load_n(&g_openxj380_syscall_hook, __ATOMIC_ACQUIRE);
+    return hook != NULL && regs != NULL && hook(syscall_number, regs);
+#else
+    (void)syscall_number;
+    (void)regs;
+    return false;
+#endif
+}
+
+EXPORT_SYMBOL(OpenXJ380Socket_RegisterMouseHook);
+EXPORT_SYMBOL(OpenXJ380Socket_RegisterKeyboardHook);
+EXPORT_SYMBOL(OpenXJ380Socket_MouseInterrupte);
+EXPORT_SYMBOL(OpenXJ380Socket_KeyboardInterrupt);
+EXPORT_SYMBOL(OpenXJ380Socket_UnregisterMouseHook);
+EXPORT_SYMBOL(OpenXJ380Socket_UnregisterKeyboardHook);
+EXPORT_SYMBOL(OpenXJ380Socket_FramebufferConfig);
+EXPORT_SYMBOL(OpenXJ380Socket_PowerAction);
+EXPORT_SYMBOL(OpenXJ380Socket_RegisterSyscallHook);
+EXPORT_SYMBOL(OpenXJ380Socket_UnregisterSyscallHook);
 
 extern bool allow_to_flush;
 extern void ahci_set_accel(bool enabled);
@@ -261,7 +411,7 @@ bool kernel_heap_extend(size_t min_bytes)
 }
 
 extern void     nvme_setup();
-#if CONFIG_KERNEL_BUILTIN_XHCI
+#if CONFIG_KERNEL_BUILTIN_XHCI && !OPENXJ380_INPUT_OUTPUT_DISABLED
 extern int      xhci_setup();
 extern void     xhci_start_workers();
 #endif
@@ -336,7 +486,7 @@ extern "C" void KernelMain(const FrameBufferConfig &fbc, EFI_SYSTEM_TABLE &Syste
     write_serial_string("BOOT: ide_setup begin\n");
     ide_setup();
     write_serial_string("BOOT: ide_setup done\n");
-#if CONFIG_KERNEL_BUILTIN_XHCI
+#if CONFIG_KERNEL_BUILTIN_XHCI && !OPENXJ380_INPUT_OUTPUT_DISABLED
     write_serial_string("BOOT: xhci_setup begin\n");
     xhci_setup();
     write_serial_string("BOOT: xhci_setup done\n");
@@ -347,9 +497,11 @@ extern "C" void KernelMain(const FrameBufferConfig &fbc, EFI_SYSTEM_TABLE &Syste
     // enable_intr();
 
     // disable_intr();
+#if !OPENXJ380_INPUT_OUTPUT_DISABLED
     // HDA 驱动现在会在初始化阶段自行完成注册，这里只需要启动探测即可。
     hda_init();
     hda_regist();
+#endif
     // sb16_init();
 
     keyboard_init();
@@ -393,7 +545,7 @@ extern "C" void KernelMain(const FrameBufferConfig &fbc, EFI_SYSTEM_TABLE &Syste
 
     disable_scheduler();
 
-#if CONFIG_KERNEL_BUILTIN_XHCI
+#if CONFIG_KERNEL_BUILTIN_XHCI && !OPENXJ380_INPUT_OUTPUT_DISABLED
     xhci_start_workers();
 #endif
 
@@ -417,7 +569,8 @@ extern "C" void KernelMain(const FrameBufferConfig &fbc, EFI_SYSTEM_TABLE &Syste
     init_syscall();
     init_message();
 
-    if ((BootConfig.boot_flags & (BOOT_FLAG_SAFE_MODE | BOOT_FLAG_DISABLE_KMOD | BOOT_FLAG_INSTALLER)) == 0) {
+    if (!OPENXJ380_INPUT_OUTPUT_DISABLED &&
+        (BootConfig.boot_flags & (BOOT_FLAG_SAFE_MODE | BOOT_FLAG_DISABLE_KMOD | BOOT_FLAG_INSTALLER)) == 0) {
         module_setup();
         dlinker_init();
         load_all_kernel_module();

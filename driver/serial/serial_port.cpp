@@ -6,6 +6,7 @@
 #include <cpu/lock.h>
 #include <proto.hpp>
 #include <dlinker.h>
+#include <openxj380/config.h>
 
 spin_t serial_lock;
 spin_t fmt_lock; // For write_serial_fmt
@@ -20,6 +21,9 @@ static constexpr const char serial_shell_prompt[] = "xj380$ ";
 
 int init_serial()
 {
+#if OPENXJ380_INPUT_OUTPUT_DISABLED
+    return 0;
+#else
     serial_lock = SPIN_INIT;
     fmt_lock    = SPIN_INIT;
     serial_prompt_active  = false;
@@ -48,19 +52,29 @@ int init_serial()
     // (not-loopback with IRQs enabled and OUT#1 and OUT#2 bits enabled)
     outb(PORT + 4, 0x0F);
     return 0;
+#endif
 }
 
 int is_transmit_empty()
 {
+#if OPENXJ380_INPUT_OUTPUT_DISABLED
+    return 1;
+#else
     return inb(PORT + 5) & 0x20;
+#endif
 }
 
 void write_serial(char a)
 {
+#if OPENXJ380_INPUT_OUTPUT_DISABLED
+    (void)a;
+    return;
+#else
     while (is_transmit_empty() == 0)
         ;
 
     outb(PORT, a);
+#endif
 }
 
 static void write_serial_string_unlocked(const char *str)
@@ -91,12 +105,20 @@ static bool serial_string_contains_newline(const char *str)
 
 static void write_serial_output_unlocked(const char *str)
 {
+#if OPENXJ380_INPUT_OUTPUT_DISABLED
+    (void)str;
+#else
     console_write(str);
     write_serial_string_unlocked(str);
+#endif
 }
 
 void write_serial_string(const char *str)
 {
+#if OPENXJ380_INPUT_OUTPUT_DISABLED
+    (void)str;
+    return;
+#else
     if (str == NULL) {
         return;
     }
@@ -106,6 +128,7 @@ void write_serial_string(const char *str)
     if (is_serial_shell_prompt(str)) serial_prompt_active = true;
     else if (serial_prompt_active && serial_string_contains_newline(str)) serial_prompt_active = false;
     spin_unlock(&serial_lock);
+#endif
 }
 
 static void serial_log_begin()
