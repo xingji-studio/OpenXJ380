@@ -26,6 +26,10 @@ cp_module_t *get_module_raw(const char *module_name);
     __attribute__((used, section(".ksymtab"))) static const dlfunc_t __ksym_##name = {             \
         #func_name, (void *)name}
 
+#define EXPORT_SYMBOL_OBJECT(name)                                                                 \
+    __attribute__((used, section(".ksymtab"))) static const dlfunc_t __ksym_object_##name = {      \
+        #name, (void *)&name}
+
 typedef int (*dlinit_t)(void);
 
 typedef struct {

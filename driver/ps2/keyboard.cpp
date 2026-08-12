@@ -1,6 +1,8 @@
 #include <proto.hpp>
 #include <atom_queue.h>
 #include <dlinker.h>
+#include <openxj380/config.h>
+#include <openxj380/socket.h>
 #include <syscall/syscall.h>
 
 struct keyboard_buf kb_fifo;
@@ -15,6 +17,37 @@ static uint8_t kb_ps2_pressed_values[2][128];
 static uint8_t kb_usb_pressed_values[256];
 extern uint8_t keyboard_code[256];
 extern uint8_t keyboard_code1[256];
+
+static void keyboard_emit_socket(void *regs_ptr, uint64_t error_code, uint8_t raw_scancode, uint8_t make_code,
+                                  uint8_t value, bool extended, bool pressed)
+{
+#if !OPENXJ380_INPUT_OUTPUT_DISABLED
+    OpenXJ380KeyboardInterruptInfo event = {};
+    event.regs = regs_ptr;
+    event.error_code = error_code;
+    event.source = OPENXJ380_INPUT_SOURCE_PS2;
+    event.raw_scancode = raw_scancode;
+    event.make_code = make_code;
+    event.value = value;
+    event.message_type = (uint8_t)(pressed ? MSG_KEYDOWN : MSG_KEYUP);
+    event.extended = extended ? 1 : 0;
+    event.pressed = pressed ? 1 : 0;
+    event.shift = kb_fifo.shift ? 1 : 0;
+    event.ctrl = kb_fifo.ctrl ? 1 : 0;
+    event.alt = kb_fifo.alt ? 1 : 0;
+    event.win = kb_fifo.win ? 1 : 0;
+    event.caps = kb_fifo.caps ? 1 : 0;
+    OpenXJ380Socket_KeyboardInterrupt(&event);
+#else
+    (void)regs_ptr;
+    (void)error_code;
+    (void)raw_scancode;
+    (void)make_code;
+    (void)value;
+    (void)extended;
+    (void)pressed;
+#endif
+}
 
 #define KB_USB_REPEAT_SLOTS 6
 #define KB_USB_REPEAT_DELAY_NS 500000000ULL
@@ -224,6 +257,15 @@ uint8_t keyboard_code1[256] = {                                                 
 
 extern "C" void c_keyboard_handler(void *regs_ptr, uint64_t error_code)
 {
+#if OPENXJ380_INPUT_OUTPUT_DISABLED
+    OpenXJ380KeyboardInterruptInfo event = {};
+    event.regs = regs_ptr;
+    event.error_code = error_code;
+    event.source = OPENXJ380_INPUT_SOURCE_PS2;
+    event.route = OPENXJ380_INPUT_ROUTE_XJ380_PS2_IRQ;
+    if (!OpenXJ380Socket_KeyboardInterrupt(&event)) send_eoi();
+    return;
+#else
     keyboard_prepare_fifo();
 
     uint8_t x = inb(0x60);
@@ -231,6 +273,7 @@ extern "C" void c_keyboard_handler(void *regs_ptr, uint64_t error_code)
     if (x == 0xe0)
     {
         kb_e0_prefix = true;
+        keyboard_emit_socket(regs_ptr, error_code, x, 0, 0, true, true);
         send_eoi();
         return;
     }
@@ -277,6 +320,8 @@ extern "C" void c_keyboard_handler(void *regs_ptr, uint64_t error_code)
 
     keyboard_update_modifier_state(make_code, extended, pressed);
 
+    keyboard_emit_socket(regs_ptr, error_code, x, make_code, event_value, extended, pressed);
+
     kb_e0_prefix = false;
 
     if (key_release)
@@ -300,10 +345,14 @@ extern "C" void c_keyboard_handler(void *regs_ptr, uint64_t error_code)
     }
 
     send_eoi();
+#endif
 }
 
 uint8_t get_keyboard_input()
 {
+#if OPENXJ380_INPUT_OUTPUT_DISABLED
+    return 0;
+#else
     keyboard_prepare_fifo();
     kb_usb_repeat_service();
 
@@ -315,40 +364,61 @@ uint8_t get_keyboard_input()
     int raw_input = atom_pop(&kb_fifo_queue);
     if (raw_input >= 0) { return (uint8_t)raw_input; }
     return NULL;
+#endif
 }
 
 void wait_ps2_write()
 {
+#if !OPENXJ380_INPUT_OUTPUT_DISABLED
     for (size_t i = 0; i < MAX_WAIT_INDEX; ++i)
     {
         if (!(inb(PS2_CMD_PORT) & KB_STATUS_IBF)) return;
     }
+#endif
 }
 
 void wait_ps2_read()
 {
+#if !OPENXJ380_INPUT_OUTPUT_DISABLED
     for (size_t i = 0; i < MAX_WAIT_INDEX; ++i)
     {
         if (!(inb(PS2_CMD_PORT) & KB_STATUS_OBF)) return;
     }
+#endif
 }
 
 void keyboard_init()
 {
+#if !OPENXJ380_INPUT_OUTPUT_DISABLED
     keyboard_prepare_fifo();
     wait_ps2_write();
     outb(PORT_KB_CMD, KBCMD_WRITE_CMD);
     wait_ps2_read();
     outb(PORT_KB_DATA, KB_INIT_MODE);
+#endif
 }
 
 extern "C" void keyboard_push_input(uint8_t value)
 {
+#if OPENXJ380_INPUT_OUTPUT_DISABLED
+    (void)value;
+#else
     kb_synth_enqueue(value);
+#endif
 }
 
 extern "C" void keyboard_usb_key_event(uint8_t usage, uint8_t value, uint8_t pressed)
 {
+#if OPENXJ380_INPUT_OUTPUT_DISABLED
+    OpenXJ380KeyboardInterruptInfo event = {};
+    event.source = OPENXJ380_INPUT_SOURCE_USB;
+    event.route = OPENXJ380_INPUT_ROUTE_XJ380_USB;
+    event.usb_usage = usage;
+    event.value = value;
+    event.message_type = (uint8_t)(pressed ? MSG_KEYDOWN : MSG_KEYUP);
+    event.pressed = pressed ? 1 : 0;
+    OpenXJ380Socket_KeyboardInterrupt(&event);
+#else
     keyboard_prepare_fifo();
     bool key_pressed = pressed != 0;
     if (value == KEY_SHIFT)
@@ -362,6 +432,14 @@ extern "C" void keyboard_usb_key_event(uint8_t usage, uint8_t value, uint8_t pre
     else if (value == KEY_ALT)
     {
         kb_fifo.alt = key_pressed;
+    }
+    else if (usage == 0xe3 || usage == 0xe7)
+    {
+        kb_fifo.win = key_pressed;
+    }
+    else if (value == KEY_CAPS && key_pressed)
+    {
+        kb_fifo.caps = !kb_fifo.caps;
     }
 
     uint8_t event_value = value;
@@ -380,6 +458,19 @@ extern "C" void keyboard_usb_key_event(uint8_t usage, uint8_t value, uint8_t pre
     }
 
     keyboard_dispatch_key_message(key_pressed ? MSG_KEYDOWN : MSG_KEYUP, event_value);
+
+    OpenXJ380KeyboardInterruptInfo event = {};
+    event.source = OPENXJ380_INPUT_SOURCE_USB;
+    event.usb_usage = usage;
+    event.value = event_value;
+    event.message_type = (uint8_t)(key_pressed ? MSG_KEYDOWN : MSG_KEYUP);
+    event.pressed = key_pressed ? 1 : 0;
+    event.shift = kb_fifo.shift ? 1 : 0;
+    event.ctrl = kb_fifo.ctrl ? 1 : 0;
+    event.alt = kb_fifo.alt ? 1 : 0;
+    event.win = kb_fifo.win ? 1 : 0;
+    event.caps = kb_fifo.caps ? 1 : 0;
+    OpenXJ380Socket_KeyboardInterrupt(&event);
 
     kb_synth_lock_acquire();
     keyboard_usb_repeat_slot *free_slot = NULL;
@@ -421,6 +512,7 @@ extern "C" void keyboard_usb_key_event(uint8_t usage, uint8_t value, uint8_t pre
     }
 
     kb_synth_lock_release();
+#endif
 }
 
 EXPORT_SYMBOL(keyboard_push_input);
