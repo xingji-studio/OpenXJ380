@@ -13,7 +13,10 @@ class CliInputSecurityTests(unittest.TestCase):
         self.assertIn("enter_syscall(XAPI_INPUT, (uint64_t)buffer, capacity, flags", cli)
         self.assertIn("read_line(password, sizeof(password), XAPI_INPUT_NO_ECHO)", cli)
         self.assertIn("read_line(line, sizeof(line))", cli)
-        self.assertIn("sizeof(path) - (size_t)(end - path)", cli)
+        self.assertIn("if (buffer == nullptr || capacity == 0) return", cli)
+        self.assertIn("char username[64] = {}", cli)
+        self.assertIn("char password[64] = {}", cli)
+        self.assertIn("char line[256] = {}", cli)
         self.assertIn("capacity == 0 || capacity > XAPI_USER_STRING_MAX", kernel)
         self.assertIn("if (input_len >= capacity) input_len = capacity - 1", kernel)
 
