@@ -102,7 +102,13 @@ extern "C" void c_mouse_handler(void *regs_ptr, uint64_t error_code)
     event.error_code = error_code;
     event.source = OPENXJ380_INPUT_SOURCE_PS2;
     event.route = OPENXJ380_INPUT_ROUTE_XJ380_PS2_IRQ;
-    if (!OpenXJ380Socket_MouseInterrupte(&event)) send_eoi();
+    if (!OpenXJ380Socket_MouseInterrupte(&event))
+    {
+        /* An unconsumed i8042 byte keeps the VMware virtual controller's
+         * output buffer asserted and can block both PS/2 ports. */
+        (void)inb(PS2_DATA_PORT);
+        send_eoi();
+    }
     return;
 #else
     uint8_t packet_byte = inb(PS2_DATA_PORT);

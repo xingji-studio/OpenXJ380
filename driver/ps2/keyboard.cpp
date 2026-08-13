@@ -263,7 +263,13 @@ extern "C" void c_keyboard_handler(void *regs_ptr, uint64_t error_code)
     event.error_code = error_code;
     event.source = OPENXJ380_INPUT_SOURCE_PS2;
     event.route = OPENXJ380_INPUT_ROUTE_XJ380_PS2_IRQ;
-    if (!OpenXJ380Socket_KeyboardInterrupt(&event)) send_eoi();
+    if (!OpenXJ380Socket_KeyboardInterrupt(&event))
+    {
+        /* Always drain an unhandled i8042 interrupt.  VMware otherwise leaves
+         * the controller output buffer full and subsequent input stalls. */
+        (void)inb(PORT_KB_DATA);
+        send_eoi();
+    }
     return;
 #else
     keyboard_prepare_fifo();
