@@ -30,8 +30,8 @@ void rng_chacha20_block(const uint32_t key[8], uint32_t counter, const uint32_t 
     static const uint32_t constants[4] = {0x61707865U, 0x3320646eU, 0x79622d32U, 0x6b206574U};
     uint32_t initial[16] = {constants[0], constants[1], constants[2], constants[3],
                             key[0], key[1], key[2], key[3], key[4], key[5], key[6], key[7],
-                            counter, nonce[0], nonce[1], nonce[2]};
-    uint32_t state[16];
+                            counter, nonce[0], nonce[1], nonce[2]};  //初始矩阵
+    uint32_t state[16];  //state从initial复制出来一份,避免破坏原始数据
     memcpy(state, initial, sizeof(state));
     for (unsigned i = 0; i < 10; ++i)
     {
@@ -52,7 +52,9 @@ void rng_chacha20_block(const uint32_t key[8], uint32_t counter, const uint32_t 
         output[i * 4 + 2] = (uint8_t)(word >> 16);
         output[i * 4 + 3] = (uint8_t)(word >> 24);
     }
+    /* 清理现场,避免它以明文形式残留在栈帧被后续代码读到  */
     memset(state, 0, sizeof(state));
+    memset(initial,0,sizeof(initial));
 }
 
 static uint64_t splitmix64(uint64_t *state)
@@ -75,7 +77,7 @@ static bool hardware_random64(uint64_t *value)
             for (unsigned i = 0; i < 10; ++i)
             {
                 unsigned char ok;
-                __asm__ volatile("rdseed %0; setc %1" : "=r"(*value), "=qm"(ok));
+                __asm__ volatile("rdseed %0; setc %1" : "=r"(*value), "=qm"(ok)::"cc");
                 if (ok) return true;
             }
         }
@@ -86,7 +88,7 @@ static bool hardware_random64(uint64_t *value)
         for (unsigned i = 0; i < 10; ++i)
         {
             unsigned char ok;
-            __asm__ volatile("rdrand %0; setc %1" : "=r"(*value), "=qm"(ok));
+            __asm__ volatile("rdrand %0; setc %1" : "=r"(*value), "=qm"(ok)::"cc");
             if (ok) return true;
         }
     }
