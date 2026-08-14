@@ -12,6 +12,14 @@ static uint32_t rng_counter;
 static size_t rng_bytes_since_reseed;
 static bool rng_initialized;
 
+/* 安全清零,避免编译器Dead Store Elimination优化  */
+static inline void secure_zero(void* p,size_t n)
+{
+     volatile uint8_t *vp = (volatile uint8_t *)p;  //volatile修饰指针,不允许因后续未读取而省略清零
+     while(n--) *vp++ = 0;   
+}
+
+
 static inline uint32_t rotl32(uint32_t value, unsigned count)
 {
     return (value << count) | (value >> (32 - count));
@@ -53,8 +61,8 @@ void rng_chacha20_block(const uint32_t key[8], uint32_t counter, const uint32_t 
         output[i * 4 + 3] = (uint8_t)(word >> 24);
     }
     /* 清理现场,避免它以明文形式残留在栈帧被后续代码读到  */
-    memset(state, 0, sizeof(state));
-    memset(initial,0,sizeof(initial));
+    secure_zero(state, sizeof(state));
+    secure_zero(initial, sizeof(initial));
 }
 
 static uint64_t splitmix64(uint64_t *state)
