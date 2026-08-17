@@ -168,6 +168,11 @@ void init_runfile()
 
 void runfile(char *path)
 {
+    // Preserve the caller's process hierarchy so terminal-backed children can
+    // find the shell group that owns their input and output buffers.
+    tcb_t caller = get_current_task();
+    pcb_t launch_parent = caller != NULL ? caller->parent_group : NULL;
+
     // 获取扩展名
     char exname[10];
     memset(exname, 0, 10);
@@ -179,7 +184,7 @@ void runfile(char *path)
     if (strcmp("elf", exname) == 0 || strcmp("epf", exname) == 0)
     {
         // 是可执行文件
-        create_user_process_from_file(path, NULL, NULL);
+        create_user_process_from_file(path, launch_parent, NULL);
         return;
     }
 
@@ -224,7 +229,7 @@ void runfile(char *path)
         {
             // 是可执行文件
             char *argv[2]    = {path, NULL};
-            create_user_process_from_file(item->runpath, NULL, argv);
+            create_user_process_from_file(item->runpath, launch_parent, argv);
             free(file_format);
             return;
         }
