@@ -987,7 +987,6 @@ int create_user_process_from_file(char *path, pcb_t pcb, char *argv[])
         return -ENOMEM;
     }
     group->argc = argc;
-    group->linux_abi = true;
     char *cwd = getCwd(path);
     if (cwd == NULL)
     {

@@ -58,6 +58,8 @@ typedef struct OpenXJ380KeyboardInterruptInfo
 
 typedef bool (*OpenXJ380MouseInterruptHook)(const OpenXJ380MouseInterruptInfo *event);
 typedef bool (*OpenXJ380KeyboardInterruptHook)(const OpenXJ380KeyboardInterruptInfo *event);
+/* Returns zero when the product-owned keyboard queue has no pending input. */
+typedef uint8_t (*OpenXJ380KeyboardInputHook)(void);
 
 #ifdef __cplusplus
 extern "C" {
@@ -68,8 +70,11 @@ bool OpenXJ380Socket_KeyboardInterrupt(const OpenXJ380KeyboardInterruptInfo *eve
 
 int OpenXJ380Socket_RegisterMouseHook(OpenXJ380MouseInterruptHook hook);
 int OpenXJ380Socket_RegisterKeyboardHook(OpenXJ380KeyboardInterruptHook hook);
+int OpenXJ380Socket_RegisterKeyboardInputHook(OpenXJ380KeyboardInputHook hook);
 void OpenXJ380Socket_UnregisterMouseHook(OpenXJ380MouseInterruptHook hook);
 void OpenXJ380Socket_UnregisterKeyboardHook(OpenXJ380KeyboardInterruptHook hook);
+void OpenXJ380Socket_UnregisterKeyboardInputHook(OpenXJ380KeyboardInputHook hook);
+uint8_t OpenXJ380Socket_GetKeyboardInput();
 const void *OpenXJ380Socket_FramebufferConfig();
 uint64_t OpenXJ380Socket_PowerAction(uint64_t action);
 

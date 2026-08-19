@@ -871,7 +871,9 @@ uint64_t page_reserve_user_range(page_directory_t *directory, uint64_t length)
     if (aligned_length == 0) return 0;
 
     pcb_t owner = find_process_by_pagedir(directory);
-    uint64_t start = (owner != NULL && owner->mmap_start >= USER_MMAP_START) ? owner->mmap_start : USER_MMAP_START;
+    if (owner == NULL) return 0;
+
+    uint64_t start = owner->mmap_start >= USER_MMAP_START ? owner->mmap_start : USER_MMAP_START;
     uint64_t addr = find_free_user_range(directory, start, aligned_length);
     if (addr == 0 && start != USER_MMAP_START)
     {
@@ -879,9 +881,8 @@ uint64_t page_reserve_user_range(page_directory_t *directory, uint64_t length)
     }
     if (addr == 0) return 0;
 
-    if (owner != NULL) owner->mmap_start = addr + aligned_length;
-    if (owner != NULL &&
-        !lazy_infoalloc(owner, addr, aligned_length, PTE_USER | PTE_PRESENT | PTE_WRITEABLE | PTE_NO_EXECUTE, 0))
+    owner->mmap_start = addr + aligned_length;
+    if (!lazy_infoalloc(owner, addr, aligned_length, PTE_USER | PTE_PRESENT | PTE_WRITEABLE | PTE_NO_EXECUTE, 0))
     {
         return 0;
     }

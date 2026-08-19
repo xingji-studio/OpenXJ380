@@ -76,6 +76,7 @@ extern void message_thread(uint64_t arg);
 extern uint64_t message_ask(uint64_t msg_type_p, uint64_t hdatap, uint64_t ldatap, uint64_t funcp, uint64_t taskp);
 static void close_exec_file_descriptors(pcb_t process);
 static void close_process_file_table(pcb_t pcb);
+static void free_owned_pointer_queue(lock_queue *queue);
 static bool fd_table_unref(pcb_t pcb);
 
 static tcb_t alloc_zeroed_tcb(void)
@@ -1531,6 +1532,27 @@ uint64_t process_execve(char *path, char **argv, char **envp)
         return (uint64_t)-ENOMEM;
     }
 
+    lock_queue *old_virt_queue = process->virt_queue;
+    lock_queue *new_virt_queue = queue_init();
+    if (new_virt_queue == NULL)
+    {
+        spin_unlock(&execve_image_lock);
+        vfs_close(node);
+        free(norm_path);
+        free(kpath);
+        free(new_cmdline);
+        free_envp(new_task_argv);
+        free_envp(new_process_argv);
+        free(new_exe_path);
+        free_envp(kargv);
+        free_envp(kenvp);
+        free_envp(new_envp);
+        free_page_directory(new_page_dir);
+        restore_runtime_state(was_scheduler_enabled, is_sti);
+        return (uint64_t)-ENOMEM;
+    }
+    process->virt_queue = new_virt_queue;
+
     char old_thread_name[sizeof(current_task->name)];
     char old_process_name[sizeof(process->name)];
     memcpy(old_thread_name, current_task->name, sizeof(old_thread_name));
@@ -1558,6 +1580,8 @@ uint64_t process_execve(char *path, char **argv, char **envp)
     if (e_entry == NULL || (int64_t)e_entry < 0)
     {
         int exec_ret = e_entry == NULL ? -ENOENT : (int)(int64_t)e_entry;
+        free_owned_pointer_queue(process->virt_queue);
+        process->virt_queue = old_virt_queue;
         memcpy(current_task->name, old_thread_name, sizeof(old_thread_name));
         memcpy(process->name, old_process_name, sizeof(old_process_name));
         process->brk_start = old_brk_start;
@@ -1582,9 +1606,11 @@ uint64_t process_execve(char *path, char **argv, char **envp)
         restore_runtime_state(was_scheduler_enabled, is_sti);
         return (uint64_t)exec_ret;
     }
-    uint64_t stack = page_reserve_user_range(get_current_directory(), BIG_USER_STACK);
+    uint64_t stack = page_reserve_user_range(new_page_dir, BIG_USER_STACK);
     if (stack == 0)
     {
+        free_owned_pointer_queue(process->virt_queue);
+        process->virt_queue = old_virt_queue;
         memcpy(current_task->name, old_thread_name, sizeof(old_thread_name));
         memcpy(process->name, old_process_name, sizeof(old_process_name));
         process->brk_start = old_brk_start;
@@ -1643,15 +1669,7 @@ uint64_t process_execve(char *path, char **argv, char **envp)
 
     vfs_close(node);
 
-    spin_lock(&process->virt_queue->lock);
-    queue_foreach(process->virt_queue, node)
-    {
-        mm_virtual_page_t *vpage = (mm_virtual_page_t *)node->data;
-        free(vpage);
-    }
-    spin_unlock(&process->virt_queue->lock);
-    queue_destroy(process->virt_queue);
-    process->virt_queue = queue_init();
+    free_owned_pointer_queue(old_virt_queue);
 
     spin_lock(&process->ipc_queue->lock);
     queue_foreach(process->ipc_queue, node)
