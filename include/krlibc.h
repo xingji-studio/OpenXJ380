@@ -123,7 +123,6 @@ char   *strchrnul(const char *s, int c);
 int     strncmp(const char *s1, const char *s2, size_t n);
 char   *strchr(const char *s, int c);
 int     strcmp(const char *s1, const char *s2);
-char   *strcpy(char *dest, const char *src);
 int     isspace(int c);
 char   *strtok(char *str, const char *delim);
 int64_t strtol(const char *str, char **endptr, int base);

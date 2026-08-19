@@ -74,16 +74,6 @@ void default_isr(struct X64_REGS *regs, uint64_t error_code);
 }
 #endif
 
-// libutf declarations; see third_party/libutf/SOURCE.md.
-typedef int32_t Rune;
-#define UTFmax    6            /* maximum bytes per rune */
-#define Runeerror ((Rune) - 1) /* decoding error in utf */
-int    charntorune(Rune *, const char *, size_t);
-int    chartorune(Rune *, const char *);
-size_t utflen(const char *);
-size_t utfnlen(const char *, size_t);
-
-extern const unsigned char utftab[64];
 /*
  *
  *  kernel/cpu/
@@ -113,7 +103,6 @@ bool mtrr_supported();
 
 // kernel/cpu/mtrr.cpp
 void mtrr_save();
-void mtrr_restore();
 
 // kernel/cpu/delay.cpp
 // 读取TSC
@@ -248,9 +237,6 @@ void backtrace(struct X64_REGS *regs);
 
 uint64_t get_counter();
 uint32_t get_freq();
-
-char     getch_from_file(void *buffer);
-uint64_t getline_from_file(void *buffer, char *str);
 
 // ulog.cpp
 void init_xuls();

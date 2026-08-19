@@ -227,7 +227,7 @@ def clean() -> None:
 
 
 def root_sources() -> tuple[list[Path], list[Path], list[Path]]:
-    roots = [ROOT / p for p in ("kernel", "driver", "graphics", "font", "lib")]
+    roots = [ROOT / p for p in ("kernel", "driver", "font", "lib")]
     c_files: list[Path] = []
     cpp_files: list[Path] = []
     h_files = list((ROOT / "include").rglob("*.h")) + list((ROOT / "include").rglob("*.hpp"))

@@ -48,7 +48,7 @@ OpenXJ380 是一个面向 x86_64 平台的独立操作系统内核项目。项�
 boot/                  UEFI 引导程序与 EFI 交接逻辑
 kernel/                内核核心子系统和启动入口
 driver/                链接到内核镜像的内建驱动
-graphics/、font/       不参与当前构建的历史图形与字体代码
+font/                   控制台字体（hankaku.bin），编译进内核
 include/               内核和模块共享的 ABI 头文件
 lib/                   基础支持代码
 kmod/                  可加载内核模块

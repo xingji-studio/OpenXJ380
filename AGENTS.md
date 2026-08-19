@@ -13,7 +13,7 @@ XJ380/
 ├── boot/                 # UEFI BOOTX64.efi, boot menu, EFI protocol handoff
 ├── kernel/               # KernelMain and core kernel subsystems
 ├── driver/               # Built-in drivers linked into kernel.krl
-├── graphics/, font/      # Historical graphics/font code; not in the current build
+├── font/                # Console font (hankaku.bin); built into the kernel
 ├── include/              # Shared kernel/module ABI headers
 ├── lib/                  # Small built-in support code
 ├── kmod/                 # Loadable kernel modules -> out/*.sys -> image /mod
@@ -38,7 +38,7 @@ XJ380/
 | User example | `tools/gen_ninja.py`, `user/cli_shell.cpp` | Links against `out/xapi/*.o`. |
 | User runtime/API | `user/xapi/`, `user/xapi/include/` | Startup shims, libc/POSIX-like wrappers. |
 | Image layout | `tools/ninja_build.py`, `tools/stage_image_base.sh`, `resources/`, `Bf/` | `ninja vdisk` stages the rootfs. |
-| CI reality | `.github/workflows/pr-build.yml` | PR CI generates Ninja and runs `ninja all`; no QEMU smoke test. |
+| CI reality | `.github/workflows/build.yml` | PR CI runs the unit-test suite and `ninja vdisk`; no QEMU smoke test. |
 
 ## CODE MAP
 | Symbol / target | Type | Location | Role |

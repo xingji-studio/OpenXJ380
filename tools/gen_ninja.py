@@ -553,10 +553,9 @@ def main() -> None:
         asm_files.extend(find_files(base, (".S",)))
         c_files.extend(find_files(base, (".c",)))
         cpp_files.extend(find_files(base, (".cpp",)))
-    cpp_files = [p for p in cpp_files if p != ROOT / "kernel/stress.cpp"]
     if builtin_xhci:
         cpp_files.extend(find_files("kmod/xhci", (".cpp",)))
-    xapi_sources = [ROOT / "user/xapi/arch/x86_64/crt0.S", ROOT / "user/xapi/libsys.cpp"]
+    xapi_sources = [ROOT / "user/xapi/arch/x86_64/crt0.S", ROOT / "user/xapi/libsys.cpp", ROOT / "user/xapi/xgui_stubs.cpp"]
     n.var("BUILTIN_XHCI", "1" if builtin_xhci else "0")
     n.var("ROOT_SOURCE_DIRS", " ".join(root_source_roots))
     n.var_list("NASM_FILES", nasm_files)

@@ -8,7 +8,7 @@ Built-in driver subtree. Objects under `driver/` are linked into `kernel.krl`, u
 driver/
 ├── ahci/, ide/, nvme/    # Storage controllers
 ├── fs/                   # FATFS, VFS, pseudo-filesystems
-├── hda/, sb16.cpp        # Audio paths
+├── hda/                  # Audio paths
 ├── pci/                  # PCI enumeration/config
 ├── ps2/                  # Keyboard and mouse
 └── serial/               # Serial logging/device support
@@ -21,7 +21,7 @@ driver/
 | PCI | `pci/`, `include/pci/` | Probing used by storage/audio/module drivers. |
 | Storage | `ahci/`, `ide/`, `nvme/` | Initialized from `KernelMain`. |
 | Input | `ps2/`, `include/ps2/` | Keyboard/mouse IRQ paths. |
-| Audio | `hda/`, `sb16.cpp` | HDA and legacy sound support. |
+| Audio | `hda/` | HDA sound support. |
 | Filesystems | `fs/` | See child `driver/fs/AGENTS.md`. |
 
 ## CONVENTIONS

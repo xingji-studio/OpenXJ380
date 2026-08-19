@@ -14,7 +14,6 @@
 #include <fs/vfs/devfs.h>
 #include <fs/vfs/vfs.h>
 #include <hda/hda.h>
-#include <hda/pcspk.h>
 #include <krlibc.h>
 #include <mm/alloc/alloc.h>
 #include <mm/frame.h>
@@ -30,16 +29,12 @@
 #include <ps2/keyboard.h>
 #include <ps2/mouse.h>
 #include <rtc.h>
-#include <sb16.h>
 #include <syscall/signal.h>
 #include <syscall/pxapi.h>
 #include <syscall/syscall.h>
 #include <task/pcb.h>
 #include <user/runfile.h>
 #include <user/settings.h>
-#include <user/info_register.h>
-#include <hda/vsound.h>
-#include <hda/hda.h>
 #include <installer_mode.h>
 
 const FrameBufferConfig *fbc_addr;
@@ -524,15 +519,11 @@ extern "C" void KernelMain(const FrameBufferConfig &fbc, EFI_SYSTEM_TABLE &Syste
     write_serial_string("BOOT: partition_init begin\n");
     partition_init();
     write_serial_string("BOOT: partition_init done\n");
-    // enable_intr();
-
-    // disable_intr();
 #if !OPENXJ380_INPUT_OUTPUT_DISABLED
     // HDA 驱动现在会在初始化阶段自行完成注册，这里只需要启动探测即可。
     hda_init();
     hda_regist();
 #endif
-    // sb16_init();
 
     keyboard_init();
     mouse_init();
@@ -626,7 +617,6 @@ extern "C" void KernelMain(const FrameBufferConfig &fbc, EFI_SYSTEM_TABLE &Syste
 
     if (BootConfig.is_qemu == 1) pr_warn("XJ380 is running under the QEMU/BOCHS.\n");
 
-    // create_kernel_thread((void *)tst, NULL, (char *)"1", NULL);
     if ((BootConfig.boot_flags & (BOOT_FLAG_SAFE_MODE | BOOT_FLAG_SAFE_STORAGE_IO)) != 0) {
         write_serial_string("AHCI: keeping conservative IO path by boot menu\n");
     } else if (ahci_is_qemu_environment()) {
@@ -642,24 +632,9 @@ extern "C" void KernelMain(const FrameBufferConfig &fbc, EFI_SYSTEM_TABLE &Syste
     if (initial_program_pcb == NULL) shutdown_boot_failure("configured initial program was not published");
     initial_program_pcb->is_initial_program = true;
 
-    // delay_s_hp(60);
-
-    // uint64_t utsk = page_alloc_random(get_current_directory(), 114, PTE_PRESENT | PTE_USER);
-    // memcpy((void *)utsk, (void *)test_task, 114);
-    // create_user_thread((void *)utsk, NULL, (char *)"test_task2", ugp);
-
-
     enable_scheduler();
     open_interrupt;
     no_interrupt = false;
-
-    // no_interrupt = true;
-    // close_interrupt;
-    // disable_scheduler();
-
-    // enable_scheduler();
-    // open_interrupt;
-    // no_interrupt = false;
 
     while (true)
     {

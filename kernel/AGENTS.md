@@ -28,7 +28,7 @@ kernel/
 | Dynamic linker/modules | `dlinker.cpp`, `include/dlinker.h` | Loads user shared objects and `.sys` modules. |
 
 ## CONVENTIONS
-- Kernel sources are freestanding GNU++17/C11 and are linked with built-in `driver/`, `graphics/`, `font/`, and `lib/` objects into `out/kernel.krl`.
+- Kernel sources are freestanding GNU++17/C11 and are linked with built-in `driver/`, `font/`, and `lib/` objects into `out/kernel.krl`.
 - `KernelMain` starts with interrupts and scheduler disabled; many initialization phases depend on that state.
 - Early order matters: CPU → IDT/GDT → timers/APIC → HHDM/frame/heap → device/VFS/storage → process/SMP → rootfs/syscalls/modules → scheduler open.
 - `open_interrupt` / `close_interrupt`, `enable_scheduler()` / `disable_scheduler()`, and `no_interrupt` are stateful gates; do not move them casually.

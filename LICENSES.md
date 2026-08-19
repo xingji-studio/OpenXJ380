@@ -15,7 +15,6 @@ binary distribution. The test image installs the repository notices at
 | Rust alloc/compiler_builtins archive | Apache-2.0 OR MIT | `liballoc-x86_64.a`; `third_party/rust-runtime` | `liballoc.txt`; `third-party compliance bundle` |
 | talc allocator | MIT | `liballoc-x86_64.a`; `third_party/talc` | `third-party compliance bundle` |
 | Linux UAPI ioctl definitions | GPL-2.0 WITH Linux-syscall-note | `include/ioctl.h`; `third_party/linux-uapi` | `third-party compliance bundle` |
-| libutf | MIT | `kernel/utflib.cpp`; `include/proto.hpp`; `third_party/libutf` | `third-party compliance bundle` |
 | XJ380 project notices | Project notice | `THIRD_PARTY_NOTICES.md` | `THIRD_PARTY_NOTICES.md` |
 | MikanOS hankaku font | Apache-2.0 | `third_party/mikanos-hankaku`; `font/hankaku.bin` | `third-party compliance bundle` |
 | MikanOS-derived framebuffer header | Apache-2.0 for derived portions | `include/efi/fbc.h`; `third_party/mikanos-hankaku/SOURCE.md` | `third-party compliance bundle` |

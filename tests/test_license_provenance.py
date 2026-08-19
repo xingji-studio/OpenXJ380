@@ -33,29 +33,6 @@ class LicenseProvenanceTests(unittest.TestCase):
             components["musl-elf"]["license_files"],
         )
 
-    def test_libutf_license_material_is_complete(self) -> None:
-        license_path = ROOT / "third_party/libutf/LICENSE"
-        source_record = ROOT / "third_party/libutf/SOURCE.md"
-        implementation = (ROOT / "kernel/utflib.cpp").read_text(encoding="utf-8")
-        manifest = json.loads(
-            (ROOT / "third_party/compliance-manifest.json").read_text(encoding="utf-8")
-        )
-        components = {component["slug"]: component for component in manifest["components"]}
-
-        self.assertIn("MIT/X Consortium License", license_path.read_text(encoding="utf-8"))
-        self.assertIn("Connor Lane Smith", source_record.read_text(encoding="utf-8"))
-        self.assertIn("SPDX-License-Identifier: MIT", implementation)
-        self.assertIn("third_party/libutf/SOURCE.md", implementation)
-        self.assertEqual("libutf", components["libutf"]["name"])
-        self.assertEqual(
-            ["third_party/libutf/LICENSE", "third_party/libutf/SOURCE.md"],
-            components["libutf"]["license_files"],
-        )
-        self.assertEqual(
-            ["kernel/utflib.cpp", "include/proto.hpp"],
-            components["libutf"]["source_files"],
-        )
-
     def test_linux_uapi_and_llist_provenance_are_clean(self) -> None:
         ioctl_header = (ROOT / "include/ioctl.h").read_text(encoding="utf-8")
         llist_header = (ROOT / "include/llist.h").read_text(encoding="utf-8")
@@ -121,8 +98,6 @@ class LicenseProvenanceTests(unittest.TestCase):
             for relative_path in (
                 "licenses/musl-elf/COPYRIGHT",
                 "licenses/musl-elf/SOURCE.md",
-                "licenses/libutf/LICENSE",
-                "licenses/libutf/SOURCE.md",
                 "licenses/linux-uapi/COPYING",
                 "licenses/linux-uapi/GPL-2.0",
                 "licenses/linux-uapi/Linux-syscall-note",

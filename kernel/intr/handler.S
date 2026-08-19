@@ -303,13 +303,6 @@ ENTRY(hda_interrupt)
     xchgq %rax, (%rsp)
     jmp Err_Code
 
-ENTRY(sb16_interr)
-    pushq $0
-    pushq %rax
-    leaq sb16_handler(%rip), %rax
-    xchgq %rax, (%rsp)
-    jmp Err_Code
-
 ENTRY(syscall_handler)
     cli
     cld

@@ -113,42 +113,11 @@ typedef struct vsound {
     size_t          bufsize;          // 每个缓冲区大小
 } *vsound_t;
 
-typedef struct ImaAdpcmCtx {
-    int index;
-    int prev_sample;
-} ImaAdpcmCtx;
+int sound_fmt_bytes(sound_pcmfmt_t fmt);
 
-void sound_ima_adpcm_encode(ImaAdpcmCtx *ctx, void *dst, const int16_t *src, size_t len);
-void sound_ima_adpcm_decode(ImaAdpcmCtx *ctx, int16_t *dst, const void *src, size_t len);
-
-bool sound_fmt_issigned(sound_pcmfmt_t fmt);
-bool sound_fmt_isfloat(sound_pcmfmt_t fmt);
-bool sound_fmt_isbe(sound_pcmfmt_t fmt);
-int  sound_fmt_bytes(sound_pcmfmt_t fmt);
-
-bool     vsound_regist(vsound_t device);
-bool     vsound_set_supported_fmt(vsound_t device, int16_t fmt);
-bool     vsound_set_supported_rate(vsound_t device, int32_t rate);
-bool     vsound_set_supported_ch(vsound_t device, int16_t ch);
-bool     vsound_set_supported_fmts(vsound_t device, const int16_t *fmts, ssize_t len);
-bool     vsound_set_supported_rates(vsound_t device, const int32_t *rates, ssize_t len);
-bool     vsound_set_supported_chs(vsound_t device, const int16_t *chs, ssize_t len);
-void     vsound_addbuf(vsound_t device, void *buf);
-void     vsound_addbufs(vsound_t device, void *const *bufs, ssize_t len);
-vsound_t vsound_find(const char *name);
-int      vsound_played(vsound_t snd);
-int      vsound_clearbuffer(vsound_t snd);
-int      vsound_open(vsound_t snd);
-int      vsound_close(vsound_t snd);
-int      vsound_play(vsound_t snd);
-int      vsound_pause(vsound_t snd);
-int      vsound_drop(vsound_t snd);
-int      vsound_drain(vsound_t snd);
-ssize_t  vsound_read(vsound_t snd, uint64_t *data, size_t len);
-ssize_t  vsound_write(vsound_t snd, uint64_t *data, size_t len);
-float    vsound_getvol(vsound_t snd);
-int      vsound_setvol(vsound_t snd, float vol);
-
-void mp3_player(const char *path);
-void wav_player(const char *path);
-void hda_test_tone(void *arg);
+bool vsound_regist(vsound_t device);
+bool vsound_set_supported_ch(vsound_t device, int16_t ch);
+bool vsound_set_supported_fmts(vsound_t device, const int16_t *fmts, ssize_t len);
+bool vsound_set_supported_rates(vsound_t device, const int32_t *rates, ssize_t len);
+void vsound_addbuf(vsound_t device, void *buf);
+int  vsound_played(vsound_t snd);

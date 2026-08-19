@@ -4,7 +4,6 @@
     {"name":"musl ELF definitions","slug":"musl-elf","license":"MIT","license_files":["third_party/musl-elf/COPYRIGHT","third_party/musl-elf/SOURCE.md"],"source_files":["include/elf.h","third_party/musl-elf/SOURCE.md"],"bundle_source":false},
     {"name":"lwIP","slug":"lwip","license":"BSD-style","license_files":["licenses/lwip-notice-full.txt"],"source_files":["kmod/netserver/lwip"],"bundle_source":false},
     {"name":"FatFs","slug":"fatfs","license":"BSD-style","license_files":["licenses/fatfs.txt"],"source_files":["driver/fs/fatfs"],"bundle_source":false},
-    {"name":"dr_mp3","slug":"dr-mp3","license":"MIT-0 OR Unlicense","license_files":["include/dr_mp3.h"],"source_files":["include/dr_mp3.h"],"bundle_source":false},
     {"name":"libvterm","slug":"libvterm","license":"MIT","license_files":["third_party/libvterm/LICENSE"],"source_files":["third_party/libvterm"],"bundle_source":false},
     {"name":"Mbed TLS","slug":"mbedtls","license":"Apache-2.0","license_files":["third_party/mbedtls-src/LICENSE","third_party/mbedtls-license-selection.json"],"source_files":["third_party/mbedtls-src"],"bundle_source":false},
     {"name":"Lexbor","slug":"lexbor","license":"Apache-2.0","license_files":["third_party/lexbor/LICENSE","third_party/lexbor/NOTICE"],"source_files":["third_party/lexbor"],"bundle_source":false},
@@ -12,7 +11,6 @@
     {"name":"talc allocator","slug":"talc","license":"MIT","license_files":["third_party/talc/LICENSE.md","third_party/talc/SOURCE.md"],"source_files":["liballoc-x86_64.a"],"bundle_source":false},
     {"name":"MikanOS hankaku font","slug":"mikanos-hankaku","license":"Apache-2.0","license_files":["third_party/mikanos-hankaku/LICENSE","third_party/mikanos-hankaku/SOURCE.md"],"source_files":["third_party/mikanos-hankaku/hankaku.txt","font/hankaku.bin"],"bundle_source":true},
     {"name":"MikanOS-derived framebuffer header","slug":"mikanos-framebuffer","license":"Apache-2.0 for derived portions","license_files":["third_party/mikanos-hankaku/LICENSE","third_party/mikanos-hankaku/SOURCE.md"],"source_files":["include/efi/fbc.h"],"bundle_source":true},
-    {"name":"libutf","slug":"libutf","license":"MIT","license_files":["third_party/libutf/LICENSE","third_party/libutf/SOURCE.md"],"source_files":["kernel/utflib.cpp","include/proto.hpp"],"bundle_source":false},
     {"name":"Linux UAPI ioctl definitions","slug":"linux-uapi","license":"GPL-2.0 WITH Linux-syscall-note","license_files":["third_party/linux-uapi/COPYING","third_party/linux-uapi/GPL-2.0","third_party/linux-uapi/Linux-syscall-note","third_party/linux-uapi/SOURCE.md"],"source_files":["include/ioctl.h"],"bundle_source":false}
   ]
 }
