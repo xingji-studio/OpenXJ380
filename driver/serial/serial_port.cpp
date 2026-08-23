@@ -17,6 +17,9 @@ static bool serial_restore_prompt = false;
 static bool serial_log_active     = false;
 static constexpr const char serial_shell_prompt[] = "xj380$ ";
 
+/* Optional product hook. OpenXJ380 remains usable without a product overlay. */
+extern "C" void serial_output_observer(const char *str) __attribute__((weak));
+
 #define PORT 0x3f8 // COM1
 
 int init_serial()
@@ -74,6 +77,11 @@ static void write_serial_string_unlocked(const char *str)
     }
 }
 
+static void notify_serial_output_observer(const char *str)
+{
+    if (serial_output_observer != nullptr) serial_output_observer(str);
+}
+
 static bool is_serial_shell_prompt(const char *str)
 {
     size_t index = 0;
@@ -96,6 +104,7 @@ static void write_serial_output_unlocked(const char *str)
     console_write(str);
 #endif
     write_serial_string_unlocked(str);
+    notify_serial_output_observer(str);
 }
 
 void write_serial_string(const char *str)
@@ -109,6 +118,7 @@ void write_serial_string(const char *str)
     if (is_serial_shell_prompt(str)) serial_prompt_active = true;
     else if (serial_prompt_active && serial_string_contains_newline(str)) serial_prompt_active = false;
     spin_unlock(&serial_lock);
+    notify_serial_output_observer(nullptr);
 }
 
 static void serial_log_begin()
@@ -137,6 +147,7 @@ static void serial_log_end()
     serial_restore_prompt = false;
     serial_log_active = false;
     spin_unlock(&serial_lock);
+    notify_serial_output_observer(nullptr);
 }
 
 void write_serial_dec(unsigned long long dec)
