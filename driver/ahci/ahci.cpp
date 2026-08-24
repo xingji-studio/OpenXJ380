@@ -14,6 +14,17 @@ static bool ahci_port_link_ready(uint32_t ssts) {
     return HBA_PXSSTS_DET(ssts) == 0x3 && HBA_PXSSTS_IPM(ssts) == 0x1;
 }
 
+static constexpr uint64_t AHCI_PORT_STOP_TIMEOUT_NS = 2000000000ULL;
+
+static bool ahci_wait_port_engine_stopped(volatile hba_reg_t *port_reg, uint64_t timeout_ns) {
+    uint64_t start = nanoTime();
+    while ((port_reg[HBA_RPxCMD] & (HBA_PxCMD_CR | HBA_PxCMD_FR)) != 0) {
+        if (nanoTime() - start >= timeout_ns) return false;
+        asm volatile("pause");
+    }
+    return true;
+}
+
 static void ahci_log_port_state(size_t port_no, volatile hba_reg_t *regs, const char *stage) {
     uint32_t ssts = regs[HBA_RPxSSTS];
     write_serial_fmt(
@@ -150,9 +161,9 @@ int hba_prepare_cmd(struct hba_port *port, struct hba_cmdt **cmdt, struct hba_cm
 void __hba_reset_port(hba_reg_t *port_reg) {
     port_reg[HBA_RPxCMD] &= ~HBA_PxCMD_ST;
     port_reg[HBA_RPxCMD] &= ~HBA_PxCMD_FRE;
-    uint64_t cnt = wait_until_expire((port_reg[HBA_RPxCMD] & (HBA_PxCMD_CR | HBA_PxCMD_FR)) == 0, 1000000);
-    if (cnt == 0) {
-        write_serial_fmt("AHCI: Port reset timeout waiting for FR/CR to clear CMD=0x%x\n", port_reg[HBA_RPxCMD]);
+    if (!ahci_wait_port_engine_stopped(port_reg, AHCI_PORT_STOP_TIMEOUT_NS)) {
+        write_serial_fmt("AHCI: Port reset timeout after %llums waiting for FR/CR to clear CMD=0x%x\n",
+                         AHCI_PORT_STOP_TIMEOUT_NS / 1000000ULL, port_reg[HBA_RPxCMD]);
         return;
     }
     hba_clear_reg(port_reg[HBA_RPxIS]);
@@ -526,5 +537,4 @@ void ahci_setup() {
     write_serial_fmt("AHCI initialized: online_ports=%d ready_ports=%d implemented_ports=%d version=%d.%d.%d\n",
                      online_ports, ready_ports, hba->ports_num, major, minor, patch);
 }
-
 
