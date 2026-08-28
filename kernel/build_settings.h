@@ -129,6 +129,10 @@
 #define CONFIG_KERNEL_AHCI_QEMU_ACCEL 1
 #endif
 
+// Retained as a build contract for the XJ380 private repository: its kernel
+// overlay (special/main.cpp) includes this header and gates busybox VFS alias
+// setup on this switch. The alias implementation itself lives on that side;
+// OpenXJ380 has no consumer for it.
 #ifndef CONFIG_KERNEL_BUSYBOX_ALIASES
 #define CONFIG_KERNEL_BUSYBOX_ALIASES 1
 #endif
