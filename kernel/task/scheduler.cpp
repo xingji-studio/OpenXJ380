@@ -12,6 +12,8 @@ volatile bool        is_scheduler = false;
 extern lock_queue   *pcb_group_queue;
 extern XSK_SMP_INFO *xsi;
 extern bool          no_interrupt;
+volatile uint64_t    system_cpu_total_ticks = 0;
+volatile uint64_t    system_cpu_busy_ticks  = 0;
 const uint64_t       TIME_SLICE = 4;
 const uint64_t       MIN_SLICE  = 1;
 static constexpr uint64_t EEVDF_TICK_NS        = 1000000ULL;
@@ -388,6 +390,11 @@ extern "C" registers_t *timer_handle(registers_t *reg)
     if (current == NULL) {
         send_eoi();
         return reg;
+    }
+
+    __atomic_fetch_add(&system_cpu_total_ticks, 1ULL, __ATOMIC_RELAXED);
+    if (current->status == RUNNING && current->task_level != TASK_IDLE_LEVEL) {
+        __atomic_fetch_add(&system_cpu_busy_ticks, 1ULL, __ATOMIC_RELAXED);
     }
 
     PROCESSOR_INFO *cpu = get_current_cpu();

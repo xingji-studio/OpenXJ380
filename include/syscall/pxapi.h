@@ -244,6 +244,7 @@ typedef void (*XApiNotifyPrcor)(uint64_t notification_id, uint64_t action_id);
 #define XAPI_PUT_HORIZONTAL_SCROLL_BAR 7468
 #define XAPI_DELETE_SCROLL_BAR         7469
 #define XAPI_SET_SCROLL_BAR_POSITION   7470
+#define XAPI_GET_SYSTEM_STATS          7472
 
 // 4-1
 #define XWIN_NORMAL				0
@@ -255,7 +256,7 @@ typedef void (*XApiNotifyPrcor)(uint64_t notification_id, uint64_t action_id);
 #define XWIN_TYPE_MASK          0x0f
 #define XWIN_SUPPORT_RESIZEABLE 0x80
 
-// 当前最大号：7470
+// 当前最大号：7472
 
 #define XAPI_TASK_NAME_LEN 32
 
@@ -274,6 +275,16 @@ typedef struct
     char     process_name[XAPI_TASK_NAME_LEN];
     char     thread_name[XAPI_TASK_NAME_LEN];
 } XapiTaskInfo;
+
+typedef struct
+{
+    uint64_t cpu_total_ticks;
+    uint64_t cpu_busy_ticks;
+    uint64_t cpu_count;
+    uint64_t memory_total_bytes;
+    uint64_t memory_free_bytes;
+    uint64_t timestamp_ns;
+} XapiSystemStats;
 
 // Proto (XAPI Edition)
 void do_xapi_Output(char *str);
@@ -302,6 +313,7 @@ uint64_t do_xapi_MapMemory(uint64_t ptr, uint64_t size, uint32_t flags);
 void do_xapi_FlushTime();
 uint64_t do_xapi_GetTaskList(uint64_t buffer, uint64_t max_count);
 uint64_t do_xapi_KillProcess(uint64_t pid);
+uint64_t do_xapi_GetSystemStats(uint64_t buffer);
 uint64_t do_xapi_UserOobeRequired();
 uint64_t do_xapi_UserList(uint64_t buffer, uint64_t max_count);
 uint64_t do_xapi_UserLogin(uint64_t username, uint64_t password);

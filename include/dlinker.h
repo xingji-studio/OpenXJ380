@@ -19,15 +19,15 @@ cp_module_t *get_module(const char *module_name);
 cp_module_t *get_module_raw(const char *module_name);
 
 #define EXPORT_SYMBOL(name)                                                                        \
-    __attribute__((used, section(".ksymtab"))) static const dlfunc_t __ksym_##name = {             \
+    __attribute__((used, section(".ksymtab"))) static dlfunc_t __ksym_##name = {                   \
         #name, (void *)name}
 
 #define EXPORT_SYMBOL_F(func_name, name)                                                           \
-    __attribute__((used, section(".ksymtab"))) static const dlfunc_t __ksym_##name = {             \
+    __attribute__((used, section(".ksymtab"))) static dlfunc_t __ksym_##name = {                   \
         #func_name, (void *)name}
 
 #define EXPORT_SYMBOL_OBJECT(name)                                                                 \
-    __attribute__((used, section(".ksymtab"))) static const dlfunc_t __ksym_object_##name = {      \
+    __attribute__((used, section(".ksymtab"))) static dlfunc_t __ksym_object_##name = {            \
         #name, (void *)&name}
 
 typedef int (*dlinit_t)(void);
