@@ -197,6 +197,8 @@ size_t fatfs_readfile(file_t file, void *addr, size_t offset, size_t size) {
     res = f_lseek(fp, offset);
     if (res != FR_OK) 
     {
+        write_serial_fmt("fatfs_readfile: seek path=%s offset=%zu size=%zu res=%d\n",
+                         file->path != NULL ? file->path : "<unknown>", offset, size, res);
         if (temp_clmt != NULL) {
             fp->cltbl = NULL;
             free(temp_clmt);
@@ -204,7 +206,7 @@ size_t fatfs_readfile(file_t file, void *addr, size_t offset, size_t size) {
         fatfs_unlock();
         return -1;
     }
-    uint32_t n;
+    uint32_t n = 0;
     res = f_read(fp, addr, size, &n);
     if (temp_clmt != NULL) {
         fp->cltbl = NULL;
@@ -212,8 +214,14 @@ size_t fatfs_readfile(file_t file, void *addr, size_t offset, size_t size) {
     }
     if (res != FR_OK) 
     {
+        write_serial_fmt("fatfs_readfile: read path=%s offset=%zu size=%zu got=%u res=%d\n",
+                         file->path != NULL ? file->path : "<unknown>", offset, size, n, res);
         fatfs_unlock();
         return -1;
+    }
+    if (n != size) {
+        write_serial_fmt("fatfs_readfile: short read path=%s offset=%zu size=%zu got=%u res=%d\n",
+                         file->path != NULL ? file->path : "<unknown>", offset, size, n, res);
     }
     fatfs_unlock();
     return n;
