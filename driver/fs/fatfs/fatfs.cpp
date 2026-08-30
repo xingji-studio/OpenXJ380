@@ -326,10 +326,22 @@ static void fatfs_apply_filinfo(vfs_node_t node, const FILINFO *fno) {
 
 void fatfs_open(void *parent, const char *name, vfs_node_t node) {
     fatfs_lock();
-    
+
+    if (parent == NULL || name == NULL || node == NULL)
+    {
+        fatfs_unlock();
+        return;
+    }
     file_t p        = (file_t)parent;
     char  *new_path = (char*)malloc(strlen(p->path) + strlen((char *)name) + 1 + 1);
     file_t nw      = (file_t)malloc(sizeof(struct file));
+    if (new_path == NULL || nw == NULL)
+    {
+        free(new_path);
+        free(nw);
+        fatfs_unlock();
+        return;
+    }
     sprintf(new_path, "%s/%s", p->path, name);
     void   *fp = NULL;
     FILINFO fno;
@@ -346,7 +358,24 @@ void fatfs_open(void *parent, const char *name, vfs_node_t node) {
         node->type = file_dir;
         nw->is_dir = true;
         fp         = malloc(sizeof(DIR));
+        if (fp == NULL)
+        {
+            free(new_path);
+            free(nw);
+            node->handle = NULL;
+            fatfs_unlock();
+            return;
+        }
         res        = f_opendir((DIR*)fp, new_path);
+        if (res != FR_OK)
+        {
+            free(fp);
+            free(new_path);
+            free(nw);
+            node->handle = NULL;
+            fatfs_unlock();
+            return;
+        }
         for (;;) {
             // 读取目录下的内容，再读会自动读下一个文件
             res = f_readdir((DIR*)fp, &fno);
@@ -376,7 +405,26 @@ void fatfs_open(void *parent, const char *name, vfs_node_t node) {
         node->type = file_none;
         nw->is_dir = false;
         fp         = malloc(sizeof(FIL));
-        res        = f_open((FIL*)fp, new_path, FA_READ | FA_WRITE);
+        if (fp == NULL)
+        {
+            free(new_path);
+            free(nw);
+            node->handle = NULL;
+            fatfs_unlock();
+            return;
+        }
+        res = f_open((FIL*)fp, new_path, FA_READ | FA_WRITE);
+        if (res != FR_OK)
+        {
+            write_serial_fmt("fatfs_open: f_open failed path=%s res=%d\n", new_path, (int)res);
+            free(fp);
+            free(new_path);
+            free(nw);
+            node->handle = NULL;
+            node->size = 0;
+            fatfs_unlock();
+            return;
+        }
         if (node->inode == 0) node->inode = ino++;
         node->size  = f_size((FIL *)fp);
         node->blksz = PAGE_SIZE;

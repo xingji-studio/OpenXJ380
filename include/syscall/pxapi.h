@@ -256,7 +256,9 @@ typedef void (*XApiNotifyPrcor)(uint64_t notification_id, uint64_t action_id);
 #define XWIN_TYPE_MASK          0x0f
 #define XWIN_SUPPORT_RESIZEABLE 0x80
 
-// 当前最大号：7472
+// 当前最大号：7473
+
+#define XAPI_CAPTURE_SCREEN 7473
 
 #define XAPI_TASK_NAME_LEN 32
 
@@ -270,6 +272,7 @@ typedef struct
     uint64_t thread_count;
     uint64_t window_count;
     uint64_t memory_bytes;
+    uint64_t cpu_runtime_ticks;
     uint32_t process_status;
     uint32_t thread_status;
     char     process_name[XAPI_TASK_NAME_LEN];
