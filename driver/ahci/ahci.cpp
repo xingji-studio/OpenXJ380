@@ -14,15 +14,35 @@ static bool ahci_port_link_ready(uint32_t ssts) {
     return HBA_PXSSTS_DET(ssts) == 0x3 && HBA_PXSSTS_IPM(ssts) == 0x1;
 }
 
-static constexpr uint64_t AHCI_PORT_STOP_TIMEOUT_NS = 2000000000ULL;
+static constexpr uint64_t AHCI_PORT_STOP_TIMEOUT_NS  = 2000000000ULL;
+static constexpr uint64_t AHCI_PORT_READY_TIMEOUT_NS = 5000000000ULL;
 
-static bool ahci_wait_port_engine_stopped(volatile hba_reg_t *port_reg, uint64_t timeout_ns) {
+static bool ahci_wait_port_cmd_clear(volatile hba_reg_t *port_reg, uint32_t mask, uint64_t timeout_ns) {
     uint64_t start = nanoTime();
-    while ((port_reg[HBA_RPxCMD] & (HBA_PxCMD_CR | HBA_PxCMD_FR)) != 0) {
+    while ((port_reg[HBA_RPxCMD] & mask) != 0) {
         if (nanoTime() - start >= timeout_ns) return false;
         asm volatile("pause");
     }
     return true;
+}
+
+static bool ahci_stop_port_engine(volatile hba_reg_t *port_reg) {
+    port_reg[HBA_RPxCMD] &= ~HBA_PxCMD_ST;
+    if (!ahci_wait_port_cmd_clear(port_reg, HBA_PxCMD_CR, AHCI_PORT_STOP_TIMEOUT_NS)) return false;
+
+    port_reg[HBA_RPxCMD] &= ~HBA_PxCMD_FRE;
+    return ahci_wait_port_cmd_clear(port_reg, HBA_PxCMD_FR, AHCI_PORT_STOP_TIMEOUT_NS);
+}
+
+static bool ahci_wait_port_ready(volatile hba_reg_t *port_reg, uint64_t timeout_ns) {
+    uint64_t start = nanoTime();
+    while (true) {
+        uint32_t ssts = port_reg[HBA_RPxSSTS];
+        uint32_t tfd  = port_reg[HBA_RPxTFD];
+        if (ahci_port_link_ready(ssts) && (tfd & (HBA_PxTFD_BSY | HBA_PxTFD_DRQ)) == 0) return true;
+        if (nanoTime() - start >= timeout_ns) return false;
+        asm volatile("pause");
+    }
 }
 
 static void ahci_log_port_state(size_t port_no, volatile hba_reg_t *regs, const char *stage) {
@@ -158,13 +178,11 @@ int hba_prepare_cmd(struct hba_port *port, struct hba_cmdt **cmdt, struct hba_cm
     return slot;
 }
 
-void __hba_reset_port(hba_reg_t *port_reg) {
-    port_reg[HBA_RPxCMD] &= ~HBA_PxCMD_ST;
-    port_reg[HBA_RPxCMD] &= ~HBA_PxCMD_FRE;
-    if (!ahci_wait_port_engine_stopped(port_reg, AHCI_PORT_STOP_TIMEOUT_NS)) {
+static bool ahci_reset_port_internal(hba_reg_t *port_reg) {
+    if (!ahci_stop_port_engine(port_reg)) {
         write_serial_fmt("AHCI: Port reset timeout after %llums waiting for FR/CR to clear CMD=0x%x\n",
                          AHCI_PORT_STOP_TIMEOUT_NS / 1000000ULL, port_reg[HBA_RPxCMD]);
-        return;
+        return false;
     }
     hba_clear_reg(port_reg[HBA_RPxIS]);
     hba_clear_reg(port_reg[HBA_RPxSERR]);
@@ -172,6 +190,11 @@ void __hba_reset_port(hba_reg_t *port_reg) {
     delay_ms_hp(1);
     port_reg[HBA_RPxSCTL] &= ~0xf;
     delay_ms_hp(10);
+    return true;
+}
+
+void __hba_reset_port(hba_reg_t *port_reg) {
+    ahci_reset_port_internal(port_reg);
 }
 
 int hba_bind_vbuf(struct hba_cmdh *cmdh, struct hba_cmdt *cmdt, struct vecbuf *vbuf) {
@@ -418,6 +441,7 @@ static int ahci_ioctl(device_t *device, size_t req, void *arg)
 
 // �?utils.cpp 中添�?
 void ahci_setup() {
+    write_serial_string("AHCI: port init fix trace v3\n");
     pci_device_t *device = pci_find_class(0x010601);
     if (device == NULL) {
         write_serial_fmt("AHCI: No AHCI controller found\n");
@@ -468,14 +492,33 @@ void ahci_setup() {
     uint32_t ready_ports  = 0;
     for (size_t i = 0; i < hba->ports_num && i < 32; i++) {
         if ((pmap & (1u << i)) == 0) continue;
+        hba_reg_t *port_regs = (hba_reg_t *)(&hba->base[HBA_RPBASE + i * HBA_RPSIZE]);
+        uint32_t initial_ssts = port_regs[HBA_RPxSSTS];
+        if (HBA_PXSSTS_DET(initial_ssts) == 0) continue;
+
         struct hba_port *port = (struct hba_port *)malloc(sizeof(struct hba_port));
         memset(port, 0, sizeof(struct hba_port));
-        hba_reg_t *port_regs = (hba_reg_t *)(&hba->base[HBA_RPBASE + i * HBA_RPSIZE]);
         port->regs = port_regs;
         port->hba  = hba;
         hba->ports[i] = port;
-        // ahci_log_port_state(i, port_regs, "before-reset");
-        __hba_reset_port((hba_reg_t *)port_regs);
+        ahci_log_port_state(i, port_regs, "before-init");
+
+        bool link_was_ready = ahci_port_link_ready(initial_ssts);
+        if (link_was_ready) {
+            if (!ahci_stop_port_engine(port_regs)) {
+                ahci_log_port_state(i, port_regs, "engine-stop-timeout");
+                continue;
+            }
+            hba_clear_reg(port_regs[HBA_RPxIS]);
+            hba_clear_reg(port_regs[HBA_RPxSERR]);
+            write_serial_fmt("AHCI[%d] preserving ready link; COMRESET skipped\n", i);
+        } else if (!ahci_reset_port_internal(port_regs)) {
+            ahci_log_port_state(i, port_regs, "reset-failed");
+            continue;
+        } else {
+            ahci_log_port_state(i, port_regs, "after-comreset");
+        }
+
         uint64_t clb_pa = alloc_frames(1);
         uint64_t fis_pa = alloc_frames(1);
         if (clb_pa == 0 || fis_pa == 0) {
@@ -497,14 +540,12 @@ void ahci_setup() {
         hba_clear_reg(port_regs[HBA_RPxSERR]);
         port_regs[HBA_RPxCMD] |= HBA_PxCMD_FRE;
         port_regs[HBA_RPxCMD] |= HBA_PxCMD_ST;
-        delay_ms_hp(1);
-        port->ssts = port_regs[HBA_RPxSSTS];
-        // ahci_log_port_state(i, port_regs, "after-start");
-        if (!ahci_port_link_ready(port->ssts)) {
-            // write_serial_fmt("AHCI[%d] skip: link not ready det=%d ipm=%d spd=%d\n", i,
-                            //  HBA_PXSSTS_DET(port->ssts), HBA_PXSSTS_IPM(port->ssts), HBA_PXSSTS_SPD(port->ssts));
+        if (!ahci_wait_port_ready(port_regs, AHCI_PORT_READY_TIMEOUT_NS)) {
+            ahci_log_port_state(i, port_regs, "ready-timeout");
             continue;
         }
+        port->ssts = port_regs[HBA_RPxSSTS];
+        ahci_log_port_state(i, port_regs, "ready");
         online_ports++;
         if (!ahci_init_device(port)) {
             write_serial_fmt("AHCI[%d] device init failed after link-up\n", i);
@@ -537,4 +578,3 @@ void ahci_setup() {
     write_serial_fmt("AHCI initialized: online_ports=%d ready_ports=%d implemented_ports=%d version=%d.%d.%d\n",
                      online_ports, ready_ports, hba->ports_num, major, minor, patch);
 }
-
