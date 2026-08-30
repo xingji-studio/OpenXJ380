@@ -395,6 +395,7 @@ extern "C" registers_t *timer_handle(registers_t *reg)
     __atomic_fetch_add(&system_cpu_total_ticks, 1ULL, __ATOMIC_RELAXED);
     if (current->status == RUNNING && current->task_level != TASK_IDLE_LEVEL) {
         __atomic_fetch_add(&system_cpu_busy_ticks, 1ULL, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&current->runtime_ticks, 1ULL, __ATOMIC_RELAXED);
     }
 
     PROCESSOR_INFO *cpu = get_current_cpu();
