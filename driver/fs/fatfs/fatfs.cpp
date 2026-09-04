@@ -272,6 +272,7 @@ static uint64_t ino = 2;
 static bool fatfs_should_prune_child(vfs_node_t node) {
     if (node == NULL) return false;
     if (node->is_mount) return false;
+    if (node->refcount > 1) return false;
     return (node->type & (file_none | file_dir)) != 0;
 }
 

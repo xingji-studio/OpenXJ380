@@ -145,7 +145,6 @@ static void devfs_open(void *parent, const char *name, vfs_node_t node) {
     node->size =
         dev_t->device->type == DEVICE_STREAM ? (uint64_t)-1 : disk_size(dev_t->device->vdiskid);
     node->fsid     = devfs_id;
-    node->refcount = 1;
 }
 
 spin_t RD_lk =SPIN_INIT;

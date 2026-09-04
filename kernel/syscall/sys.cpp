@@ -3864,19 +3864,7 @@ sys_(unlinkat)
         return SYSCALL_FAULT_(ENOTDIR);
     }
 
-    uint64_t ret;
-    if (node->refcount > 1)
-    {
-        node->refcount--;
-        ret = 0;
-    }
-    else
-    {
-        ret = vfs_delete(node) == VFS_STATUS_SUCCESS ? 0 : SYSCALL_FAULT_(ENOENT);
-        node = NULL;
-    }
-
-    if (node != NULL) vfs_close(node);
+    uint64_t ret = vfs_delete(node) == VFS_STATUS_SUCCESS ? 0 : SYSCALL_FAULT_(ENOENT);
     free(path);
     return ret;
 }
