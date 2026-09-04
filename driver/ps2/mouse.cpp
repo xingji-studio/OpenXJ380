@@ -6,6 +6,17 @@
 #include <ps2/mouse.h>
 
 static mouse_dec g_mouse = {};
+static uint32_t  g_mouse_wheel_reverse = 0;
+
+extern "C" void set_mouse_wheel_reverse(bool enabled)
+{
+    __atomic_store_n(&g_mouse_wheel_reverse, enabled ? 1U : 0U, __ATOMIC_RELAXED);
+}
+
+extern "C" int mouse_transform_wheel_delta(int wheel)
+{
+    return __atomic_load_n(&g_mouse_wheel_reverse, __ATOMIC_RELAXED) != 0 ? -wheel : wheel;
+}
 
 static void mouse_wait_write()
 {
@@ -25,6 +36,9 @@ static void mouse_write(uint8_t value)
 
 static void mouse_apply_report(int dx, int dy, uint8_t buttons, int wheel)
 {
+#if !OPENXJ380_INPUT_OUTPUT_DISABLED
+    wheel = mouse_transform_wheel_delta(wheel);
+#endif
     g_mouse.buttons = buttons & 0x07;
     g_mouse.x += dx;
     g_mouse.y += dy;
