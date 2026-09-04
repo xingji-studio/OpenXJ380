@@ -253,8 +253,19 @@ size_t fatfs_writefile(file_t file, const void *addr, size_t offset, size_t size
             return -1;
         }
     }
-    uint32_t n;
+    uint32_t n = 0;
     res = f_write(fp, addr, size, &n);
+    if (res == FR_OK)
+    {
+        FRESULT sync_res = f_sync(fp);
+        if (sync_res != FR_OK)
+        {
+            write_serial_fmt("fatfs_writefile: sync path=%s offset=%zu size=%zu wrote=%u res=%d\n",
+                             file->path != NULL ? file->path : "<null>", offset, size, n, sync_res);
+            fatfs_unlock();
+            return -1;
+        }
+    }
     if (res != FR_OK) 
     {
         write_serial_fmt("fatfs_writefile: write path=%s offset=%zu size=%zu wrote=%u res=%d\n",
@@ -272,6 +283,7 @@ static uint64_t ino = 2;
 static bool fatfs_should_prune_child(vfs_node_t node) {
     if (node == NULL) return false;
     if (node->is_mount) return false;
+    if (node->refcount > 1) return false;
     return (node->type & (file_none | file_dir)) != 0;
 }
 
@@ -562,8 +574,13 @@ void fatfs_unmount(void *root) {
 
 int fatfs_stat(void *handle, vfs_node_t node) {
     fatfs_lock();
-    
-    file_t  f = (file_t)handle;
+
+    file_t f = (file_t)handle;
+    if (f == NULL || f->path == NULL || node == NULL || node->root == NULL)
+    {
+        fatfs_unlock();
+        return -EINVAL;
+    }
     FILINFO fno;
     FRESULT res = f_stat(f->path, &fno);
     if (res != FR_OK) 
@@ -576,7 +593,18 @@ int fatfs_stat(void *handle, vfs_node_t node) {
     if (fno.fattrib & AM_DIR) {
         node->type = file_dir;
         DIR *fp    = (DIR*)malloc(sizeof(DIR));
+        if (fp == NULL)
+        {
+            fatfs_unlock();
+            return -ENOMEM;
+        }
         res        = f_opendir(fp, f->path);
+        if (res != FR_OK)
+        {
+            free(fp);
+            fatfs_unlock();
+            return -1;
+        }
         vfs_child_lock();
         list_foreach(node->child, child_node0) {
             vfs_node_t e_child = (vfs_node_t)child_node0->data;
@@ -639,8 +667,13 @@ int fatfs_stat(void *handle, vfs_node_t node) {
 
 int fatfs_delete(file_t parent, vfs_node_t node) {
     fatfs_lock();
-    
+
     file_t file = (file_t)node->handle;
+    if (file == NULL || file->path == NULL)
+    {
+        fatfs_unlock();
+        return -EINVAL;
+    }
 
     FRESULT res = f_unlink(file->path);
     

@@ -19,3 +19,5 @@ int  get_mouse_scroll();
 void set_mouse_position(int x, int y);
 
 extern "C" void mouse_inject_report(int dx, int dy, uint8_t buttons, int wheel);
+extern "C" void set_mouse_wheel_reverse(bool enabled);
+extern "C" int  mouse_transform_wheel_delta(int wheel);
