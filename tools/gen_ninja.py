@@ -738,7 +738,7 @@ def main() -> None:
     # edges.  Ninja still tracks their visible target names here.
     # License files are copied during staging.  Make staging targets depend on
     # an always-dirty phony input so an existing image is refreshed on every
-    # request, including `complete`, rather than being skipped by Ninja.
+    # request rather than being skipped by Ninja.
     n.build("always_stage_licenses", "phony", use_default_order_only=False)
     image_deps = all_deps + manifest_inputs + ["always_stage_licenses"]
     n.build(
@@ -747,37 +747,9 @@ def main() -> None:
         image_deps,
         variables={"cmd": "vdisk", "desc": log_desc("VDISK", "XJ380.img"), "pool": "console"},
     )
-    n.build(
-        "complete",
-        "python_cmd",
-        image_deps,
-        variables={"cmd": "complete", "desc": log_desc("VDISK", "complete XJ380.img"), "pool": "console"},
-    )
-    n.build(
-        ["installer.system.stage", "out/system-payload.pak"],
-        "python_cmd",
-        image_deps,
-        variables={"cmd": "installer-system-stage", "desc": log_desc("STAGE", "installer system")},
-    )
-    n.build(
-        ["installer.root.stage", "out/installer-root.pak"],
-        "python_cmd",
-        all_deps,
-        variables={"cmd": "installer-root-stage", "desc": log_desc("STAGE", "installer root")},
-    )
-    n.build(
-        ["installer.iso", "XJ380-installer.iso"],
-        "python_cmd",
-        ["installer.system.stage", "installer.root.stage"],
-        variables={"cmd": "installer-iso", "desc": log_desc("ISO", "XJ380-installer.iso")},
-    )
     n.build(["vmdk", "XJ380.vmdk"], "python_cmd", ["vdisk"], variables={"cmd": "vmdk", "desc": log_desc("VMDK", "XJ380.vmdk")})
     n.build("run", "python_cmd", ["vdisk"], variables={"cmd": "run", "desc": log_desc("RUN", "QEMU"), "pool": "console"})
     n.build("justrun", "python_cmd", variables={"cmd": "run", "desc": log_desc("RUN", "QEMU"), "pool": "console"})
-    n.build("prepare", "python_cmd", variables={"cmd": "prepare", "desc": log_desc("PREP", "root")})
-    n.build("installer.prepare", "python_cmd", variables={"cmd": "installer-prepare", "desc": log_desc("PREP", "installer root")})
-    n.build("stage.selfhost-user", "python_cmd", variables={"cmd": "stage-selfhost-user", "desc": log_desc("STAGE", "selfhost user")})
-    n.build("stage.linux-compat", "python_cmd", variables={"cmd": "stage-linux-compat", "desc": log_desc("STAGE", "linux compat")})
     n.build("format", "python_cmd", variables={"cmd": "format", "desc": log_desc("FMT", "sources")})
     n.build("check", "python_cmd", variables={"cmd": "check", "desc": log_desc("CHECK", "sources")})
     n.build("gen.clangd", "python_cmd", variables={"cmd": "gen-clangd", "desc": log_desc("GEN", "clangd")})
