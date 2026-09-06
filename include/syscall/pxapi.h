@@ -32,6 +32,18 @@ typedef struct {
 #define SXAH_UNLOCK_OUTPUT_LOCK     128956723895689208      // 完成输出，关闭输出锁
 #define SXAH_MESSAGE_ASK            128956723895689209      // message查询
 #define SXAH_SET_MOUSE_WHEEL_REVERSE 128956723895689210     // 设置全局鼠标滚轮方向
+#define SXAH_SET_LOG_CONFIG          128956723895689211     // 设置日志与日志框配置
+#define SXAH_GET_LOG_CONFIG          128956723895689212     // 获取日志与日志框配置
+
+#define LOG_CONFIG_OVERLAY_ENABLED   (1ULL << 0)
+#define LOG_CONFIG_RECORD_LOGS       (1ULL << 1)
+#define LOG_CONFIG_CAT_GRAPHICS      (1ULL << 2)
+#define LOG_CONFIG_CAT_NETWORK       (1ULL << 3)
+#define LOG_CONFIG_CAT_DRIVER        (1ULL << 4)
+#define LOG_CONFIG_CAT_DEBUG         (1ULL << 5)
+#define LOG_CONFIG_CAT_KERNEL        (1ULL << 6)
+#define LOG_CONFIG_DEFAULT           (0x7FULL)
+
 #define SXAH_INSTALLER_ENUM_DISKS       128956723895689220
 #define SXAH_INSTALLER_START            128956723895689221
 #define SXAH_INSTALLER_PROGRESS         128956723895689222
