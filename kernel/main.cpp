@@ -221,29 +221,70 @@ static char busybox_alias_applets[][16] = {
 };//暴力枚举这一块，好像只能这么做了
   //Maybe we can try to load this applet when vfs inited.
 
+static int load_busybox_alias_applets()
+{
+    vfs_node_t vfp = vfs_open("/etc/busybox/alias/applets.csv");
+    if(!vfp) return -1;
+    char csv[1024] /* = malloc(vfs -> size) */;
+    char * csv_pointer = csv;
+    memset(csv, 0, 1024 /* vfs -> size / sizeof(char) */);
+    int idx = 0, i = 0;
+    
+    if(vfp -> size >= sizeof(csv)) {
+        idx = -2;
+        goto cleanup;
+    }
+    vfs_read(vfp, csv, 0, vfp -> size);
+
+    while(true) {
+        int j = 0;
+        while(true) {
+            switch(*csv_pointer)
+            {
+            case ',':
+            case '\r':
+            case '\n':
+                csv_pointer++;
+                busybox_alias_applets[i][j] = '\0';
+                goto finish_load;
+            case '\0':
+                busybox_alias_applets[i][j] = '\0';
+                goto finish;
+            default:
+                busybox_alias_applets[i][j] = *csv_pointer;
+                csv_pointer++;
+                j++;
+            }
+        }
+    finish_load:
+        i++;
+    }
+
+finish:
+    i++;
+    busybox_alias_applets[i][0] = '\0'; 
+cleanup:
+    vfs_close(vfp);
+    /* free(csv); */
+    return idx;
+}
+
+/*
 static void load_busybox_alias_applets()
 {
-    if (current_user == NULL) return;
-
-    char setfile_path[256];
-    memset(setfile_path, 0, 256);
-    strcat(setfile_path, "/etc/busybox/alias/applets.dat");
+    char setfile_path[32] = "/etc/busybox/alias/applets.dat";
     vfs_node_t vfp = vfs_open(setfile_path);
     if (!vfp) return;
-    char tmp[1024];
-    if (vfp->size >= sizeof(tmp))
-    {
-        vfs_close(vfp);
-        return;
-    }
-    vfs_read(vfp, tmp, 0, vfp->size);
-    char alias[8];
-    memset(alias, 0, 8);
+    char csv[1024];
+    char alias[9];
     int applet_index = 0, alias_index = 0;
     const int applet_count = sizeof(busybox_alias_applets) / sizeof(busybox_alias_applets[0]);
+    if (vfp->size >= sizeof(csv)) goto cleanup;
+    vfs_read(vfp, csv, 0, vfp->size);
+    memset(alias, 0, 9);
     for (uint64_t i = 0; i < vfp->size && applet_index < applet_count - 1; i++)
     {
-        if (tmp[i] == ',')
+        if (csv[i] == ',')
         {
             strcpy(busybox_alias_applets[applet_index], alias);
             applet_index++;
@@ -251,12 +292,14 @@ static void load_busybox_alias_applets()
             memset(alias, 0, sizeof(alias));
             continue;
         }
-        if (alias_index < sizeof(alias) - 1) alias[alias_index++] = tmp[i];
+        if (alias_index < sizeof(alias) - 1) alias[alias_index++] = csv[i];
     }
     if (alias_index > 0 && applet_index < applet_count - 1) strcpy(busybox_alias_applets[applet_index], alias);
 
+cleanup:
     vfs_close(vfp);
 }
+*/
 
 static const char *busybox_binary_path = "/apps/busybox";
 
