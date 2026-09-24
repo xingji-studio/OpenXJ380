@@ -34,6 +34,7 @@ typedef struct {
 #define SXAH_SET_MOUSE_WHEEL_REVERSE 128956723895689210     // 设置全局鼠标滚轮方向
 #define SXAH_SET_LOG_CONFIG          128956723895689211     // 设置日志与日志框配置
 #define SXAH_GET_LOG_CONFIG          128956723895689212     // 获取日志与日志框配置
+#define SXAH_SET_INPUT_SETTINGS      128956723895689213      // 设置键盘布局、重复和鼠标参数
 
 #define LOG_CONFIG_OVERLAY_ENABLED   (1ULL << 0)
 #define LOG_CONFIG_RECORD_LOGS       (1ULL << 1)
@@ -226,6 +227,7 @@ typedef void (*XApiNotifyPrcor)(uint64_t notification_id, uint64_t action_id);
 #define MSG_RESIZE  8
 #define MSG_KEYUP   9
 #define MSG_KEYDOWN 10
+#define MSG_KEYLONGPRESS 16
 #define MSG_LBUTTONDOWN 11
 #define MSG_LBUTTONUP   12
 

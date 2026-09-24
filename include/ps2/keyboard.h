@@ -99,4 +99,17 @@ void wait_ps2_read();
 uint8_t get_keyboard_input();
 void keyboard_init();
 
+enum keyboard_layout_id
+{
+    KEYBOARD_LAYOUT_US = 0,
+    KEYBOARD_LAYOUT_DVORAK = 1,
+};
+
+extern "C" void keyboard_set_settings(uint64_t layout, uint64_t repeat_rate_hz, uint64_t repeat_delay_ms,
+                                      uint64_t long_press_ms);
+extern "C" uint64_t keyboard_get_layout();
+extern "C" uint64_t keyboard_get_repeat_rate_hz();
+extern "C" uint64_t keyboard_get_repeat_delay_ms();
+extern "C" uint64_t keyboard_get_long_press_ms();
+
 #endif
