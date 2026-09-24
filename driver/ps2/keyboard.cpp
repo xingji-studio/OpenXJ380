@@ -17,6 +17,10 @@ static uint8_t kb_ps2_pressed_values[2][128];
 static uint8_t kb_usb_pressed_values[256];
 extern uint8_t keyboard_code[256];
 extern uint8_t keyboard_code1[256];
+static volatile uint64_t kb_layout = KEYBOARD_LAYOUT_US;
+static volatile uint64_t kb_repeat_rate_hz = 40;
+static volatile uint64_t kb_repeat_delay_ms = 500;
+static volatile uint64_t kb_long_press_ms = 500;
 
 static void keyboard_emit_socket(void *regs_ptr, uint64_t error_code, uint8_t raw_scancode, uint8_t make_code,
                                   uint8_t value, bool extended, bool pressed)
@@ -78,6 +82,66 @@ static void kb_synth_lock_release()
 static bool kb_value_repeatable(uint8_t value)
 {
     return value == '\b' || value == '\n' || (value >= 32 && value < 127);
+}
+
+static uint8_t keyboard_dvorak_value(uint8_t make_code, bool shifted)
+{
+    char value = 0;
+    switch (make_code)
+    {
+    case 0x0c: value = '['; break;
+    case 0x0d: value = ']'; break;
+    case 0x10: value = '\''; break;
+    case 0x11: value = ','; break;
+    case 0x12: value = '.'; break;
+    case 0x13: value = 'p'; break;
+    case 0x14: value = 'y'; break;
+    case 0x15: value = 'f'; break;
+    case 0x16: value = 'g'; break;
+    case 0x17: value = 'c'; break;
+    case 0x18: value = 'r'; break;
+    case 0x19: value = 'l'; break;
+    case 0x1a: value = '/'; break;
+    case 0x1b: value = '='; break;
+    case 0x1e: value = 'a'; break;
+    case 0x1f: value = 'o'; break;
+    case 0x20: value = 'e'; break;
+    case 0x21: value = 'u'; break;
+    case 0x22: value = 'i'; break;
+    case 0x23: value = 'd'; break;
+    case 0x24: value = 'h'; break;
+    case 0x25: value = 't'; break;
+    case 0x26: value = 'n'; break;
+    case 0x27: value = 's'; break;
+    case 0x28: value = '-'; break;
+    case 0x2c: value = ';'; break;
+    case 0x2d: value = 'q'; break;
+    case 0x2e: value = 'j'; break;
+    case 0x2f: value = 'k'; break;
+    case 0x30: value = 'x'; break;
+    case 0x31: value = 'b'; break;
+    case 0x32: value = 'm'; break;
+    case 0x33: value = 'w'; break;
+    case 0x34: value = 'v'; break;
+    case 0x35: value = 'z'; break;
+    default:
+        return shifted ? keyboard_code1[make_code] : keyboard_code[make_code];
+    }
+    if (!shifted) return (uint8_t)value;
+    if (value >= 'a' && value <= 'z') return (uint8_t)(value - 'a' + 'A');
+    switch (value)
+    {
+    case '\'': return '"';
+    case ',': return '<';
+    case '.': return '>';
+    case '/': return '?';
+    case '=': return '+';
+    case '-': return '_';
+    case '[': return '{';
+    case ']': return '}';
+    case ';': return ':';
+    default: return (uint8_t)value;
+    }
 }
 
 static void kb_synth_enqueue_locked(uint8_t value)
@@ -152,7 +216,9 @@ static void kb_usb_repeat_service()
         if (!slot->active || now < slot->next_repeat_ns) { continue; }
 
         kb_synth_enqueue_locked(slot->value);
-        slot->next_repeat_ns = now + KB_USB_REPEAT_INTERVAL_NS;
+        uint64_t rate = __atomic_load_n(&kb_repeat_rate_hz, __ATOMIC_RELAXED);
+        if (rate == 0) rate = 1;
+        slot->next_repeat_ns = now + 1000000000ULL / rate;
     }
     kb_synth_lock_release();
 }
@@ -162,6 +228,16 @@ static uint8_t keyboard_translate_base_make_code(uint8_t make_code, bool shift,
 {
     if (make_code >= 128) {
         return 0;
+    }
+
+    if (__atomic_load_n(&kb_layout, __ATOMIC_RELAXED) == KEYBOARD_LAYOUT_DVORAK)
+    {
+        uint8_t dvorak = keyboard_dvorak_value(make_code, shift);
+        if (dvorak >= 'a' && dvorak <= 'z' && (shift ^ caps))
+            dvorak = (uint8_t)(dvorak - 'a' + 'A');
+        else if (dvorak >= 'A' && dvorak <= 'Z' && !(shift ^ caps))
+            dvorak = (uint8_t)(dvorak - 'A' + 'a');
+        return dvorak;
     }
 
     uint8_t base = keyboard_code[make_code];
@@ -404,6 +480,40 @@ void keyboard_init()
 #endif
 }
 
+extern "C" void keyboard_set_settings(uint64_t layout, uint64_t repeat_rate_hz, uint64_t repeat_delay_ms,
+                                      uint64_t long_press_ms)
+{
+    if (layout > KEYBOARD_LAYOUT_DVORAK) layout = KEYBOARD_LAYOUT_US;
+    if (repeat_rate_hz < 1) repeat_rate_hz = 1;
+    if (repeat_rate_hz > 100) repeat_rate_hz = 100;
+    if (repeat_delay_ms > 5000) repeat_delay_ms = 5000;
+    if (long_press_ms > 10000) long_press_ms = 10000;
+    __atomic_store_n(&kb_layout, layout, __ATOMIC_RELAXED);
+    __atomic_store_n(&kb_repeat_rate_hz, repeat_rate_hz, __ATOMIC_RELAXED);
+    __atomic_store_n(&kb_repeat_delay_ms, repeat_delay_ms, __ATOMIC_RELAXED);
+    __atomic_store_n(&kb_long_press_ms, long_press_ms, __ATOMIC_RELAXED);
+}
+
+extern "C" uint64_t keyboard_get_layout()
+{
+    return __atomic_load_n(&kb_layout, __ATOMIC_RELAXED);
+}
+
+extern "C" uint64_t keyboard_get_repeat_rate_hz()
+{
+    return __atomic_load_n(&kb_repeat_rate_hz, __ATOMIC_RELAXED);
+}
+
+extern "C" uint64_t keyboard_get_repeat_delay_ms()
+{
+    return __atomic_load_n(&kb_repeat_delay_ms, __ATOMIC_RELAXED);
+}
+
+extern "C" uint64_t keyboard_get_long_press_ms()
+{
+    return __atomic_load_n(&kb_long_press_ms, __ATOMIC_RELAXED);
+}
+
 extern "C" void keyboard_push_input(uint8_t value)
 {
 #if OPENXJ380_INPUT_OUTPUT_DISABLED
@@ -501,7 +611,8 @@ extern "C" void keyboard_usb_key_event(uint8_t usage, uint8_t value, uint8_t pre
                 slot->active = true;
                 slot->usage = usage;
                 slot->value = event_value;
-                slot->next_repeat_ns = now ? now + KB_USB_REPEAT_DELAY_NS : 0;
+                uint64_t delay_ms = __atomic_load_n(&kb_repeat_delay_ms, __ATOMIC_RELAXED);
+                slot->next_repeat_ns = now ? now + delay_ms * 1000000ULL : 0;
             }
         }
     }

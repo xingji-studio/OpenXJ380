@@ -32,6 +32,7 @@ typedef struct {
 #define SXAH_UNLOCK_OUTPUT_LOCK     128956723895689208      // 完成输出，关闭输出锁
 #define SXAH_MESSAGE_ASK            128956723895689209      // message查询
 #define SXAH_SET_MOUSE_WHEEL_REVERSE 128956723895689210     // 设置全局鼠标滚轮方向
+#define SXAH_SET_INPUT_SETTINGS     128956723895689211      // 设置键盘布局、重复和鼠标参数
 #define SXAH_INSTALLER_ENUM_DISKS       128956723895689220
 #define SXAH_INSTALLER_START            128956723895689221
 #define SXAH_INSTALLER_PROGRESS         128956723895689222
@@ -211,6 +212,7 @@ typedef void (*XApiNotifyPrcor)(uint64_t notification_id, uint64_t action_id);
 #define MSG_RESIZE  8
 #define MSG_KEYUP   9
 #define MSG_KEYDOWN 10
+#define MSG_KEYLONGPRESS 16
 #define MSG_LBUTTONDOWN 11
 #define MSG_LBUTTONUP   12
 
