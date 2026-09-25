@@ -221,85 +221,49 @@ static char busybox_alias_applets[][16] = {
 };//暴力枚举这一块，好像只能这么做了
   //Maybe we can try to load this applet when vfs inited.
 
-static int load_busybox_alias_applets()
+static int load_busybox_alias_applets(void)
 {
-    vfs_node_t vfp = vfs_open("/etc/busybox/alias/applets.csv");
-    if(!vfp) return -1;
-    char csv[1024] /* = malloc(vfs -> size) */;
-    char * csv_pointer = csv;
-    memset(csv, 0, 1024 /* vfs -> size / sizeof(char) */);
-    int idx = 0, i = 0;
-    
-    if(vfp -> size >= sizeof(csv)) {
-        idx = -2;
-        goto cleanup;
-    }
-    vfs_read(vfp, csv, 0, vfp -> size);
+    static const char *csv_path = "/etc/busybox/alias/applets.csv";
+    static const int   max_applets =
+        (int)(sizeof(busybox_alias_applets)
+        / sizeof(busybox_alias_applets[0])) - 1; /* keep room for terminator */
+    static const int   max_name_len =
+        (int)(sizeof(busybox_alias_applets[0])
+        / sizeof(busybox_alias_applets[0][0])) - 1;
 
-    while(true) {
+    vfs_node_t vfp = vfs_open(csv_path);
+    if (vfp == NULL) return -1;
+
+    char csv[1024];
+    if (vfp->size >= sizeof(csv)) {
+        vfs_close(vfp);
+        return -2;
+    }
+
+    memset(csv, 0, sizeof(csv));
+    vfs_read(vfp, csv, 0, vfp->size);
+    vfs_close(vfp);
+
+    int i = 0;
+    const char *p = csv;
+    while (*p != '\0' && i < max_applets) {
+        /* skip field separators (comma, CR, LF) */
+        while (*p == ',' || *p == '\r' || *p == '\n') p++;
+        if (*p == '\0') break;
+
         int j = 0;
-        while(true) {
-            switch(*csv_pointer)
-            {
-            case ',':
-            case '\r':
-            case '\n':
-                csv_pointer++;
-                busybox_alias_applets[i][j] = '\0';
-                goto finish_load;
-            case '\0':
-                busybox_alias_applets[i][j] = '\0';
-                goto finish;
-            default:
-                busybox_alias_applets[i][j] = *csv_pointer;
-                csv_pointer++;
-                j++;
-            }
+        while (*p != '\0' && *p != ',' && *p != '\r' && *p != '\n') {
+            if (j < max_name_len) busybox_alias_applets[i][j++] = *p;
+            p++;
         }
-    finish_load:
+        busybox_alias_applets[i][j] = '\0';
         i++;
     }
 
-finish:
-    i++;
-    busybox_alias_applets[i][0] = '\0'; 
-cleanup:
-    vfs_close(vfp);
-    /* free(csv); */
-    return idx;
+    /* sentinel: empty row terminates iteration in setup_busybox_vfs_aliases() */
+    busybox_alias_applets[i][0] = '\0';
+    return i;
 }
-
-/*
-static void load_busybox_alias_applets()
-{
-    char setfile_path[32] = "/etc/busybox/alias/applets.dat";
-    vfs_node_t vfp = vfs_open(setfile_path);
-    if (!vfp) return;
-    char csv[1024];
-    char alias[9];
-    int applet_index = 0, alias_index = 0;
-    const int applet_count = sizeof(busybox_alias_applets) / sizeof(busybox_alias_applets[0]);
-    if (vfp->size >= sizeof(csv)) goto cleanup;
-    vfs_read(vfp, csv, 0, vfp->size);
-    memset(alias, 0, 9);
-    for (uint64_t i = 0; i < vfp->size && applet_index < applet_count - 1; i++)
-    {
-        if (csv[i] == ',')
-        {
-            strcpy(busybox_alias_applets[applet_index], alias);
-            applet_index++;
-            alias_index = 0;
-            memset(alias, 0, sizeof(alias));
-            continue;
-        }
-        if (alias_index < sizeof(alias) - 1) alias[alias_index++] = csv[i];
-    }
-    if (alias_index > 0 && applet_index < applet_count - 1) strcpy(busybox_alias_applets[applet_index], alias);
-
-cleanup:
-    vfs_close(vfp);
-}
-*/
 
 static const char *busybox_binary_path = "/apps/busybox";
 
@@ -595,6 +559,13 @@ extern "C" void KernelMain(const FrameBufferConfig &fbc, EFI_SYSTEM_TABLE &Syste
     bool installer_mode = false;
     mount_root();
 #if CONFIG_KERNEL_BUSYBOX_ALIASES
+    {
+        int loaded = load_busybox_alias_applets();
+        if (loaded >= 0)
+            write_serial_fmt("[busybox] loaded %d applet aliases from CSV\n", loaded);
+        else
+            write_serial_string("[busybox] no CSV, using builtin alias list\n");
+    }
     setup_busybox_vfs_aliases();
 #endif
     setup_xbps_vfs_aliases();
