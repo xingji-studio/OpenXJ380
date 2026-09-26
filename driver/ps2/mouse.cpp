@@ -4,11 +4,12 @@
 #include <proto.hpp>
 #include <ps2/keyboard.h>
 #include <ps2/mouse.h>
+#include <user/settings.h>
 
 static mouse_dec g_mouse = {};
 static uint32_t  g_mouse_wheel_reverse = 0;
 static volatile uint64_t g_mouse_pointer_speed_percent = 100;
-static volatile uint64_t g_mouse_double_click_speed_ms = 2000;
+static volatile uint64_t g_mouse_double_click_speed_ms = XJ380_MOUSE_DOUBLE_CLICK_DEFAULT_MS;
 
 extern "C" void set_mouse_wheel_reverse(bool enabled)
 {
@@ -24,8 +25,8 @@ extern "C" void mouse_set_settings(uint64_t pointer_speed_percent, uint64_t doub
 {
     if (pointer_speed_percent < 10) pointer_speed_percent = 10;
     if (pointer_speed_percent > 400) pointer_speed_percent = 400;
-    if (double_click_ms < 100) double_click_ms = 100;
-    if (double_click_ms > 2000) double_click_ms = 2000;
+    if (double_click_ms < XJ380_MOUSE_DOUBLE_CLICK_MIN_MS) double_click_ms = XJ380_MOUSE_DOUBLE_CLICK_MIN_MS;
+    if (double_click_ms > XJ380_MOUSE_DOUBLE_CLICK_MAX_MS) double_click_ms = XJ380_MOUSE_DOUBLE_CLICK_MAX_MS;
     __atomic_store_n(&g_mouse_pointer_speed_percent, pointer_speed_percent, __ATOMIC_RELAXED);
     __atomic_store_n(&g_mouse_double_click_speed_ms, double_click_ms, __ATOMIC_RELAXED);
 }
