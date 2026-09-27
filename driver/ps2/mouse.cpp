@@ -7,6 +7,8 @@
 #include <user/settings.h>
 
 static mouse_dec g_mouse = {};
+static uint8_t   g_ps2_mouse_buttons = 0;
+static uint8_t   g_usb_mouse_buttons = 0;
 static uint32_t  g_mouse_wheel_reverse = 0;
 static volatile uint64_t g_mouse_pointer_speed_percent = 100;
 static volatile uint64_t g_mouse_double_click_speed_ms = XJ380_MOUSE_DOUBLE_CLICK_DEFAULT_MS;
@@ -57,12 +59,19 @@ static void mouse_write(uint8_t value)
     outb(PS2_DATA_PORT, value);
 }
 
-static void mouse_apply_report(int dx, int dy, uint8_t buttons, int wheel)
+static void mouse_update_button_source(uint8_t *source_buttons, uint8_t buttons)
+{
+    if (source_buttons == NULL) return;
+    *source_buttons = buttons & 0x07U;
+    g_mouse.buttons = (uint8_t)(g_ps2_mouse_buttons | g_usb_mouse_buttons) & 0x07U;
+}
+
+static void mouse_apply_report(int dx, int dy, uint8_t buttons, int wheel, uint8_t *source_buttons)
 {
 #if !OPENXJ380_INPUT_OUTPUT_DISABLED
     wheel = mouse_transform_wheel_delta(wheel);
 #endif
-    g_mouse.buttons = buttons & 0x07;
+    mouse_update_button_source(source_buttons, buttons);
     g_mouse.x += dx;
     g_mouse.y += dy;
     g_mouse.scroll += wheel;
@@ -72,7 +81,7 @@ static void mouse_apply_packet()
 {
     int dx = (int8_t)g_mouse.buf[1];
     int dy = -(int)(int8_t)g_mouse.buf[2];
-    mouse_apply_report(dx, dy, g_mouse.buf[0] & 0x07, 0);
+    mouse_apply_report(dx, dy, g_mouse.buf[0] & 0x07, 0, &g_ps2_mouse_buttons);
 }
 
 bool mousedecode(uint8_t data)
@@ -117,7 +126,7 @@ extern "C" void mouse_inject_report(int dx, int dy, uint8_t buttons, int wheel)
     event.wheel = (int16_t)wheel;
     OpenXJ380Socket_MouseInterrupte(&event);
 #else
-    mouse_apply_report(dx, dy, buttons, wheel);
+    mouse_apply_report(dx, dy, buttons, wheel, &g_usb_mouse_buttons);
     OpenXJ380MouseInterruptInfo event = {};
     event.source = OPENXJ380_INPUT_SOURCE_USB;
     event.packet_complete = 1;
@@ -174,6 +183,8 @@ void mouse_init()
 {
 #if !OPENXJ380_INPUT_OUTPUT_DISABLED
     g_mouse = {};
+    g_ps2_mouse_buttons = 0;
+    g_usb_mouse_buttons = 0;
     mouse_wait_write();
     outb(PS2_CMD_PORT, KB_EN_MOUSE_INTFACE);
     mouse_write(MOUSE_EN);

@@ -1452,6 +1452,10 @@ static void xhci_release_hid(xhci_slot_state *slot) {
     }
 
     xhci_keyboard_release_report(slot);
+    if (slot->hid.kind == XHCI_HID_MOUSE)
+    {
+        mouse_inject_report(0, 0, 0, 0);
+    }
     if (slot->hid.report_buffer) {
         xhci_dma_free(slot->hid.report_buffer, slot->hid.report_buffer_phys,
                       slot->hid.report_buffer_len);
