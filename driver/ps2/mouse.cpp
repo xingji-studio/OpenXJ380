@@ -9,6 +9,7 @@
 static mouse_dec g_mouse = {};
 static uint8_t   g_ps2_mouse_buttons = 0;
 static uint8_t   g_usb_mouse_buttons = 0;
+static spin_t    g_mouse_button_lock = SPIN_INIT;
 static uint32_t  g_mouse_wheel_reverse = 0;
 static volatile uint64_t g_mouse_pointer_speed_percent = 100;
 static volatile uint64_t g_mouse_double_click_speed_ms = XJ380_MOUSE_DOUBLE_CLICK_DEFAULT_MS;
@@ -62,8 +63,10 @@ static void mouse_write(uint8_t value)
 static void mouse_update_button_source(uint8_t *source_buttons, uint8_t buttons)
 {
     if (source_buttons == NULL) return;
+    spin_lock(&g_mouse_button_lock);
     *source_buttons = buttons & 0x07U;
     g_mouse.buttons = (uint8_t)(g_ps2_mouse_buttons | g_usb_mouse_buttons) & 0x07U;
+    spin_unlock(&g_mouse_button_lock);
 }
 
 static void mouse_apply_report(int dx, int dy, uint8_t buttons, int wheel, uint8_t *source_buttons)
@@ -185,6 +188,7 @@ void mouse_init()
     g_mouse = {};
     g_ps2_mouse_buttons = 0;
     g_usb_mouse_buttons = 0;
+    spin_init(&g_mouse_button_lock);
     mouse_wait_write();
     outb(PS2_CMD_PORT, KB_EN_MOUSE_INTFACE);
     mouse_write(MOUSE_EN);
