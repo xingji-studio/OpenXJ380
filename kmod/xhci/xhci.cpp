@@ -217,6 +217,15 @@ static bool xhci_keyboard_usage_present(const uint8_t *report, uint8_t usage) {
     return false;
 }
 
+static bool xhci_keyboard_report_has_rollover(const uint8_t *report) {
+    for (size_t i = 2; i < 8; ++i) {
+        if (report[i] == 0x01U) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static uint8_t xhci_keyboard_translate_usage(uint8_t usage, bool shift,
                                              bool caps_lock) {
     if (usage >= 0x04 && usage <= 0x1DU) {
@@ -344,6 +353,14 @@ static void xhci_handle_keyboard_report(xhci_slot_state *slot,
             bool pressed = (current[0] & modifier_map[i].mask) != 0;
             xhci_keyboard_update_modifier(pressed, modifier_map[i].value);
         }
+    }
+
+    if (xhci_keyboard_report_has_rollover(current))
+    {
+        // ErrorRollOver means the key slots are incomplete. Keep the previous
+        // slots so a transient rollover report cannot synthesize releases.
+        hid->prev_report[0] = current[0];
+        return;
     }
 
     bool shift = (current[0] & 0x22U) != 0;
