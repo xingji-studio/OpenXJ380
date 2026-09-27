@@ -53,7 +53,8 @@ static void keyboard_emit_socket(void *regs_ptr, uint64_t error_code, uint8_t ra
 #endif
 }
 
-#define KB_USB_REPEAT_SLOTS 6
+// USB HID keyboard usages are one byte wide, so keep one repeat slot per usage.
+#define KB_USB_REPEAT_SLOTS 256
 #define KB_USB_REPEAT_DELAY_NS 500000000ULL
 #define KB_USB_REPEAT_INTERVAL_NS 25000000ULL
 struct keyboard_usb_repeat_slot
@@ -598,38 +599,28 @@ extern "C" void keyboard_usb_key_event(uint8_t usage, uint8_t value, uint8_t pre
     OpenXJ380Socket_KeyboardInterrupt(&event);
 
     kb_synth_lock_acquire();
-    keyboard_usb_repeat_slot *free_slot = NULL;
-    keyboard_usb_repeat_slot *match = NULL;
-
-    for (size_t i = 0; i < KB_USB_REPEAT_SLOTS; ++i)
-    {
-        keyboard_usb_repeat_slot *slot = &kb_usb_repeat[i];
-        if (slot->active && slot->usage == usage) { match = slot; }
-        else if (!slot->active && free_slot == NULL) { free_slot = slot; }
-    }
+    keyboard_usb_repeat_slot *slot = &kb_usb_repeat[usage];
 
     if (key_pressed)
     {
         kb_synth_enqueue_locked(event_value);
         if (kb_value_repeatable(event_value))
         {
-            keyboard_usb_repeat_slot *slot = match ? match : free_slot;
-            if (slot != NULL)
-            {
-                uint64_t now = nanoTime();
-                slot->active = true;
-                slot->usage = usage;
-                slot->value = event_value;
-                uint64_t delay_ms = __atomic_load_n(&kb_repeat_delay_ms, __ATOMIC_RELAXED);
-                slot->next_repeat_ns = now ? now + delay_ms * 1000000ULL : 0;
-            }
+            uint64_t now = nanoTime();
+            slot->active = true;
+            slot->usage = usage;
+            slot->value = event_value;
+            uint64_t delay_ms = __atomic_load_n(&kb_repeat_delay_ms, __ATOMIC_RELAXED);
+            slot->next_repeat_ns = now ? now + delay_ms * 1000000ULL : 0;
+        }
+        else
+        {
+            slot->active = false;
         }
     }
     else
     {
-        if (match != NULL) {
-            match->active = false;
-        }
+        slot->active = false;
         if (event_value == KEY_CTRL)
         {
             // Keep legacy terminal input behavior consistent with the PS/2 path.
