@@ -316,6 +316,57 @@ static void xhci_keyboard_update_modifier(bool pressed, uint8_t value) {
     keyboard_usb_key_event(value, value, pressed ? 1U : 0U);
 }
 
+static void xhci_keyboard_release_report(xhci_slot_state *slot) {
+    if (!slot || slot->hid.kind != XHCI_HID_KEYBOARD) {
+        return;
+    }
+
+    xhci_hid_state *hid = &slot->hid;
+    const struct
+    {
+        uint8_t mask;
+        uint8_t value;
+    } modifier_map[] = {
+        {0x11U, KEY_CTRL},
+        {0x22U, KEY_SHIFT},
+        {0x44U, KEY_ALT},
+        {0x08U, 0xE3U},
+        {0x80U, 0xE7U},
+    };
+
+    for (size_t i = 0; i < sizeof(modifier_map) / sizeof(modifier_map[0]); ++i)
+    {
+        if ((hid->prev_report[0] & modifier_map[i].mask) != 0)
+        {
+            xhci_keyboard_update_modifier(false, modifier_map[i].value);
+        }
+    }
+
+    for (size_t i = 2; i < sizeof(hid->prev_report); ++i)
+    {
+        uint8_t usage = hid->prev_report[i];
+        if (usage == 0 || usage == 0x01U) {
+            continue;
+        }
+
+        bool seen = false;
+        for (size_t j = 2; j < i; ++j)
+        {
+            if (hid->prev_report[j] == usage)
+            {
+                seen = true;
+                break;
+            }
+        }
+        if (!seen)
+        {
+            keyboard_usb_key_event(usage, 0, 0);
+        }
+    }
+
+    memset(hid->prev_report, 0, sizeof(hid->prev_report));
+}
+
 static void xhci_handle_keyboard_report(xhci_slot_state *slot,
                                         const uint8_t *report,
                                         uint32_t report_len) {
@@ -1400,6 +1451,7 @@ static void xhci_release_hid(xhci_slot_state *slot) {
         return;
     }
 
+    xhci_keyboard_release_report(slot);
     if (slot->hid.report_buffer) {
         xhci_dma_free(slot->hid.report_buffer, slot->hid.report_buffer_phys,
                       slot->hid.report_buffer_len);
