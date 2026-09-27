@@ -449,23 +449,31 @@ uint8_t get_keyboard_input()
 #endif
 }
 
-void wait_ps2_write()
+bool wait_ps2_write()
 {
 #if !OPENXJ380_INPUT_OUTPUT_DISABLED
     for (size_t i = 0; i < MAX_WAIT_INDEX; ++i)
     {
-        if (!(inb(PS2_CMD_PORT) & KB_STATUS_IBF)) return;
+        if (!(inb(PS2_CMD_PORT) & KB_STATUS_IBF)) return true;
+        __asm__ volatile("pause" ::: "memory");
     }
+    return false;
+#else
+    return true;
 #endif
 }
 
-void wait_ps2_read()
+bool wait_ps2_read()
 {
 #if !OPENXJ380_INPUT_OUTPUT_DISABLED
     for (size_t i = 0; i < MAX_WAIT_INDEX; ++i)
     {
-        if (!(inb(PS2_CMD_PORT) & KB_STATUS_OBF)) return;
+        if (!(inb(PS2_CMD_PORT) & KB_STATUS_OBF)) return true;
+        __asm__ volatile("pause" ::: "memory");
     }
+    return false;
+#else
+    return true;
 #endif
 }
 
@@ -473,14 +481,14 @@ void keyboard_init()
 {
 #if !OPENXJ380_INPUT_OUTPUT_DISABLED
     keyboard_prepare_fifo();
-    wait_ps2_write();
+    if (!wait_ps2_write()) return;
     outb(PORT_KB_CMD, KBCMD_WRITE_CMD);
-    wait_ps2_read();
+    if (!wait_ps2_read()) return;
     outb(PORT_KB_DATA, KB_INIT_MODE);
 #endif
 }
 
-extern "C" void keyboard_set_settings(uint64_t layout, uint64_t repeat_rate_hz, uint64_t repeat_delay_ms,
+extern "C" bool keyboard_set_settings(uint64_t layout, uint64_t repeat_rate_hz, uint64_t repeat_delay_ms,
                                       uint64_t long_press_ms)
 {
     if (layout > KEYBOARD_LAYOUT_DVORAK) layout = KEYBOARD_LAYOUT_US;
@@ -492,6 +500,7 @@ extern "C" void keyboard_set_settings(uint64_t layout, uint64_t repeat_rate_hz, 
     __atomic_store_n(&kb_repeat_rate_hz, repeat_rate_hz, __ATOMIC_RELAXED);
     __atomic_store_n(&kb_repeat_delay_ms, repeat_delay_ms, __ATOMIC_RELAXED);
     __atomic_store_n(&kb_long_press_ms, long_press_ms, __ATOMIC_RELAXED);
+    return true;
 }
 
 extern "C" uint64_t keyboard_get_layout()
