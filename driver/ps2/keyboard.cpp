@@ -53,7 +53,8 @@ static void keyboard_emit_socket(void *regs_ptr, uint64_t error_code, uint8_t ra
 #endif
 }
 
-#define KB_USB_REPEAT_SLOTS 6
+// USB HID keyboard usages are one byte wide, so keep one repeat slot per usage.
+#define KB_USB_REPEAT_SLOTS 256
 #define KB_USB_REPEAT_DELAY_NS 500000000ULL
 #define KB_USB_REPEAT_INTERVAL_NS 25000000ULL
 struct keyboard_usb_repeat_slot
@@ -449,23 +450,31 @@ uint8_t get_keyboard_input()
 #endif
 }
 
-void wait_ps2_write()
+bool wait_ps2_write()
 {
 #if !OPENXJ380_INPUT_OUTPUT_DISABLED
     for (size_t i = 0; i < MAX_WAIT_INDEX; ++i)
     {
-        if (!(inb(PS2_CMD_PORT) & KB_STATUS_IBF)) return;
+        if (!(inb(PS2_CMD_PORT) & KB_STATUS_IBF)) return true;
+        __asm__ volatile("pause" ::: "memory");
     }
+    return false;
+#else
+    return true;
 #endif
 }
 
-void wait_ps2_read()
+bool wait_ps2_read()
 {
 #if !OPENXJ380_INPUT_OUTPUT_DISABLED
     for (size_t i = 0; i < MAX_WAIT_INDEX; ++i)
     {
-        if (!(inb(PS2_CMD_PORT) & KB_STATUS_OBF)) return;
+        if (!(inb(PS2_CMD_PORT) & KB_STATUS_OBF)) return true;
+        __asm__ volatile("pause" ::: "memory");
     }
+    return false;
+#else
+    return true;
 #endif
 }
 
@@ -473,14 +482,14 @@ void keyboard_init()
 {
 #if !OPENXJ380_INPUT_OUTPUT_DISABLED
     keyboard_prepare_fifo();
-    wait_ps2_write();
+    if (!wait_ps2_write()) return;
     outb(PORT_KB_CMD, KBCMD_WRITE_CMD);
-    wait_ps2_read();
+    if (!wait_ps2_read()) return;
     outb(PORT_KB_DATA, KB_INIT_MODE);
 #endif
 }
 
-extern "C" void keyboard_set_settings(uint64_t layout, uint64_t repeat_rate_hz, uint64_t repeat_delay_ms,
+extern "C" bool keyboard_set_settings(uint64_t layout, uint64_t repeat_rate_hz, uint64_t repeat_delay_ms,
                                       uint64_t long_press_ms)
 {
     if (layout > KEYBOARD_LAYOUT_DVORAK) layout = KEYBOARD_LAYOUT_US;
@@ -492,6 +501,7 @@ extern "C" void keyboard_set_settings(uint64_t layout, uint64_t repeat_rate_hz, 
     __atomic_store_n(&kb_repeat_rate_hz, repeat_rate_hz, __ATOMIC_RELAXED);
     __atomic_store_n(&kb_repeat_delay_ms, repeat_delay_ms, __ATOMIC_RELAXED);
     __atomic_store_n(&kb_long_press_ms, long_press_ms, __ATOMIC_RELAXED);
+    return true;
 }
 
 extern "C" uint64_t keyboard_get_layout()
@@ -589,38 +599,28 @@ extern "C" void keyboard_usb_key_event(uint8_t usage, uint8_t value, uint8_t pre
     OpenXJ380Socket_KeyboardInterrupt(&event);
 
     kb_synth_lock_acquire();
-    keyboard_usb_repeat_slot *free_slot = NULL;
-    keyboard_usb_repeat_slot *match = NULL;
-
-    for (size_t i = 0; i < KB_USB_REPEAT_SLOTS; ++i)
-    {
-        keyboard_usb_repeat_slot *slot = &kb_usb_repeat[i];
-        if (slot->active && slot->usage == usage) { match = slot; }
-        else if (!slot->active && free_slot == NULL) { free_slot = slot; }
-    }
+    keyboard_usb_repeat_slot *slot = &kb_usb_repeat[usage];
 
     if (key_pressed)
     {
         kb_synth_enqueue_locked(event_value);
         if (kb_value_repeatable(event_value))
         {
-            keyboard_usb_repeat_slot *slot = match ? match : free_slot;
-            if (slot != NULL)
-            {
-                uint64_t now = nanoTime();
-                slot->active = true;
-                slot->usage = usage;
-                slot->value = event_value;
-                uint64_t delay_ms = __atomic_load_n(&kb_repeat_delay_ms, __ATOMIC_RELAXED);
-                slot->next_repeat_ns = now ? now + delay_ms * 1000000ULL : 0;
-            }
+            uint64_t now = nanoTime();
+            slot->active = true;
+            slot->usage = usage;
+            slot->value = event_value;
+            uint64_t delay_ms = __atomic_load_n(&kb_repeat_delay_ms, __ATOMIC_RELAXED);
+            slot->next_repeat_ns = now ? now + delay_ms * 1000000ULL : 0;
+        }
+        else
+        {
+            slot->active = false;
         }
     }
     else
     {
-        if (match != NULL) {
-            match->active = false;
-        }
+        slot->active = false;
         if (event_value == KEY_CTRL)
         {
             // Keep legacy terminal input behavior consistent with the PS/2 path.
