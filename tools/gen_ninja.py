@@ -368,6 +368,11 @@ def xapi(n: Ninja) -> tuple[list[Path], Path, Path]:
         ROOT / "user/xapi/arch/x86_64/crt0.S",
         ROOT / "user/xapi/libsys.cpp",
         ROOT / "user/xapi/xgui_stubs.cpp",
+        ROOT / "user/xapi/libc_string.cpp",
+        ROOT / "user/xapi/libc_stdio.cpp",
+        ROOT / "user/xapi/libc_stdlib.cpp",
+        ROOT / "user/xapi/libc_unistd.cpp",
+        ROOT / "user/xapi/libc_misc.cpp",
     ]
     core_objs: list[Path] = []
     for src in srcs:
@@ -397,7 +402,14 @@ def user_apps(n: Ninja, core_objs: list[Path], constart_obj: Path) -> list[Path]
     user_compile(n, shell_obj, "user/cli_shell.cpp", "$user_cflags", headers("user/xapi/include"))
     target = Path("out/shell.elf")
     n.build(target, "user_ld", core_objs + [constart_obj, shell_obj], variables={"message": log_desc("LD", target.as_posix())})
-    return [target]
+
+    # libc test program
+    test_obj = Path("out/test_libc.o")
+    user_compile(n, test_obj, "user/xapi/test_libc.cpp", "$user_cflags", headers("user/xapi/include"))
+    test_target = Path("out/test_libc.elf")
+    n.build(test_target, "user_ld", core_objs + [constart_obj, test_obj], variables={"message": log_desc("LD", test_target.as_posix())})
+
+    return [target, test_target]
 
 
 def kmods(n: Ninja) -> list[Path]:
