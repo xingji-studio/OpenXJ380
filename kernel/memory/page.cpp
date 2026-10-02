@@ -716,8 +716,18 @@ page_directory_t *clone_page_directory(page_directory_t *dir, bool all_copy)
 {
     spin_lock(&page_lock);
     page_directory_t *new_directory = (page_directory_t *)(malloc(sizeof(page_directory_t)));
-    if (new_directory == NULL) return NULL;
+    if (new_directory == NULL)
+    {
+        spin_unlock(&page_lock);
+        return NULL;
+    }
     new_directory->table = copy_page_table_recursive(dir->table, 4, all_copy, false);
+    if (new_directory->table == NULL)
+    {
+        free(new_directory);
+        spin_unlock(&page_lock);
+        return NULL;
+    }
     if (!all_copy) memcpy((uint64_t *)new_directory->table + 256, (uint64_t *)dir->table + 256, PAGE_SIZE / 2);
     spin_unlock(&page_lock);
     return new_directory;

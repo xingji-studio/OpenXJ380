@@ -4,9 +4,15 @@
 #include <proto.hpp>
 #include <ps2/keyboard.h>
 #include <ps2/mouse.h>
+#include <user/settings.h>
 
 static mouse_dec g_mouse = {};
+static uint8_t   g_ps2_mouse_buttons = 0;
+static uint8_t   g_usb_mouse_buttons = 0;
+static spin_t    g_mouse_button_lock = SPIN_INIT;
 static uint32_t  g_mouse_wheel_reverse = 0;
+static volatile uint64_t g_mouse_pointer_speed_percent = 100;
+static volatile uint64_t g_mouse_double_click_speed_ms = XJ380_MOUSE_DOUBLE_CLICK_DEFAULT_MS;
 
 extern "C" void set_mouse_wheel_reverse(bool enabled)
 {
@@ -16,6 +22,26 @@ extern "C" void set_mouse_wheel_reverse(bool enabled)
 extern "C" int mouse_transform_wheel_delta(int wheel)
 {
     return __atomic_load_n(&g_mouse_wheel_reverse, __ATOMIC_RELAXED) != 0 ? -wheel : wheel;
+}
+
+extern "C" void mouse_set_settings(uint64_t pointer_speed_percent, uint64_t double_click_ms)
+{
+    if (pointer_speed_percent < 10) pointer_speed_percent = 10;
+    if (pointer_speed_percent > 400) pointer_speed_percent = 400;
+    if (double_click_ms < XJ380_MOUSE_DOUBLE_CLICK_MIN_MS) double_click_ms = XJ380_MOUSE_DOUBLE_CLICK_MIN_MS;
+    if (double_click_ms > XJ380_MOUSE_DOUBLE_CLICK_MAX_MS) double_click_ms = XJ380_MOUSE_DOUBLE_CLICK_MAX_MS;
+    __atomic_store_n(&g_mouse_pointer_speed_percent, pointer_speed_percent, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_mouse_double_click_speed_ms, double_click_ms, __ATOMIC_RELAXED);
+}
+
+extern "C" uint64_t mouse_get_pointer_speed_percent()
+{
+    return __atomic_load_n(&g_mouse_pointer_speed_percent, __ATOMIC_RELAXED);
+}
+
+extern "C" uint64_t mouse_get_double_click_speed_ms()
+{
+    return __atomic_load_n(&g_mouse_double_click_speed_ms, __ATOMIC_RELAXED);
 }
 
 static void mouse_wait_write()
@@ -34,12 +60,21 @@ static void mouse_write(uint8_t value)
     outb(PS2_DATA_PORT, value);
 }
 
-static void mouse_apply_report(int dx, int dy, uint8_t buttons, int wheel)
+static void mouse_update_button_source(uint8_t *source_buttons, uint8_t buttons)
+{
+    if (source_buttons == NULL) return;
+    spin_lock(&g_mouse_button_lock);
+    *source_buttons = buttons & 0x07U;
+    g_mouse.buttons = (uint8_t)(g_ps2_mouse_buttons | g_usb_mouse_buttons) & 0x07U;
+    spin_unlock(&g_mouse_button_lock);
+}
+
+static void mouse_apply_report(int dx, int dy, uint8_t buttons, int wheel, uint8_t *source_buttons)
 {
 #if !OPENXJ380_INPUT_OUTPUT_DISABLED
     wheel = mouse_transform_wheel_delta(wheel);
 #endif
-    g_mouse.buttons = buttons & 0x07;
+    mouse_update_button_source(source_buttons, buttons);
     g_mouse.x += dx;
     g_mouse.y += dy;
     g_mouse.scroll += wheel;
@@ -49,7 +84,7 @@ static void mouse_apply_packet()
 {
     int dx = (int8_t)g_mouse.buf[1];
     int dy = -(int)(int8_t)g_mouse.buf[2];
-    mouse_apply_report(dx, dy, g_mouse.buf[0] & 0x07, 0);
+    mouse_apply_report(dx, dy, g_mouse.buf[0] & 0x07, 0, &g_ps2_mouse_buttons);
 }
 
 bool mousedecode(uint8_t data)
@@ -94,7 +129,7 @@ extern "C" void mouse_inject_report(int dx, int dy, uint8_t buttons, int wheel)
     event.wheel = (int16_t)wheel;
     OpenXJ380Socket_MouseInterrupte(&event);
 #else
-    mouse_apply_report(dx, dy, buttons, wheel);
+    mouse_apply_report(dx, dy, buttons, wheel, &g_usb_mouse_buttons);
     OpenXJ380MouseInterruptInfo event = {};
     event.source = OPENXJ380_INPUT_SOURCE_USB;
     event.packet_complete = 1;
@@ -151,6 +186,9 @@ void mouse_init()
 {
 #if !OPENXJ380_INPUT_OUTPUT_DISABLED
     g_mouse = {};
+    g_ps2_mouse_buttons = 0;
+    g_usb_mouse_buttons = 0;
+    spin_init(&g_mouse_button_lock);
     mouse_wait_write();
     outb(PS2_CMD_PORT, KB_EN_MOUSE_INTFACE);
     mouse_write(MOUSE_EN);

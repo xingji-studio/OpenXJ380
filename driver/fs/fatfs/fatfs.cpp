@@ -219,7 +219,10 @@ size_t fatfs_readfile(file_t file, void *addr, size_t offset, size_t size) {
         fatfs_unlock();
         return -1;
     }
-    if (n != size) {
+    uint64_t file_size = (uint64_t)fp->obj.objsize;
+    bool     reached_eof = (uint64_t)offset >= file_size ||
+                       (uint64_t)n >= file_size - (uint64_t)offset;
+    if (n != size && !reached_eof) {
         write_serial_fmt("fatfs_readfile: short read path=%s offset=%zu size=%zu got=%u res=%d\n",
                          file->path != NULL ? file->path : "<unknown>", offset, size, n, res);
     }
