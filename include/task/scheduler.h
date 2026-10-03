@@ -7,7 +7,21 @@ extern const uint64_t TIME_SLICE;
 extern const uint64_t MIN_SLICE;
 
 // 调度器函数声明
-// Global boot/panic gate; runtime critical sections must use local nesting.
+/*
+ * Scheduler safety contract:
+ *
+ * - scheduler_start/stop control the system-wide boot or fatal-error gate.
+ *   They are not runtime critical-section primitives.
+ * - disable_scheduler/enable_scheduler change the current CPU's nesting
+ *   depth. Every disable must be paired on every returning path.
+ * - Code that temporarily enters a disabled section must save
+ *   scheduler_disable_depth() and restore that exact value. Do not blindly
+ *   enable once: callers may already be inside an outer disabled section.
+ * - Keep interrupts disabled while changing the nesting depth if an interrupt
+ *   could observe partially updated state or re-enter protected code.
+ * - Never wait, allocate, call VFS, or take a blocking mutex while holding a
+ *   spin lock or while scheduling is disabled.
+ */
 void scheduler_start();
 void scheduler_stop();
 bool scheduler_is_enabled();

@@ -16,6 +16,8 @@ void ipc_send(pcb_t process, ipc_message_t message) {
 
 void ipc_free_type(uint8_t type) {
     pcb_t pcb = get_current_task()->parent_group;
+    // Another consumer or exec's queue drain may empty the queue between the
+    // size snapshot and dequeue. NULL is therefore a normal concurrent result.
     for (size_t i = 0; i < pcb->ipc_queue->size; ++i) {
         ipc_message_t message = (ipc_message_t)queue_dequeue(pcb->ipc_queue);
         if (message == NULL) { break; }

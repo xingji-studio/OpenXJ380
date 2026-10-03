@@ -95,6 +95,8 @@ size_t lock_queue_enqueue(lock_queue *q, void *data)
     queue_append_node(q, new_node);
     spin_unlock(&q->lock);
 
+    // The node is visible to consumers after unlock and may already be freed.
+    // Return the index copied while locked; never dereference new_node here.
     return index;
 }
 
@@ -186,6 +188,8 @@ size_t queue_enqueue_ref(lock_queue *q, void *data, lock_node **out_node)
     size_t index = q->next_index++;
     new_node->index = index;
     queue_append_node(q, new_node);
+    // Publish the optional node handle under the queue lock for consumers that
+    // can remove the node immediately after publication.
     if (out_node != NULL) *out_node = new_node;
     spin_unlock(&q->lock);
 

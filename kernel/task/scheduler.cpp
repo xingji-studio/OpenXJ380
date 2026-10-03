@@ -34,6 +34,11 @@ static_assert(__builtin_offsetof(PROCESSOR_INFO, syscall_user_rax) == 0x4e8,
 static_assert(__builtin_offsetof(PROCESSOR_INFO, scheduler_disable_depth) == 0x4f0,
               "PROCESSOR_INFO.scheduler_disable_depth must follow syscall scratch fields");
 
+/*
+ * Keep boot/fatal state separate from runtime preemption state. A shared
+ * boolean let one CPU's critical section disable scheduling on every CPU, and
+ * a stray enable from an unrelated path could then make it globally runnable.
+ */
 void scheduler_start()
 {
     __atomic_store_n(&scheduler_boot_ready, true, __ATOMIC_RELEASE);
@@ -62,6 +67,8 @@ void scheduler_restore_depth(uint64_t depth)
 {
     PROCESSOR_INFO *cpu = get_current_cpu();
     if (cpu == NULL) return;
+    // Restore the caller's nesting level; never decrement an unknown outer
+    // critical section with enable_scheduler().
     __atomic_store_n(&cpu->scheduler_disable_depth, depth, __ATOMIC_RELEASE);
 }
 
@@ -82,6 +89,8 @@ void disable_scheduler()
 {
     PROCESSOR_INFO *cpu = get_current_cpu();
     if (cpu == NULL) return;
+    // This is local to the current CPU; callers must still protect transitions
+    // from interrupt re-entry when the critical section requires it.
     __atomic_fetch_add(&cpu->scheduler_disable_depth, 1ULL, __ATOMIC_ACQ_REL);
 }
 

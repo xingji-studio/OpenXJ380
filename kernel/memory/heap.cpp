@@ -7,9 +7,17 @@ extern "C" void __real_free(void *ptr);
 extern "C" void *__real_realloc(void *ptr, size_t size);
 extern "C" void *__real_aligned_alloc(size_t alignment, size_t size);
 
-// liballoc's internal spinlock does not mask interrupts. Its owner must not
-// be preempted by another allocator user on the same CPU, including IRQ code.
-// This guard also works before SMP and the scheduler have been initialized.
+/*
+ * liballoc's internal spinlock does not mask interrupts. If its owner is
+ * interrupted and an IRQ path allocates/frees, the same CPU spins forever on
+ * the lock held by the interrupted context. Keep IRQs disabled across every
+ * liballoc entry, including free and the heap-extension retry. This must work
+ * before SMP/current-CPU state and the scheduler have been initialized.
+ *
+ * Keep --wrap=malloc/calloc/free/realloc/aligned_alloc in both Ninja
+ * generators: ordinary kernel and module ABI references must enter these
+ * wrappers. Calls to __real_* are the only intentional bypass.
+ */
 static uint64_t allocator_irq_save()
 {
     uint64_t flags;

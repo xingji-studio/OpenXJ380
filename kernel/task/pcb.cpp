@@ -1629,6 +1629,12 @@ uint64_t process_execve(char *path, char **argv, char **envp)
         restore_runtime_state(scheduler_depth, is_sti);
         return (uint64_t)-EAGAIN;
     }
+    /*
+     * This is the exec image publication point. Keep it short and nonblocking:
+     * staging used private state so other tasks could run; here the PCB begins
+     * naming the new image. Do not move ELF/VFS work or heap allocation under
+     * create_thread_lock or this scheduler-disabled section.
+     */
     bool was_vfork = process->vfork;
     lock_queue *old_virt_queue = process->virt_queue;
     vma_manager_t old_vma_manager = process->vma_manager;
@@ -1691,7 +1697,10 @@ uint64_t process_execve(char *path, char **argv, char **envp)
     free_owned_pointer_queue(old_virt_queue);
 
     // Keep the published queue object valid for concurrent senders. Detach
-    // the old messages under its lock and reclaim only the detached nodes.
+    // old messages under its lock and reclaim detached nodes after unlocking.
+    // Replacing/destroying this queue here lets a concurrent sender retain a
+    // freed queue pointer; freeing a published message before detaching also
+    // races with queue consumers.
     lock_queue *ipc_queue = process->ipc_queue;
     spin_lock(&ipc_queue->lock);
     lock_node *old_messages = ipc_queue->head;
