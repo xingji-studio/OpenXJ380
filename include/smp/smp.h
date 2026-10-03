@@ -46,6 +46,12 @@ struct PROCESSOR_INFO
     uint64_t            scheduler_ticks; // 当前时间片已运行的 tick 数
     uint64_t            syscall_user_rsp;
     uint64_t            syscall_user_rax;
+    /*
+     * Per-CPU preemption disable nesting.  Keep this after the fields used
+     * directly by intr/handler.S; those offsets are part of the syscall ABI.
+     */
+    uint64_t            scheduler_disable_depth;
+    page_directory_t    temporary_page_directory;
 };
 
 struct XSK_SMP_INFO

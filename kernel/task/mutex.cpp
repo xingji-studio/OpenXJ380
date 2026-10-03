@@ -187,3 +187,30 @@ tcb_t mutex_get_owner(mutex_t *mutex) {
     
     return owner;
 }
+
+/*
+ * Process teardown happens before a TCB is freed, which gives subsystems that
+ * own process-scoped mutexes one last safe point to release an abandoned lock.
+ * Do not release a lock held by a live thread: doing so would let two threads
+ * mutate the protected state concurrently.
+ */
+bool mutex_abort_for_process(mutex_t *mutex, pcb_t process)
+{
+    if (mutex == NULL || process == NULL) return false;
+
+    bool released = false;
+    spin_lock(&mutex->lock);
+
+    tcb_t owner = mutex->owner;
+    if (mutex->state == MUTEX_LOCKED && owner != NULL && owner->parent_group == process &&
+        (owner->status == DEATH || owner->status == OUT))
+    {
+        mutex->owner = NULL;
+        mutex->rcc = 0;
+        mutex->state = MUTEX_UNLOCKED;
+        released = true;
+    }
+
+    spin_unlock(&mutex->lock);
+    return released;
+}
