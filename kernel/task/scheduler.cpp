@@ -1,6 +1,7 @@
 #include "cpu/fpu.h"
 #include "cpu/fsgsbase.h"
 #include "cpu/lock.h"
+#include "../build_settings.h"
 #include "dlinker.h"
 #include "krlibc.h"
 #include "lock_queue.h"
@@ -23,7 +24,9 @@ static constexpr uint64_t EEVDF_WAKEUP_CREDIT  = EEVDF_BASE_SLICE_NS;
 static constexpr uint64_t EEVDF_SLEEPER_CREDIT = EEVDF_BASE_SLICE_NS * 2;
 static constexpr uint64_t EEVDF_DEFAULT_WEIGHT = 1024ULL;
 static volatile uint64_t scheduler_disabled_diag_count = 0;
+#if CONFIG_KERNEL_DEBUG_SCHEDULER_FMANAGER_TIMER_LOG
 static volatile uint64_t scheduler_fmanager_diag_count = 0;
+#endif
 
 static_assert(__builtin_offsetof(PROCESSOR_INFO, current_task) == 0x4c0,
               "PROCESSOR_INFO.current_task offset must match intr/handler.S");
@@ -495,6 +498,7 @@ extern "C" registers_t *timer_handle(registers_t *reg)
     }
 
     tcb_t best = select_next_task();
+#if CONFIG_KERNEL_DEBUG_SCHEDULER_FMANAGER_TIMER_LOG
     if ((current != NULL && strcmp(current->name, "fmanager") == 0) ||
         (best != NULL && strcmp(best->name, "fmanager") == 0))
     {
@@ -521,6 +525,7 @@ extern "C" registers_t *timer_handle(registers_t *reg)
                              best != NULL ? (unsigned)best->status : 0U);
         }
     }
+#endif
     if (best == NULL || best == current) {
         cpu->scheduler_ticks = 0;
         send_eoi();
