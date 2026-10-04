@@ -11,7 +11,9 @@
 #include <elf.h>
 #include <errno.h>
 #include <fs/vfs/vfs.h>
+#if defined(XJ380)
 #include <graphics/window/window.h>
+#endif
 #include <mm/lazyalloc.h>
 #include <mm/uaccess.h>
 #include <openxj380/syscall.h>
@@ -373,11 +375,14 @@ void kill_proc0(pcb_t pcb)
     spin_unlock(&pcb->thread_queue->lock);
 
     /*
-     * Graphics windows retain task pointers. Remove them before destroying
-     * the process threads and PCB so mouse/compositor/task-dock readers
-     * cannot observe a window owned by freed kernel objects.
+     * The XJ380 product layer keeps graphics windows pointing at task-owned
+     * objects. Remove those references before destroying the process threads
+     * and PCB. Generic OpenXJ380 builds do not include the product window
+     * implementation and use the socket hook as a no-op.
      */
+#if defined(XJ380)
     OpenXJ380Socket_NotifyProcessExit(pcb);
+#endif
 
     procfs_on_exit_task(pcb);
 
