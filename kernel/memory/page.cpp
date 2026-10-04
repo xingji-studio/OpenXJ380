@@ -77,11 +77,10 @@ static pcb_t find_process_by_pagedir(page_directory_t *directory)
     return ret;
 }
 
-static uint64_t find_free_user_range(page_directory_t *directory, uint64_t start, uint64_t length)
+static uint64_t find_free_user_range(page_directory_t *directory, uint64_t start, uint64_t length, pcb_t owner)
 {
     if (directory == NULL || length == 0) return 0;
 
-    pcb_t owner = find_process_by_pagedir(directory);
     uint64_t aligned_length = page_align_up(length);
     if (aligned_length == 0 || aligned_length >= USER_BRK_START) return 0;
 
@@ -338,6 +337,7 @@ static void dump_user_mapping_probe(page_directory_t *pagedir, const char *tag, 
 
 extern "C" void handle_page_fault(struct X64_REGS *frame, uint64_t error_code)
 {
+    uint64_t scheduler_depth = scheduler_disable_depth();
     close_interrupt;
     disable_scheduler();
     tcb_t current_task = get_current_task();
@@ -360,14 +360,13 @@ extern "C" void handle_page_fault(struct X64_REGS *frame, uint64_t error_code)
             errno_t status = lazy_tryalloc(current_proc, faulting_address);
             if (status == 0)
             {
-                enable_scheduler();
-                open_interrupt;
+                scheduler_restore_depth(scheduler_depth);
+                // The exception return restores the faulting context's IF.
                 return;
             }
             if (try_map_user_stack_fault(current_task, faulting_address))
             {
-                enable_scheduler();
-                open_interrupt;
+                scheduler_restore_depth(scheduler_depth);
                 return;
             }
             goto err;
@@ -455,7 +454,7 @@ err:;
         if (current_task != NULL && current_task->parent_group != NULL)
         {
             kill_proc(current_task->parent_group, 128 + 11, true);
-            enable_scheduler();
+            scheduler_restore_depth(scheduler_depth);
             open_interrupt;
             scheduler_yield();
             while (1) { __asm__ __volatile__("hlt"); }
@@ -463,12 +462,11 @@ err:;
         if (current_task != NULL && current_task->task_level == TASK_APPLICATION_LEVEL)
         {
             kill_thread(current_task);
-            enable_scheduler();
+            scheduler_restore_depth(scheduler_depth);
             open_interrupt;
             scheduler_yield();
         }
-        enable_scheduler();
-        open_interrupt;
+        scheduler_restore_depth(scheduler_depth);
         return;
     }
 
@@ -604,14 +602,31 @@ page_directory_t *get_kernel_pagedir()
     return &kernel_page_dir;
 }
 
-extern volatile bool is_scheduler;
-
-page_directory_t gdc_temp_pdt;
+static page_directory_t early_page_directory;
 
 page_directory_t *get_current_directory()
 {
-    gdc_temp_pdt.table = (page_table_t *)phys_to_virt(get_cr3());
-    return &gdc_temp_pdt;
+    page_table_t *table = (page_table_t *)phys_to_virt(get_cr3());
+    if (table == kernel_page_dir.table) return &kernel_page_dir;
+
+    PROCESSOR_INFO *cpu = get_current_cpu();
+    if (cpu != NULL)
+    {
+        tcb_t task = cpu->current_task;
+        page_directory_t *directory =
+            task != NULL && task->parent_group != NULL ? task->parent_group->pagedir : NULL;
+        if (directory != NULL && directory->table == table) return directory;
+
+        // A loader may temporarily use another address space with scheduling
+        // disabled. Never share this scratch descriptor across CPUs. Callers
+        // saving an address space across a switch must keep their own CR3 copy.
+        cpu->temporary_page_directory.table = table;
+        return &cpu->temporary_page_directory;
+    }
+
+    // Only the BSP executes before CPU state is initialized.
+    early_page_directory.table = table;
+    return &early_page_directory;
 }
 
 EXPORT_SYMBOL(get_current_directory);
@@ -808,7 +823,7 @@ EXPORT_SYMBOL(page_map_to);
 
 void switch_process_page_directory(page_directory_t *dir)
 {
-    bool was_scheduler_enabled = is_scheduler;
+    uint64_t scheduler_depth = scheduler_disable_depth();
     bool was_interrupt_enabled = are_interrupts_enabled();
 
     disable_scheduler();
@@ -817,7 +832,7 @@ void switch_process_page_directory(page_directory_t *dir)
     pcb->pagedir = dir;
     switch_page_directory(dir);
 
-    if (was_scheduler_enabled) enable_scheduler();
+    scheduler_restore_depth(scheduler_depth);
     if (was_interrupt_enabled && !no_interrupt) open_interrupt;
 }
 
@@ -853,10 +868,10 @@ uint64_t page_alloc_random(page_directory_t *directory, uint64_t length, uint64_
     {
         pcb_t owner = find_process_by_pagedir(directory);
         uint64_t start = (owner != NULL && owner->mmap_start >= USER_MMAP_START) ? owner->mmap_start : USER_MMAP_START;
-        addr = find_free_user_range(directory, start, aligned_length);
+        addr = find_free_user_range(directory, start, aligned_length, owner);
         if (addr == 0 && start != USER_MMAP_START)
         {
-            addr = find_free_user_range(directory, USER_MMAP_START, aligned_length);
+            addr = find_free_user_range(directory, USER_MMAP_START, aligned_length, owner);
         }
         if (addr == 0)
         {
@@ -875,19 +890,24 @@ uint64_t page_alloc_random(page_directory_t *directory, uint64_t length, uint64_
 
 uint64_t page_reserve_user_range(page_directory_t *directory, uint64_t length)
 {
-    if (directory == NULL || length == 0) return 0;
+    return page_reserve_process_user_range(find_process_by_pagedir(directory), length);
+}
+
+uint64_t page_reserve_process_user_range(pcb_t owner, uint64_t length)
+{
+    // exec stages a private image before publishing it in pcb_group_queue.
+    // An explicit owner keeps both the VMA and lazy-range checks on that image.
+    if (owner == NULL || owner->pagedir == NULL || length == 0) return 0;
+    page_directory_t *directory = owner->pagedir;
 
     uint64_t aligned_length = page_align_up(length);
     if (aligned_length == 0) return 0;
 
-    pcb_t owner = find_process_by_pagedir(directory);
-    if (owner == NULL) return 0;
-
     uint64_t start = owner->mmap_start >= USER_MMAP_START ? owner->mmap_start : USER_MMAP_START;
-    uint64_t addr = find_free_user_range(directory, start, aligned_length);
+    uint64_t addr = find_free_user_range(directory, start, aligned_length, owner);
     if (addr == 0 && start != USER_MMAP_START)
     {
-        addr = find_free_user_range(directory, USER_MMAP_START, aligned_length);
+        addr = find_free_user_range(directory, USER_MMAP_START, aligned_length, owner);
     }
     if (addr == 0) return 0;
 

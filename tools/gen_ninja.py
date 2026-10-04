@@ -632,7 +632,7 @@ def main() -> None:
     n.rule("objcopy_bin", "mkdir -p $$(dirname $out) && $objc -I binary -O elf64-x86-64 $bin_input $out", log_desc("OBJCOPY", "$bin_input"))
     n.rule(
         "kernel_link",
-        "$ld -z muldefs -T linker.ld --static --wrap=malloc --wrap=calloc --wrap=realloc --wrap=aligned_alloc "
+        "$ld -z muldefs -T linker.ld --static --wrap=malloc --wrap=calloc --wrap=free --wrap=realloc --wrap=aligned_alloc "
         "-o $out $in",
         log_desc("LD", "$out"),
     )

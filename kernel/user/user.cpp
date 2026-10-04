@@ -18,9 +18,11 @@
 #include <stdint.h>
 #include <syscall/syscall.h>
 #include <task/pcb.h>
+#include <task/scheduler.h>
 #include <user/user.h>
 #include <user/runfile.h>
 #include <cpu/lock.h>
+#include <cpu/regio.h>
 
 char *current_user_envp[100] = {
     ENVP_SYSTEM_VERSION,
@@ -93,11 +95,9 @@ UserInfo *task_effective_user()
 }
 
 extern bool no_interrupt;
-extern bool is_scheduler;
-
-static void restore_runtime_state(bool was_scheduler_enabled, bool was_interrupt_enabled)
+static void restore_runtime_state(uint64_t scheduler_depth, bool was_interrupt_enabled)
 {
-    if (was_scheduler_enabled) enable_scheduler();
+    scheduler_restore_depth(scheduler_depth);
     if (was_interrupt_enabled && !no_interrupt) open_interrupt;
     else close_interrupt;
 }
@@ -760,11 +760,13 @@ uint64_t parse_elf_file(char *path, pcb_t group)
     }
 
     bool is_sti                = are_interrupts_enabled();
-    bool was_scheduler_enabled = is_scheduler;
+    uint64_t scheduler_depth = scheduler_disable_depth();
     if (!no_interrupt) close_interrupt;
     disable_scheduler();
 
-    page_directory_t *current_pagedir = get_current_directory();
+    // Keep the saved CR3 on this stack. get_current_directory's scratch
+    // object can otherwise be overwritten by another CPU during ELF loading.
+    page_directory_t current_pagedir = {(page_table_t *)phys_to_virt(get_cr3())};
     switch_page_directory(group->pagedir);
 
     loaded_user_elf_t main_elf;
@@ -777,8 +779,8 @@ uint64_t parse_elf_file(char *path, pcb_t group)
         ret = load_user_elf_image(interp_buf, interp_size, group, interp_path, USER_INTERP_BASE, &interp_elf);
     }
 
-    switch_page_directory(current_pagedir); // 恢复页表
-    restore_runtime_state(was_scheduler_enabled, is_sti);
+    switch_page_directory(&current_pagedir); // 恢复页表
+    restore_runtime_state(scheduler_depth, is_sti);
 
     if (ret < 0)
     {
