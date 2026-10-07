@@ -18,9 +18,11 @@
 #include <stdint.h>
 #include <syscall/syscall.h>
 #include <task/pcb.h>
+#include <task/scheduler.h>
 #include <user/user.h>
 #include <user/runfile.h>
 #include <cpu/lock.h>
+#include <cpu/regio.h>
 
 char *current_user_envp[100] = {
     ENVP_SYSTEM_VERSION,
@@ -29,6 +31,7 @@ char *current_user_envp[100] = {
 };
 
 UserInfo *current_user = NULL;
+static uint32_t user_session_ready_flag = 0;
 
 UserInfo root_user = {
     .name = "Root",
@@ -92,11 +95,9 @@ UserInfo *task_effective_user()
 }
 
 extern bool no_interrupt;
-extern bool is_scheduler;
-
-static void restore_runtime_state(bool was_scheduler_enabled, bool was_interrupt_enabled)
+static void restore_runtime_state(uint64_t scheduler_depth, bool was_interrupt_enabled)
 {
-    if (was_scheduler_enabled) enable_scheduler();
+    scheduler_restore_depth(scheduler_depth);
     if (was_interrupt_enabled && !no_interrupt) open_interrupt;
     else close_interrupt;
 }
@@ -254,13 +255,25 @@ static void set_current_user_from_info(UserInfo *info)
     current_user->envp      = current_user_envp;
 }
 
+bool user_session_is_ready()
+{
+    return __atomic_load_n(&user_session_ready_flag, __ATOMIC_ACQUIRE) != 0;
+}
+
+void user_session_set_ready(bool ready)
+{
+    __atomic_store_n(&user_session_ready_flag, ready ? 1U : 0U, __ATOMIC_RELEASE);
+}
+
 void user_session_use_root()
 {
+    user_session_set_ready(false);
     set_current_user_from_info(&root_user);
 }
 
 void user_session_use_login()
 {
+    user_session_set_ready(false);
     UserInfo login_user;
     memset(&login_user, 0, sizeof(login_user));
     strcpy(login_user.name, "Login");
@@ -328,12 +341,13 @@ int user_session_login(const char *username, const char *password)
             return -EACCES;
         }
 
+        user_session_set_ready(false);
         set_current_user_from_info(&registry.uinf[i]);
         spin_lock(&login_lock);
         failed_attempts = 0;
         retry_after_ns = 0;
         spin_unlock(&login_lock);
-        if (current_user != NULL) init_user_profile(current_user->name);
+        if (current_user == NULL || !init_user_profile(current_user->name)) return -EIO;
         return 0;
     }
     spin_lock(&login_lock);
@@ -346,6 +360,7 @@ int user_session_login(const char *username, const char *password)
 int user_session_create_first(const char *username, const char *password)
 {
     if (username == NULL || username[0] == '\0' || password == NULL || password[0] == '\0') return -EINVAL;
+    user_session_set_ready(false);
     for (const char *p = username; *p != '\0'; p++)
     {
         if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
@@ -377,7 +392,7 @@ int user_session_create_first(const char *username, const char *password)
             if (first_user != NULL)
             {
                 set_current_user_from_info(first_user);
-                if (current_user != NULL) init_user_profile(current_user->name);
+                if (current_user == NULL || !init_user_profile(current_user->name)) return -EIO;
                 return 0;
             }
         }
@@ -745,11 +760,13 @@ uint64_t parse_elf_file(char *path, pcb_t group)
     }
 
     bool is_sti                = are_interrupts_enabled();
-    bool was_scheduler_enabled = is_scheduler;
+    uint64_t scheduler_depth = scheduler_disable_depth();
     if (!no_interrupt) close_interrupt;
     disable_scheduler();
 
-    page_directory_t *current_pagedir = get_current_directory();
+    // Keep the saved CR3 on this stack. get_current_directory's scratch
+    // object can otherwise be overwritten by another CPU during ELF loading.
+    page_directory_t current_pagedir = {(page_table_t *)phys_to_virt(get_cr3())};
     switch_page_directory(group->pagedir);
 
     loaded_user_elf_t main_elf;
@@ -762,8 +779,8 @@ uint64_t parse_elf_file(char *path, pcb_t group)
         ret = load_user_elf_image(interp_buf, interp_size, group, interp_path, USER_INTERP_BASE, &interp_elf);
     }
 
-    switch_page_directory(current_pagedir); // 恢复页表
-    restore_runtime_state(was_scheduler_enabled, is_sti);
+    switch_page_directory(&current_pagedir); // 恢复页表
+    restore_runtime_state(scheduler_depth, is_sti);
 
     if (ret < 0)
     {
@@ -987,7 +1004,6 @@ int create_user_process_from_file(char *path, pcb_t pcb, char *argv[])
         return -ENOMEM;
     }
     group->argc = argc;
-    group->linux_abi = true;
     char *cwd = getCwd(path);
     if (cwd == NULL)
     {

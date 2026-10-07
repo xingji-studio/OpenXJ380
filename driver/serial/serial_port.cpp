@@ -6,6 +6,8 @@
 #include <cpu/lock.h>
 #include <proto.hpp>
 #include <dlinker.h>
+#include <openxj380/config.h>
+#include <syscall/pxapi.h>
 
 spin_t serial_lock;
 spin_t fmt_lock; // For write_serial_fmt
@@ -14,7 +16,12 @@ static bool serial_prompt_active  = false;
 static bool serial_line_start     = true;
 static bool serial_restore_prompt = false;
 static bool serial_log_active     = false;
+static uint64_t serial_log_config = LOG_CONFIG_DEFAULT;
 static constexpr const char serial_shell_prompt[] = "xj380$ ";
+
+/* Optional product hook. OpenXJ380 remains usable without a product overlay. */
+extern "C" void serial_output_observer(const char *str) __attribute__((weak));
+extern "C" bool serial_logging_allowed() __attribute__((weak));
 
 #define PORT 0x3f8 // COM1
 
@@ -26,6 +33,7 @@ int init_serial()
     serial_line_start     = true;
     serial_restore_prompt = false;
     serial_log_active     = false;
+    serial_log_config_set(LOG_CONFIG_DEFAULT);
 
     outb(PORT + 1, 0x00); // Disable all interrupts
     outb(PORT + 3, 0x80); // Enable DLAB (set baud rate divisor)
@@ -48,6 +56,21 @@ int init_serial()
     // (not-loopback with IRQs enabled and OUT#1 and OUT#2 bits enabled)
     outb(PORT + 4, 0x0F);
     return 0;
+}
+
+void serial_log_config_set(uint64_t flags)
+{
+    __atomic_store_n(&serial_log_config, flags & LOG_CONFIG_VALID_MASK, __ATOMIC_RELEASE);
+}
+
+uint64_t serial_log_config_get()
+{
+    return __atomic_load_n(&serial_log_config, __ATOMIC_ACQUIRE);
+}
+
+extern "C" bool serial_logging_allowed()
+{
+    return (serial_log_config_get() & LOG_CONFIG_RECORD_LOGS) != 0;
 }
 
 int is_transmit_empty()
@@ -73,6 +96,11 @@ static void write_serial_string_unlocked(const char *str)
     }
 }
 
+static void notify_serial_output_observer(const char *str)
+{
+    if (serial_output_observer != nullptr) serial_output_observer(str);
+}
+
 static bool is_serial_shell_prompt(const char *str)
 {
     size_t index = 0;
@@ -91,9 +119,17 @@ static bool serial_string_contains_newline(const char *str)
 
 static void write_serial_output_unlocked(const char *str)
 {
+    if (serial_log_active && serial_logging_allowed != nullptr && !serial_logging_allowed())
+    {
+        return;
+    }
+#if !OPENXJ380_INPUT_OUTPUT_DISABLED
     console_write(str);
+#endif
     write_serial_string_unlocked(str);
+    notify_serial_output_observer(str);
 }
+
 
 void write_serial_string(const char *str)
 {
@@ -106,6 +142,7 @@ void write_serial_string(const char *str)
     if (is_serial_shell_prompt(str)) serial_prompt_active = true;
     else if (serial_prompt_active && serial_string_contains_newline(str)) serial_prompt_active = false;
     spin_unlock(&serial_lock);
+    notify_serial_output_observer(nullptr);
 }
 
 static void serial_log_begin()
@@ -134,6 +171,7 @@ static void serial_log_end()
     serial_restore_prompt = false;
     serial_log_active = false;
     spin_unlock(&serial_lock);
+    notify_serial_output_observer(nullptr);
 }
 
 void write_serial_dec(unsigned long long dec)

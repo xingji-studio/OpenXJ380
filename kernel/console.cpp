@@ -1,5 +1,6 @@
 #include <console.h>
 #include <cpu/lock.h>
+#include <openxj380/config.h>
 #include <stdint.h>
 
 extern const uint8_t _binary___font_hankaku_bin_start;
@@ -120,6 +121,10 @@ static void put_character(char value)
 
 void console_init(const FrameBufferConfig &fbc)
 {
+#if OPENXJ380_CONSOLE_DISABLED
+    (void)fbc;
+    return;
+#else
     if (fbc.frame_buffer == nullptr || fbc.horizontal_resolution < CHARACTER_WIDTH ||
         fbc.vertical_resolution < CHARACTER_HEIGHT)
         return;
@@ -129,12 +134,18 @@ void console_init(const FrameBufferConfig &fbc)
     g_rows        = fbc.vertical_resolution / CHARACTER_HEIGHT;
     spin_init(&g_console_lock);
     clear_screen();
+#endif
 }
 
 void console_write(const char *str)
 {
+#if OPENXJ380_CONSOLE_DISABLED
+    (void)str;
+    return;
+#else
     if (g_framebuffer == nullptr || str == nullptr) return;
     spin_lock(&g_console_lock);
     while (*str != '\0') put_character(*str++);
     spin_unlock(&g_console_lock);
+#endif
 }

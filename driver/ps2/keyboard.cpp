@@ -1,6 +1,8 @@
 #include <proto.hpp>
 #include <atom_queue.h>
 #include <dlinker.h>
+#include <openxj380/config.h>
+#include <openxj380/socket.h>
 #include <syscall/syscall.h>
 
 struct keyboard_buf kb_fifo;
@@ -15,8 +17,44 @@ static uint8_t kb_ps2_pressed_values[2][128];
 static uint8_t kb_usb_pressed_values[256];
 extern uint8_t keyboard_code[256];
 extern uint8_t keyboard_code1[256];
+static volatile uint64_t kb_layout = KEYBOARD_LAYOUT_US;
+static volatile uint64_t kb_repeat_rate_hz = 40;
+static volatile uint64_t kb_repeat_delay_ms = 500;
+static volatile uint64_t kb_long_press_ms = 500;
 
-#define KB_USB_REPEAT_SLOTS 6
+static void keyboard_emit_socket(void *regs_ptr, uint64_t error_code, uint8_t raw_scancode, uint8_t make_code,
+                                  uint8_t value, bool extended, bool pressed)
+{
+#if !OPENXJ380_INPUT_OUTPUT_DISABLED
+    OpenXJ380KeyboardInterruptInfo event = {};
+    event.regs = regs_ptr;
+    event.error_code = error_code;
+    event.source = OPENXJ380_INPUT_SOURCE_PS2;
+    event.raw_scancode = raw_scancode;
+    event.make_code = make_code;
+    event.value = value;
+    event.message_type = (uint8_t)(pressed ? MSG_KEYDOWN : MSG_KEYUP);
+    event.extended = extended ? 1 : 0;
+    event.pressed = pressed ? 1 : 0;
+    event.shift = kb_fifo.shift ? 1 : 0;
+    event.ctrl = kb_fifo.ctrl ? 1 : 0;
+    event.alt = kb_fifo.alt ? 1 : 0;
+    event.win = kb_fifo.win ? 1 : 0;
+    event.caps = kb_fifo.caps ? 1 : 0;
+    OpenXJ380Socket_KeyboardInterrupt(&event);
+#else
+    (void)regs_ptr;
+    (void)error_code;
+    (void)raw_scancode;
+    (void)make_code;
+    (void)value;
+    (void)extended;
+    (void)pressed;
+#endif
+}
+
+// USB HID keyboard usages are one byte wide, so keep one repeat slot per usage.
+#define KB_USB_REPEAT_SLOTS 256
 #define KB_USB_REPEAT_DELAY_NS 500000000ULL
 #define KB_USB_REPEAT_INTERVAL_NS 25000000ULL
 struct keyboard_usb_repeat_slot
@@ -45,6 +83,66 @@ static void kb_synth_lock_release()
 static bool kb_value_repeatable(uint8_t value)
 {
     return value == '\b' || value == '\n' || (value >= 32 && value < 127);
+}
+
+static uint8_t keyboard_dvorak_value(uint8_t make_code, bool shifted)
+{
+    char value = 0;
+    switch (make_code)
+    {
+    case 0x0c: value = '['; break;
+    case 0x0d: value = ']'; break;
+    case 0x10: value = '\''; break;
+    case 0x11: value = ','; break;
+    case 0x12: value = '.'; break;
+    case 0x13: value = 'p'; break;
+    case 0x14: value = 'y'; break;
+    case 0x15: value = 'f'; break;
+    case 0x16: value = 'g'; break;
+    case 0x17: value = 'c'; break;
+    case 0x18: value = 'r'; break;
+    case 0x19: value = 'l'; break;
+    case 0x1a: value = '/'; break;
+    case 0x1b: value = '='; break;
+    case 0x1e: value = 'a'; break;
+    case 0x1f: value = 'o'; break;
+    case 0x20: value = 'e'; break;
+    case 0x21: value = 'u'; break;
+    case 0x22: value = 'i'; break;
+    case 0x23: value = 'd'; break;
+    case 0x24: value = 'h'; break;
+    case 0x25: value = 't'; break;
+    case 0x26: value = 'n'; break;
+    case 0x27: value = 's'; break;
+    case 0x28: value = '-'; break;
+    case 0x2c: value = ';'; break;
+    case 0x2d: value = 'q'; break;
+    case 0x2e: value = 'j'; break;
+    case 0x2f: value = 'k'; break;
+    case 0x30: value = 'x'; break;
+    case 0x31: value = 'b'; break;
+    case 0x32: value = 'm'; break;
+    case 0x33: value = 'w'; break;
+    case 0x34: value = 'v'; break;
+    case 0x35: value = 'z'; break;
+    default:
+        return shifted ? keyboard_code1[make_code] : keyboard_code[make_code];
+    }
+    if (!shifted) return (uint8_t)value;
+    if (value >= 'a' && value <= 'z') return (uint8_t)(value - 'a' + 'A');
+    switch (value)
+    {
+    case '\'': return '"';
+    case ',': return '<';
+    case '.': return '>';
+    case '/': return '?';
+    case '=': return '+';
+    case '-': return '_';
+    case '[': return '{';
+    case ']': return '}';
+    case ';': return ':';
+    default: return (uint8_t)value;
+    }
 }
 
 static void kb_synth_enqueue_locked(uint8_t value)
@@ -119,7 +217,9 @@ static void kb_usb_repeat_service()
         if (!slot->active || now < slot->next_repeat_ns) { continue; }
 
         kb_synth_enqueue_locked(slot->value);
-        slot->next_repeat_ns = now + KB_USB_REPEAT_INTERVAL_NS;
+        uint64_t rate = __atomic_load_n(&kb_repeat_rate_hz, __ATOMIC_RELAXED);
+        if (rate == 0) rate = 1;
+        slot->next_repeat_ns = now + 1000000000ULL / rate;
     }
     kb_synth_lock_release();
 }
@@ -129,6 +229,16 @@ static uint8_t keyboard_translate_base_make_code(uint8_t make_code, bool shift,
 {
     if (make_code >= 128) {
         return 0;
+    }
+
+    if (__atomic_load_n(&kb_layout, __ATOMIC_RELAXED) == KEYBOARD_LAYOUT_DVORAK)
+    {
+        uint8_t dvorak = keyboard_dvorak_value(make_code, shift);
+        if (dvorak >= 'a' && dvorak <= 'z' && (shift ^ caps))
+            dvorak = (uint8_t)(dvorak - 'a' + 'A');
+        else if (dvorak >= 'A' && dvorak <= 'Z' && !(shift ^ caps))
+            dvorak = (uint8_t)(dvorak - 'A' + 'a');
+        return dvorak;
     }
 
     uint8_t base = keyboard_code[make_code];
@@ -224,6 +334,21 @@ uint8_t keyboard_code1[256] = {                                                 
 
 extern "C" void c_keyboard_handler(void *regs_ptr, uint64_t error_code)
 {
+#if OPENXJ380_INPUT_OUTPUT_DISABLED
+    OpenXJ380KeyboardInterruptInfo event = {};
+    event.regs = regs_ptr;
+    event.error_code = error_code;
+    event.source = OPENXJ380_INPUT_SOURCE_PS2;
+    event.route = OPENXJ380_INPUT_ROUTE_XJ380_PS2_IRQ;
+    if (!OpenXJ380Socket_KeyboardInterrupt(&event))
+    {
+        /* Always drain an unhandled i8042 interrupt.  VMware otherwise leaves
+         * the controller output buffer full and subsequent input stalls. */
+        (void)inb(PORT_KB_DATA);
+        send_eoi();
+    }
+    return;
+#else
     keyboard_prepare_fifo();
 
     uint8_t x = inb(0x60);
@@ -231,6 +356,7 @@ extern "C" void c_keyboard_handler(void *regs_ptr, uint64_t error_code)
     if (x == 0xe0)
     {
         kb_e0_prefix = true;
+        keyboard_emit_socket(regs_ptr, error_code, x, 0, 0, true, true);
         send_eoi();
         return;
     }
@@ -277,6 +403,8 @@ extern "C" void c_keyboard_handler(void *regs_ptr, uint64_t error_code)
 
     keyboard_update_modifier_state(make_code, extended, pressed);
 
+    keyboard_emit_socket(regs_ptr, error_code, x, make_code, event_value, extended, pressed);
+
     kb_e0_prefix = false;
 
     if (key_release)
@@ -300,10 +428,14 @@ extern "C" void c_keyboard_handler(void *regs_ptr, uint64_t error_code)
     }
 
     send_eoi();
+#endif
 }
 
 uint8_t get_keyboard_input()
 {
+#if OPENXJ380_INPUT_OUTPUT_DISABLED
+    return 0;
+#else
     keyboard_prepare_fifo();
     kb_usb_repeat_service();
 
@@ -315,40 +447,104 @@ uint8_t get_keyboard_input()
     int raw_input = atom_pop(&kb_fifo_queue);
     if (raw_input >= 0) { return (uint8_t)raw_input; }
     return NULL;
+#endif
 }
 
-void wait_ps2_write()
+bool wait_ps2_write()
 {
+#if !OPENXJ380_INPUT_OUTPUT_DISABLED
     for (size_t i = 0; i < MAX_WAIT_INDEX; ++i)
     {
-        if (!(inb(PS2_CMD_PORT) & KB_STATUS_IBF)) return;
+        if (!(inb(PS2_CMD_PORT) & KB_STATUS_IBF)) return true;
+        __asm__ volatile("pause" ::: "memory");
     }
+    return false;
+#else
+    return true;
+#endif
 }
 
-void wait_ps2_read()
+bool wait_ps2_read()
 {
+#if !OPENXJ380_INPUT_OUTPUT_DISABLED
     for (size_t i = 0; i < MAX_WAIT_INDEX; ++i)
     {
-        if (!(inb(PS2_CMD_PORT) & KB_STATUS_OBF)) return;
+        if (!(inb(PS2_CMD_PORT) & KB_STATUS_OBF)) return true;
+        __asm__ volatile("pause" ::: "memory");
     }
+    return false;
+#else
+    return true;
+#endif
 }
 
 void keyboard_init()
 {
+#if !OPENXJ380_INPUT_OUTPUT_DISABLED
     keyboard_prepare_fifo();
-    wait_ps2_write();
+    if (!wait_ps2_write()) return;
     outb(PORT_KB_CMD, KBCMD_WRITE_CMD);
-    wait_ps2_read();
+    if (!wait_ps2_read()) return;
     outb(PORT_KB_DATA, KB_INIT_MODE);
+#endif
+}
+
+extern "C" bool keyboard_set_settings(uint64_t layout, uint64_t repeat_rate_hz, uint64_t repeat_delay_ms,
+                                      uint64_t long_press_ms)
+{
+    if (layout > KEYBOARD_LAYOUT_DVORAK) layout = KEYBOARD_LAYOUT_US;
+    if (repeat_rate_hz < 1) repeat_rate_hz = 1;
+    if (repeat_rate_hz > 100) repeat_rate_hz = 100;
+    if (repeat_delay_ms > 5000) repeat_delay_ms = 5000;
+    if (long_press_ms > 10000) long_press_ms = 10000;
+    __atomic_store_n(&kb_layout, layout, __ATOMIC_RELAXED);
+    __atomic_store_n(&kb_repeat_rate_hz, repeat_rate_hz, __ATOMIC_RELAXED);
+    __atomic_store_n(&kb_repeat_delay_ms, repeat_delay_ms, __ATOMIC_RELAXED);
+    __atomic_store_n(&kb_long_press_ms, long_press_ms, __ATOMIC_RELAXED);
+    return true;
+}
+
+extern "C" uint64_t keyboard_get_layout()
+{
+    return __atomic_load_n(&kb_layout, __ATOMIC_RELAXED);
+}
+
+extern "C" uint64_t keyboard_get_repeat_rate_hz()
+{
+    return __atomic_load_n(&kb_repeat_rate_hz, __ATOMIC_RELAXED);
+}
+
+extern "C" uint64_t keyboard_get_repeat_delay_ms()
+{
+    return __atomic_load_n(&kb_repeat_delay_ms, __ATOMIC_RELAXED);
+}
+
+extern "C" uint64_t keyboard_get_long_press_ms()
+{
+    return __atomic_load_n(&kb_long_press_ms, __ATOMIC_RELAXED);
 }
 
 extern "C" void keyboard_push_input(uint8_t value)
 {
+#if OPENXJ380_INPUT_OUTPUT_DISABLED
+    (void)value;
+#else
     kb_synth_enqueue(value);
+#endif
 }
 
 extern "C" void keyboard_usb_key_event(uint8_t usage, uint8_t value, uint8_t pressed)
 {
+#if OPENXJ380_INPUT_OUTPUT_DISABLED
+    OpenXJ380KeyboardInterruptInfo event = {};
+    event.source = OPENXJ380_INPUT_SOURCE_USB;
+    event.route = OPENXJ380_INPUT_ROUTE_XJ380_USB;
+    event.usb_usage = usage;
+    event.value = value;
+    event.message_type = (uint8_t)(pressed ? MSG_KEYDOWN : MSG_KEYUP);
+    event.pressed = pressed ? 1 : 0;
+    OpenXJ380Socket_KeyboardInterrupt(&event);
+#else
     keyboard_prepare_fifo();
     bool key_pressed = pressed != 0;
     if (value == KEY_SHIFT)
@@ -362,6 +558,14 @@ extern "C" void keyboard_usb_key_event(uint8_t usage, uint8_t value, uint8_t pre
     else if (value == KEY_ALT)
     {
         kb_fifo.alt = key_pressed;
+    }
+    else if (usage == 0xe3 || usage == 0xe7)
+    {
+        kb_fifo.win = key_pressed;
+    }
+    else if (value == KEY_CAPS && key_pressed)
+    {
+        kb_fifo.caps = !kb_fifo.caps;
     }
 
     uint8_t event_value = value;
@@ -381,38 +585,42 @@ extern "C" void keyboard_usb_key_event(uint8_t usage, uint8_t value, uint8_t pre
 
     keyboard_dispatch_key_message(key_pressed ? MSG_KEYDOWN : MSG_KEYUP, event_value);
 
-    kb_synth_lock_acquire();
-    keyboard_usb_repeat_slot *free_slot = NULL;
-    keyboard_usb_repeat_slot *match = NULL;
+    OpenXJ380KeyboardInterruptInfo event = {};
+    event.source = OPENXJ380_INPUT_SOURCE_USB;
+    event.usb_usage = usage;
+    event.value = event_value;
+    event.message_type = (uint8_t)(key_pressed ? MSG_KEYDOWN : MSG_KEYUP);
+    event.pressed = key_pressed ? 1 : 0;
+    event.shift = kb_fifo.shift ? 1 : 0;
+    event.ctrl = kb_fifo.ctrl ? 1 : 0;
+    event.alt = kb_fifo.alt ? 1 : 0;
+    event.win = kb_fifo.win ? 1 : 0;
+    event.caps = kb_fifo.caps ? 1 : 0;
+    OpenXJ380Socket_KeyboardInterrupt(&event);
 
-    for (size_t i = 0; i < KB_USB_REPEAT_SLOTS; ++i)
-    {
-        keyboard_usb_repeat_slot *slot = &kb_usb_repeat[i];
-        if (slot->active && slot->usage == usage) { match = slot; }
-        else if (!slot->active && free_slot == NULL) { free_slot = slot; }
-    }
+    kb_synth_lock_acquire();
+    keyboard_usb_repeat_slot *slot = &kb_usb_repeat[usage];
 
     if (key_pressed)
     {
         kb_synth_enqueue_locked(event_value);
         if (kb_value_repeatable(event_value))
         {
-            keyboard_usb_repeat_slot *slot = match ? match : free_slot;
-            if (slot != NULL)
-            {
-                uint64_t now = nanoTime();
-                slot->active = true;
-                slot->usage = usage;
-                slot->value = event_value;
-                slot->next_repeat_ns = now ? now + KB_USB_REPEAT_DELAY_NS : 0;
-            }
+            uint64_t now = nanoTime();
+            slot->active = true;
+            slot->usage = usage;
+            slot->value = event_value;
+            uint64_t delay_ms = __atomic_load_n(&kb_repeat_delay_ms, __ATOMIC_RELAXED);
+            slot->next_repeat_ns = now ? now + delay_ms * 1000000ULL : 0;
+        }
+        else
+        {
+            slot->active = false;
         }
     }
     else
     {
-        if (match != NULL) {
-            match->active = false;
-        }
+        slot->active = false;
         if (event_value == KEY_CTRL)
         {
             // Keep legacy terminal input behavior consistent with the PS/2 path.
@@ -421,6 +629,7 @@ extern "C" void keyboard_usb_key_event(uint8_t usage, uint8_t value, uint8_t pre
     }
 
     kb_synth_lock_release();
+#endif
 }
 
 EXPORT_SYMBOL(keyboard_push_input);

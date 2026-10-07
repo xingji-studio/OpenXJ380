@@ -1,5 +1,10 @@
 #include <stdint.h>
 #include <dlinker.h>
+
+#ifndef UINT64_MAX
+    #define UINT64_MAX 0xffffffffffffffff
+#endif
+
 // 读取TSC
 static inline uint64_t rdtsc()
 {
@@ -29,20 +34,36 @@ extern uint64_t nanoTime();
 
 void delay_ns(uint64_t ns)
 {
-    uint64_t old_t = nanoTime();
-    while (nanoTime() - old_t <= ns)
+    uint64_t last = nanoTime();
+    uint64_t elapsed = 0;
+    while (elapsed < ns)
     {
-        __asm__ volatile("nop");
+        uint64_t now = nanoTime();
+        uint64_t d_time = now - last;
+        if (elapsed > UINT64_MAX-d_time)
+        {
+            elapsed = UINT64_MAX;
+        } else {
+            elapsed += d_time;
+        }
+        last = now;
     }
 }
+
 void delay_us_hp(uint64_t us)
 {
-    delay_ns(us * 1000);
+    if (us > UINT64_MAX / 1000ULL)
+        delay_ns(UINT64_MAX);
+    else
+        delay_ns(us * 1000ULL);
 }
 
 void delay_ms_hp(uint64_t ms)
 {
-    delay_us_hp(ms * 1000);
+    if (ms > UINT64_MAX / 1000000ULL)
+        delay_ns(UINT64_MAX);
+    else
+        delay_ns(ms * 1000000ULL);
 }
 
 EXPORT_SYMBOL(delay_ms_hp);

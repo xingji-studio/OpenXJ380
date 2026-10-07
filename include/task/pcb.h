@@ -213,6 +213,7 @@ struct thread_control_block
     uint64_t eevdf_deadline;
     uint64_t eevdf_slice;
     uint64_t eevdf_last_start;
+    uint64_t runtime_ticks;
 
     bool owns_user_stack;
 };

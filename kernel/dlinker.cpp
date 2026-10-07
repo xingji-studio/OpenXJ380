@@ -179,15 +179,29 @@ dlinit_t load_dynamic(kernel_mode_t *kmod,Elf64_Phdr *phdrs, Elf64_Ehdr *ehdr, u
         uint32_t    type       = ELF64_R_TYPE(r->r_info);
 
         if (type == R_X86_64_GLOB_DAT || type == R_X86_64_JUMP_SLOT) {
-            void *symbol_addr = resolve_symbol(symtab, sym_idx);
+            Elf64_Sym *symbol = &symtab[sym_idx];
+            void *symbol_addr = NULL;
+            if (symbol->st_shndx == SHN_UNDEF) {
+                dlfunc_t *external = find_func(&strtab[symbol->st_name]);
+                if (external != NULL) symbol_addr = external->addr;
+            } else {
+                symbol_addr = (void *)(symbol->st_value + offset);
+            }
             if (symbol_addr == NULL) return NULL;
-            *reloc_addr = (uint64_t)symbol_addr + offset;
+            *reloc_addr = (uint64_t)symbol_addr;
         } else if (type == R_X86_64_RELATIVE) {
             *reloc_addr = (uint64_t)(offset + r->r_addend);
         } else if (type == R_X86_64_64) {
-            void *symbol_addr = resolve_symbol(symtab, sym_idx);
+            Elf64_Sym *symbol = &symtab[sym_idx];
+            void *symbol_addr = NULL;
+            if (symbol->st_shndx == SHN_UNDEF) {
+                dlfunc_t *external = find_func(&strtab[symbol->st_name]);
+                if (external != NULL) symbol_addr = external->addr;
+            } else {
+                symbol_addr = (void *)(symbol->st_value + offset);
+            }
             if (symbol_addr == NULL) return NULL;
-            *reloc_addr = (uint64_t)symbol_addr + r->r_addend + offset;
+            *reloc_addr = (uint64_t)symbol_addr + r->r_addend;
         }
     }
     if (!handle_relocations(jmprel, symtab, strtab, jmprel_sz, offset)) {
@@ -445,10 +459,24 @@ elf_start load_executor_elf(uint8_t *data, page_directory_t *dir, uint64_t offse
 //     kernel_modules_load_offset += (load_size + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
 // }
 
+static bool dlinker_mangled_global_matches(const char *mangled, const char *exported)
+{
+    if (mangled == NULL || exported == NULL || mangled[0] != '_' || mangled[1] != 'Z') return false;
+    const char *cursor = mangled + 2;
+    if (*cursor < '0' || *cursor > '9') return false;
+    size_t length = 0;
+    while (*cursor >= '0' && *cursor <= '9')
+    {
+        length = length * 10 + (size_t)(*cursor - '0');
+        cursor++;
+    }
+    return length != 0 && strlen(exported) == length && strncmp(cursor, exported, length) == 0;
+}
+
 dlfunc_t *find_func(const char *name) {
     for (size_t i = 0; i < dlfunc_count; i++) {
         dlfunc_t *entry = &__ksymtab_start[i];
-        if (strcmp(entry->name, name) == 0) { return entry; }
+        if (strcmp(entry->name, name) == 0 || dlinker_mangled_global_matches(name, entry->name)) { return entry; }
     }
     return NULL;
 }
@@ -736,7 +764,8 @@ static dlfunc_t *find_export(dlhandle_t *handle, const char *name) {
 static void* find_symbol_internal(const char* name, dlhandle_t* exclude) {
     // 1. 先在全局符号表中查找
     for (size_t i = 0; i < global_symbol_count; i++) {
-        if (strcmp(global_symbol_table[i].name, name) == 0) {
+        if (strcmp(global_symbol_table[i].name, name) == 0 ||
+            dlinker_mangled_global_matches(name, global_symbol_table[i].name)) {
             // 确保不是来自排除的句柄
             if (exclude == NULL || global_symbol_table[i].owner != exclude) {
                 return global_symbol_table[i].addr;
@@ -747,7 +776,7 @@ static void* find_symbol_internal(const char* name, dlhandle_t* exclude) {
     // 2. 在内核符号表中查找
     for (size_t i = 0; i < dlfunc_count; i++) {
         dlfunc_t* entry = &__ksymtab_start[i];
-        if (strcmp(entry->name, name) == 0) {
+        if (strcmp(entry->name, name) == 0 || dlinker_mangled_global_matches(name, entry->name)) {
             return entry->addr;
         }
     }

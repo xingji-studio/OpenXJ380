@@ -31,6 +31,23 @@ typedef struct {
 #define SXAH_CHECK_INPUT_BUFFER     128956723895689207      // 检查是否需要输入
 #define SXAH_UNLOCK_OUTPUT_LOCK     128956723895689208      // 完成输出，关闭输出锁
 #define SXAH_MESSAGE_ASK            128956723895689209      // message查询
+#define SXAH_SET_MOUSE_WHEEL_REVERSE 128956723895689210     // 设置全局鼠标滚轮方向
+#define SXAH_SET_LOG_CONFIG          128956723895689211     // 设置日志与日志框配置
+#define SXAH_GET_LOG_CONFIG          128956723895689212     // 获取日志与日志框配置
+#define SXAH_SET_INPUT_SETTINGS      128956723895689213      // 设置键盘布局、重复和鼠标参数
+
+#define LOG_CONFIG_OVERLAY_ENABLED   (1ULL << 0)
+#define LOG_CONFIG_RECORD_LOGS       (1ULL << 1)
+#define LOG_CONFIG_CAT_GRAPHICS      (1ULL << 2)
+#define LOG_CONFIG_CAT_NETWORK       (1ULL << 3)
+#define LOG_CONFIG_CAT_DRIVER        (1ULL << 4)
+#define LOG_CONFIG_CAT_DEBUG         (1ULL << 5)
+#define LOG_CONFIG_CAT_KERNEL        (1ULL << 6)
+#define LOG_CONFIG_CATEGORY_MASK     (LOG_CONFIG_CAT_GRAPHICS | LOG_CONFIG_CAT_NETWORK | LOG_CONFIG_CAT_DRIVER | \
+                                      LOG_CONFIG_CAT_DEBUG | LOG_CONFIG_CAT_KERNEL)
+#define LOG_CONFIG_VALID_MASK        (LOG_CONFIG_OVERLAY_ENABLED | LOG_CONFIG_RECORD_LOGS | LOG_CONFIG_CATEGORY_MASK)
+#define LOG_CONFIG_DEFAULT           LOG_CONFIG_VALID_MASK
+
 #define SXAH_INSTALLER_ENUM_DISKS       128956723895689220
 #define SXAH_INSTALLER_START            128956723895689221
 #define SXAH_INSTALLER_PROGRESS         128956723895689222
@@ -80,7 +97,8 @@ typedef struct {
 #define XAPI_OPEN_FILE      7387
 #define XAPI_CLOSE_FILE     7388
 
-#define XAPI_SEARCH_FILE    7416
+#define XAPI_SEARCH_FILE       7416
+#define XAPI_SEARCH_FILE_FREEM 7471
 
 #define XAPI_MAKEDIR        7425
 #define XAPI_CREATE_FILE    7420
@@ -209,6 +227,7 @@ typedef void (*XApiNotifyPrcor)(uint64_t notification_id, uint64_t action_id);
 #define MSG_RESIZE  8
 #define MSG_KEYUP   9
 #define MSG_KEYDOWN 10
+#define MSG_KEYLONGPRESS 16
 #define MSG_LBUTTONDOWN 11
 #define MSG_LBUTTONUP   12
 
@@ -243,6 +262,7 @@ typedef void (*XApiNotifyPrcor)(uint64_t notification_id, uint64_t action_id);
 #define XAPI_PUT_HORIZONTAL_SCROLL_BAR 7468
 #define XAPI_DELETE_SCROLL_BAR         7469
 #define XAPI_SET_SCROLL_BAR_POSITION   7470
+#define XAPI_GET_SYSTEM_STATS          7472
 
 // 4-1
 #define XWIN_NORMAL				0
@@ -254,7 +274,9 @@ typedef void (*XApiNotifyPrcor)(uint64_t notification_id, uint64_t action_id);
 #define XWIN_TYPE_MASK          0x0f
 #define XWIN_SUPPORT_RESIZEABLE 0x80
 
-// 当前最大号：7470
+// 当前最大号：7473
+
+#define XAPI_CAPTURE_SCREEN 7473
 
 #define XAPI_TASK_NAME_LEN 32
 
@@ -268,11 +290,22 @@ typedef struct
     uint64_t thread_count;
     uint64_t window_count;
     uint64_t memory_bytes;
+    uint64_t cpu_runtime_ticks;
     uint32_t process_status;
     uint32_t thread_status;
     char     process_name[XAPI_TASK_NAME_LEN];
     char     thread_name[XAPI_TASK_NAME_LEN];
 } XapiTaskInfo;
+
+typedef struct
+{
+    uint64_t cpu_total_ticks;
+    uint64_t cpu_busy_ticks;
+    uint64_t cpu_count;
+    uint64_t memory_total_bytes;
+    uint64_t memory_free_bytes;
+    uint64_t timestamp_ns;
+} XapiSystemStats;
 
 // Proto (XAPI Edition)
 void do_xapi_Output(char *str);
@@ -281,7 +314,8 @@ char do_xapi_Getch();
 void do_xapi_Endline();
 void do_xapi_Printline(char *str);
 void do_xapi_OutputSerial(char *str);
-void do_xapi_SearchFile(uint64_t path, uint64_t count, uint64_t dir);
+void do_xapi_SearchFile(uint64_t path, uint64_t count, XAPIT_DirNode **dir);
+void do_xapi_SearchFile_freem(XAPIT_DirNode *dir, int32_t count);
 void do_xapi_GetSystemVersion(uint64_t str);
 uint64_t do_xapi_GetTime();
 void do_xapi_GetCurrentUser(uint64_t dst);
@@ -300,6 +334,7 @@ uint64_t do_xapi_MapMemory(uint64_t ptr, uint64_t size, uint32_t flags);
 void do_xapi_FlushTime();
 uint64_t do_xapi_GetTaskList(uint64_t buffer, uint64_t max_count);
 uint64_t do_xapi_KillProcess(uint64_t pid);
+uint64_t do_xapi_GetSystemStats(uint64_t buffer);
 uint64_t do_xapi_UserOobeRequired();
 uint64_t do_xapi_UserList(uint64_t buffer, uint64_t max_count);
 uint64_t do_xapi_UserLogin(uint64_t username, uint64_t password);

@@ -13,6 +13,21 @@ static size_t ahci_max_sectors_per_cmd(const struct hba_device *dev)
     return limit;
 }
 
+static void sata_log_io_context(const char *reason, struct hba_port *port, struct hba_cmdh *header,
+                                struct hba_cmdt *table, int slot, int write, uint64_t lba, uint32_t count,
+                                uint64_t buf, uint32_t len)
+{
+    uint64_t buf_phys  = page_virt_to_phys(buf);
+    uint64_t prdt_phys = ((uint64_t)table->entries[0].data_base_upper << 32) | table->entries[0].data_base;
+    write_serial_fmt(
+        "AHCI IO: %s op=%s lba=%llu sectors=%u bytes=%u slot=%d buf=0x%llx phys=0x%llx "
+        "prdt=0x%llx dbc=0x%x prdbc=%u CI=0x%x SACT=0x%x IS=0x%x TFD=0x%x SERR=0x%x SSTS=0x%x CMD=0x%x\n",
+        reason, write ? "write" : "read", lba, count, len, slot, buf, buf_phys, prdt_phys,
+        table->entries[0].byte_count, header->transferred_size, port->regs[HBA_RPxCI], port->regs[HBA_RPxSACT],
+        port->regs[HBA_RPxIS], port->regs[HBA_RPxTFD], port->regs[HBA_RPxSERR], port->regs[HBA_RPxSSTS],
+        port->regs[HBA_RPxCMD]);
+}
+
 void sata_read_error(struct hba_port *port)
 {
     write_serial_fmt("SATA read error\n");
@@ -60,15 +75,18 @@ static void sata_submit_safe(struct hba_device *dev, struct blkio_req *io_req)
                         //  fis->head.type, fis->head.options, fis->head.status_cmd, fis->head.feat_err, fis->lba0,
                         //  fis->lba8, fis->lba16, fis->dev, fis->count);
     }
-    if (ahci_try_send(port, slot)) {
-        io_mfence();
-        if (!write && io_req->lba < 8) {
-            // write_serial_fmt("AHCI TRACE: done lba=%llu prdbc=0x%x tfd=0x%x\n",
-                            //  io_req->lba, header->transferred_size, port->regs[HBA_RPxTFD]);
-        }
-        delay_us_hp(50);
-        io_req->status = 0;
+    if (!ahci_try_send(port, slot)) {
+        sata_log_io_context("command-failed", port, header, table, slot, write, io_req->lba, count, io_req->buf,
+                            io_req->len);
+        return;
     }
+    io_mfence();
+    if (header->transferred_size != io_req->len) {
+        sata_log_io_context("transfer-size-mismatch", port, header, table, slot, write, io_req->lba, count,
+                            io_req->buf, io_req->len);
+    }
+    delay_us_hp(50);
+    io_req->status = 0;
 }
 
 static void sata_submit_fast(struct hba_device *dev, struct blkio_req *io_req)
@@ -122,11 +140,15 @@ static void sata_submit_fast(struct hba_device *dev, struct blkio_req *io_req)
                             //  fis->head.type, fis->head.options, fis->head.status_cmd, fis->head.feat_err, fis->lba0,
                             //  fis->lba8, fis->lba16, fis->dev, fis->count);
         }
-        if (!ahci_try_send(port, slot)) { return; }
+        if (!ahci_try_send(port, slot)) {
+            sata_log_io_context("command-failed", port, header, table, slot, write, lba, count,
+                                io_req->buf + offset, chunk);
+            return;
+        }
         io_mfence();
-        if (!write && lba < 8) {
-            // write_serial_fmt("AHCI TRACE: done lba=%llu prdbc=0x%x tfd=0x%x\n", lba, header->transferred_size,
-                            //  port->regs[HBA_RPxTFD]);
+        if (header->transferred_size != chunk) {
+            sata_log_io_context("transfer-size-mismatch", port, header, table, slot, write, lba, count,
+                                io_req->buf + offset, chunk);
         }
         remaining -= chunk;
         offset    += chunk;

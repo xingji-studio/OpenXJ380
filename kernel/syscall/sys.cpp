@@ -610,7 +610,7 @@ static ipc_message_t wait4_pop_exit_message(pcb_t parent, long pid, bool wait)
 
             if (message->type == IPC_MSG_TYPE_EPID && (pid == -1 || message->pid == pid)) return message;
 
-            message->index = lock_queue_enqueue(parent->ipc_queue, message);
+            lock_queue_enqueue(parent->ipc_queue, message);
         }
 
         if (!wait) return NULL;
@@ -3864,19 +3864,7 @@ sys_(unlinkat)
         return SYSCALL_FAULT_(ENOTDIR);
     }
 
-    uint64_t ret;
-    if (node->refcount > 1)
-    {
-        node->refcount--;
-        ret = 0;
-    }
-    else
-    {
-        ret = vfs_delete(node) == VFS_STATUS_SUCCESS ? 0 : SYSCALL_FAULT_(ENOENT);
-        node = NULL;
-    }
-
-    if (node != NULL) vfs_close(node);
+    uint64_t ret = vfs_delete(node) == VFS_STATUS_SUCCESS ? 0 : SYSCALL_FAULT_(ENOENT);
     free(path);
     return ret;
 }

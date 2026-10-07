@@ -141,7 +141,13 @@ DRESULT disk_read(byte  pdrv,   /* Physical drive nmuber to identify the drive *
     }
 
     fatfs_cache_invalidate(pdrv);
-    if (vfs_read(node, buff, sector * 0x200, count * 0x200) != count * 0x200) return RES_ERROR;
+    size_t expected = (size_t)count * 0x200;
+    size_t got      = vfs_read(node, buff, sector * 0x200, expected);
+    if (got != expected) {
+        write_serial_fmt("FATFS: disk_read failed pdrv=%u sector=%llu count=%u expected=%zu got=%zu\n", pdrv,
+                         (uint64_t)sector, count, expected, got);
+        return RES_ERROR;
+    }
     res = RES_OK;
     return res;
 }

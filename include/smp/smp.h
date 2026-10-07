@@ -46,6 +46,18 @@ struct PROCESSOR_INFO
     uint64_t            scheduler_ticks; // 当前时间片已运行的 tick 数
     uint64_t            syscall_user_rsp;
     uint64_t            syscall_user_rax;
+    /*
+     * Per-CPU preemption-disable nesting. The first fields above are consumed
+     * by fixed offsets in kernel/intr/handler.S and are asserted in
+     * kernel/task/scheduler.cpp. Keep this field after that assembly ABI.
+     *
+     * temporary_page_directory is per CPU because get_current_directory()
+     * returns a scratch descriptor when CR3 is not the current PCB's directory.
+     * Do not retain that returned pointer across a CPU/context switch; copy
+     * the page-table pointer into caller-owned storage when it must survive.
+     */
+    uint64_t            scheduler_disable_depth;
+    page_directory_t    temporary_page_directory;
 };
 
 struct XSK_SMP_INFO

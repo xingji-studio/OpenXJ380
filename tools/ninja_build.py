@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import glob
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -11,6 +12,14 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+OVMF_FIRMWARE_CANDIDATES = (
+    Path("/usr/share/edk2/x64/OVMF.4m.fd"),
+    Path("/usr/share/edk2/x64/OVMF_CODE.4m.fd"),
+    Path("/usr/share/OVMF/OVMF_CODE.fd"),
+    Path("/usr/share/edk2-ovmf/x64/OVMF_CODE.fd"),
+    Path("/usr/share/qemu/OVMF.fd"),
+    Path("/usr/share/ovmf/OVMF.fd"),
+)
 
 XBPS_BOOTSTRAP_BASE = (
     "base-minimal bash dash coreutils findutils sed grep gawk diffutils gzip tar "
@@ -51,6 +60,26 @@ def capture(args: list[str]) -> str:
         return subprocess.check_output(args, cwd=str(ROOT), text=True, stderr=subprocess.DEVNULL).strip()
     except Exception:
         return ""
+
+
+def ovmf_firmware() -> Path:
+    override = os.environ.get("OVMF_FIRMWARE")
+    if override:
+        firmware = Path(override).expanduser()
+        if not firmware.is_absolute():
+            firmware = ROOT / firmware
+        if firmware.is_file():
+            return firmware
+        raise FileNotFoundError(f"OVMF_FIRMWARE does not point to a file: {firmware}")
+
+    for firmware in OVMF_FIRMWARE_CANDIDATES:
+        if firmware.is_file():
+            return firmware
+
+    raise FileNotFoundError(
+        "missing OVMF firmware; install the distro OVMF/edk2-ovmf package "
+        "or set OVMF_FIRMWARE=/path/to/OVMF.fd"
+    )
 
 
 def chmod_rw(path: Path) -> None:
@@ -97,16 +126,13 @@ def host_gcc_triple() -> str:
 
 
 def stage_selfhost_user(root: Path) -> None:
-    for rel in ("apps/user", "apps/include", "apps/lib", "apps/third_party", "apps/liballoc-x86_64.a"):
+    for rel in ("apps/user", "apps/include", "apps/lib", "apps/liballoc-x86_64.a"):
         rm_rf(root / rel)
-    mkdir(root / "apps/third_party")
     cp(ROOT / "user", root / "apps/user")
     cp(ROOT / "include", root / "apps/include")
     cp(ROOT / "lib", root / "apps/lib")
     cp(ROOT / "liballoc-x86_64.a", root / "apps/liballoc-x86_64.a")
-    for rel in ("third_party/mbedtls-src", "third_party/libvterm"):
-        cp(ROOT / rel, root / "apps/third_party")
-    shell(f'find "{root / "apps/user"}" "{root / "apps/third_party"}" -type d -name .git -prune -exec rm -rf {{}} +')
+    shell(f'find "{root / "apps/user"}" -type d -name .git -prune -exec rm -rf {{}} +')
 
 
 def stage_linux_compat(root: Path) -> None:
@@ -125,7 +151,6 @@ def stage_linux_compat(root: Path) -> None:
     if (ROOT / "lolcat_100.0.1-3_all.deb").exists():
         cp(ROOT / "lolcat_100.0.1-3_all.deb", root / "apps/lolcat.deb")
     cp(env("APP_FASTFETCH", "resources/apps/fastfetch"), root / "apps/fastfetch")
-    cp(ROOT / "1.c", root / "apps/1.c")
 
     stage_env = {
         "IMAGE_TOOLCHAIN": env("IMAGE_TOOLCHAIN", "clang"),
@@ -186,6 +211,7 @@ def copy_modules(root: Path) -> None:
 def copy_license_material(root: Path, *, complete: bool) -> None:
     destination = root / "usr/share/doc/xj380/licenses"
     mkdir(destination)
+    cp(ROOT / "LICENSE", destination / "LICENSE")
     cp(ROOT / "LICENSES.md", destination / "LICENSES.md")
     cp(ROOT / "THIRD_PARTY_NOTICES.md", destination / "THIRD_PARTY_NOTICES.md")
     for license_file in sorted((ROOT / "licenses").glob("*.txt")):
@@ -342,8 +368,9 @@ def qemu_cmd() -> str:
             "-drive if=none,id=harddisk,file=XJ380.img,index=0,format=raw "
             "-device ahci,id=ahci -device ide-hd,bus=ahci.0,drive=harddisk,bootindex=0"
         )
+    firmware = shlex.quote(str(ovmf_firmware()))
     return (
-        f"{sudo_cmd}qemu-system-x86_64 --display {env('DISPLAY_BACKEND', 'gtk')} -M q35 -bios OVMF.fd "
+        f"{sudo_cmd}qemu-system-x86_64 --display {env('DISPLAY_BACKEND', 'gtk')} -M q35 -bios {firmware} "
         f"-m 8192 -smp {env('SMP', '4')} {kvm_flag} -device qemu-xhci,id=xhci {storage} "
         "-boot strict=on "
         f"{env('USB_XHCI_DEVICES', '-device usb-kbd,bus=xhci.0,port=1 -device usb-mouse,bus=xhci.0,port=2')} "
@@ -356,7 +383,11 @@ def qemu_cmd() -> str:
 
 def run_qemu() -> None:
     (ROOT / "serial.log").unlink(missing_ok=True)
-    shell(qemu_cmd())
+    try:
+        command = qemu_cmd()
+    except FileNotFoundError as error:
+        raise SystemExit(str(error)) from None
+    shell(command)
 
 
 def clean() -> None:
@@ -454,8 +485,6 @@ def size_report() -> None:
         "主要应用",
         [
             Path("out/shell.elf"),
-            Path("out/busyterm.elf"),
-            Path("out/bcms-sp.elf"),
         ],
     )
     print_size_group("内核模块", [Path("out/e1000.sys"), Path("out/netserver.sys"), Path("out/xhci.sys")])
@@ -554,7 +583,9 @@ def check_tools() -> None:
 
     if rustc:
         rust_target = env("RUST_TARGET", "x86_64-unknown-none")
-        libdir = capture([rustc, "--print", "target-libdir", "--target", rust_target])
+        libdir = env("RUST_TARGET_LIBDIR", "")
+        if not libdir:
+            libdir = capture([rustc, "--print", "target-libdir", "--target", rust_target])
         rust_libs_ok = False
         if libdir:
             rust_libs_ok = bool(list(Path(libdir).glob("libcore-*.rlib"))) and bool(
@@ -565,7 +596,7 @@ def check_tools() -> None:
         else:
             print(f"[缺失] rust target {rust_target:14} 编译 Rust no_std 用户态应用需要该目标")
             missing.append((f"rust target {rust_target}", "缺少 libcore/libcompiler_builtins",
-                            f"rustup target add {rust_target}"))
+                            f"rustup target add {rust_target} 或设置 RUST_TARGET_LIBDIR"))
 
     if missing:
         print("\n缺失工具和建议安装命令：")

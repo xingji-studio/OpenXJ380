@@ -1,6 +1,7 @@
 #include "cpu/fpu.h"
 #include "cpu/fsgsbase.h"
 #include "cpu/lock.h"
+#include "../build_settings.h"
 #include "dlinker.h"
 #include "krlibc.h"
 #include "lock_queue.h"
@@ -8,10 +9,12 @@
 #include "smp/smp.h"
 #include "task/pcb.h"
 
-volatile bool        is_scheduler = false;
 extern lock_queue   *pcb_group_queue;
 extern XSK_SMP_INFO *xsi;
 extern bool          no_interrupt;
+static volatile bool scheduler_boot_ready = false;
+volatile uint64_t    system_cpu_total_ticks = 0;
+volatile uint64_t    system_cpu_busy_ticks  = 0;
 const uint64_t       TIME_SLICE = 4;
 const uint64_t       MIN_SLICE  = 1;
 static constexpr uint64_t EEVDF_TICK_NS        = 1000000ULL;
@@ -20,20 +23,84 @@ static constexpr uint64_t EEVDF_MIN_SLICE_NS   = MIN_SLICE * EEVDF_TICK_NS;
 static constexpr uint64_t EEVDF_WAKEUP_CREDIT  = EEVDF_BASE_SLICE_NS;
 static constexpr uint64_t EEVDF_SLEEPER_CREDIT = EEVDF_BASE_SLICE_NS * 2;
 static constexpr uint64_t EEVDF_DEFAULT_WEIGHT = 1024ULL;
+static volatile uint64_t scheduler_disabled_diag_count = 0;
+#if CONFIG_KERNEL_DEBUG_SCHEDULER_FMANAGER_TIMER_LOG
+static volatile uint64_t scheduler_fmanager_diag_count = 0;
+#endif
+
+static_assert(__builtin_offsetof(PROCESSOR_INFO, current_task) == 0x4c0,
+              "PROCESSOR_INFO.current_task offset must match intr/handler.S");
+static_assert(__builtin_offsetof(PROCESSOR_INFO, syscall_user_rsp) == 0x4e0,
+              "PROCESSOR_INFO.syscall_user_rsp offset must match intr/handler.S");
+static_assert(__builtin_offsetof(PROCESSOR_INFO, syscall_user_rax) == 0x4e8,
+              "PROCESSOR_INFO.syscall_user_rax offset must match intr/handler.S");
+static_assert(__builtin_offsetof(PROCESSOR_INFO, scheduler_disable_depth) == 0x4f0,
+              "PROCESSOR_INFO.scheduler_disable_depth must follow syscall scratch fields");
+
+/*
+ * Keep boot/fatal state separate from runtime preemption state. A shared
+ * boolean let one CPU's critical section disable scheduling on every CPU, and
+ * a stray enable from an unrelated path could then make it globally runnable.
+ */
+void scheduler_start()
+{
+    __atomic_store_n(&scheduler_boot_ready, true, __ATOMIC_RELEASE);
+}
+
+void scheduler_stop()
+{
+    __atomic_store_n(&scheduler_boot_ready, false, __ATOMIC_RELEASE);
+}
+
+bool scheduler_is_enabled()
+{
+    if (!__atomic_load_n(&scheduler_boot_ready, __ATOMIC_ACQUIRE)) return false;
+    PROCESSOR_INFO *cpu = get_current_cpu();
+    return cpu != NULL && __atomic_load_n(&cpu->scheduler_disable_depth, __ATOMIC_ACQUIRE) == 0;
+}
+
+uint64_t scheduler_disable_depth()
+{
+    PROCESSOR_INFO *cpu = get_current_cpu();
+    if (cpu == NULL) return 0;
+    return __atomic_load_n(&cpu->scheduler_disable_depth, __ATOMIC_ACQUIRE);
+}
+
+void scheduler_restore_depth(uint64_t depth)
+{
+    PROCESSOR_INFO *cpu = get_current_cpu();
+    if (cpu == NULL) return;
+    // Restore the caller's nesting level; never decrement an unknown outer
+    // critical section with enable_scheduler().
+    __atomic_store_n(&cpu->scheduler_disable_depth, depth, __ATOMIC_RELEASE);
+}
 
 void enable_scheduler()
 {
-    is_scheduler = true;
+    PROCESSOR_INFO *cpu = get_current_cpu();
+    if (cpu == NULL) return;
+
+    uint64_t depth = __atomic_load_n(&cpu->scheduler_disable_depth, __ATOMIC_RELAXED);
+    while (depth != 0 &&
+           !__atomic_compare_exchange_n(&cpu->scheduler_disable_depth, &depth, depth - 1, false, __ATOMIC_RELEASE,
+                                        __ATOMIC_RELAXED))
+    {
+    }
 }
 
 void disable_scheduler()
 {
-    is_scheduler = false;
+    PROCESSOR_INFO *cpu = get_current_cpu();
+    if (cpu == NULL) return;
+    // This is local to the current CPU; callers must still protect transitions
+    // from interrupt re-entry when the critical section requires it.
+    __atomic_fetch_add(&cpu->scheduler_disable_depth, 1ULL, __ATOMIC_ACQ_REL);
 }
 
 tcb_t get_current_task()
 {
-    return get_current_cpu()->current_task;
+    PROCESSOR_INFO *cpu = get_current_cpu();
+    return cpu != NULL ? cpu->current_task : NULL;
 }
 EXPORT_SYMBOL(get_current_task);
 
@@ -314,21 +381,21 @@ static void mark_task_dispatched(tcb_t task, uint64_t now)
 tcb_t select_next_task_safe()
 {
     struct PROCESSOR_INFO *cpu = get_current_cpu();
+    if (cpu == NULL) return NULL;
     lock_queue *queue = cpu->scheduler_queue;
-    
-    if (queue == NULL || queue->size == 0) {
-        return NULL;
-    }
+    if (queue == NULL) return NULL;
 
     spin_lock(&queue->lock);
+
+    if (queue->size == 0 || queue->head == NULL)
+    {
+        spin_unlock(&queue->lock);
+        return NULL;
+    }
     
     tcb_t current = get_current_task();
     uint64_t now = nanoTime();
     wake_sleeping_task(current, now, current != NULL ? current->eevdf_vruntime : 0);
-    if (queue->head == NULL) {
-        spin_unlock(&queue->lock);
-        return NULL;
-    }
 
     tcb_t fallback = NULL;
     tcb_t idle = NULL;
@@ -379,18 +446,46 @@ extern pcb_t kernel_group;
 extern "C" registers_t *timer_handle(registers_t *reg)
 {
     // send_eoi();
-    if (!is_scheduler) { 
+    PROCESSOR_INFO *cpu = get_current_cpu();
+    const bool boot_ready = __atomic_load_n(&scheduler_boot_ready, __ATOMIC_ACQUIRE);
+    const uint64_t disable_depth =
+        cpu != NULL ? __atomic_load_n(&cpu->scheduler_disable_depth, __ATOMIC_ACQUIRE) : 0;
+    if (!boot_ready || cpu == NULL || disable_depth != 0) {
+        /*
+         * A task may be enqueued while the local CPU is inside a nested
+         * critical section. Keep this diagnostic rate limited: it is only
+         * intended to distinguish a timer that stopped arriving from a timer
+         * that is deliberately declining to schedule.
+         */
+        if (boot_ready && cpu != NULL && disable_depth != 0)
+        {
+            uint64_t sample = __atomic_fetch_add(&scheduler_disabled_diag_count, 1ULL, __ATOMIC_RELAXED);
+            if ((sample & 0x3ffULL) == 0)
+            {
+                write_serial_fmt("[sched-debug] timer blocked cpu=%llu lapic=%llu depth=%llu current=%s tid=%llu\n",
+                                 (unsigned long long)cpu->processor_id,
+                                 (unsigned long long)cpu->lapic_id,
+                                 (unsigned long long)disable_depth,
+                                 cpu->current_task != NULL ? cpu->current_task->name : "(none)",
+                                 cpu->current_task != NULL ? (unsigned long long)cpu->current_task->tid : 0ULL);
+            }
+        }
         send_eoi();
         return reg; 
     }
 
-    tcb_t current = get_current_task();
+    tcb_t current = cpu->current_task;
     if (current == NULL) {
         send_eoi();
         return reg;
     }
 
-    PROCESSOR_INFO *cpu = get_current_cpu();
+    __atomic_fetch_add(&system_cpu_total_ticks, 1ULL, __ATOMIC_RELAXED);
+    if (current->status == RUNNING && current->task_level != TASK_IDLE_LEVEL) {
+        __atomic_fetch_add(&system_cpu_busy_ticks, 1ULL, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&current->runtime_ticks, 1ULL, __ATOMIC_RELAXED);
+    }
+
     if (likely(current->status == RUNNING && current->task_level != TASK_IDLE_LEVEL)) {
         cpu->scheduler_ticks++;
         charge_current_eevdf_runtime(current, EEVDF_TICK_NS);
@@ -403,6 +498,34 @@ extern "C" registers_t *timer_handle(registers_t *reg)
     }
 
     tcb_t best = select_next_task();
+#if CONFIG_KERNEL_DEBUG_SCHEDULER_FMANAGER_TIMER_LOG
+    if ((current != NULL && strcmp(current->name, "fmanager") == 0) ||
+        (best != NULL && strcmp(best->name, "fmanager") == 0))
+    {
+        uint64_t sample = __atomic_fetch_add(&scheduler_fmanager_diag_count, 1ULL, __ATOMIC_RELAXED);
+        if ((sample & 0x3fULL) == 0)
+        {
+            size_t queue_size = 0;
+            if (cpu->scheduler_queue != NULL)
+            {
+                spin_lock(&cpu->scheduler_queue->lock);
+                queue_size = cpu->scheduler_queue->size;
+                spin_unlock(&cpu->scheduler_queue->lock);
+            }
+            write_serial_fmt("[sched-debug] fmanager timer cpu=%llu depth=%llu queue=%llu current=%s/%llu/%u "
+                             "best=%s/%llu/%u\n",
+                             (unsigned long long)cpu->processor_id,
+                             (unsigned long long)disable_depth,
+                             (unsigned long long)queue_size,
+                             current != NULL ? current->name : "(none)",
+                             current != NULL ? (unsigned long long)current->tid : 0ULL,
+                             current != NULL ? (unsigned)current->status : 0U,
+                             best != NULL ? best->name : "(none)",
+                             best != NULL ? (unsigned long long)best->tid : 0ULL,
+                             best != NULL ? (unsigned)best->status : 0U);
+        }
+    }
+#endif
     if (best == NULL || best == current) {
         cpu->scheduler_ticks = 0;
         send_eoi();
@@ -421,9 +544,7 @@ extern "C" registers_t *timer_handle(registers_t *reg)
     }
 
     // 正式切换
-    if (get_current_cpu()->current_task != best) {
-        disable_scheduler();
-        
+    if (cpu->current_task != best) {
         // 更新任务状态
         if (current->status == RUNNING) { 
             current->status = START; 
@@ -442,8 +563,6 @@ extern "C" registers_t *timer_handle(registers_t *reg)
             current->status = RUNNING;
             cpu->scheduler_ticks = 0;
         }
-        
-        enable_scheduler();
     }
     send_eoi();
     return reg;
@@ -451,15 +570,17 @@ extern "C" registers_t *timer_handle(registers_t *reg)
 
 void scheduler_yield()
 {
-    if (!is_scheduler) return;
-    get_current_cpu()->scheduler_ticks = TIME_SLICE;
+    if (!scheduler_is_enabled()) return;
+    PROCESSOR_INFO *cpu = get_current_cpu();
+    if (cpu == NULL) return;
+    cpu->scheduler_ticks = TIME_SLICE;
     __asm__ volatile("int %0" ::"i"(32));
 }
 EXPORT_SYMBOL(scheduler_yield);
 
 void scheduler_sleep_ns(uint64_t nano)
 {
-    if (!is_scheduler || nano == 0) {
+    if (!scheduler_is_enabled() || nano == 0) {
         scheduler_yield();
         return;
     }
@@ -515,6 +636,28 @@ void debug_sched_queue(lock_queue *q)
     spin_unlock(&q->lock);
 }
 
+static size_t scheduler_queue_size(lock_queue *queue)
+{
+    if (queue == NULL) return 0;
+    spin_lock(&queue->lock);
+    size_t size = queue->size;
+    spin_unlock(&queue->lock);
+    return size;
+}
+
+static size_t scheduler_cpu_index(PROCESSOR_INFO *cpu)
+{
+    if (cpu == NULL || xsi == NULL) return (size_t)-1;
+
+    size_t cpu_count = get_cpu_num();
+    if (cpu_count > MAX_CPU_NUM) cpu_count = MAX_CPU_NUM;
+    for (size_t i = 0; i < cpu_count; i++)
+    {
+        if (&xsi->pcr_inf[i] == cpu) return i;
+    }
+    return (size_t)-1;
+}
+
 size_t add_task(tcb_t new_task)
 {
     if (new_task == NULL) return -1;
@@ -526,24 +669,78 @@ size_t add_task(tcb_t new_task)
         new_task->status = START;
     }
     
-    struct PROCESSOR_INFO *min_cpu = get_cpu(0);
-    size_t                 min_cpu_index = 0;
-
-    if (new_task->task_level != TASK_APPLICATION_LEVEL) {
-        for (size_t i = 1; i < get_cpu_num(); i++) {
-            struct PROCESSOR_INFO *cpui = get_cpu(i);
-            if (cpui != NULL && cpui->scheduler_queue != NULL &&
-                cpui->scheduler_queue->size < min_cpu->scheduler_queue->size) {
-                min_cpu       = cpui;
+    /*
+     * Keep a newly-created task on the creator's CPU when possible, then
+     * balance all task classes by queue length.  Applications used to be
+     * forced onto pcr_inf[0], which silently breaks when the BSP is not the
+     * first MADT entry and overloads one queue even though every CPU has a
+     * timer.  cpu_id is an array index, so derive it from the actual
+     * PROCESSOR_INFO pointer rather than from processor_id/LAPIC ID.
+     */
+    PROCESSOR_INFO *min_cpu = get_current_cpu();
+    size_t min_cpu_index = scheduler_cpu_index(min_cpu);
+    if (min_cpu == NULL || min_cpu->scheduler_queue == NULL || min_cpu_index == (size_t)-1)
+    {
+        min_cpu = NULL;
+        min_cpu_index = (size_t)-1;
+        size_t cpu_count = get_cpu_num();
+        if (cpu_count > MAX_CPU_NUM) cpu_count = MAX_CPU_NUM;
+        for (size_t i = 0; i < cpu_count; i++)
+        {
+            PROCESSOR_INFO *cpu = get_cpu(i);
+            if (cpu != NULL && cpu->scheduler_queue != NULL)
+            {
+                min_cpu = cpu;
                 min_cpu_index = i;
+                break;
             }
         }
     }
-	    
+
+    if (min_cpu == NULL || min_cpu->scheduler_queue == NULL || min_cpu_index == (size_t)-1)
+    {
+        spin_unlock(&scheduler_lock);
+        return (size_t)-1;
+    }
+
+    size_t min_queue_size = scheduler_queue_size(min_cpu->scheduler_queue);
+    size_t cpu_count = get_cpu_num();
+    if (cpu_count > MAX_CPU_NUM) cpu_count = MAX_CPU_NUM;
+    for (size_t i = 0; i < cpu_count; i++)
+    {
+        PROCESSOR_INFO *cpui = get_cpu(i);
+        if (cpui == NULL || cpui->scheduler_queue == NULL || cpui == min_cpu) continue;
+
+        size_t queue_size = scheduler_queue_size(cpui->scheduler_queue);
+        if (queue_size < min_queue_size)
+        {
+            min_cpu = cpui;
+            min_cpu_index = i;
+            min_queue_size = queue_size;
+        }
+    }
+
     uint64_t now = nanoTime();
-    init_task_eevdf_entity(new_task, queue_average_vruntime(min_cpu->scheduler_queue, NULL, now, NULL, NULL), now);
+    spin_lock(&min_cpu->scheduler_queue->lock);
+    uint64_t base_vruntime = queue_average_vruntime(min_cpu->scheduler_queue, NULL, now, NULL, NULL);
+    spin_unlock(&min_cpu->scheduler_queue->lock);
+    init_task_eevdf_entity(new_task, base_vruntime, now);
     new_task->cpu_id      = min_cpu_index;
     new_task->queue_index = queue_enqueue_ref(min_cpu->scheduler_queue, new_task, &new_task->sched_node);
+    if (strcmp(new_task->name, "fmanager") == 0)
+    {
+        write_serial_fmt("[sched-debug] enqueue fmanager task=%p tid=%llu cpu=%llu lapic=%llu queue=%llu "
+                         "status=%u rip=%llx rsp=%llx depth=%llu\n",
+                         (void *)new_task,
+                         (unsigned long long)new_task->tid,
+                         (unsigned long long)min_cpu_index,
+                         (unsigned long long)min_cpu->lapic_id,
+                         (unsigned long long)new_task->queue_index,
+                         (unsigned)new_task->status,
+                         (unsigned long long)new_task->context0.rip,
+                         (unsigned long long)new_task->context0.rsp,
+                         (unsigned long long)scheduler_disable_depth());
+    }
 
     // debug_sched_queue(min_cpu->scheduler_queue);
     
@@ -551,17 +748,15 @@ size_t add_task(tcb_t new_task)
     return new_task->queue_index;
 }
 
-void remove_task(tcb_t task) {
+void remove_task(tcb_t task)
+{
     if (task == NULL) return;
     spin_lock(&scheduler_lock);
 
     if (task->cpu_id < get_cpu_num()) {
         PROCESSOR_INFO *cpu = get_cpu(task->cpu_id);
-        if (cpu != NULL &&
-            cpu->scheduler_queue != NULL &&
-            task->sched_node != NULL &&
-            task->sched_node->data == task) {
-            queue_remove_node(cpu->scheduler_queue, task->sched_node);
+        if (cpu != NULL && cpu->scheduler_queue != NULL &&
+            queue_remove_data(cpu->scheduler_queue, task) == task) {
             task->sched_node = NULL;
             spin_unlock(&scheduler_lock);
             return;
@@ -571,15 +766,12 @@ void remove_task(tcb_t task) {
     for (size_t i = 0; i < get_cpu_num(); i++) {
         PROCESSOR_INFO *cpu = get_cpu(i);
         if (cpu == NULL || cpu->scheduler_queue == NULL) continue;
-        lock_node *node = cpu->scheduler_queue->head;
-        while (node != NULL && node->data != task) node = node->next;
-        if (node == NULL) continue;
-
-        task->cpu_id = i;
-        task->sched_node = node;
-        queue_remove_node(cpu->scheduler_queue, task->sched_node);
-        task->sched_node = NULL;
-        break;
+        if (queue_remove_data(cpu->scheduler_queue, task) == task)
+        {
+            task->cpu_id = i;
+            task->sched_node = NULL;
+            break;
+        }
     }
 
     spin_unlock(&scheduler_lock);

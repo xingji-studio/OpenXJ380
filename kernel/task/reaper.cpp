@@ -52,7 +52,6 @@ void reaper_thread()
         if (!no_interrupt)
         {
             open_interrupt;
-            enable_scheduler();
         }
         pcb_t target = find_reapable_child(kernel_group);
         if (target != NULL) kill_proc(target, 0, false);

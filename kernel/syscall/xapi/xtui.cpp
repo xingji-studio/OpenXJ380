@@ -9,6 +9,7 @@
 #include <krlibc.h>
 #include <mm/frame.h>
 #include <mm/uaccess.h>
+#include <openxj380/config.h>
 #include <pci/pci.h>
 #include <proto.hpp>
 #include <power.h>
@@ -39,6 +40,10 @@ uint64_t do_xapi_GetTime()
 // Helpers prefixed with p_xapi_ are private to this translation unit.
 void p_xapi_output_kernel(const char *str)
 {
+#if OPENXJ380_INPUT_OUTPUT_DISABLED
+    (void)str;
+    return;
+#else
     if (str == NULL) return;
 
     pcb_t front_p = get_current_task()->parent_group;
@@ -83,6 +88,7 @@ void p_xapi_output_kernel(const char *str)
         }
         front_p = front_p->parent_task;
     }
+#endif
 }
 
 static void p_xapi_free_argv(char **argv)
@@ -158,40 +164,96 @@ void do_xapi_GetCurrentUser(uint64_t dst)
 
 uint64_t do_xapi_UserOobeRequired()
 {
-    return 0;
+    return user_session_needs_oobe() ? 1 : 0;
 }
 
 uint64_t do_xapi_UserList(uint64_t buffer, uint64_t max_count)
 {
-    (void)buffer;
-    (void)max_count;
-    return (uint64_t)-ENOSYS;
+    if (buffer == 0) return (uint64_t)-EINVAL;
+    if (max_count > 128) max_count = 128;
+
+    UserInfo users[128];
+    memset(users, 0, sizeof(users));
+    int count = user_session_list(users, (int)max_count);
+    if (count < 0) return (uint64_t)count;
+
+    xapi_type_LoginUserInfo out[128];
+    memset(out, 0, sizeof(out));
+    for (int i = 0; i < count; i++)
+    {
+        strncpy(out[i].name, users[i].name, sizeof(out[i].name) - 1);
+        out[i].user_type = users[i].user_type;
+    }
+
+    if (count > 0 && !copy_to_user_pagedir(xapi_current_pagedir(), (void *)buffer, out,
+                                           sizeof(xapi_type_LoginUserInfo) * (size_t)count))
+    {
+        return (uint64_t)-EFAULT;
+    }
+    return (uint64_t)count;
 }
 
 uint64_t do_xapi_UserLogin(uint64_t username, uint64_t password)
 {
-    (void)username;
-    (void)password;
-    return (uint64_t)-ENOSYS;
+    char *kusername = NULL;
+    char *kpassword = NULL;
+    int ret = xapi_copy_string_from_user(&kusername, (const char *)username, sizeof(((UserInfo *)0)->name));
+    if (ret < 0) return (uint64_t)ret;
+    ret = xapi_copy_string_from_user(&kpassword, (const char *)password, sizeof(((UserInfo *)0)->password));
+    if (ret < 0)
+    {
+        free(kusername);
+        return (uint64_t)ret;
+    }
+
+    ret = user_session_login(kusername, kpassword);
+    memset(kpassword, 0, sizeof(((UserInfo *)0)->password));
+    free(kusername);
+    free(kpassword);
+    return (uint64_t)ret;
 }
 
 uint64_t do_xapi_UserCreateFirst(uint64_t username, uint64_t password)
 {
-    (void)username;
-    (void)password;
-    return (uint64_t)-ENOSYS;
+    char *kusername = NULL;
+    char *kpassword = NULL;
+    int ret = xapi_copy_string_from_user(&kusername, (const char *)username, sizeof(((UserInfo *)0)->name));
+    if (ret < 0) return (uint64_t)ret;
+    ret = xapi_copy_string_from_user(&kpassword, (const char *)password, sizeof(((UserInfo *)0)->password));
+    if (ret < 0)
+    {
+        free(kusername);
+        return (uint64_t)ret;
+    }
+
+    ret = user_session_create_first(kusername, kpassword);
+    memset(kpassword, 0, sizeof(((UserInfo *)0)->password));
+    free(kusername);
+    free(kpassword);
+    return (uint64_t)ret;
 }
 
 void do_xapi_Output(char *str)
 {
+#if OPENXJ380_INPUT_OUTPUT_DISABLED
+    (void)str;
+    return;
+#else
     char *kstr = NULL;
     if (xapi_copy_string_from_user(&kstr, str, XAPI_USER_STRING_MAX) < 0) return;
     p_xapi_output_kernel(kstr);
     free(kstr);
+#endif
 }
 
 int do_xapi_Input(char *str, size_t capacity, uint64_t flags)
 {
+#if OPENXJ380_INPUT_OUTPUT_DISABLED
+    (void)str;
+    (void)capacity;
+    (void)flags;
+    return -ENOSYS;
+#else
     if (str == NULL) return -EFAULT;
     if (capacity == 0 || capacity > XAPI_USER_STRING_MAX) return -EINVAL;
     if ((flags & ~((uint64_t)XAPI_INPUT_NO_ECHO)) != 0) return -EINVAL;
@@ -267,10 +329,14 @@ int do_xapi_Input(char *str, size_t capacity, uint64_t flags)
         }
         front_p = front_p->parent_task;
     }
+#endif
 }
 
 char do_xapi_Getch()
 {
+#if OPENXJ380_INPUT_OUTPUT_DISABLED
+    return 0;
+#else
     pcb_t front_p = get_current_task()->parent_group;
     while (true)
     {
@@ -293,6 +359,7 @@ char do_xapi_Getch()
         }
         front_p = front_p->parent_task;
     }
+#endif
 }
 
 void do_xapi_Endline()
@@ -313,6 +380,10 @@ void do_xapi_Printline(char *str)
 
 void do_xapi_OutputSerial(char *str)
 {
+#if OPENXJ380_INPUT_OUTPUT_DISABLED
+    (void)str;
+    return;
+#else
     char *kstr = NULL;
     if (xapi_copy_string_from_user(&kstr, str, XAPI_USER_STRING_MAX) < 0) return;
     tcb_t task = get_current_task();
@@ -321,6 +392,7 @@ void do_xapi_OutputSerial(char *str)
                      (unsigned long long)(uint64_t)str);
     write_serial_string(kstr);
     free(kstr);
+#endif
 }
 
 void do_xapi_Printf(char *str)

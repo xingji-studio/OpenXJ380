@@ -1,0 +1,87 @@
+name: Build bootable image
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build XJ380.img
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      VDISK_SIZE_MIB: 512
+      VDISK_FAT_MIB: 510
+
+    steps:
+      - name: Check out sources
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes \
+            binutils \
+            bzip2 \
+            clang \
+            dosfstools \
+            g++ \
+            gcc \
+            gcc-mingw-w64-x86-64 \
+            gdisk \
+            libclang-rt-dev \
+            lld \
+            mtools \
+            nasm \
+            ninja-build \
+            python3
+
+      - name: Install Rust target
+        run: rustup target add x86_64-unknown-none
+
+      - name: Generate Ninja build graph
+        run: python3 tools/gen_ninja.py --out build.ninja
+
+      - name: Run tests
+        run: python3 -m unittest discover --start-directory tests --pattern 'test_*.py'
+
+      - name: Build bootable disk image
+        run: ninja -f build.ninja vdisk -j"$(nproc)"
+
+      - name: Verify bootable disk image
+        run: |
+          test -s XJ380.img
+          sgdisk --verify XJ380.img
+          mdir -i XJ380.img@@1048576 ::/EFI/BOOT/BOOTX64.efi
+          mdir -i XJ380.img@@1048576 ::/system/kernel.krl
+          mdir -i XJ380.img@@1048576 ::/apps/system/shell.elf
+          mdir -i XJ380.img@@1048576 ::/mod/e1000.sys
+          mdir -i XJ380.img@@1048576 ::/mod/netserver.sys
+          mdir -i XJ380.img@@1048576 ::/system/licenses/third-party/MANIFEST.json
+          sha256sum XJ380.img > XJ380.img.sha256
+          ninja -f build.ninja size
+
+      - name: Upload bootable disk image
+        uses: actions/upload-artifact@v4
+        with:
+          name: XJ380-bootable-${{ github.sha }}
+          path: |
+            XJ380.img
+            XJ380.img.sha256
+          if-no-files-found: error
+          retention-days: 7
+

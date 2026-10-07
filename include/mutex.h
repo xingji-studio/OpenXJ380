@@ -27,3 +27,4 @@ int mutex_unlock(mutex_t *mutex);
 int mutex_destroy(mutex_t *mutex);
 bool mutex_is_locked(mutex_t *mutex);
 tcb_t mutex_get_owner(mutex_t *mutex);
+bool mutex_abort_for_process(mutex_t *mutex, pcb_t process);

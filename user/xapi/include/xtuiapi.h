@@ -93,9 +93,10 @@ void xapi_CloseFile(XFILE* fsptr);
 
 void  xapi_SearchFile(
 	WSTR	 path,
-	UINT32	*count,
-	DirNode	*dir
+	INT32	*count,
+	DirNode	**dir
 );
+void xapi_SearchFile_freem(DirNode *dir, INT32 count);
 
 UINT64 xapi_Mkdir(WSTR path);
 UINT64 xapi_CreateFile(WSTR filename);
