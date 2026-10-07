@@ -1,3 +1,6 @@
+/* SPDX-License-Identifier: MIT */
+/* Source: parson JSON parser; see third_party/parson/SOURCE.md. */
+
 typedef struct xapi_JsonParser
 {
     const char *cursor;
