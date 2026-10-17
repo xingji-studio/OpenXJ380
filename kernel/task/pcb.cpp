@@ -361,6 +361,9 @@ static char **copy_kernel_string_vector_owned(char **argv, size_t argc)
 
 void kill_proc0(pcb_t pcb)
 {
+    // Withdraw before destroying thread_queue: terminal group-signal delivery
+    // holds the process-list lock while visiting that queue.
+    queue_remove_data(pcb_group_queue, pcb);
     /*
      * Mark every thread dead before notifying product subsystems. Exit hooks
      * use the status to reclaim process-owned locks while TCB pointers are
@@ -397,7 +400,6 @@ void kill_proc0(pcb_t pcb)
     } while (true);
 
     queue_destroy(pcb->thread_queue);
-    queue_remove_data(pcb_group_queue, pcb);
 
     // 保存需要在free之后访问的字段
     char *cmdline = pcb->cmdline;

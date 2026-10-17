@@ -27,6 +27,9 @@ typedef struct pty_handle {
     uint8_t            *master_buffer;
     uint8_t            *slave_buffer;
     struct llist_header list_node;
+    // Per-byte record markers keep EOF distinct from user data, including NUL.
+    size_t              canonical_start;
+    uint8_t             input_flags[PTY_BUFF_SIZE];
 } pty_handle_t;
 
 void pty_init();
