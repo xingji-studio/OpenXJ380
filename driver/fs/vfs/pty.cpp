@@ -7,6 +7,7 @@
 #include <krlibc.h>
 #include <proto.hpp>
 #include <pty.h>
+#include <syscall/signal.h>
 #include <task/pcb.h>
 #include <task/poll.h>
 #include <task/scheduler.h>
@@ -17,6 +18,11 @@ static struct llist_header ptmx_list_head;
 static spin_t              pty_global_lock = SPIN_INIT;
 static id_allocator_t     *pty_allocator   = NULL;
 static vfs_node_t          pts_root        = NULL;
+
+static constexpr uint8_t PTY_INPUT_END = 1;
+static constexpr uint8_t PTY_INPUT_EOF = 2;
+
+static size_t pts_write_inner(pty_handle_t *pair, const uint8_t *in, size_t size);
 
 static int pty_dummy()
 {
@@ -59,7 +65,7 @@ static void pty_termios_default(struct termios *term)
     term->c_iflag = ICRNL | IXON | BRKINT | ISTRIP | INPCK;
     term->c_oflag = OPOST | ONLCR;
     term->c_cflag = B38400 | CS8 | CREAD | HUPCL;
-    term->c_lflag = ISIG | ICANON | ECHO | ECHOE | ECHOK;
+    term->c_lflag = ISIG | ICANON | ECHO | ECHOE | ECHOK | ECHOCTL;
 
     term->c_cc[VINTR]  = 3;
     term->c_cc[VQUIT]  = 28;
@@ -120,10 +126,7 @@ static size_t pts_data_available(pty_handle_t *pair)
 
     for (size_t i = 0; i < pair->ptr_slave; i++)
     {
-        if (pair->slave_buffer[i] == '\n' || pair->slave_buffer[i] == pair->term.c_cc[VEOF] ||
-            pair->slave_buffer[i] == pair->term.c_cc[VEOL] ||
-            pair->slave_buffer[i] == pair->term.c_cc[VEOL2])
-            return i + 1;
+        if (pair->input_flags[i] & PTY_INPUT_END) return i + 1;
     }
     return 0;
 }
@@ -246,6 +249,7 @@ static size_t ptmx_read(void *file, void *addr, size_t offset, size_t size)
     UNUSED(offset);
     pty_handle_t *pair = (pty_handle_t *)file;
     if (pair == NULL || addr == NULL) return VFS_STATUS_FAILED;
+    if (size == 0) return 0;
 
     while (true)
     {
@@ -273,39 +277,159 @@ static size_t ptmx_read(void *file, void *addr, size_t offset, size_t size)
     return to_copy;
 }
 
+static bool pty_cc_matches(const struct termios *term, unsigned int index, uint8_t ch)
+{
+    // Linux uses zero for a disabled control character; NUL remains ordinary input.
+    return term->c_cc[index] != 0 && term->c_cc[index] == ch;
+}
+
+static bool pty_echo_bytes(pty_handle_t *pair, const uint8_t *bytes, size_t size)
+{
+    size_t needed = size;
+    if ((pair->term.c_oflag & (OPOST | ONLCR)) == (OPOST | ONLCR))
+    {
+        for (size_t i = 0; i < size; i++)
+            if (bytes[i] == '\n') needed++;
+    }
+    if (needed > PTY_BUFF_SIZE - pair->ptr_master) return false;
+    pts_write_inner(pair, bytes, size);
+    return true;
+}
+
+static bool pty_echo_control(const struct termios *term, uint8_t ch)
+{
+    return (term->c_lflag & ECHOCTL) && (ch < 32 || ch == 127) && ch != '\t' && ch != '\n';
+}
+
+static bool pty_echo_char(pty_handle_t *pair, uint8_t ch)
+{
+    uint32_t flags = pair->term.c_lflag;
+    if (!(flags & ECHO) && !((flags & ICANON) && (flags & ECHONL) && ch == '\n')) return true;
+    if (pty_echo_control(&pair->term, ch))
+    {
+        uint8_t echo[2] = {'^', (uint8_t)(ch == 127 ? '?' : ch + '@')};
+        return pty_echo_bytes(pair, echo, sizeof(echo));
+    }
+    return pty_echo_bytes(pair, &ch, 1);
+}
+
+static void pty_flush_input(pty_handle_t *pair)
+{
+    pair->ptr_slave       = 0;
+    pair->canonical_start = 0;
+}
+
+// Called with pair->lock held. No allocation, waiting, or signal delivery here.
+// A false result leaves the byte unconsumed, so a full queue can be retried safely.
+static bool pty_input_byte(pty_handle_t *pair, uint8_t ch, int *signal)
+{
+    *signal = 0;
+    const struct termios *term = &pair->term;
+    uint32_t flags = term->c_lflag;
+    bool canonical = (flags & ICANON) != 0;
+    if (ch == '\r')
+    {
+        if (term->c_iflag & IGNCR) return true;
+        if (term->c_iflag & ICRNL) ch = '\n';
+    }
+    else if (ch == '\n' && (term->c_iflag & INLCR)) ch = '\r';
+
+    if (flags & ISIG)
+    {
+        if (pty_cc_matches(term, VINTR, ch)) *signal = SIGINT;
+        else if (pty_cc_matches(term, VQUIT, ch)) *signal = SIGQUIT;
+        else if (pty_cc_matches(term, VSUSP, ch)) *signal = SIGTSTP;
+        if (*signal != 0)
+        {
+            if (!(flags & NOFLSH))
+            {
+                pty_flush_input(pair);
+                pair->ptr_master = 0;
+            }
+            // A full echo queue must never prevent interrupting the foreground job.
+            pty_echo_char(pair, ch);
+            return true;
+        }
+    }
+
+    if (canonical && pty_cc_matches(term, VERASE, ch))
+    {
+        if (pair->ptr_slave == pair->canonical_start) return true;
+        if (flags & ECHO)
+        {
+            if (flags & ECHOE)
+            {
+                const uint8_t erase[] = {'\b', ' ', '\b', '\b', ' ', '\b'};
+                size_t count = pty_echo_control(term, pair->slave_buffer[pair->ptr_slave - 1]) ? 6 : 3;
+                if (!pty_echo_bytes(pair, erase, count)) return false;
+            }
+            else if (!pty_echo_char(pair, ch)) return false;
+        }
+        pair->ptr_slave--;
+        return true;
+    }
+    if (canonical && pty_cc_matches(term, VKILL, ch))
+    {
+        if (flags & ECHO)
+        {
+            if (flags & ECHOK)
+            {
+                const uint8_t newline = '\n';
+                if (!pty_echo_bytes(pair, &newline, 1)) return false;
+            }
+            else if (!pty_echo_char(pair, ch)) return false;
+        }
+        pair->ptr_slave = pair->canonical_start;
+        return true;
+    }
+
+    bool eof = canonical && pty_cc_matches(term, VEOF, ch);
+    bool end = canonical && (eof || ch == '\n' || pty_cc_matches(term, VEOL, ch) ||
+                             ((flags & IEXTEN) && pty_cc_matches(term, VEOL2, ch)));
+    // Reserve the final slot for a delimiter. Discard excess bytes of an overlong
+    // unfinished line instead of blocking forever before Enter/Erase can arrive.
+    if (canonical && !end && pair->ptr_slave >= PTY_BUFF_SIZE - 1 && pair->canonical_start == 0) return true;
+    if (pair->ptr_slave == PTY_BUFF_SIZE) return false;
+    if (!eof && !pty_echo_char(pair, ch)) return false;
+
+    size_t pos = pair->ptr_slave++;
+    pair->slave_buffer[pos] = eof ? 0 : ch;
+    pair->input_flags[pos] = end ? PTY_INPUT_END | (eof ? PTY_INPUT_EOF : 0) : 0;
+    if (end) pair->canonical_start = pair->ptr_slave;
+    return true;
+}
+
 static size_t ptmx_write(void *file, const void *addr, size_t offset, size_t size)
 {
     UNUSED(offset);
     pty_handle_t *pair = (pty_handle_t *)file;
     if (pair == NULL || addr == NULL) return VFS_STATUS_FAILED;
-    if (size == 0) return 0;
 
-    while (true)
+    const uint8_t *input = (const uint8_t *)addr;
+    size_t written = 0;
+    while (written < size)
     {
+        int signal = 0;
         spin_lock(&pair->lock);
-        if (pair->ptr_slave < PTY_BUFF_SIZE)
+        if (pair->slave_fds == 0)
         {
             spin_unlock(&pair->lock);
-            break;
+            return written != 0 ? written : (size_t)-EIO;
         }
+        bool consumed = pty_input_byte(pair, input[written], &signal);
+        int pgid = pair->ctrl_pgid;
         spin_unlock(&pair->lock);
-        scheduler_yield();
-    }
 
-    spin_lock(&pair->lock);
-    size_t writable = MIN(size, PTY_BUFF_SIZE - pair->ptr_slave);
-    memcpy(pair->slave_buffer + pair->ptr_slave, addr, writable);
-    if (pair->term.c_iflag & ICRNL)
-    {
-        for (size_t i = 0; i < writable; i++)
+        if (signal != 0 && pgid > 0) signal_send_group(pgid, signal);
+        if (consumed) written++;
+        else
         {
-            if (pair->slave_buffer[pair->ptr_slave + i] == '\r')
-                pair->slave_buffer[pair->ptr_slave + i] = '\n';
+            if (written != 0) return written;
+            if (signals_pending_quick(get_current_task())) return (size_t)-EINTR;
+            scheduler_yield();
         }
     }
-    pair->ptr_slave += writable;
-    spin_unlock(&pair->lock);
-    return writable;
+    return written;
 }
 
 static errno_t ptmx_ioctl(void *handle, size_t request, void *arg)
@@ -442,14 +566,26 @@ static size_t pts_read(void *file, void *addr, size_t offset, size_t size)
     UNUSED(offset);
     pty_handle_t *pair = (pty_handle_t *)file;
     if (pair == NULL || addr == NULL) return VFS_STATUS_FAILED;
+    if (size == 0) return 0;
 
     while (true)
     {
         spin_lock(&pair->lock);
-        if (pts_data_available(pair) > 0)
+        size_t available = pts_data_available(pair);
+        if (available == 0 && pair->master_fds == 0) available = pair->ptr_slave;
+        if (available > 0)
         {
+            bool eof = (pair->term.c_lflag & ICANON) && (pair->input_flags[available - 1] & PTY_INPUT_EOF);
+            size_t to_copy = MIN(size, available - (eof ? 1 : 0));
+            size_t consumed = to_copy;
+            if (eof && to_copy == available - 1) consumed++;
+            memcpy(addr, pair->slave_buffer, to_copy);
+            memmove(pair->slave_buffer, pair->slave_buffer + consumed, pair->ptr_slave - consumed);
+            memmove(pair->input_flags, pair->input_flags + consumed, pair->ptr_slave - consumed);
+            pair->ptr_slave -= consumed;
+            pair->canonical_start = pair->canonical_start > consumed ? pair->canonical_start - consumed : 0;
             spin_unlock(&pair->lock);
-            break;
+            return to_copy;
         }
         if (pair->master_fds == 0)
         {
@@ -457,16 +593,9 @@ static size_t pts_read(void *file, void *addr, size_t offset, size_t size)
             return 0;
         }
         spin_unlock(&pair->lock);
+        if (signals_pending_quick(get_current_task())) return (size_t)-EINTR;
         scheduler_yield();
     }
-
-    spin_lock(&pair->lock);
-    size_t to_copy = MIN(size, pts_data_available(pair));
-    memcpy(addr, pair->slave_buffer, to_copy);
-    memmove(pair->slave_buffer, pair->slave_buffer + to_copy, pair->ptr_slave - to_copy);
-    pair->ptr_slave -= to_copy;
-    spin_unlock(&pair->lock);
-    return to_copy;
 }
 
 static size_t pts_write_inner(pty_handle_t *pair, const uint8_t *in, size_t size)
@@ -526,6 +655,30 @@ static size_t pts_write(void *file, const void *addr, size_t offset, size_t size
     return written;
 }
 
+static void pty_set_termios(pty_handle_t *pair, const struct termios *term, bool flush)
+{
+    if (flush) pty_flush_input(pair);
+    if ((pair->term.c_lflag ^ term->c_lflag) & ICANON)
+    {
+        // Keep typeahead when readline changes modes, but never expose internal EOF markers.
+        size_t out = 0;
+        for (size_t i = 0; i < pair->ptr_slave; i++)
+        {
+            if (pair->input_flags[i] & PTY_INPUT_EOF) continue;
+            pair->slave_buffer[out] = pair->slave_buffer[i];
+            pair->input_flags[out++] = 0;
+        }
+        pair->ptr_slave = out;
+        pair->canonical_start = 0;
+        if ((term->c_lflag & ICANON) && out != 0)
+        {
+            pair->input_flags[out - 1] = PTY_INPUT_END;
+            pair->canonical_start = out;
+        }
+    }
+    memcpy(&pair->term, term, sizeof(pair->term));
+}
+
 static errno_t pts_ioctl(void *handle, size_t request, void *arg)
 {
     pty_handle_t *pair = (pty_handle_t *)handle;
@@ -571,7 +724,7 @@ static errno_t pts_ioctl(void *handle, size_t request, void *arg)
             ret = -EFAULT;
             break;
         }
-        memcpy(&pair->term, arg, sizeof(pair->term));
+        pty_set_termios(pair, (const struct termios *)arg, req == TCSETSF);
         break;
     case TIOCGPGRP:
         if (arg == NULL)

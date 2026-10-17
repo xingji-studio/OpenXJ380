@@ -347,10 +347,10 @@ static int64_t write_from_user_buffer(fd_file_handle *handle, const uint8_t *buf
             signal_send_process(process, SIGPIPE);
             return total > 0 ? (int64_t)total : -EPIPE;
         }
-        if (wrote == (size_t)VFS_STATUS_FAILED)
+        if ((ssize_t)wrote < 0)
         {
             free(bounce);
-            return total > 0 ? (int64_t)total : -EIO;
+            return total > 0 ? (int64_t)total : wrote == (size_t)VFS_STATUS_FAILED ? -EIO : (int64_t)wrote;
         }
         if (!(handle->node->type & file_pipe) && handle->node->size != (uint64_t)-1) handle->offset += wrote;
         total += wrote;
@@ -500,10 +500,10 @@ static int64_t read_to_user_buffer(fd_file_handle *handle, uint8_t *buffer, size
         else
         {
             size_t got = vfs_read(handle->node, bounce, offset + total, chunk);
-            if (got == (size_t)VFS_STATUS_FAILED)
+            if ((ssize_t)got < 0)
             {
                 free(bounce);
-                return total > 0 ? (int64_t)total : -EIO;
+                return total > 0 ? (int64_t)total : got == (size_t)VFS_STATUS_FAILED ? -EIO : (int64_t)got;
             }
             read_now = (ssize_t)got;
         }
@@ -2583,7 +2583,7 @@ static uint64_t poll_kernel_fds(struct pollfd *fds_user, size_t nfds, size_t tim
             }
         }
 
-        // sigexit = signals_pending_quick(get_current_task());
+        sigexit = signals_pending_quick(get_current_task());
 
         if (ready > 0 || sigexit) break;
 
