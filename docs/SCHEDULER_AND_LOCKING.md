@@ -62,6 +62,13 @@ Never retain `mutex_get_owner()` outside that lifetime boundary for recovery.
 The CPU scan is bounded; yielding and rebuilding happen after unlocking.
 The input-method service reloads its verified settings journal and revokes the
 old engine session when a caller dies while holding its service mutex.
+Learning storage uses its own recoverable mutex with the same process-exit hook.
+The service mutex must be released before storage/VFS operations. The storage
+transaction may briefly acquire the service mutex to revalidate identity, so
+never acquire the storage mutex while holding the service mutex. The async
+save queue spin lock protects job publication/status only; snapshot allocation,
+free, thread creation and VFS work happen after releasing it. Delayed writes
+must check the policy generation under the storage mutex before writing.
 
 ## Exec and IPC publication
 

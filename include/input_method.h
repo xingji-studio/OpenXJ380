@@ -23,6 +23,8 @@ bool    ime_filter_message(uint64_t type, uint64_t value, uint64_t callback, tcb
 bool    ime_take_delivery(ImeDelivery *delivery);
 bool    ime_snapshot_ui(XImeUi *ui, int *x, int *y, uint64_t *revision);
 void    ime_candidate_click(uint32_t index);
+bool    ime_snapshot_ui_v2(XImeUiV2 *ui, int *x, int *y, uint64_t *revision);
+void    ime_ui_action(uint32_t kind, uint64_t value, uint64_t revision, uint64_t context);
 int64_t ime_syscall(uint64_t number, uint64_t user_request);
 void    ime_process_loaded(pcb_t process);
 void    ime_process_exit(pcb_t process);

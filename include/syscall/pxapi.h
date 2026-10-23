@@ -274,7 +274,7 @@ typedef void (*XApiNotifyPrcor)(uint64_t notification_id, uint64_t action_id);
 #define XWIN_TYPE_MASK          0x0f
 #define XWIN_SUPPORT_RESIZEABLE 0x80
 
-// 当前最大号：7484
+// 当前最大号：7485
 
 #define XAPI_CAPTURE_SCREEN 7473
 
@@ -376,3 +376,4 @@ uint64_t message_ask(uint64_t msg_type_p, uint64_t hdatap, uint64_t ldatap, uint
 #define XAPI_IME_UPDATE_UI        7482
 #define XAPI_IME_SET_MODE         7483
 #define XAPI_IME_SET_CONTEXT      7484
+#define XAPI_IME_USER_DATA        7485

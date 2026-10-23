@@ -9,6 +9,7 @@ static const size_t   CONFIG_LIMIT = 32768;
 static const char    *CONFIG_PATH  = "/settings.json";
 static const char    *PENDING_PATH = "/settings.json.ime-new";
 static const char    *BACKUP_PATH  = "/settings.json.ime-backup";
+static const uint64_t USER_DATA_NODE = 1ULL << 60;
 static const uint64_t CONFIG_NODE  = 1ULL << 61;
 static const uint64_t MANAGER_NODE = 1ULL << 62;
 
@@ -39,9 +40,24 @@ static bool equal_fold(const char *a, const char *b)
     return *a == *b;
 }
 
+static bool user_data_parent(vfs_node_t node)
+{
+    for (unsigned depth = 0; node && depth < 64; ++depth, node = node->parent)
+    {
+        if (node->ime_protection & USER_DATA_NODE) return true;
+        if (node->name && equal_fold(node->name, "ime") && node->parent && node->parent->parent &&
+            node->parent->parent->parent == rootdir && node->parent->parent->name &&
+            equal_fold(node->parent->parent->name, "users")) return true;
+    }
+    return false;
+}
+
 static uint64_t protected_name(vfs_node_t parent, const char *name)
 {
     if (!parent || !name) return 0;
+    if (user_data_parent(parent) ||
+        (equal_fold(name, "ime") && parent->parent && parent->parent->parent == rootdir &&
+         parent->parent->name && equal_fold(parent->parent->name, "users"))) return USER_DATA_NODE;
     if (parent == rootdir && (equal_fold(name, "settings.json") || equal_fold(name, "settings.json.ime-new") ||
                               equal_fold(name, "settings.json.ime-backup")))
         return CONFIG_NODE;
@@ -61,6 +77,7 @@ static uint64_t node_protection(vfs_node_t node)
 {
     if (!node) return 0;
     uint64_t flags = node->ime_protection | protected_name(node->parent, node->name);
+    if (user_data_parent(node)) flags |= USER_DATA_NODE;
     // Resolved symlink/proxy objects must retain the target's restrictions.
     for (unsigned i = 0; node->linkto && i < 16; ++i)
     {
@@ -94,6 +111,42 @@ bool ime_vfs_access(vfs_node_t node, const char *path, ImeFileOperation operatio
             free(normalized);
             return false;
         }
+        // Protect per-user learning subtrees even before their nodes exist.
+        char *user_end = NULL;
+        if (normalized[0] == '/')
+        {
+            char *first = strchr(normalized + 1, '/');
+            if (first)
+            {
+                char saved = *first; *first = 0;
+                bool users = equal_fold(normalized, "/users");
+                *first = saved;
+                if (users)
+                {
+                    user_end = strchr(first + 1, '/');
+                    if (user_end)
+                    {
+                        char *end = strchr(user_end + 1, '/');
+                        char tail = end ? *end : 0;
+                        if (end) *end = 0;
+                        if (equal_fold(user_end + 1, "ime")) protection |= USER_DATA_NODE;
+                        if (end) *end = tail;
+                    }
+                    if (operation != IME_FILE_READ && !user_end)
+                    {
+                        vfs_node_t target = vfs_open(normalized);
+                        bool directory = target && (target->type & file_dir);
+                        if (target) vfs_close(target);
+                        if (directory) { free(normalized); return false; }
+                    }
+                }
+            }
+            else if (operation != IME_FILE_READ && equal_fold(normalized, "/users"))
+            {
+                free(normalized);
+                return false;
+            }
+        }
         // Check the resolved parent as well as the spelling of the path. This
         // catches aliases/symlinks for creation and rename destinations.
         char *slash = strrchr(normalized, '/');
@@ -104,17 +157,30 @@ bool ime_vfs_access(vfs_node_t node, const char *path, ImeFileOperation operatio
             if (parent)
             {
                 protection |= protected_name(parent, slash + 1);
+                bool users_parent = parent->parent == rootdir && parent->name && equal_fold(parent->name, "users");
+                bool users_root = parent == rootdir && equal_fold(slash + 1, "users");
+                if (operation != IME_FILE_READ && (users_parent || users_root))
+                {
+                    *slash = '/';
+                    vfs_node_t target = vfs_open(normalized);
+                    bool directory = target && (target->type & file_dir);
+                    if (target) vfs_close(target);
+                    if (directory) { vfs_close(parent); free(normalized); return false; }
+                }
                 vfs_close(parent);
             }
         }
         free(normalized);
     }
-    if (protection & CONFIG_NODE) return false;
+    if (protection & (CONFIG_NODE | USER_DATA_NODE)) return false;
     if ((protection & MANAGER_NODE) && operation != IME_FILE_READ) return false;
     if (operation == IME_FILE_REMOVE && node)
     {
         // Prevent replacement of the protected executable's ancestor directories.
-        if (node == rootdir || (node->parent == rootdir && equal_fold(node->name, "apps")) ||
+        if (node == rootdir || (node->parent == rootdir && equal_fold(node->name, "users")) ||
+            ((node->type & file_dir) && node->parent && node->parent->parent == rootdir &&
+             equal_fold(node->parent->name, "users")) ||
+            (node->parent == rootdir && equal_fold(node->name, "apps")) ||
             (node->parent && node->parent->parent == rootdir && equal_fold(node->parent->name, "apps") &&
              equal_fold(node->name, "system")))
             return false;
@@ -124,7 +190,7 @@ bool ime_vfs_access(vfs_node_t node, const char *path, ImeFileOperation operatio
 
 bool ime_valid_id(const char *id)
 {
-    if (!id || !id[0]) return false;
+    if (!id || !id[0] || !strcmp(id, ".") || !strcmp(id, "..")) return false;
     for (size_t i = 0; i < XIME_ID_BYTES; ++i)
     {
         char c = id[i];

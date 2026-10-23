@@ -19,16 +19,19 @@ static uint64_t       engine_pid, engine_session, launch_generation             
 static uint64_t       ui_revision = 1;
 static uint32_t       modifiers;
 static bool           launch_requested, reset_pending = true;
-static XImeUi         ui;
+static XImeUiV2       ui;
+static uint32_t       engine_version = XIME_ABI_VERSION, engine_page_size = XIME_MAX_CANDIDATES;
+static char           engine_account[64], launch_account[64];
+static bool           awaiting_account;
 static const size_t   EVENT_CAPACITY   = 128;
 static const uint64_t EVENT_TIMEOUT_NS = 2000000000ULL;
 struct PendingEvent
 {
-    XImeEvent event;
+    XImeEventV2 event;
     bool      fetched, replied;
     uint32_t  action;
     uint64_t  created;
-    char      text[XIME_TEXT_BYTES];
+    char      text[XIME_COMMIT_BYTES];
     size_t    text_offset;
 };
 static PendingEvent events[EVENT_CAPACITY];
@@ -70,6 +73,7 @@ static void reset_locked()
 static void detach_locked()
 {
     engine_pid = engine_session = 0;
+    engine_account[0] = launch_account[0] = 0;
     ++launch_generation;
     reset_locked();
 }
@@ -77,6 +81,7 @@ static void detach_locked()
 static void fail_open_locked()
 {
     engine_pid = engine_session = 0;
+    engine_account[0] = launch_account[0] = 0;
     ++launch_generation;
     memset(&ui, 0, sizeof(ui));
     ++ui_revision;
@@ -96,6 +101,7 @@ static void fail_open_locked()
 void ime_initialize()
 {
     mutex_create(&ime_lock, false);
+    ime_user_store_initialize();
     initialized = true;
 }
 
@@ -153,6 +159,7 @@ int ime_launch_manager(pcb_t parent, char **argv)
 void ime_process_exit(pcb_t process)
 {
     if (!initialized || !process) return;
+    ime_user_store_process_exit(process);
     bool     abandoned = mutex_abort_for_process(&ime_lock, process);
     ImeGuard guard;
     if (abandoned)
@@ -180,6 +187,18 @@ void ime_service()
         if (!enabled) return;
         load_locked();
         if (config_error) return;
+        bool ready = current_user && user_session_is_ready();
+        if (launch_account[0] && (!ready || strcmp(launch_account, current_user->name)))
+        {
+            detach_locked();
+            awaiting_account = true;
+        }
+        if (!ready) return;
+        if (awaiting_account)
+        {
+            awaiting_account = false;
+            launch_requested = registry.active[0] != 0;
+        }
         uint64_t now = nanoTime();
         if (engine_session && event_count && now - events[event_head].created > EVENT_TIMEOUT_NS)
         {
@@ -194,6 +213,7 @@ void ime_service()
             if (entry >= 0)
             {
                 strcpy(path, registry.entries[entry].executable);
+                strncpy(launch_account, current_user->name, sizeof(launch_account) - 1);
                 generation = launch_generation;
             }
         }
@@ -255,7 +275,7 @@ static bool queue_event(uint32_t kind, uint64_t type, uint64_t value, bool reser
     PendingEvent &pending = events[(event_head + event_count++) % EVENT_CAPACITY];
     memset(&pending, 0, sizeof(pending));
     pending.created  = nanoTime();
-    XImeEvent &event = pending.event;
+    XImeEventV2 &event = pending.event;
     event.size       = sizeof(event);
     event.version    = XIME_ABI_VERSION;
     event.session    = engine_session;
@@ -308,7 +328,7 @@ bool ime_take_delivery(ImeDelivery *delivery)
         if (pending.action == XIME_REPLY_COMMIT_UTF8 && pending.text[pending.text_offset])
         {
             const char *s        = pending.text + pending.text_offset;
-            size_t      n        = ime_utf8_scalar_bytes(s, XIME_TEXT_BYTES - pending.text_offset);
+            size_t      n        = ime_utf8_scalar_bytes(s, XIME_COMMIT_BYTES - pending.text_offset);
             delivery->message    = MSG_CHAR;
             delivery->value      = ime_utf8_pack(s, n);
             pending.text_offset += n;
@@ -324,15 +344,42 @@ bool ime_take_delivery(ImeDelivery *delivery)
     return false;
 }
 
-bool ime_snapshot_ui(XImeUi *out, int *x, int *y, uint64_t *revision)
+bool ime_snapshot_ui_v2(XImeUiV2 *out, int *x, int *y, uint64_t *revision)
 {
     if (!initialized) return false;
     ImeGuard guard;
     if (*revision == ui_revision) return false;
-    *out      = ui;
-    *x        = focus.x;
-    *y        = focus.y;
+    *out = ui;
+    *x = focus.x;
+    *y = focus.y;
     *revision = ui_revision;
+    return true;
+}
+
+static void copy_ui_label(char *out, size_t capacity, const char *text)
+{
+    size_t used = 0;
+    while (text[used])
+    {
+        size_t length = ime_utf8_scalar_bytes(text + used, 4);
+        if (!length || used + length >= capacity) break;
+        memcpy(out + used, text + used, length);
+        used += length;
+    }
+    out[used] = 0;
+}
+
+bool ime_snapshot_ui(XImeUi *out, int *x, int *y, uint64_t *revision)
+{
+    XImeUiV2 value = {};
+    if (!ime_snapshot_ui_v2(&value, x, y, revision)) return false;
+    memset(out, 0, sizeof(*out));
+    memcpy(out, &value, 48);
+    out->size = sizeof(*out);
+    out->version = XIME_ABI_VERSION;
+    copy_ui_label(out->preedit, sizeof(out->preedit), value.preedit);
+    for (uint32_t i = 0; i < value.count; ++i)
+        copy_ui_label(out->candidates[i], XIME_CANDIDATE_BYTES, value.candidates[i]);
     return true;
 }
 
@@ -340,7 +387,42 @@ void ime_candidate_click(uint32_t index)
 {
     if (!initialized) return;
     ImeGuard guard;
-    if (engine_session && ui.visible && index < ui.count) queue_event(XIME_EVENT_CANDIDATE, 0, index);
+    if (engine_session && ui.visible && index < ui.count)
+    {
+        if (queue_event(XIME_EVENT_CANDIDATE, 0, index))
+            events[(event_head + event_count - 1) % EVENT_CAPACITY].event.revision = ui.revision;
+    }
+}
+
+void ime_ui_action(uint32_t kind, uint64_t value, uint64_t revision, uint64_t context)
+{
+    if (!initialized) return;
+    ImeGuard guard;
+    if (!engine_session || !ui.visible || ui.revision != revision || ui.context != context) return;
+    bool valid = kind == XIME_EVENT_CANDIDATE && value < ui.count;
+    if (engine_version == XIME_ABI_V2)
+    {
+        if (kind == XIME_EVENT_PAGE)
+            valid = (value == 0 && (ui.flags & XIME_UI_PREVIOUS)) ||
+                    (value == 1 && (ui.flags & XIME_UI_NEXT));
+        if (kind == XIME_EVENT_LAYOUT) valid = value >= 1 && value <= XIME_MAX_CANDIDATES;
+    }
+    if (valid && queue_event(kind, 0, value))
+        events[(event_head + event_count - 1) % EVENT_CAPACITY].event.revision = revision;
+}
+
+// Inspect only the common header before copying the selected wire layout.
+// A V1 caller never needs memory beyond the original record size.
+static int read_wire(uint64_t address, void *out, size_t v1, size_t v2, uint32_t *version)
+{
+    uint32_t header[2];
+    if (!address || !copy_from_user_pagedir(xapi_current_pagedir(), header, (void *)address, sizeof(header)))
+        return -EFAULT;
+    size_t size = header[1] == XIME_ABI_VERSION ? v1 : header[1] == XIME_ABI_V2 ? v2 : 0;
+    if (!size || header[0] != size) return -EINVAL;
+    if (!copy_from_user_pagedir(xapi_current_pagedir(), out, (void *)address, size)) return -EFAULT;
+    *version = header[1];
+    return 0;
 }
 
 template <class T>
@@ -361,12 +443,38 @@ static int write_result(uint64_t address, const T *result)
 static bool engine_authorized(pcb_t caller)
 {
     return caller && caller->ime_role == 1 && caller->ime_launch_generation == launch_generation &&
-           caller->pid == engine_pid && engine_session;
+           caller->pid == engine_pid && engine_session && current_user &&
+           !strcmp(engine_account, current_user->name) && user_session_is_ready();
+}
+
+int ime_user_authorize(const XImeUserData *request, ImeUserIdentity *identity)
+{
+    if (!initialized) return -ENODEV;
+    ImeGuard guard;
+    tcb_t task = get_current_task();
+    if (!task || !task->parent_group || !current_user || !user_session_is_ready()) return -EPERM;
+    pcb_t caller = task->parent_group;
+    bool manager = caller->ime_role == 2;
+    if (!manager && (!engine_authorized(caller) || request->session != engine_session)) return -EPERM;
+    if (!manager && (request->operation == XIME_DATA_CLEAR || request->operation == XIME_DATA_SET_ENABLED))
+        return -EPERM;
+    if (manager && request->operation != XIME_DATA_INFO && request->operation != XIME_DATA_CLEAR &&
+        request->operation != XIME_DATA_SET_ENABLED) return -EPERM;
+    const char *id = request->id[0] ? request->id : registry.active;
+    if (!ime_valid_id(id) || find_entry(id) < 0) return -ENOENT;
+    if (!manager && strcmp(id, registry.active)) return -EPERM;
+    if (!memchr(current_user->name, 0, sizeof(identity->user)) || !current_user->name[0] ||
+        strchr(current_user->name, '/') || strchr(current_user->name, '\\') ||
+        !strcmp(current_user->name, ".") || !strcmp(current_user->name, "..")) return -EINVAL;
+    strcpy(identity->user, current_user->name);
+    strcpy(identity->id, id);
+    return 0;
 }
 
 int64_t ime_syscall(uint64_t number, uint64_t address)
 {
     if (!initialized) return -ENODEV;
+    if (number == XAPI_IME_USER_DATA) return ime_user_store_syscall(address);
     tcb_t task = get_current_task();
     if (!task || !task->parent_group) return -ESRCH;
     pcb_t    caller = task->parent_group;
@@ -476,60 +584,81 @@ int64_t ime_syscall(uint64_t number, uint64_t address)
         return 0;
     }
     case XAPI_IME_ATTACH: {
-        XImeSession request = {};
-        int         error   = read_request(address, &request);
+        XImeSessionV2 request = {};
+        uint32_t version = 0;
+        int error = read_wire(address, &request, sizeof(XImeSession), sizeof(request), &version);
         if (error) return error;
         int entry = find_entry(registry.active);
         if (caller->ime_role != 1 || caller->ime_launch_generation != launch_generation || entry < 0 ||
-            !caller->exe_path || strcmp(caller->exe_path, registry.entries[entry].executable))
-            return -EPERM;
+            !caller->exe_path || strcmp(caller->exe_path, registry.entries[entry].executable) ||
+            !current_user || !user_session_is_ready() || strcmp(launch_account, current_user->name)) return -EPERM;
         if (engine_session) return -EBUSY;
-        uint64_t session = ++session_generation;
-        request.session  = session;
-        error            = write_result(address, &request);
-        if (error) return error;
-        engine_pid     = caller->pid;
-        engine_session = session;
+        if (version == XIME_ABI_V2 && (request.capabilities & ~(XIME_CAP_PAGING | XIME_CAP_LONG_TEXT)))
+            return -EINVAL;
+        request.session = ++session_generation;
+        request.capabilities = XIME_CAP_PAGING | XIME_CAP_LONG_TEXT;
+        request.page_size = XIME_MAX_CANDIDATES;
+        size_t size = version == XIME_ABI_V2 ? sizeof(request) : sizeof(XImeSession);
+        if (!copy_to_user_pagedir(xapi_current_pagedir(), (void *)address, &request, size)) return -EFAULT;
+        engine_pid = caller->pid;
+        engine_session = request.session;
+        engine_version = version;
+        engine_page_size = XIME_MAX_CANDIDATES;
+        strncpy(engine_account, current_user->name, sizeof(engine_account) - 1);
         reset_locked();
         return 0;
     }
     case XAPI_IME_GET_EVENT: {
         if (!engine_authorized(caller)) return -EPERM;
-        XImeEvent result = {};
-        int       error  = read_request(address, &result);
+        XImeEventV2 result = {};
+        uint32_t version = 0;
+        int error = read_wire(address, &result, sizeof(XImeEvent), sizeof(result), &version);
         if (error) return error;
+        if (version != engine_version) return -EINVAL;
+        size_t size = version == XIME_ABI_V2 ? sizeof(result) : sizeof(XImeEvent);
         if (reset_pending)
         {
             memset(&result, 0, sizeof(result));
-            result.size    = sizeof(result);
-            result.version = XIME_ABI_VERSION;
-            result.kind    = XIME_EVENT_RESET;
+            result.size = size;
+            result.version = version;
+            result.kind = XIME_EVENT_RESET;
             result.session = engine_session;
             result.context = context_generation;
-            result.mode    = registry.mode;
-            error          = write_result(address, &result);
-            if (!error) reset_pending = false;
-            return error;
+            result.mode = registry.mode;
+            if (!copy_to_user_pagedir(xapi_current_pagedir(), (void *)address, &result, size)) return -EFAULT;
+            reset_pending = false;
+            return 0;
         }
         for (size_t i = 0; i < event_count; ++i)
         {
             PendingEvent &pending = events[(event_head + i) % EVENT_CAPACITY];
             if (pending.replied) continue;
-            if (pending.fetched) return -EAGAIN; // Exactly one outstanding reply.
-            error = write_result(address, &pending.event);
-            if (!error) pending.fetched = true;
-            return error;
+            if (pending.fetched) return -EAGAIN;
+            if (pending.event.kind != XIME_EVENT_KEY && pending.event.revision != ui.revision)
+            {
+                pending.replied = true;
+                pending.action = XIME_REPLY_CONSUMED;
+                continue;
+            }
+            result = pending.event;
+            result.size = size;
+            result.version = version;
+            if (!copy_to_user_pagedir(xapi_current_pagedir(), (void *)address, &result, size)) return -EFAULT;
+            pending.fetched = true;
+            return 0;
         }
         return -EAGAIN;
     }
     case XAPI_IME_REPLY_EVENT: {
         if (!engine_authorized(caller)) return -EPERM;
-        XImeReply reply = {};
-        int       error = read_request(address, &reply);
+        XImeReplyV2 reply = {};
+        uint32_t version = 0;
+        int error = read_wire(address, &reply, sizeof(XImeReply), sizeof(reply), &version);
         if (error) return error;
+        if (version != engine_version) return -EINVAL;
+        size_t capacity = version == XIME_ABI_V2 ? XIME_COMMIT_BYTES : XIME_TEXT_BYTES;
         if (reply.reserved || reply.action > XIME_REPLY_COMMIT_UTF8 || reply.session != engine_session ||
-            reply.context != context_generation || !ime_utf8_valid(reply.text, sizeof(reply.text)))
-            return -EINVAL;
+            reply.context != context_generation || !ime_utf8_valid(reply.text, capacity)) return -EINVAL;
         for (const unsigned char *p = (const unsigned char *)reply.text; *p; ++p)
             if (*p < 32 || *p == 127) return -EINVAL;
         for (size_t i = 0; i < event_count; ++i)
@@ -546,13 +675,40 @@ int64_t ime_syscall(uint64_t number, uint64_t address)
     }
     case XAPI_IME_UPDATE_UI: {
         if (!engine_authorized(caller)) return -EPERM;
-        XImeUi value = {};
-        int    error = read_request(address, &value);
-        if (error) return error;
+        XImeUiV2 value = {};
+        uint32_t header[2];
+        if (!address || !copy_from_user_pagedir(xapi_current_pagedir(), header, (void *)address, sizeof(header)))
+            return -EFAULT;
+        if (header[1] != engine_version) return -EINVAL;
+        if (engine_version == XIME_ABI_V2)
+        {
+            uint32_t version;
+            int error = read_wire(address, &value, sizeof(XImeUi), sizeof(value), &version);
+            if (error) return error;
+            if (!value.revision || value.page_size < 1 || value.page_size > XIME_MAX_CANDIDATES ||
+                value.count > value.page_size || (value.flags & ~(XIME_UI_PREVIOUS | XIME_UI_NEXT | XIME_UI_PREDICTION)) ||
+                !ime_utf8_valid(value.preview, sizeof(value.preview))) return -EINVAL;
+        }
+        else
+        {
+            XImeUi old = {};
+            int error = read_request(address, &old);
+            if (error) return error;
+            if (!ime_utf8_valid(old.preedit, sizeof(old.preedit))) return -EINVAL;
+            memcpy(&value, &old, 48);
+            value.page_size = XIME_MAX_CANDIDATES;
+            value.revision = ui.revision + 1;
+            memcpy(value.preedit, old.preedit, sizeof(old.preedit));
+            if (old.count > XIME_MAX_CANDIDATES) return -EINVAL;
+            for (uint32_t i = 0; i < old.count; ++i)
+            {
+                if (!ime_utf8_valid(old.candidates[i], XIME_CANDIDATE_BYTES)) return -EINVAL;
+                memcpy(value.candidates[i], old.candidates[i], XIME_CANDIDATE_BYTES);
+            }
+        }
         if (value.session != engine_session || value.context != context_generation || value.visible > 1 ||
             value.count > XIME_MAX_CANDIDATES || (value.count && value.selected >= value.count) ||
-            !ime_utf8_valid(value.preedit, sizeof(value.preedit)))
-            return -EINVAL;
+            !ime_utf8_valid(value.preedit, sizeof(value.preedit))) return -EINVAL;
         bool outstanding = false;
         for (size_t i = 0; i < event_count; ++i)
         {
@@ -561,8 +717,11 @@ int64_t ime_syscall(uint64_t number, uint64_t address)
         }
         if (!outstanding) return -ESTALE;
         for (uint32_t i = 0; i < value.count; ++i)
-            if (!ime_utf8_valid(value.candidates[i], XIME_CANDIDATE_BYTES)) return -EINVAL;
+            if (!ime_utf8_valid(value.candidates[i], XIME_LABEL_BYTES)) return -EINVAL;
+        value.size = sizeof(value);
+        value.version = XIME_ABI_V2;
         ui = value;
+        engine_page_size = value.page_size;
         ++ui_revision;
         return 0;
     }
