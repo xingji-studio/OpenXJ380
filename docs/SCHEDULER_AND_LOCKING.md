@@ -49,6 +49,20 @@ preemption disabled. If a protected operation needs a large copy or allocation,
 capture/pin the required state, release the spin lock, do the work, then
 validate the generation/lifetime before publishing the result.
 
+## Recovering abandoned UI locks
+
+`mutex_lock_recoverable()` is opt-in for state that can be rebuilt, currently
+image decoding, task-dock painting, and the input-method service. Ordinary
+`mutex_lock()` retains its original semantics. A terminal thread may still be
+executing a kernel call on another CPU, so recovery checks both DEATH/OUT status
+and absence from every CPU's `current_task`. The mutex metadata spin lock pins
+the owner pointer during this check: each participating subsystem must retain
+its process-exit hook, clearing the lock before its owner's TCB is freed.
+Never retain `mutex_get_owner()` outside that lifetime boundary for recovery.
+The CPU scan is bounded; yielding and rebuilding happen after unlocking.
+The input-method service reloads its verified settings journal and revokes the
+old engine session when a caller dies while holding its service mutex.
+
 ## Exec and IPC publication
 
 `process_execve()` prepares a private ELF image while scheduling is available,

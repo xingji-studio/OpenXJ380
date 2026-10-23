@@ -1,3 +1,8 @@
+#include <input_method.h>
+#include <ime_utf8.h>
+static ImeTextSink ime_text_sink;
+void ime_set_text_sink(ImeTextSink sink) { ime_text_sink = sink; }
+static spin_t getch_lock = SPIN_INIT;
 #include <cpu/msr.h>
 #include <errno.h>
 #include <fs/vfs/vfs.h>
@@ -152,17 +157,26 @@ uint64_t message_ask(uint64_t msg_type_p, uint64_t hdatap, uint64_t ldatap, uint
     return 0;
 }
 
-void do_message(uint64_t msg_type, uint64_t hData, uint64_t lData, MsgPrcor WinMpf, tcb_t ftask)
+void do_message_unfiltered(uint64_t msg_type, uint64_t hData, uint64_t lData, MsgPrcor WinMpf, tcb_t ftask)
 {
     if (ftask == NULL || ftask->parent_group == NULL || ftask->parent_group->xtttp_stc == NULL) return;
 
     tcb_t current = ftask;
+    if (ime_text_sink) ime_text_sink(msg_type, lData, (uint64_t)WinMpf, ftask);
 
-    // 看看需不需要getch?
-    if (current->parent_group->xtttp_stc->wait_for_getch && msg_type == MSG_CHAR)
+    if (msg_type == MSG_CHAR)
     {
-        current->parent_group->xtttp_stc->char_for_getch = lData;
-        current->parent_group->xtttp_stc->wait_for_getch = false;
+        xtttp_dtt *terminal = current->parent_group->xtttp_stc;
+        char bytes[8]; memcpy(bytes, &lData, sizeof(bytes));
+        size_t count = ime_utf8_scalar_bytes(bytes, 4);
+        spin_lock(&getch_lock);
+        if ((terminal->wait_for_getch || terminal->getch_count) && count && terminal->getch_count + count <= 128)
+        {
+            for (size_t i = 0; i < count; ++i)
+                terminal->getch_bytes[(terminal->getch_head + terminal->getch_count++) % 128] = bytes[i];
+            terminal->wait_for_getch = false;
+        }
+        spin_unlock(&getch_lock);
     }
 
     // 检查是否有注册的信号处理函数
@@ -182,6 +196,12 @@ void do_message(uint64_t msg_type, uint64_t hData, uint64_t lData, MsgPrcor WinM
     // 空的就不用管了
 }
 
+void do_message(uint64_t msg_type, uint64_t hData, uint64_t lData, MsgPrcor WinMpf, tcb_t ftask)
+{
+    if (ime_filter_message(msg_type, lData, (uint64_t)WinMpf, ftask)) return;
+    do_message_unfiltered(msg_type, hData, lData, WinMpf, ftask);
+}
+
 void init_message()
 {
     size_t message_thread_size = (size_t)((uintptr_t)message_ask - (uintptr_t)message_thread);
@@ -199,4 +219,19 @@ void init_message()
            (void *)message_thread, message_thread_size);
 
     write_serial_fmt("XJ380 Message Initialize Success.\n");
+}
+
+int message_getch_try(xtttp_dtt *terminal)
+{
+    spin_lock(&getch_lock);
+    int result = -1;
+    if (terminal->getch_count)
+    {
+        result = (unsigned char)terminal->getch_bytes[terminal->getch_head];
+        terminal->getch_head = (terminal->getch_head + 1) % 128;
+        --terminal->getch_count;
+    }
+    else terminal->wait_for_getch = true;
+    spin_unlock(&getch_lock);
+    return result;
 }

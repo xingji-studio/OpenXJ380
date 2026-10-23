@@ -274,7 +274,7 @@ typedef void (*XApiNotifyPrcor)(uint64_t notification_id, uint64_t action_id);
 #define XWIN_TYPE_MASK          0x0f
 #define XWIN_SUPPORT_RESIZEABLE 0x80
 
-// 当前最大号：7473
+// 当前最大号：7484
 
 #define XAPI_CAPTURE_SCREEN 7473
 
@@ -363,3 +363,16 @@ void init_message();
 bool init_notify_message(pcb_t process, uint64_t func);
 void message_thread(uint64_t arg);
 uint64_t message_ask(uint64_t msg_type_p, uint64_t hdatap, uint64_t ldatap, uint64_t funcp, uint64_t taskp);
+
+// Input method ABI v1. MSG_CHAR continues to carry one packed UTF-8 character.
+#define XAPI_IME_REGISTER         7474
+#define XAPI_IME_ENUM             7475
+#define XAPI_IME_GET_STATE        7476
+#define XAPI_IME_SET_ACTIVE       7477
+#define XAPI_IME_UNREGISTER       7478
+#define XAPI_IME_ATTACH           7479
+#define XAPI_IME_GET_EVENT        7480
+#define XAPI_IME_REPLY_EVENT      7481
+#define XAPI_IME_UPDATE_UI        7482
+#define XAPI_IME_SET_MODE         7483
+#define XAPI_IME_SET_CONTEXT      7484

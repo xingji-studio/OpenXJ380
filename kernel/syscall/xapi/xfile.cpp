@@ -368,23 +368,20 @@ uint64_t do_xapi_ReadFile(struct X64_REGS *regs)
     char *fpath = xfile_build_user_path(regs->rdi);
     if (fpath == NULL)
     {
-        regs->rax = (uint64_t)-EFAULT;
-        return 0;
+        return (uint64_t)-EFAULT;
     }
     vfs_node_t node = vfs_open(fpath);
     if (!node)
     {
-        regs->rax = (uint64_t)-ENOENT;
         free(fpath);
-        return 0;
+        return (uint64_t)-ENOENT;
     }
 
     if (node->type & file_dir)
     {
         vfs_close(node);
         free(fpath);
-        regs->rax = (uint64_t)-EISDIR;
-        return 0;
+        return (uint64_t)-EISDIR;
     }
 
     ssize_t ret = xfile_read_to_user(node, (void *)regs->rsi, regs->r9, regs->rdx);
@@ -398,8 +395,7 @@ uint64_t do_xapi_WriteFile(struct X64_REGS *regs)
     char *fpath = xfile_build_user_path(regs->rdi);
     if (fpath == NULL)
     {
-        regs->rax = (uint64_t)-EFAULT;
-        return 0;
+        return (uint64_t)-EFAULT;
     }
     vfs_node_t node = vfs_open(fpath);
     if (!node)
@@ -408,25 +404,22 @@ uint64_t do_xapi_WriteFile(struct X64_REGS *regs)
         int create_ret = vfs_mkfile(fpath);
         if (create_ret < 0)
         {
-            regs->rax = (uint64_t)-ENOENT;
             free(fpath);
-            return 0;
+            return (uint64_t)-ENOENT;
         }
         node = vfs_open(fpath);
         if (!node)
         {
-            regs->rax = (uint64_t)-ENOENT;
             free(fpath);
-            return 0;
+            return (uint64_t)-ENOENT;
         }
     }
 
     if (node->type & file_dir)
     {
         vfs_close(node);
-        regs->rax = (uint64_t)-EISDIR;
         free(fpath);
-        return 0;
+        return (uint64_t)-EISDIR;
     }
 
     ssize_t ret = xfile_write_from_user(node, (void *)regs->rsi, regs->r9, regs->rdx);

@@ -1,3 +1,4 @@
+#include <input_method.h>
 #include <ahci/ahci.h>
 #include <efi/boot.h>
 #include <efi/efi.h>
@@ -347,15 +348,12 @@ char do_xapi_Getch()
         }
         if (front_p->xtttp_stc->is_shell)
         {
-            // 等待命令行输入
-            front_p->xtttp_stc->wait_for_getch = true;
             while (true)
             {
-                if (!front_p->xtttp_stc->wait_for_getch) break;
+                int value = message_getch_try(front_p->xtttp_stc);
+                if (value >= 0) return (char)value;
                 scheduler_yield();
             }
-            // found it!
-            return front_p->xtttp_stc->char_for_getch;
         }
         front_p = front_p->parent_task;
     }
