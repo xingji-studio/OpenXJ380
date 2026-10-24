@@ -662,6 +662,10 @@ extern "C" uint64_t c_syscall_handler(struct X64_REGS *regs, uint64_t user_rsp)
     case XAPI_GET_PIC_SIZE: case XAPI_CALC_TEXT_WIDTH:
         regs->rax = (uint64_t)-ENOSYS;
         break;
+    case XAPI_SET_SECRET:
+        // Reserved for process-lifetime capture protection; never report false success.
+        regs->rax = (uint64_t)-ENOSYS;
+        break;
     case XAPI_GET_VERSION: do_xapi_GetSystemVersion(regs->rdi); break;
     case XAPI_GET_TIME: regs->rax = (uint64_t)do_xapi_GetTime(); break;
     case XAPI_GET_CURRENT_USER: do_xapi_GetCurrentUser(regs->rdi); break;

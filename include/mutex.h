@@ -22,6 +22,8 @@ typedef struct mutex {
 
 void mutex_create(mutex_t* mtx,bool recursive);
 int mutex_lock(mutex_t *mutex);
+// Only for rebuildable state with a process-exit hook clearing owners before TCB destruction.
+int mutex_lock_recoverable(mutex_t *mutex, bool *recovered = NULL);
 int mutex_trylock(mutex_t *mutex);
 int mutex_unlock(mutex_t *mutex);
 int mutex_destroy(mutex_t *mutex);

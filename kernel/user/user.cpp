@@ -1,3 +1,4 @@
+#include <input_method.h>
 #include "../build_settings.h"
 #include <ahci/ahci.h>
 #include <efi/boot.h>
@@ -1012,6 +1013,7 @@ int create_user_process_from_file(char *path, pcb_t pcb, char *argv[])
         return -ENOMEM;
     }
     write_serial_fmt("CWD: %s\n", cwd);
+    ime_process_loaded(group);
     size_t tid = create_user_thread(entry, thread_argv, argc, process_name, group, cwd);
     if ((int64_t)tid < 0)
     {

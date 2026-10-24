@@ -1,4 +1,6 @@
 #include "./include/stdint.h"
+#include "./include/libsys.h"
+#include "./include/xtuiapi.h"
 
 extern "C" uint64_t enter_syscall(uint64_t syscall_number, uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64_t arg4,
                                   uint64_t arg5, uint64_t arg6)
@@ -12,6 +14,11 @@ extern "C" uint64_t enter_syscall(uint64_t syscall_number, uint64_t arg1, uint64
                          : "a"(syscall_number), "D"(arg1), "S"(arg2), "d"(arg3), "r"(r10), "r"(r8), "r"(r9)
                          : "rcx", "r11", "memory");
     return ret;
+}
+
+extern "C" INT64 xapi_SetSecret(void)
+{
+    return (INT64)enter_syscall(XAPI_SET_SECRET, 0, 0, 0, 0, 0, 0);
 }
 
 extern "C" uint64_t __stack_chk_guard = 0x5858333830475541ULL;

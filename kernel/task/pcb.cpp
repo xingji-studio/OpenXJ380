@@ -1,3 +1,4 @@
+#include <input_method.h>
 #include "task/pcb.h"
 #include "cpu/fsgsbase.h"
 #include "cpu/regio.h"
@@ -383,6 +384,7 @@ void kill_proc0(pcb_t pcb)
      * and PCB. Generic OpenXJ380 builds do not include the product window
      * implementation and use the socket hook as a no-op.
      */
+    ime_process_exit(pcb);
 #if defined(XJ380)
     OpenXJ380Socket_NotifyProcessExit(pcb);
 #endif
@@ -1609,6 +1611,7 @@ uint64_t process_execve(char *path, char **argv, char **envp)
         restore_runtime_state(scheduler_depth, is_sti);
         return (uint64_t)-ENOMEM;
     }
+    ime_process_exit(process);
     // Publish the complete image together with its page directory. No VFS or
     // blocking lock acquisition is allowed inside this short commit section.
     close_interrupt;
