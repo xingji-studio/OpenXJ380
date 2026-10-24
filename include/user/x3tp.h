@@ -27,6 +27,8 @@ typedef struct
     bool  wait_for_getch;   // true  = waiting getch
     bool  wait_for_input;   // true  = waiting input (for console)
     char  char_for_getch;
+    uint32_t getch_head, getch_count;
+    char getch_bytes[128];
     uint32_t input_flags;
     char input[1024];
     char output[1024];

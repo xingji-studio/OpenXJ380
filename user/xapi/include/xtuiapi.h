@@ -145,6 +145,10 @@ UINT64  xapi_RunArgs(WSTR path, WSTR argv[]);
 UINT64  xapi_PowerAction(UINT64 action);
 void 	xapi_FlushTime(void);
 
+// Reserved syscall 7486. Returns -ENOSYS until capture protection is implemented.
+// A successful implementation will protect the entire process until it exits.
+INT64 xapi_SetSecret(void);
+
 // 3-7
 void   *xapi_AllocateMemory(UINT64 size);
 void    xapi_FreeMemory(void *ptr);

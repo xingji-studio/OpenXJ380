@@ -138,6 +138,8 @@ struct process_control_block
     size_t   notify_pcor_tid;
     uint64_t notify_pcor_func;
     bool     notify_pcor_registered;
+    uint64_t ime_launch_generation;
+    uint32_t ime_role; // 0: application, 1: selected engine, 2: trusted settings manager
 };
 #ifndef CONFIG_USER_ELF_HEADER_START
 #define CONFIG_USER_ELF_HEADER_START 0x0000300000000000UL
@@ -216,6 +218,10 @@ struct thread_control_block
     uint64_t runtime_ticks;
 
     bool owns_user_stack;
+    uint32_t ime_storage_depth; // Trusted filesystem I/O, not a user raw-device grant.
+    uint32_t ime_config_depth; // Kernel-only settings transaction scope.
+    uint64_t ime_launch_generation;
+    uint32_t ime_launch_role; // Consumed by a controlled loader invocation.
 };
 
 extern pcb_t kernel_group;

@@ -38,8 +38,17 @@ static bool make_user_path(char *out, size_t out_size, const char *username, con
 
 bool init_user_dirs(const char *username)
 {
-    if (username == NULL || username[0] == '\0') return false;
+    if (username == NULL || username[0] == '\0' || strchr(username, '/') || strchr(username, '\\') ||
+        !strcmp(username, ".") || !strcmp(username, "..")) return false;
 
+    // Profile creation is a trusted kernel operation. Ordinary VFS callers
+    // cannot replace account directories that anchor private IME data.
+    struct ProfileScope
+    {
+        tcb_t task;
+        ProfileScope() : task(get_current_task()) { if (task) ++task->ime_config_depth; }
+        ~ProfileScope() { if (task) --task->ime_config_depth; }
+    } scope;
     vfs_mkdir("/users");
 
     char user_folder_path[256];
