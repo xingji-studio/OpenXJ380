@@ -2186,6 +2186,15 @@ sys_(mmap, uint64_t addr, size_t length, uint64_t prot, uint64_t flags, int fd,
 
     if (!(flags & MAP_ANONYMOUS)) {
         uint64_t ret = (uint64_t)vfs_map(file_handle->node, start_addr, aligned_len, prot, flags, offset);
+        if (ret == 0)
+        {
+            // A denied device mapping must not look like a successful mapping at
+            // address zero, nor leave an unmapped reservation in the VMA list.
+            vma_remove(mgr, vma);
+            vma_free(vma);
+            mm_op_lock_release();
+            return SYSCALL_FAULT_((file_handle->node->type & file_fbdev) ? EACCES : ENOMEM);
+        }
         mm_op_lock_release();
         return ret;
     }

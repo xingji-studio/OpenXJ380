@@ -14,6 +14,13 @@ struct ImeDelivery
     uint64_t context, message, value;
     ImeFocus target;
 };
+struct ImeModeNotice
+{
+    uint64_t revision;
+    uint32_t mode;
+    int32_t  x, y;
+};
+bool    ime_snapshot_mode_notice(ImeModeNotice *notice);
 void    ime_initialize();
 void    ime_service();
 void    ime_set_focus(const ImeFocus *focus);

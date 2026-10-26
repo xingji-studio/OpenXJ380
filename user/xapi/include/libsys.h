@@ -381,5 +381,5 @@ uint64_t enter_syscall(uint64_t syscall_number, uint64_t arg1, uint64_t arg2, ui
 #define XAPI_IME_SET_CONTEXT      7484
 #define XAPI_IME_USER_DATA        7485
 
-// Reserved: process-lifetime screen capture protection (not implemented).
+// Process-lifetime global screen capture protection.
 #define XAPI_SET_SECRET           7486

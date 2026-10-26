@@ -27,6 +27,9 @@ typedef long long          XImeResult;
 #define XIME_MOD_ALT           4U
 #define XIME_MOD_WIN           8U
 #define XIME_MOD_CAPS          16U
+// Set by the manager only on a standalone Shift release, never on a chord.
+#define XIME_MOD_SHIFT_TAP     32U
+#define XIME_KEY_SHIFT         133U
 #define XIME_EVENT_KEY         1U
 #define XIME_EVENT_RESET       2U
 #define XIME_EVENT_CANDIDATE   3U

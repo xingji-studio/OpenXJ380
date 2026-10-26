@@ -378,5 +378,5 @@ uint64_t message_ask(uint64_t msg_type_p, uint64_t hdatap, uint64_t ldatap, uint
 #define XAPI_IME_SET_CONTEXT      7484
 #define XAPI_IME_USER_DATA        7485
 
-// Reserved: process-lifetime screen capture protection (not implemented).
+// Process-lifetime global screen capture protection.
 #define XAPI_SET_SECRET           7486
