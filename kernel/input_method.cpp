@@ -18,6 +18,9 @@ static uint64_t       context_generation = 1, next_sequence = 1, session_generat
 static uint64_t       engine_pid, engine_session, launch_generation                 = 1;
 static uint64_t       ui_revision = 1;
 static uint32_t       modifiers;
+static bool           shift_down, shift_tap;
+static bool           held_keys[256];
+static uint64_t       mode_notice_revision, mode_notice_until;
 static bool           launch_requested, reset_pending = true;
 static XImeUiV2       ui;
 static uint32_t       engine_version = XIME_ABI_VERSION, engine_page_size = XIME_MAX_CANDIDATES;
@@ -61,6 +64,9 @@ struct ImeGuard
 
 static void reset_locked()
 {
+    shift_down = shift_tap = false;
+    memset(held_keys, 0, sizeof(held_keys));
+    mode_notice_until = 0;
     ++context_generation;
     event_head = event_count = 0;
     memset(&ui, 0, sizeof(ui));
@@ -80,6 +86,9 @@ static void detach_locked()
 
 static void fail_open_locked()
 {
+    shift_down = shift_tap = false;
+    memset(held_keys, 0, sizeof(held_keys));
+    mode_notice_until = 0;
     engine_pid = engine_session = 0;
     engine_account[0] = launch_account[0] = 0;
     ++launch_generation;
@@ -257,7 +266,8 @@ void ime_set_modifiers(uint32_t value)
 {
     if (!initialized) return;
     ImeGuard guard;
-    modifiers = value;
+    modifiers = value & ~XIME_MOD_SHIFT_TAP;
+    if (modifiers & (XIME_MOD_CTRL | XIME_MOD_ALT | XIME_MOD_WIN)) shift_tap = false;
 }
 
 void ime_reset_input()
@@ -298,14 +308,42 @@ bool ime_filter_message(uint64_t type, uint64_t value, uint64_t callback, tcb_t 
     if (!engine_session || task->parent_group->pid != focus.pid || task->tid != focus.tid ||
         callback != focus.callback || !(focus.flags & XIME_CONTEXT_ENABLED) || (focus.flags & XIME_CONTEXT_PASSWORD))
         return false;
-    bool toggle = (modifiers & XIME_MOD_CTRL) && !(modifiers & (XIME_MOD_ALT | XIME_MOD_WIN)) && value == ' ';
+    bool toggle = false;
+    if (value < 256 && value != XIME_KEY_SHIFT)
+    {
+        if (type == MSG_KEYDOWN) held_keys[value] = true;
+        if (type == MSG_KEYUP) held_keys[value] = false;
+    }
+    if (value == XIME_KEY_SHIFT && type != MSG_CHAR)
+    {
+        // Modifier messages still reach the application. Only a verified solo
+        // release needs an engine round trip, including while in English.
+        if (type == MSG_KEYDOWN)
+        {
+            shift_tap = !shift_down && !(modifiers & (XIME_MOD_CTRL | XIME_MOD_ALT | XIME_MOD_WIN));
+            for (bool held : held_keys) if (held) shift_tap = false;
+            shift_down = true;
+        }
+        else if (type == MSG_KEYUP)
+        {
+            toggle = shift_down && shift_tap && !(modifiers & (XIME_MOD_CTRL | XIME_MOD_ALT | XIME_MOD_WIN));
+            shift_down = shift_tap = false;
+        }
+        if (!toggle) return false;
+    }
+    else if (type == MSG_KEYDOWN || type == MSG_KEYUP || type == MSG_CHAR || type == MSG_SPCHAR)
+        shift_tap = false;
     if (!toggle && (modifiers & (XIME_MOD_CTRL | XIME_MOD_ALT | XIME_MOD_WIN)))
     {
         if (ui.visible) reset_locked();
         return false;
     }
     if (!toggle && registry.mode == XIME_MODE_ENGLISH && !ui.visible && !event_count) return false;
-    if (queue_event(XIME_EVENT_KEY, type, value)) return true;
+    if (queue_event(XIME_EVENT_KEY, type, value))
+    {
+        if (toggle) events[(event_head + event_count - 1) % EVENT_CAPACITY].event.modifiers |= XIME_MOD_SHIFT_TAP;
+        return true;
+    }
     fail_open_locked();
     queue_event(XIME_EVENT_KEY, type, value, true);
     PendingEvent &pending = events[(event_head + event_count - 1) % EVENT_CAPACITY];
@@ -334,7 +372,12 @@ bool ime_take_delivery(ImeDelivery *delivery)
             pending.text_offset += n;
             return true;
         }
-        bool pass         = pending.action == XIME_REPLY_PASS && pending.event.kind == XIME_EVENT_KEY;
+        // A switch may commit unfinished spelling first. Preserve the original
+        // Shift KEYUP as well, to match its directly delivered KEYDOWN.
+        bool pass = pending.event.kind == XIME_EVENT_KEY &&
+                    (pending.action == XIME_REPLY_PASS ||
+                     (pending.action == XIME_REPLY_COMMIT_UTF8 &&
+                      (pending.event.modifiers & XIME_MOD_SHIFT_TAP)));
         delivery->message = pending.event.message;
         delivery->value   = pending.event.value;
         event_head        = (event_head + 1) % EVENT_CAPACITY;
@@ -353,6 +396,19 @@ bool ime_snapshot_ui_v2(XImeUiV2 *out, int *x, int *y, uint64_t *revision)
     *x = focus.x;
     *y = focus.y;
     *revision = ui_revision;
+    return true;
+}
+
+bool ime_snapshot_mode_notice(ImeModeNotice *notice)
+{
+    if (!initialized || !notice) return false;
+    ImeGuard guard;
+    if (!engine_session || !mode_notice_until || nanoTime() >= mode_notice_until ||
+        !(focus.flags & XIME_CONTEXT_ENABLED) || (focus.flags & XIME_CONTEXT_PASSWORD)) return false;
+    notice->revision = mode_notice_revision;
+    notice->mode = registry.mode;
+    notice->x = focus.x;
+    notice->y = focus.y;
     return true;
 }
 
@@ -736,6 +792,12 @@ int64_t ime_syscall(uint64_t number, uint64_t address)
         error             = ime_config_save(&registry);
         if (error) registry.mode = previous;
         if (!error && manager) reset_locked();
+        if (!error && previous != registry.mode && (focus.flags & XIME_CONTEXT_ENABLED) &&
+            !(focus.flags & XIME_CONTEXT_PASSWORD))
+        {
+            ++mode_notice_revision;
+            mode_notice_until = nanoTime() + 900000000ULL;
+        }
         return error;
     }
     default: return -ENOSYS;
