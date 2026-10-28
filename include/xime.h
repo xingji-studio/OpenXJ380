@@ -134,6 +134,10 @@ typedef struct XImeContext
 #define XIME_DATA_ASYNC       2U
 #define XIME_DATA_PENDING     4U
 #define XIME_DATA_STATUS      5U
+#define XIME_DATA_SET_OPTIONS 6U
+#define XIME_DATA_PREDICTION  8U
+#define XIME_DATA_PUNCTUATION 16U
+#define XIME_DATA_OPTIONS     (XIME_DATA_ENABLED | XIME_DATA_PREDICTION | XIME_DATA_PUNCTUATION)
 
 typedef struct XImeSessionV2
 {
@@ -178,7 +182,7 @@ typedef struct XImeUserData
     XImeU32 size, version, operation, flags;
     XImeU64 session, generation, buffer;
     XImeU32 capacity, length;
-    char id[XIME_ID_BYTES]; // Engine: empty or own ID. Manager: installed ID.
+    char id[XIME_ID_BYTES]; // Engine: own ID. Dedicated settings: its own input method only.
 } XImeUserData;
 
 #ifdef __cplusplus

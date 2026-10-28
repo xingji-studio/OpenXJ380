@@ -1,6 +1,11 @@
 #pragma once
 #include <input_method.h>
 
+static const char IME_PINYIN_ID[] = "xingji.pinyin";
+static const char IME_PINYIN_ENGINE[] = "/apps/xingji-pinyin/inmeth_pinyin.elf";
+static const char IME_PINYIN_SETTINGS[] = "/apps/xingji-pinyin/settings.elf";
+static const char IME_PINYIN_CONFIG[] = "/config/xingji-pinyin";
+
 struct ImeRegistry
 {
     uint32_t count, mode;

@@ -45,6 +45,9 @@ static bool user_data_parent(vfs_node_t node)
     for (unsigned depth = 0; node && depth < 64; ++depth, node = node->parent)
     {
         if (node->ime_protection & USER_DATA_NODE) return true;
+        if (node->name && equal_fold(node->name, "xingji-pinyin") && node->parent &&
+            node->parent->parent == rootdir && node->parent->name && equal_fold(node->parent->name, "config"))
+            return true;
         if (node->name && equal_fold(node->name, "ime") && node->parent && node->parent->parent &&
             node->parent->parent->parent == rootdir && node->parent->parent->name &&
             equal_fold(node->parent->parent->name, "users")) return true;
@@ -55,6 +58,20 @@ static bool user_data_parent(vfs_node_t node)
 static uint64_t protected_name(vfs_node_t parent, const char *name)
 {
     if (!parent || !name) return 0;
+    if (parent->parent == rootdir && parent->name && equal_fold(parent->name, "config") &&
+        equal_fold(name, "xingji-pinyin")) return USER_DATA_NODE;
+    // Both executables and their containing directory are immutable to apps;
+    // the settings role is derived from this verified install location.
+    unsigned depth = 0;
+    for (vfs_node_t node = parent; node && node != rootdir && depth++ < 64; node = node->parent)
+    {
+        if (node->ime_protection & MANAGER_NODE) return MANAGER_NODE;
+        if (node->name && equal_fold(node->name, "xingji-pinyin") && node->parent &&
+            node->parent->parent == rootdir && node->parent->name && equal_fold(node->parent->name, "apps"))
+            return MANAGER_NODE;
+    }
+    if (parent->parent == rootdir && parent->name && equal_fold(parent->name, "apps") &&
+        equal_fold(name, "xingji-pinyin")) return MANAGER_NODE;
     if (user_data_parent(parent) ||
         (equal_fold(name, "ime") && parent->parent && parent->parent->parent == rootdir &&
          parent->parent->name && equal_fold(parent->parent->name, "users"))) return USER_DATA_NODE;
@@ -103,10 +120,23 @@ bool ime_vfs_access(vfs_node_t node, const char *path, ImeFileOperation operatio
             equal_fold(normalized, BACKUP_PATH))
             protection |= CONFIG_NODE;
         if (equal_fold(normalized, "/apps/system/ctrlmenu.elf")) protection |= MANAGER_NODE;
+        const char *pinyin_roots[] = {IME_PINYIN_CONFIG, "/apps/xingji-pinyin"};
+        size_t normalized_length = strlen(normalized);
+        for (unsigned i = 0; i < 2; ++i)
+        {
+            size_t length = strlen(pinyin_roots[i]);
+            if (normalized_length < length) continue;
+            char saved = normalized[length];
+            normalized[length] = 0;
+            bool matches = equal_fold(normalized, pinyin_roots[i]);
+            normalized[length] = saved;
+            if (matches && (!saved || saved == '/')) protection |= i == 0 ? USER_DATA_NODE : MANAGER_NODE;
+        }
         // Creation of duplicate directory/symlink nodes must not shadow the
         // protected manager's ancestors in the VFS namespace.
         if (operation != IME_FILE_READ &&
-            (equal_fold(normalized, "/") || equal_fold(normalized, "/apps") || equal_fold(normalized, "/apps/system")))
+            (equal_fold(normalized, "/") || equal_fold(normalized, "/apps") || equal_fold(normalized, "/apps/system") ||
+             equal_fold(normalized, "/config")))
         {
             free(normalized);
             return false;
@@ -159,7 +189,8 @@ bool ime_vfs_access(vfs_node_t node, const char *path, ImeFileOperation operatio
                 protection |= protected_name(parent, slash + 1);
                 bool users_parent = parent->parent == rootdir && parent->name && equal_fold(parent->name, "users");
                 bool users_root = parent == rootdir && equal_fold(slash + 1, "users");
-                if (operation != IME_FILE_READ && (users_parent || users_root))
+                bool config_root = parent == rootdir && equal_fold(slash + 1, "config");
+                if (operation != IME_FILE_READ && (users_parent || users_root || config_root))
                 {
                     *slash = '/';
                     vfs_node_t target = vfs_open(normalized);
@@ -178,6 +209,7 @@ bool ime_vfs_access(vfs_node_t node, const char *path, ImeFileOperation operatio
     {
         // Prevent replacement of the protected executable's ancestor directories.
         if (node == rootdir || (node->parent == rootdir && equal_fold(node->name, "users")) ||
+            (node->parent == rootdir && equal_fold(node->name, "config")) ||
             ((node->type & file_dir) && node->parent && node->parent->parent == rootdir &&
              equal_fold(node->parent->name, "users")) ||
             (node->parent == rootdir && equal_fold(node->name, "apps")) ||
