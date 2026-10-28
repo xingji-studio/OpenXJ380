@@ -124,38 +124,12 @@ static int find_entry(const char *id)
 static void load_locked()
 {
     if (config_loaded) return;
+    // A headless kernel has no product configuration or default engine.
+    // Leave the cache retryable until a trusted platform module is installed.
+    if (!ime_platform()) { config_error = -ENODEV; return; }
     config_loaded = true;
-    config_error  = ime_config_load(&registry);
+    config_error = ime_config_load(&registry);
     if (config_error) return;
-    // Provision the bundled engine once. A deliberately empty active ID in an
-    // existing configuration remains direct input on subsequent boots.
-    if (!registry.provisioned)
-    {
-        vfs_node_t file = vfs_open(IME_PINYIN_ENGINE);
-        if (file)
-        {
-            vfs_close(file);
-            registry.provisioned = true;
-            registry.count       = 1;
-            strcpy(registry.entries[0].id, "xingji.pinyin");
-            strcpy(registry.entries[0].name, "星际拼音");
-            strcpy(registry.entries[0].executable, IME_PINYIN_ENGINE);
-            strcpy(registry.active, "xingji.pinyin");
-            config_error = ime_config_save(&registry);
-        }
-    }
-    // Upgrade only the bundled engine's known old location. Third-party
-    // registrations and a deliberately disabled active input method survive.
-    for (uint32_t i = 0; !config_error && i < registry.count; ++i)
-    {
-        XImeInfo &entry = registry.entries[i];
-        if (strcmp(entry.id, IME_PINYIN_ID) || strcmp(entry.executable, "/apps/system/inmeth_pinyin.elf")) continue;
-        vfs_node_t file = vfs_open(IME_PINYIN_ENGINE);
-        if (!file) continue;
-        vfs_close(file);
-        strcpy(entry.executable, IME_PINYIN_ENGINE);
-        config_error = ime_config_save(&registry);
-    }
     launch_requested = registry.active[0] != 0 && !config_error;
 }
 
@@ -165,17 +139,19 @@ void ime_process_loaded(pcb_t process)
     if (!process) return;
     process->ime_role              = current ? current->ime_launch_role : 0;
     process->ime_launch_generation = current ? current->ime_launch_generation : 0;
-    // The settings executable is protected by VFS, and receives only its own
-    // preference-management role. This grants no registry or model-read access.
-    if (process->exe_path && !strcmp(process->exe_path, IME_PINYIN_SETTINGS)) process->ime_role = 3;
+    // Only immutable executables in the installed policy receive an own-IME
+    // settings role. The table grants neither registry nor model access.
+    if (ime_settings_provider(process->exe_path)) process->ime_role = 3;
 }
 
 int ime_launch_manager(pcb_t parent, char **argv)
 {
     tcb_t task = get_current_task();
     if (!task) return -ESRCH;
+    const ImePlatform *platform = ime_platform();
+    if (!platform) return -ENODEV;
     task->ime_launch_role = 2;
-    int result            = create_user_process_from_file((char *)"/apps/system/ctrlmenu.elf", parent, argv);
+    int result = create_user_process_from_file((char *)platform->manager, parent, argv);
     task->ime_launch_role = 0;
     return result;
 }
@@ -527,17 +503,19 @@ int ime_user_authorize(const XImeUserData *request, ImeUserIdentity *identity)
     tcb_t task = get_current_task();
     if (!task || !task->parent_group || !current_user || !user_session_is_ready()) return -EPERM;
     pcb_t caller = task->parent_group;
-    bool settings = caller->ime_role == 3 && caller->exe_path && !strcmp(caller->exe_path, IME_PINYIN_SETTINGS);
+    const ImeProviderPolicy *owner = caller->ime_role == 3 ? ime_settings_provider(caller->exe_path) : NULL;
+    bool settings = owner != NULL;
     if (!settings && (!engine_authorized(caller) || request->session != engine_session)) return -EPERM;
     bool preference = request->operation == XIME_DATA_CLEAR || request->operation == XIME_DATA_SET_ENABLED ||
                       request->operation == XIME_DATA_SET_OPTIONS;
     if (!settings && preference) return -EPERM;
     if (settings && request->operation != XIME_DATA_INFO && !preference) return -EPERM;
-    const char *id = request->id[0] ? request->id : settings ? IME_PINYIN_ID : registry.active;
+    const char *id = request->id[0] ? request->id : settings ? owner->id : registry.active;
     int entry = find_entry(id);
     if (!ime_valid_id(id) || entry < 0) return -ENOENT;
-    if (settings ? strcmp(id, IME_PINYIN_ID) : strcmp(id, registry.active)) return -EPERM;
-    if (!strcmp(id, IME_PINYIN_ID) && strcmp(registry.entries[entry].executable, IME_PINYIN_ENGINE)) return -EPERM;
+    if (settings ? strcmp(id, owner->id) : strcmp(id, registry.active)) return -EPERM;
+    const ImeProviderPolicy *provider = ime_provider(id);
+    if (provider && strcmp(registry.entries[entry].executable, provider->executable)) return -EPERM;
     if (!memchr(current_user->name, 0, sizeof(identity->user)) || !current_user->name[0] ||
         strchr(current_user->name, '/') || strchr(current_user->name, '\\') ||
         !strcmp(current_user->name, ".") || !strcmp(current_user->name, "..")) return -EINVAL;
@@ -572,7 +550,8 @@ int64_t ime_syscall(uint64_t number, uint64_t address)
             free(path);
             return -EINVAL;
         }
-        if (!strcmp(request.id, IME_PINYIN_ID) && strcmp(path, IME_PINYIN_ENGINE))
+        const ImeProviderPolicy *provider = ime_provider(request.id);
+        if (provider && strcmp(path, provider->executable))
         {
             free(path);
             return -EPERM;
@@ -809,8 +788,8 @@ int64_t ime_syscall(uint64_t number, uint64_t address)
         XImeMode value = {};
         int      error = read_request(address, &value);
         if (error) return error;
-        bool settings = caller->ime_role == 3 && caller->exe_path && !strcmp(caller->exe_path, IME_PINYIN_SETTINGS) &&
-                        !strcmp(registry.active, IME_PINYIN_ID) && current_user && user_session_is_ready();
+        const ImeProviderPolicy *owner = caller->ime_role == 3 ? ime_settings_provider(caller->exe_path) : NULL;
+        bool settings = owner && !strcmp(registry.active, owner->id) && current_user && user_session_is_ready();
         if (!settings && (!engine_authorized(caller) || value.session != engine_session)) return -EPERM;
         if (value.reserved || value.mode > XIME_MODE_CHINESE) return -EINVAL;
         uint32_t previous = registry.mode;

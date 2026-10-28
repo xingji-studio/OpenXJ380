@@ -1,18 +1,9 @@
 #pragma once
-#include <input_method.h>
+#include <input_method_platform.h>
 
-static const char IME_PINYIN_ID[] = "xingji.pinyin";
-static const char IME_PINYIN_ENGINE[] = "/apps/xingji-pinyin/inmeth_pinyin.elf";
-static const char IME_PINYIN_SETTINGS[] = "/apps/xingji-pinyin/settings.elf";
-static const char IME_PINYIN_CONFIG[] = "/config/xingji-pinyin";
-
-struct ImeRegistry
-{
-    uint32_t count, mode;
-    bool     provisioned;
-    char     active[XIME_ID_BYTES];
-    XImeInfo entries[XIME_MAX_INSTALLED];
-};
+const ImePlatform *ime_platform();
+const ImeProviderPolicy *ime_provider(const char *id);
+const ImeProviderPolicy *ime_settings_provider(const char *executable);
 int  ime_config_load(ImeRegistry *registry);
 int  ime_config_save(const ImeRegistry *registry);
 bool ime_valid_id(const char *id);
