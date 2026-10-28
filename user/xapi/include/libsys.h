@@ -383,3 +383,23 @@ uint64_t enter_syscall(uint64_t syscall_number, uint64_t arg1, uint64_t arg2, ui
 
 // Process-lifetime global screen capture protection.
 #define XAPI_SET_SECRET           7486
+
+// Private XJ380 extension syscall numbers. Internal ABI, not a security boundary.
+// 终端文本传输协议（XTTTP）：虚拟键盘 / 输入中间层 / 输入法引擎注入文本用。
+#define SXAH_CHECK_TERMINAL_INIT_STATUS 3801    // 查询终端初始化状态
+#define SXAH_SYSCALL_RETURN         128956723895689201      // syscall返回
+#define SXAH_CREATE_KERNEL_TERMINAL 128956723895689202      // 创建内核态进程
+#define SXAH_CHECK_USER_PASSWORD    128956723895689203      // 检查用户密码
+#define SXAH_MARK_IS_TERMINAL       128956723895689204      // 标记为命令行
+#define SXAH_WRITE_INPUT_BUFFER     128956723895689205      // 写入XTTTP输入缓冲区
+#define SXAH_READ_OUTPUT_BUFFER     128956723895689206      // 读取XTTTP输出缓冲区
+#define SXAH_CHECK_INPUT_BUFFER     128956723895689207      // 检查是否需要输入
+#define SXAH_UNLOCK_OUTPUT_LOCK     128956723895689208      // 完成输出，关闭输出锁
+#define SXAH_MESSAGE_ASK            128956723895689209      // message查询
+#define SXAH_SET_MOUSE_WHEEL_REVERSE 128956723895689210     // 设置全局鼠标滚轮方向
+#define SXAH_SET_LOG_CONFIG          128956723895689211     // 设置日志与日志框配置
+#define SXAH_GET_LOG_CONFIG          128956723895689212     // 获取日志与日志框配置
+#define SXAH_SET_INPUT_SETTINGS      128956723895689213     // 设置键盘布局、重复和鼠标参数
+
+#define XTTTP_INPUT_STATUS_WAITING  0x1
+#define XTTTP_INPUT_STATUS_NO_ECHO  0x2
