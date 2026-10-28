@@ -21,7 +21,7 @@ struct StoreHeader
 {
     uint32_t magic, version, length, enabled;
     uint64_t generation, serial;
-    uint32_t checksum, reserved;
+    uint32_t checksum, options; // V1 reserved=0; V2 persists non-learning preferences here.
 };
 static_assert(sizeof(StoreHeader) == 40, "Learning store layout changed");
 static const uint32_t STORE_MAGIC = 0x32444d49; // IMD2
@@ -78,7 +78,25 @@ static bool directory(const char *path)
     return ok;
 }
 
-static unsigned char *read_slot(const char *path, StoreHeader *header)
+// Create only the validated policy's directory chain. Symlink/proxy parents
+// remain forbidden, including during a migration from account storage.
+static bool directories(const char *path)
+{
+    char current[512];
+    strcpy(current, path);
+    for (char *p = current + 1;; ++p)
+    {
+        if (*p != '/' && *p) continue;
+        char saved = *p;
+        *p = 0;
+        if (!directory(current)) return false;
+        *p = saved;
+        if (!saved) return true;
+    }
+}
+
+static unsigned char *read_slot(const char *path, StoreHeader *header,
+                                uint32_t option_mask = ~(XIME_DATA_ENABLED | XIME_DATA_ASYNC | XIME_DATA_PENDING))
 {
     vfs_node_t node = vfs_open(path);
     if (!node) return NULL;
@@ -86,9 +104,10 @@ static unsigned char *read_slot(const char *path, StoreHeader *header)
               node->size >= sizeof(*header) && node->size <= sizeof(*header) + XIME_USER_DATA_LIMIT;
     if (ok) ok = vfs_read(node, header, 0, sizeof(*header)) == sizeof(*header);
     if (ok)
-        ok = header->magic == STORE_MAGIC && header->version == 1 && header->enabled <= 1 &&
+        ok = header->magic == STORE_MAGIC && (header->version == 1 || header->version == 2) && header->enabled <= 1 &&
              header->length <= XIME_USER_DATA_LIMIT && header->generation && header->serial &&
-             !header->reserved && node->size == sizeof(*header) + header->length;
+             !(header->options & ~option_mask) &&
+             (header->version != 1 || !header->options) && node->size == sizeof(*header) + header->length;
     unsigned char *data = ok ? (unsigned char *)malloc(header->length ? header->length : 1) : NULL;
     if (data && header->length)
         ok = vfs_read(node, data, sizeof(*header), header->length) == header->length;
@@ -136,31 +155,84 @@ static int store_transaction(XImeUserData &request, const ImeUserIdentity &ident
     StoreGuard guard;
     StoreScope scope;
     error = authorize ? authorize_again(&request, identity) : 0;
-    char path[512], paths[2][512], account[129], engine[97];
+    char path[512], paths[2][768], account[129], engine[97], account_directory[XIME_PATH_BYTES + 64];
     encode_component(account, identity.user);
     encode_component(engine, identity.id);
+    const ImePlatform *platform = ime_platform();
+    if (!platform) return -ENODEV;
+    const char *pattern = platform->account_store, *slot = strchr(pattern, '*');
+    size_t prefix = slot - pattern;
+    memcpy(account_directory, pattern, prefix);
+    strcpy(account_directory + prefix, identity.user);
+    strcpy(account_directory + prefix + strlen(identity.user), slot + 1);
+    char legacy_directory[512];
+    snprintf(legacy_directory, sizeof(legacy_directory), "%s/e%s", account_directory, engine);
+    const ImeProviderPolicy *provider = ime_provider(identity.id);
+    uint32_t option_mask = provider ? provider->option_mask :
+                           ~(XIME_DATA_ENABLED | XIME_DATA_ASYNC | XIME_DATA_PENDING);
+    uint32_t defaults = provider ? provider->default_flags : XIME_DATA_ENABLED;
+    bool relocated = provider && provider->data_root;
     bool dirs = false;
     if (!error)
     {
-        dirs = directory("/users");
-        snprintf(path, sizeof(path), "/users/%s", identity.user);
-        dirs = dirs && directory(path);
-        snprintf(path, sizeof(path), "/users/%s/ime", identity.user);
-        dirs = dirs && directory(path);
-        snprintf(path, sizeof(path), "/users/%s/ime/e%s", identity.user, engine);
-        dirs = dirs && directory(path);
+        if (relocated)
+        {
+            dirs = directories(provider->data_root);
+            strcpy(path, provider->data_root);
+        }
+        else
+        {
+            strcpy(path, legacy_directory);
+            dirs = directories(path);
+        }
         for (unsigned i = 0; i < 2; ++i)
-            snprintf(paths[i], sizeof(paths[i]), "/users/%s/ime/e%s/u%s.%u", identity.user, engine, account, i);
+            snprintf(paths[i], sizeof(paths[i]), "%s/u%s.%u", path, account, i);
         if (!dirs) error = -EIO;
     }
     StoreHeader headers[2] = {};
     unsigned char *slots[2] = {};
     if (!error)
-        for (unsigned i = 0; i < 2; ++i) slots[i] = read_slot(paths[i], &headers[i]);
+        for (unsigned i = 0; i < 2; ++i) slots[i] = read_slot(paths[i], &headers[i], option_mask);
     int selected = slots[0] ? 0 : -1;
     if (slots[1] && (selected < 0 || headers[1].serial > headers[0].serial)) selected = 1;
-    StoreHeader current = {STORE_MAGIC, 1, 0, 1, 1, 0, 0, 0};
+    // Copy the newest verified legacy snapshot to both new slots before
+    // removing either old file. A failed migration leaves the old data intact.
+    if (!error && relocated && selected < 0)
+    {
+        StoreHeader legacy_headers[2] = {};
+        unsigned char *legacy[2] = {};
+        char old_paths[2][768];
+        for (unsigned i = 0; i < 2; ++i)
+        {
+            snprintf(old_paths[i], sizeof(old_paths[i]), "%s/u%s.%u", legacy_directory, account, i);
+            legacy[i] = read_slot(old_paths[i], &legacy_headers[i], option_mask);
+        }
+        int old = legacy[0] ? 0 : -1;
+        if (legacy[1] && (old < 0 || legacy_headers[1].serial > legacy_headers[0].serial)) old = 1;
+        if (old >= 0)
+        {
+            StoreHeader migrated = legacy_headers[old];
+            if (migrated.version == 1) migrated.options = defaults & option_mask;
+            migrated.version = 2;
+            if (!write_slot(paths[0], &migrated, legacy[old]) || !write_slot(paths[1], &migrated, legacy[old])) error = -EIO;
+            else
+            {
+                for (unsigned i = 0; i < 2; ++i)
+                {
+                    vfs_node_t node = vfs_open(old_paths[i]);
+                    if (node) vfs_delete(node); // Releases the opened node reference.
+                    slots[i] = read_slot(paths[i], &headers[i], option_mask);
+                }
+                selected = slots[0] ? 0 : slots[1] ? 1 : -1;
+                if (selected < 0) error = -EIO;
+            }
+        }
+        free(legacy[0]); free(legacy[1]);
+    }
+    StoreHeader current = {STORE_MAGIC, 2, 0, (defaults & XIME_DATA_ENABLED) != 0, 1, 0, 0, defaults & option_mask};
     if (selected >= 0) current = headers[selected];
+    if (current.version == 1) current.options = defaults & option_mask;
+    current.version = 2;
     unsigned char *data = selected >= 0 ? slots[selected] : NULL;
     if (!error && authorize) error = authorize_again(&request, identity);
     if (!error && request.operation == XIME_DATA_SAVE)
@@ -169,14 +241,21 @@ static int store_transaction(XImeUserData &request, const ImeUserIdentity &ident
         else if (!current.enabled) error = -EPERM;
         else { current.length = request.length; data = incoming; }
     }
-    if (!error && (request.operation == XIME_DATA_CLEAR || request.operation == XIME_DATA_SET_ENABLED))
+    bool preference = request.operation == XIME_DATA_SET_ENABLED || request.operation == XIME_DATA_SET_OPTIONS;
+    if (!error && (request.operation == XIME_DATA_CLEAR || preference))
     {
-        if (current.generation == ~0ULL) error = -EOVERFLOW;
+        if (request.operation == XIME_DATA_SET_OPTIONS && request.generation != current.generation) error = -ESTALE;
+        else if (current.generation == ~0ULL) error = -EOVERFLOW;
         else ++current.generation;
         if (request.operation == XIME_DATA_CLEAR) { current.length = 0; data = NULL; }
-        else current.enabled = (request.flags & XIME_DATA_ENABLED) != 0;
+        else
+        {
+            current.enabled = (request.flags & XIME_DATA_ENABLED) != 0;
+            if (request.operation == XIME_DATA_SET_OPTIONS)
+                current.options = request.flags & option_mask;
+        }
     }
-    if (!error && request.operation >= XIME_DATA_SAVE && request.operation <= XIME_DATA_SET_ENABLED)
+    if (!error && (request.operation == XIME_DATA_SAVE || request.operation == XIME_DATA_CLEAR || preference))
     {
         if (current.serial == ~0ULL) error = -EOVERFLOW;
         else
@@ -195,12 +274,12 @@ static int store_transaction(XImeUserData &request, const ImeUserIdentity &ident
         else if (current.length && !copy_to_user_pagedir(xapi_current_pagedir(), (void *)request.buffer,
                                                         data, current.length)) error = -EFAULT;
     }
-    request.flags = current.enabled ? XIME_DATA_ENABLED : 0;
+    request.flags = (current.enabled ? XIME_DATA_ENABLED : 0) | current.options;
     request.length = current.length;
     request.generation = current.generation;
     free(slots[0]);
     free(slots[1]);
-    if (!error && (request.operation == XIME_DATA_CLEAR || request.operation == XIME_DATA_SET_ENABLED))
+    if (!error && (request.operation == XIME_DATA_CLEAR || preference))
         ime_reset_input();
     return error;
 }
@@ -304,12 +383,16 @@ int64_t ime_user_store_syscall(uint64_t address)
     if (!address || !copy_from_user_pagedir(xapi_current_pagedir(), &request, (void *)address, sizeof(request)))
         return -EFAULT;
     if (request.size != sizeof(request) || request.version != XIME_ABI_V2 ||
-        request.operation > XIME_DATA_STATUS || (request.flags & ~(XIME_DATA_ENABLED | XIME_DATA_ASYNC)) ||
+        request.operation > XIME_DATA_SET_OPTIONS || (request.flags & XIME_DATA_PENDING) ||
         request.capacity > XIME_USER_DATA_LIMIT || request.length > XIME_USER_DATA_LIMIT ||
         !memchr(request.id, 0, sizeof(request.id))) return -EINVAL;
     ImeUserIdentity identity = {};
     int error = ime_user_authorize(&request, &identity);
     if (error) return error;
+    const ImeProviderPolicy *provider = ime_provider(identity.id);
+    uint32_t option_mask = provider ? provider->option_mask :
+                           ~(XIME_DATA_ENABLED | XIME_DATA_ASYNC | XIME_DATA_PENDING);
+    if (request.flags & ~(option_mask | XIME_DATA_ENABLED | XIME_DATA_ASYNC)) return -EINVAL;
     if (!strcmp(identity.id, ".") || !strcmp(identity.id, "..")) return -EINVAL;
     if ((request.operation == XIME_DATA_SAVE && request.length > request.capacity) ||
         ((request.operation == XIME_DATA_SAVE || request.operation == XIME_DATA_LOAD) &&
