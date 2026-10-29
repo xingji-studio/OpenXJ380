@@ -782,7 +782,8 @@ int vsound_open(vsound_t snd) { // 打开设备
     if ((snd->supported_rates & MASK32(id)) == 0) return -1;
     if ((snd->supported_chs & MASK32(snd->channels - 1)) == 0) return -1;
     snd->bytes_per_sample = sound_fmt_bytes((sound_pcmfmt_t)snd->fmt) * snd->channels;
-    snd->open(snd);
+    int result = snd->open(snd);
+    if (result != 0) return result;
     snd->is_using = true;
     return 0;
 }

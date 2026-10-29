@@ -7,6 +7,8 @@
 #include <pci/pci.h>
 #include <cpu/longm.h>
 #include <pctable/idt.h>
+#include <cpu/lock.h>
+#include <errno.h>
 
 #define mem_geti(addr)   ({ *(volatile ssize_t *)(addr); })
 #define mem_geti8(addr)  ({ *(volatile int8_t *)(addr); })
@@ -56,6 +58,14 @@ static uint64_t  hda_buffer_phys = 0;
 static bool      hda_stopping   = false;
 static pcb_t    use_task;
 
+// XAudio owns the controller as one shared output. IRQs only account periods;
+// no lock_queue operations (which allocate nodes) occur on this path.
+static spin_t audio_dma_lock = SPIN_INIT;
+static bool audio_owned, audio_failed, audio_ready[HDA_AUDIO_PERIODS];
+static uint64_t audio_sequence, audio_irq_time;
+static void *audio_buffer;
+static void hda_audio_interrupt();
+
 static constexpr uint32_t HDA_WAIT_STEP_US           = 50;
 static constexpr uint32_t HDA_MMIO_VERB_TIMEOUT_US   = 20000;
 static constexpr uint32_t HDA_DMA_VERB_TIMEOUT_US    = 20000;
@@ -92,6 +102,7 @@ static void *hda_alloc_dma32(size_t size, uint64_t *phys_out) {
 
 static int hda_open(vsound_t vsound) {
     write_serial_fmt("hda open has been called");
+    if (__atomic_load_n(&audio_owned, __ATOMIC_ACQUIRE)) return -EBUSY;
     use_task = get_current_task()->parent_group;
     return 0;
 }
@@ -127,6 +138,11 @@ static void hda_handle_buffer_completion() {
     uint8_t status = mem_get8(hda_output_base + 0x3);
     if ((status & (1 << 2)) == 0) return;
 
+    if (__atomic_load_n(&audio_owned, __ATOMIC_ACQUIRE))
+    {
+        hda_audio_interrupt();
+        return;
+    }
     mem_set8(hda_output_base + 0x3, 1 << 2);
     if (hda_stopping) {
         hda_stop();
@@ -308,8 +324,8 @@ void explicit_bzero(void *_s, size_t _n) {
     }
 }
 
-void hda_play_pcm(void *buffer, uint32_t size, uint32_t sample_rate, uint32_t channels,
-                  uint32_t bits_per_sample) {
+static void hda_program_pcm(void *buffer, uint32_t size, uint32_t sample_rate, uint32_t channels,
+                            uint32_t bits_per_sample, unsigned periods) {
     // BDL 中写入的必须是物理地址，直接写虚拟地址会导致控制器 DMA 到错误位置。
     const uint64_t buffer_phys = (uint64_t)virt_to_phys((uint64_t)buffer);
     uint16_t data_format = hda_return_sound_data_format(sample_rate, channels, bits_per_sample);
@@ -340,24 +356,23 @@ void hda_play_pcm(void *buffer, uint32_t size, uint32_t sample_rate, uint32_t ch
     delay_ms_hp(250);
 
     mem_set8(hda_output_base + 0x3, 0b11100);
-    explicit_bzero(hda_output_buffer, 16 * 2);
-    hda_output_buffer[0] = (uint32_t)(buffer_phys & 0xffffffffu);
-    hda_output_buffer[1] = (uint32_t)(buffer_phys >> 32);
-    hda_output_buffer[2] = size;
-    hda_output_buffer[3] = 1;
-
-    hda_output_buffer[4] = (uint32_t)((buffer_phys + size) & 0xffffffffu);
-    hda_output_buffer[5] = (uint32_t)((buffer_phys + size) >> 32);
-    hda_output_buffer[6] = size;
-    hda_output_buffer[7] = 1;
+    explicit_bzero(hda_output_buffer, 16 * periods);
+    for (unsigned i = 0; i < periods; ++i)
+    {
+        uint64_t physical = buffer_phys + (uint64_t)i * size;
+        hda_output_buffer[i * 4] = (uint32_t)physical;
+        hda_output_buffer[i * 4 + 1] = (uint32_t)(physical >> 32);
+        hda_output_buffer[i * 4 + 2] = size;
+        hda_output_buffer[i * 4 + 3] = 1;
+    }
 
     __asm__ volatile("wbinvd");
 
     mem_set32(hda_output_base + 0x18, (uint32_t)(hda_output_buffer_phys & 0xffffffffu));
     mem_set32(hda_output_base + 0x1c, (uint32_t)(hda_output_buffer_phys >> 32));
 
-    mem_set32(hda_output_base + 0x8, size * 2);
-    mem_set16(hda_output_base + 0xc, 1);
+    mem_set32(hda_output_base + 0x8, size * periods);
+    mem_set16(hda_output_base + 0xc, periods - 1);
     mem_set16(hda_output_base + 0x12, data_format);
     // printf("data_format = %x %d\n", data_format, hda_pin_output_node);
     hda_verb(hda_codec_number, hda_pin_output_node, 0x2, data_format);
@@ -366,6 +381,11 @@ void hda_play_pcm(void *buffer, uint32_t size, uint32_t sample_rate, uint32_t ch
     mem_set8(hda_output_base + 0x2, 0x1c);
 
     mem_set8(hda_output_base + 0x0, 0b110);
+}
+
+void hda_play_pcm(void *buffer, uint32_t size, uint32_t sample_rate, uint32_t channels, uint32_t bits_per_sample)
+{
+    hda_program_pcm(buffer, size, sample_rate, channels, bits_per_sample, 2);
 }
 
 void hda_init_output_pin(uint32_t codec, uint32_t node) {
@@ -748,4 +768,114 @@ void hda_regist() {
     vsound_addbuf(snd, hda_buffer_ptr);
     // 第二块缓冲区紧跟第一块之后，按字节偏移一个完整的 HDA_BUF_SIZE。
     vsound_addbuf(snd, (uint8_t *)hda_buffer_ptr + HDA_BUF_SIZE);
+}
+
+
+bool hda_audio_available()
+{
+    return snd && snd->is_registed && hda_output_base && hda_buffer_ptr &&
+           (hda_pin_stream_format_cap & 1) && hda_is_supported_sample_rate(48000) &&
+           (hda_pin_pcm_format_cap & (1U << 17));
+}
+
+static void hda_audio_interrupt()
+{
+    spin_lock(&audio_dma_lock);
+    if (!(mem_get8(hda_output_base + 3) & 4))
+    {
+        spin_unlock(&audio_dma_lock);
+        return;
+    }
+    mem_set8(hda_output_base + 3, 4);
+    const uint64_t now = nanoTime();
+    const unsigned active = (mem_get32(hda_output_base + 4) / HDA_BUF_SIZE) % HDA_AUDIO_PERIODS;
+    const unsigned advanced = (active + HDA_AUDIO_PERIODS - audio_sequence % HDA_AUDIO_PERIODS) % HDA_AUDIO_PERIODS;
+    // LPIB accounts coalesced IRQs. A whole-ring lapse is ambiguous and must
+    // fail closed: replayed samples cannot be reported as newly presented data.
+    if (!advanced || !audio_ready[active] ||
+        (audio_irq_time && now - audio_irq_time > 160000000ULL))
+    {
+        audio_failed = true;
+        hda_stop();
+    }
+    else
+    {
+        for (unsigned i = 0; i < advanced; ++i)
+        {
+            unsigned finished = audio_sequence % HDA_AUDIO_PERIODS;
+            if (!audio_ready[finished])
+            {
+                audio_failed = true;
+                hda_stop();
+                break;
+            }
+            audio_ready[finished] = false;
+            ++audio_sequence;
+        }
+        audio_irq_time = now;
+    }
+    spin_unlock(&audio_dma_lock);
+}
+
+int hda_audio_start()
+{
+    if (!hda_audio_available()) return -ENODEV;
+    spin_lock(&audio_dma_lock);
+    if (snd->is_using || audio_owned)
+    {
+        spin_unlock(&audio_dma_lock);
+        return -EBUSY;
+    }
+    snd->is_using = true;
+    audio_failed = false;
+    for (bool &ready : audio_ready) ready = true;
+    audio_sequence = audio_irq_time = 0;
+    __atomic_store_n(&audio_owned, true, __ATOMIC_RELEASE);
+    spin_unlock(&audio_dma_lock);
+    uint64_t physical;
+    audio_buffer = hda_alloc_dma32(HDA_BUF_SIZE * HDA_AUDIO_PERIODS, &physical);
+    if (!audio_buffer) return -ENOMEM;
+    hda_program_pcm(audio_buffer, HDA_BUF_SIZE, 48000, 2, 16, HDA_AUDIO_PERIODS);
+    spin_lock(&audio_dma_lock);
+    if (!(mem_get8(hda_output_base) & 2)) audio_failed = true;
+    bool failed = audio_failed;
+    spin_unlock(&audio_dma_lock);
+    return failed ? -EIO : 0;
+}
+
+int hda_audio_progress(uint64_t *completed)
+{
+    hda_poll();
+    spin_lock(&audio_dma_lock);
+    *completed = audio_sequence;
+    bool failed = audio_failed;
+    spin_unlock(&audio_dma_lock);
+    return failed ? -EIO : 0;
+}
+
+int hda_audio_refill(uint64_t sequence, const int16_t *pcm)
+{
+    spin_lock(&audio_dma_lock);
+    bool valid = sequence && sequence <= audio_sequence &&
+                 audio_sequence - sequence < HDA_AUDIO_PERIODS - 1 && !audio_failed;
+    spin_unlock(&audio_dma_lock);
+    if (!valid) return -EIO;
+    unsigned slot = (sequence - 1) % HDA_AUDIO_PERIODS;
+    // Copy with scheduling enabled. If preempted beyond the next boundary,
+    // the IRQ stops DMA because this slot has not yet been published ready.
+    memcpy((uint8_t *)audio_buffer + slot * HDA_BUF_SIZE, pcm, HDA_BUF_SIZE);
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    spin_lock(&audio_dma_lock);
+    valid = sequence <= audio_sequence && audio_sequence - sequence < HDA_AUDIO_PERIODS - 1 && !audio_failed;
+    if (valid) audio_ready[slot] = true;
+    spin_unlock(&audio_dma_lock);
+    return valid ? 0 : -EIO;
+}
+
+void hda_audio_abort()
+{
+    spin_lock(&audio_dma_lock);
+    audio_failed = true;
+    if (hda_output_base) hda_stop();
+    spin_unlock(&audio_dma_lock);
 }

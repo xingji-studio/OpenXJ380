@@ -24,6 +24,9 @@
 #include <syscall/syscall.h>
 #include <task/ipc.h>
 
+// Product audio resources are revoked at successful image publication.
+extern "C" void OpenXJ380Audio_ReleaseProcess(void *) __attribute__((weak));
+
 #define SA_RPL3 3
 
 #define SA_RPL_MASK      0xFFFC
@@ -1668,6 +1671,7 @@ uint64_t process_execve(char *path, char **argv, char **envp)
     process->aux_execfn = image.aux_execfn;
     process->elf_file = image.elf_file;
     process->elf_size = image.elf_size;
+    if (OpenXJ380Audio_ReleaseProcess) OpenXJ380Audio_ReleaseProcess(process);
     process->pagedir = new_page_dir;
     switch_page_directory(new_page_dir);
     if (current_task->tid_directory == old_page_dir) current_task->tid_directory = new_page_dir;
