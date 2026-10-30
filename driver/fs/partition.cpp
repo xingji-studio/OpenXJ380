@@ -577,9 +577,10 @@ static bool root_probe_has_file_from(vfs_node_t root, const char *path)
 
 static bool root_probe_has_system_markers(vfs_node_t root)
 {
-    bool has_boot = root_probe_has_file_from(root, "EFI/BOOT/BOOTX64.EFI");
+    // The marker identifies the system partition; its contents are not significant.
+    bool has_marker = root_probe_has_file_from(root, "system/activept.cfk");
     bool has_kernel = root_probe_has_file_from(root, "system/kernel.krl");
-    return has_boot && has_kernel;
+    return has_marker && has_kernel;
 }
 
 static bool root_probe_partition(const char *dev_path)
@@ -622,6 +623,9 @@ static bool mount_partition_index(uint64_t index, const char *reason)
     sprintf(buf, "/dev/%sp%zu", src_dev->drive_name, index);
     write_serial_string(buf);
     write_serial_string("\n");
+
+    // Partition labels must not bypass the required system files.
+    if (!root_probe_partition(buf)) return false;
 
     if (vfs_mount((const char *)buf, rootdir) == VFS_STATUS_SUCCESS)
     {
