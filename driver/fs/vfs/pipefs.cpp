@@ -9,6 +9,50 @@ vfs_node_t pipefs_root = NULL;
 int        pipefs_id   = 0;
 int        pipefd_id   = 0;
 
+int pipefs_create_pair(vfs_node_t *reader, vfs_node_t *writer)
+{
+    if (!reader || !writer) return -EINVAL;
+    *reader = *writer = NULL;
+    if (!pipefs_root) return -ENOSYS;
+    static uint64_t next_inode = 1;
+    vfs_node_t input = vfs_node_alloc(NULL, "pipe-read");
+    vfs_node_t output = vfs_node_alloc(NULL, "pipe-write");
+    pipe_info_t *info = (pipe_info_t *)calloc(1, sizeof(pipe_info_t));
+    pipe_specific_t *read_spec = (pipe_specific_t *)calloc(1, sizeof(pipe_specific_t));
+    pipe_specific_t *write_spec = (pipe_specific_t *)calloc(1, sizeof(pipe_specific_t));
+    char *buffer = (char *)calloc(1, PIPE_BUFF);
+    if (!input || !output || !info || !read_spec || !write_spec || !buffer)
+    {
+        // These nodes have not acquired filesystem handles yet.
+        if (input) { free(input->name); free(input); }
+        if (output) { free(output->name); free(output); }
+        free(info);
+        free(read_spec);
+        free(write_spec);
+        free(buffer);
+        return -ENOMEM;
+    }
+    info->buf = buffer;
+    info->lock = SPIN_INIT;
+    info->read_fds = info->write_fds = 1;
+    info->read_spec = read_spec;
+    info->write_spec = write_spec;
+    read_spec->info = write_spec->info = info;
+    read_spec->node = input;
+    write_spec->node = output;
+    write_spec->write = true;
+    input->type = output->type = file_pipe;
+    input->fsid = output->fsid = pipefs_id;
+    input->root = output->root = pipefs_root;
+    input->dev = output->dev = PIEFS_REGISTER_ID;
+    input->inode = output->inode = __atomic_fetch_add(&next_inode, 1ULL, __ATOMIC_RELAXED);
+    input->handle = read_spec;
+    output->handle = write_spec;
+    *reader = input;
+    *writer = output;
+    return 0;
+}
+
 static bool pipe_waiter_contains(task_block_list_t *head, tcb_t task) {
     task_block_list_t *node = head->next;
     while (node != NULL) {

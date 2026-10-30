@@ -694,6 +694,7 @@ extern "C" uint64_t c_syscall_handler(struct X64_REGS *regs, uint64_t user_rsp)
     case XAPI_SEND_APP_MSG: regs->rax = do_xapi_SendAppMessage((char *)regs->rdi, (char *)regs->rsi); break;
     case XAPI_RUN: do_xapi_Run((char *)regs->rdi); break;
     case XAPI_RUN_ARGS: regs->rax = do_xapi_RunArgs((char *)regs->rdi, (char **)regs->rsi); break;
+    case XAPI_SPAWN_INHERITED: regs->rax = do_xapi_SpawnInherited((char *)regs->rdi, (char **)regs->rsi); break;
     case XAPI_MAP_MEMORY: regs->rax = do_xapi_MapMemory(regs->rdi, regs->rsi, regs->rdx); break;
     case XAPI_REMOVEDIR: sys_rmdir(regs->rdi, 0, 0, 0, 0, 0, regs); break;
     case XAPI_FLUSH_TIME: regs->rax = (uint64_t)-ENOSYS; break;

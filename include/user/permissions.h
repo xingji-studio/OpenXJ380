@@ -14,7 +14,10 @@ struct PermissionPrompt
 };
 
 void permissions_session_publish(const UserInfo *info);
-void permissions_process_init(pcb_t process, pcb_t parent);
+enum ProcessCredentialSource { XPCS_SESSION, XPCS_VISITOR, XPCS_INHERIT };
+void permissions_process_init(pcb_t process, pcb_t parent, ProcessCredentialSource source = XPCS_INHERIT);
+bool permissions_launch_matches(pcb_t process, pcb_t parent, ProcessCredentialSource source);
+bool permissions_dialog_metadata(vfs_node_t node, int operation);
 void permissions_process_exec(pcb_t process, const char *directory = NULL);
 int permissions_executable_directory(vfs_node_t executable, char *out, size_t capacity);
 void permissions_thread_exit(tcb_t task);
@@ -52,4 +55,40 @@ public:
     ~PermissionProfileScope();
     PermissionProfileScope(const PermissionProfileScope &) = delete;
     PermissionProfileScope &operator=(const PermissionProfileScope &) = delete;
+};
+
+// Only the fixed file picker executable may be loaded through this service.
+// Its interpreter/dependencies still use the caller's ordinary access policy.
+class PermissionDialogLaunchScope
+{
+    tcb_t task;
+public:
+    PermissionDialogLaunchScope();
+    ~PermissionDialogLaunchScope();
+    PermissionDialogLaunchScope(const PermissionDialogLaunchScope &) = delete;
+    PermissionDialogLaunchScope &operator=(const PermissionDialogLaunchScope &) = delete;
+};
+
+class PermissionDialogReaderScope
+{
+    tcb_t task;
+public:
+    explicit PermissionDialogReaderScope(vfs_node_t reader);
+    ~PermissionDialogReaderScope();
+    PermissionDialogReaderScope(const PermissionDialogReaderScope &) = delete;
+    PermissionDialogReaderScope &operator=(const PermissionDialogReaderScope &) = delete;
+};
+
+// Console startup execs the fixed shell without adding NV to the application.
+// finish() must run before exec's non-returning user-mode handoff.
+class PermissionTerminalLaunchScope
+{
+    tcb_t task;
+    bool previous, active;
+public:
+    explicit PermissionTerminalLaunchScope(bool enabled);
+    ~PermissionTerminalLaunchScope();
+    void finish();
+    PermissionTerminalLaunchScope(const PermissionTerminalLaunchScope &) = delete;
+    PermissionTerminalLaunchScope &operator=(const PermissionTerminalLaunchScope &) = delete;
 };

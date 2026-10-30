@@ -16,6 +16,11 @@ extern "C" uint64_t enter_syscall(uint64_t syscall_number, uint64_t arg1, uint64
     return ret;
 }
 
+extern "C" UINT64 xapi_SpawnInherited(WSTR path, WSTR argv[])
+{
+    return enter_syscall(XAPI_SPAWN_INHERITED, (uint64_t)path, (uint64_t)argv, 0, 0, 0, 0);
+}
+
 extern "C" INT64 xapi_SetSecret(void)
 {
     return (INT64)enter_syscall(XAPI_SET_SECRET, 0, 0, 0, 0, 0, 0);

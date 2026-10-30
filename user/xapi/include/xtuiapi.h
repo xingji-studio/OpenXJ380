@@ -141,7 +141,11 @@ UINT64  xapi_SetNotifyPrcor(XApiNotifyPrcor func);
 UINT64  xapi_SendNotification(const XApiNotificationRequest *req);
 void 	xapi_Sleep(UINT64 ms);
 void 	xapi_Run(WSTR path);
+// Ordinary Run/RunArgs start a new Visitor, independent of the caller.
 UINT64  xapi_RunArgs(WSTR path, WSTR argv[]);
+// Parent-associated fork/exec-style spawn: snapshots the caller's user and permissions.
+// Returns a child PID or a negative errno; never grants permissions beyond the parent.
+UINT64  xapi_SpawnInherited(WSTR path, WSTR argv[]);
 UINT64  xapi_PowerAction(UINT64 action);
 void 	xapi_FlushTime(void);
 

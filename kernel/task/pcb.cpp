@@ -1,5 +1,6 @@
 #include <screen_capture.h>
 #include <user/permissions.h>
+#include <user/process_launch.h>
 #include <input_method.h>
 #include "task/pcb.h"
 #include "cpu/fsgsbase.h"
@@ -810,9 +811,9 @@ static void switch_task_to_user_mode(tcb_t task)
             fd_file_handle *stderr = (fd_file_handle *)calloc(1, sizeof(fd_file_handle));
             stderr->node           = stdio;
             stderr->offset         = 0;
-            stdin->fd              = queue_enqueue(task->parent_group->file_open, stdin);
-            stdout->fd             = queue_enqueue(task->parent_group->file_open, stdout);
-            stderr->fd             = queue_enqueue(task->parent_group->file_open, stderr);
+            stdin->fd              = queue_enqueue_lowest(task->parent_group->file_open, stdin);
+            stdout->fd             = queue_enqueue_lowest(task->parent_group->file_open, stdout);
+            stderr->fd             = queue_enqueue_lowest(task->parent_group->file_open, stderr);
         }
         else
         {
@@ -1403,6 +1404,8 @@ uint64_t process_execve(char *path, char **argv, char **envp)
         restore_runtime_state(scheduler_depth, is_sti);
         return (uint64_t)-ENOENT;
     }
+    PermissionTerminalLaunchScope console_host(kargc == 1 && kargv &&
+                                               !strcmp(kargv[0], "-xj380sys-terminal-app-mode"));
     int shebang_ret = rewrite_shebang_exec(&node, &norm_path, &kargv, &kargc);
     if (shebang_ret < 0)
     {
@@ -1595,6 +1598,7 @@ uint64_t process_execve(char *path, char **argv, char **envp)
 
     write_serial_fmt("execve process name :%s \n", image.name);
     uint64_t e_entry = (uint64_t)parse_elf_file(norm_path, &image);
+    console_host.finish();
     if (e_entry == NULL || (int64_t)e_entry < 0)
     {
         int exec_ret = e_entry == NULL ? -ENOENT : (int)(int64_t)e_entry;
@@ -2655,6 +2659,12 @@ size_t create_message_thread(void *_start, char *name, pcb_t pcb, char *cwd, uin
 
 pcb_t create_process_group(const char *name, pcb_t parent, page_directory_t *directory, char *cmdline)
 {
+    return create_process_group_with_credentials(name, parent, directory, cmdline, XPCS_SESSION);
+}
+
+pcb_t create_process_group_with_credentials(const char *name, pcb_t parent, page_directory_t *directory,
+                                           char *cmdline, ProcessCredentialSource source)
+{
     pcb_t pcb        = (pcb_t)calloc(1, sizeof(struct process_control_block));
     if (pcb == NULL) return NULL;
 
@@ -2665,7 +2675,7 @@ pcb_t create_process_group(const char *name, pcb_t parent, page_directory_t *dir
         return NULL;
     }
 
-    permissions_process_init(pcb, parent);
+    permissions_process_init(pcb, parent, source);
     pcb->pid         = alloc_pid();
     pcb->parent_task = parent_group;
     pcb->status      = START;
@@ -2683,7 +2693,7 @@ pcb_t create_process_group(const char *name, pcb_t parent, page_directory_t *dir
     }
     strncpy(pcb->name, name != NULL ? name : "", sizeof(pcb->name) - 1);
     pcb->thread_queue = queue_init();
-    pcb->ppid         = 0;
+    pcb->ppid         = parent_group->pid;
     pcb->pagedir      = directory ? directory : get_kernel_pagedir();
     pcb->child_pcb    = queue_init();
     pcb->vfork        = false;
@@ -2707,9 +2717,9 @@ pcb_t create_process_group(const char *name, pcb_t parent, page_directory_t *dir
         return NULL;
     }
 
-    if (parent == NULL)
+    if (source != XPCS_INHERIT || parent == NULL)
     {
-        UserInfo *user = current_user != NULL ? current_user : &root_user;
+        UserInfo *user = &pcb->permission_user;
         pcb->envc = user->envc;
         pcb->envp = copy_envp(user->envp);
     }

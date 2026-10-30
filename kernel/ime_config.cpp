@@ -206,6 +206,7 @@ bool ime_vfs_access(vfs_node_t node, const char *path, ImeFileOperation operatio
     if (!task || task->task_level != TASK_APPLICATION_LEVEL) return true;
     if (task->ime_config_depth && !task->permission_profile_owner) return true;
     if (!permissions_file_access(node, path, operation)) return false;
+    if (permissions_dialog_metadata(node, operation)) return true;
     if (task->permission_profile_owner) return true;
     if (operation == IME_FILE_MOUNT || (node && (node->type & file_block) && !task->ime_storage_depth)) return false;
     bool mutation = operation == IME_FILE_WRITE || operation == IME_FILE_REMOVE ||

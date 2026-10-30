@@ -1,5 +1,6 @@
 #include <input_method.h>
 #include <user/permissions.h>
+#include <user/process_launch.h>
 #include "../build_settings.h"
 #include <ahci/ahci.h>
 #include <efi/boot.h>
@@ -908,6 +909,18 @@ static void free_process_argv(char **argv)
 
 int create_user_process_from_file(char *path, pcb_t pcb, char *argv[])
 {
+    return create_user_process_with_options(path, pcb, argv, ProcessLaunchOptions{});
+}
+
+int create_user_process_with_options(char *path, pcb_t pcb, char *argv[], const ProcessLaunchOptions &options)
+{
+    // A picker result endpoint is owned by exactly one side, including every
+    // failed ELF/argument/thread setup path. Publish it before the first thread.
+    struct PendingWriter
+    {
+        vfs_node_t node;
+        ~PendingWriter() { if (node) vfs_close(node); }
+    } writer{options.result_writer};
     if (path == NULL)
     {
         write_serial_fmt("Create User Process Failed. Reason: Empty Path.\n");
@@ -927,7 +940,8 @@ int create_user_process_from_file(char *path, pcb_t pcb, char *argv[])
         write_serial_fmt("Create User Process Failed. Reason: Cannot Clone Page Directory.\n");
         return -ENOMEM;
     }
-    pcb_t             group         = create_process_group(process_name, pcb, new_directory, (char *)"");
+    pcb_t group = create_process_group_with_credentials(process_name, pcb, new_directory, (char *)"",
+                                                         options.credentials);
     if (group == NULL)
     {
         free_page_directory(new_directory);
@@ -951,6 +965,11 @@ int create_user_process_from_file(char *path, pcb_t pcb, char *argv[])
         write_serial_fmt("Create User Process Failed. Reason: Cannot Copy Exec Path.\n");
         kill_proc(group, 0, false);
         return -ENOMEM;
+    }
+    if (options.file_dialog && strcmp(group->exe_path, XJ380_FILE_DIALOG_PATH))
+    {
+        kill_proc(group, 0, false);
+        return -EACCES;
     }
 
     entry = (void *)parse_elf_file(path, group);
@@ -1037,6 +1056,30 @@ int create_user_process_from_file(char *path, pcb_t pcb, char *argv[])
     }
     write_serial_fmt("CWD: %s\n", cwd);
     ime_process_loaded(group);
+    if (writer.node)
+    {
+        fd_file_handle *handle = (fd_file_handle *)calloc(1, sizeof(fd_file_handle));
+        if (!handle)
+        {
+            free(cwd);
+            free_process_argv(thread_argv);
+            kill_proc(group, 0, false);
+            return -ENOMEM;
+        }
+        handle->node = writer.node;
+        handle->fd = XJ380_FILE_DIALOG_RESULT_FD;
+        handle->flags = O_WRONLY | O_CLOEXEC;
+        if (queue_enqueue_id(group->file_open, handle, handle->fd) == (size_t)-1)
+        {
+            free(handle);
+            free(cwd);
+            free_process_argv(thread_argv);
+            kill_proc(group, 0, false);
+            return -ENOMEM;
+        }
+        writer.node = NULL; // The child's descriptor table now owns this end.
+    }
+    __atomic_store_n(&group->permission_file_dialog, options.file_dialog, __ATOMIC_RELEASE);
     size_t tid = create_user_thread(entry, thread_argv, argc, process_name, group, cwd);
     if ((int64_t)tid < 0)
     {

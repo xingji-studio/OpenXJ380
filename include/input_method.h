@@ -1,5 +1,6 @@
 #pragma once
 #include <task/pcb.h>
+#include <user/permissions.h>
 #include <xime.h>
 
 // Core owns the session; graphics owns and validates window lifetimes.
@@ -35,7 +36,7 @@ void    ime_ui_action(uint32_t kind, uint64_t value, uint64_t revision, uint64_t
 int64_t ime_syscall(uint64_t number, uint64_t user_request);
 void    ime_process_loaded(pcb_t process);
 void    ime_process_exit(pcb_t process);
-int     ime_launch_manager(pcb_t parent, char **argv);
+int     ime_launch_manager(pcb_t parent, char **argv, ProcessCredentialSource source = XPCS_SESSION);
 
 // This is a kernel-only policy boundary, shared by legacy XAPI and POSIX I/O.
 enum ImeFileOperation

@@ -3741,79 +3741,55 @@ sys_(statx, int dirfd, char *pathname, uint64_t flags, uint64_t mask, struct sta
 
 sys_(pipe2, int *pipefd, uint64_t flags)
 {
-    /* fs/pipefs.c */
-    extern vfs_node_t pipefs_root;
-    extern int        pipefd_id;
-    extern int        pipefs_id;
-    static uint64_t   pipe_inode_next = 1;
-
     if ((flags & ~(O_CLOEXEC | O_NONBLOCK)) != 0) return SYSCALL_FAULT_(EINVAL);
-    if (pipefs_root == NULL) return SYSCALL_FAULT_(ENOSYS);
     if (pipefd == NULL) return SYSCALL_FAULT_(EINVAL);
     bool kernel_pipefd = regs == NULL;
     if (!kernel_pipefd && !user_range_mapped(current_user_pagedir(), pipefd, sizeof(int) * 2))
         return SYSCALL_FAULT_(EFAULT);
 
-    char buf[16];
-    sprintf(buf, "pipe%d", pipefd_id++);
-
-    // Anonymous pipe ends are descriptor-owned, outside the mounted namespace.
-    // Publishing them under /pipe would impose NV and expose guessed names.
-    vfs_node_t node_input = vfs_node_alloc(NULL, buf);
-    node_input->type      = file_pipe;
-    node_input->fsid      = pipefs_id;
-    node_input->root      = pipefs_root;
-
-    sprintf(buf, "pipe%d", pipefd_id++);
-    vfs_node_t node_output = vfs_node_alloc(NULL, buf);
-    node_output->type      = file_pipe;
-    node_output->fsid      = pipefs_id;
-    node_output->root      = pipefs_root;
-
-    uint64_t pipe_inode = pipe_inode_next++;
-    node_input->inode   = pipe_inode;
-    node_output->inode  = pipe_inode;
-    node_input->dev     = PIEFS_REGISTER_ID;
-    node_output->dev    = PIEFS_REGISTER_ID;
-
-    pipe_info_t *info = (pipe_info_t *)malloc(sizeof(pipe_info_t));
-    memset(info, 0, sizeof(pipe_info_t));
-    info->buf       = (char*)calloc(1, PIPE_BUFF);
-    info->read_fds  = 1;
-    info->write_fds = 1;
-    info->ptr       = 0;
-    info->lock      = SPIN_INIT;
-
-    pipe_specific_t *read_spec = (pipe_specific_t *)malloc(sizeof(pipe_specific_t));
-    read_spec->write           = false;
-    read_spec->info            = info;
-    read_spec->node            = node_input;
-
-    pipe_specific_t *write_spec = (pipe_specific_t *)malloc(sizeof(pipe_specific_t));
-    write_spec->write           = true;
-    write_spec->info            = info;
-    write_spec->node            = node_output;
-
-    info->read_spec  = read_spec;
-    info->write_spec = write_spec;
-
-    node_input->handle  = read_spec;
-    node_output->handle = write_spec;
+    vfs_node_t node_input, node_output;
+    int ret = pipefs_create_pair(&node_input, &node_output);
+    if (ret < 0) return SYSCALL_FAULT_(-ret);
 
     lock_queue     *queue     = get_current_task()->parent_group->file_open;
-    fd_file_handle *handle_in = (fd_file_handle*)malloc(sizeof(fd_file_handle));
+    fd_file_handle *handle_in = (fd_file_handle *)calloc(1, sizeof(fd_file_handle));
+    fd_file_handle *handle_out = (fd_file_handle *)calloc(1, sizeof(fd_file_handle));
+    if (!handle_in || !handle_out)
+    {
+        free(handle_in);
+        free(handle_out);
+        vfs_close(node_input);
+        vfs_close(node_output);
+        return SYSCALL_FAULT_(ENOMEM);
+    }
     handle_in->node           = node_input;
     handle_in->offset         = 0;
     handle_in->flags          = (flags & ~O_ACCMODE) | O_RDONLY;
     handle_in->node->flags    = handle_in->flags;
     handle_in->fd             = queue_enqueue_lowest(queue, handle_in);
+    if (handle_in->fd == (size_t)-1)
+    {
+        free(handle_in);
+        free(handle_out);
+        vfs_close(node_input);
+        vfs_close(node_output);
+        return SYSCALL_FAULT_(ENOMEM);
+    }
 
-    fd_file_handle *handle_out = (fd_file_handle*)malloc(sizeof(fd_file_handle));
     handle_out->node           = node_output;
     handle_out->offset         = 0;
     handle_out->flags          = (flags & ~O_ACCMODE) | O_WRONLY;
     handle_out->node->flags    = handle_out->flags;
     handle_out->fd             = queue_enqueue_lowest(queue, handle_out);
+    if (handle_out->fd == (size_t)-1)
+    {
+        queue_remove_at(queue, handle_in->fd);
+        free(handle_in);
+        free(handle_out);
+        vfs_close(node_input);
+        vfs_close(node_output);
+        return SYSCALL_FAULT_(ENOMEM);
+    }
 
     int kpipefd[2] = {(int)handle_in->fd, (int)handle_out->fd};
     if (kernel_pipefd)
@@ -3822,6 +3798,12 @@ sys_(pipe2, int *pipefd, uint64_t flags)
     }
     else if (!copy_to_user_pagedir(current_user_pagedir(), pipefd, kpipefd, sizeof(kpipefd)))
     {
+        queue_remove_at(queue, handle_in->fd);
+        queue_remove_at(queue, handle_out->fd);
+        free(handle_in);
+        free(handle_out);
+        vfs_close(node_input);
+        vfs_close(node_output);
         return SYSCALL_FAULT_(EFAULT);
     }
 

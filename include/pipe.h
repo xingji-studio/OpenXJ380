@@ -33,3 +33,6 @@ struct pipe_specific {
 };
 
 void pipefs_setup();
+// Descriptor-owned endpoints, never published under /pipe. Each returned
+// reference must be transferred to an FD table or released with vfs_close().
+int pipefs_create_pair(vfs_node_t *reader, vfs_node_t *writer);

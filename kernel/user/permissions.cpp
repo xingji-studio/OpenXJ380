@@ -1,4 +1,5 @@
 #include <user/permissions.h>
+#include <user/process_launch.h>
 #include <cpu/lock.h>
 #include <errno.h>
 #include <fs/vfs/vfs.h>
@@ -42,23 +43,59 @@ void permissions_session_publish(const UserInfo *info)
     spin_unlock(&permission_lock);
 }
 
-void permissions_process_init(pcb_t process, pcb_t parent)
+static UserType session_type_locked()
+{
+    return user_session_is_ready() && current_user ? current_user->user_type : XUT_Admin;
+}
+
+static uint8_t session_mask_locked()
+{
+    return user_session_is_ready() && current_user ? mask_of(current_user) : user_type_permission_mask(XUT_Admin);
+}
+
+static void launch_user_locked(UserInfo *out, pcb_t parent, ProcessCredentialSource source)
+{
+    bool inherit = source == XPCS_INHERIT && parent && parent != kernel_group;
+    const UserInfo *user = inherit ? &parent->permission_user :
+        (user_session_is_ready() && current_user ? current_user : &root_user);
+    *out = user ? *user : root_user;
+    if (!inherit)
+    {
+        if (source == XPCS_VISITOR) out->user_type = XUT_Visitor;
+        else if (!user_session_is_ready() || !user) out->user_type = XUT_Admin;
+        if (out->user_type != XUT_Custom) out->user_prms = user_permissions_from_mask(mask_of(out));
+    }
+    memset(out->password, 0, sizeof(out->password));
+}
+
+void permissions_process_init(pcb_t process, pcb_t parent, ProcessCredentialSource source)
 {
     spin_lock(&permission_lock);
-    const UserInfo *source = parent && parent != kernel_group ? &parent->permission_user : current_user;
-    process->permission_user = source ? *source : root_user;
-    // Passwords are account data and must never be copied into process credentials.
-    memset(process->permission_user.password, 0, sizeof(process->permission_user.password));
+    launch_user_locked(&process->permission_user, parent, source);
     process->permission_revision = 1;
-    if (parent && parent != kernel_group)
+    process->permission_file_dialog = false;
+    if (source == XPCS_INHERIT && parent && parent != kernel_group)
         memcpy(process->permission_directory, parent->permission_directory, sizeof(process->permission_directory));
     else process->permission_directory[0] = 0;
     spin_unlock(&permission_lock);
 }
 
+bool permissions_launch_matches(pcb_t process, pcb_t parent, ProcessCredentialSource source)
+{
+    UserInfo expected;
+    spin_lock(&permission_lock);
+    launch_user_locked(&expected, parent, source);
+    bool matches = process && expected.user_type == process->permission_user.user_type &&
+        mask_of(&expected) == mask_of(&process->permission_user) &&
+        !strcmp(expected.name, process->permission_user.name);
+    spin_unlock(&permission_lock);
+    return matches;
+}
+
 void permissions_process_exec(pcb_t process, const char *directory)
 {
     spin_lock(&permission_lock);
+    __atomic_store_n(&process->permission_file_dialog, false, __ATOMIC_RELEASE);
     if (directory)
     {
         strncpy(process->permission_directory, directory, sizeof(process->permission_directory) - 1);
@@ -107,7 +144,7 @@ static PermissionRequest *first_locked()
         if (!backend_available || !valid_locked(r)) { r->done = true; continue; }
         uint8_t current = mask_of(&r->process->permission_user);
         r->remaining &= ~current;
-        r->remaining &= mask_of(current_user);
+        r->remaining &= session_mask_locked();
         if (!r->remaining && !r->role_confirmation) { r->done = true; continue; }
         if (!r->prompt.token)
         {
@@ -149,7 +186,7 @@ void permissions_answer(uint64_t token, bool approved)
     {
         if (approved)
         {
-            uint8_t granted = r->prompt.asking & mask_of(current_user);
+            uint8_t granted = r->prompt.asking & session_mask_locked();
             UserInfo *user = &r->process->permission_user;
             user->user_prms = user_permissions_from_mask(mask_of(user) | granted);
             user->user_type = XUT_Custom;
@@ -188,6 +225,8 @@ static void unlink_locked(PermissionRequest *r)
 
 void permissions_thread_exit(tcb_t task)
 {
+    vfs_node_t dialog_reader = __atomic_exchange_n(&task->permission_dialog_reader, (vfs_node_t)NULL, __ATOMIC_ACQ_REL);
+    if (dialog_reader) vfs_close(dialog_reader);
     PermissionRequest *garbage = NULL;
     spin_lock(&permission_lock);
     for (PermissionRequest *r = requests, *next; r; r = next)
@@ -261,19 +300,19 @@ static int request_permissions(uint8_t target, UserType type, bool individual)
         return 0;
     }
     uint8_t missing = target & ~current;
-    if (!individual && process->permission_user.user_type != XUT_Custom && current_user &&
-        current_user->user_type != XUT_Custom && type < current_user->user_type)
+    UserType session_type = session_type_locked();
+    if (!individual && process->permission_user.user_type != XUT_Custom &&
+        session_type != XUT_Custom && type < session_type)
     {
         spin_unlock(&permission_lock);
         free(r);
         return missing ? missing : -EACCES;
     }
-    r->remaining = missing & mask_of(current_user);
+    r->remaining = missing & session_mask_locked();
     r->role_confirmation = !individual && process->permission_user.user_type != XUT_Custom &&
         type < process->permission_user.user_type && !missing;
     // Equal permission sets do not bypass the named user's grade ceiling.
-    if (r->role_confirmation && (!current_user ||
-        (current_user->user_type != XUT_Custom && type < current_user->user_type)))
+    if (r->role_confirmation && session_type != XUT_Custom && type < session_type)
     {
         spin_unlock(&permission_lock);
         free(r);
@@ -390,6 +429,54 @@ PermissionProfileScope::~PermissionProfileScope()
     if (task) task->permission_profile_owner = previous;
 }
 
+PermissionDialogLaunchScope::PermissionDialogLaunchScope() : task(get_current_task())
+{
+    if (task) ++task->permission_dialog_launch_depth;
+}
+
+PermissionDialogLaunchScope::~PermissionDialogLaunchScope()
+{
+    if (task) --task->permission_dialog_launch_depth;
+}
+
+PermissionDialogReaderScope::PermissionDialogReaderScope(vfs_node_t reader) : task(get_current_task())
+{
+    __atomic_store_n(&task->permission_dialog_reader, reader, __ATOMIC_RELEASE);
+}
+
+PermissionDialogReaderScope::~PermissionDialogReaderScope()
+{
+    vfs_node_t reader = __atomic_exchange_n(&task->permission_dialog_reader, (vfs_node_t)NULL, __ATOMIC_ACQ_REL);
+    if (reader) vfs_close(reader);
+}
+
+PermissionTerminalLaunchScope::PermissionTerminalLaunchScope(bool enabled) :
+    task(get_current_task()), previous(task && task->permission_terminal_launch), active(task && enabled)
+{
+    if (active) task->permission_terminal_launch = true;
+}
+
+PermissionTerminalLaunchScope::~PermissionTerminalLaunchScope()
+{
+    finish();
+}
+
+void PermissionTerminalLaunchScope::finish()
+{
+    if (!active) return;
+    task->permission_terminal_launch = previous;
+    active = false;
+}
+
+bool permissions_dialog_metadata(vfs_node_t node, int operation)
+{
+    tcb_t task = get_current_task();
+    return task && task->parent_group &&
+        __atomic_load_n(&task->parent_group->permission_file_dialog, __ATOMIC_ACQUIRE) &&
+        (operation == IME_FILE_LOOKUP || operation == IME_FILE_LIST || operation == IME_FILE_STAT ||
+         (operation == IME_FILE_READ && node && (node->type & file_dir)));
+}
+
 int permissions_executable_directory(vfs_node_t executable, char *out, size_t capacity)
 {
     if (!executable || !out || !capacity) return -EINVAL;
@@ -493,6 +580,7 @@ static bool file_access(vfs_node_t node, const char *path, int operation, unsign
     tcb_t task = get_current_task();
     if (!task || task->task_level != TASK_APPLICATION_LEVEL) return true;
     if (operation == IME_FILE_LOOKUP) return true;
+    if (permissions_dialog_metadata(node, operation)) return true;
     if (operation == IME_FILE_MOUNT) { permissions_set_file_error(EACCES); return false; }
     // Filesystem callbacks already authorized the file operation. Their scoped
     // backend block I/O must not additionally require NV on /dev or /disk.
@@ -548,8 +636,15 @@ static bool file_access(vfs_node_t node, const char *path, int operation, unsign
     application[sizeof(application) - 1] = 0;
     char *resolved = node ? vfs_get_fullpath(node) : path ? canonical_target(path) : NULL;
     if (!resolved) { permissions_set_file_error(EACCES); return false; }
-    bool allowed = path_access(resolved, node && (node->type & file_dir), operation, mask, username,
-                               application, process);
+    // Fixed runtime image loading and picker icons have read-only exceptions.
+    // The picker never receives permission to read selected data.
+    bool service_read = operation == IME_FILE_READ &&
+        ((task->permission_dialog_launch_depth && equal_fold(resolved, XJ380_FILE_DIALOG_PATH)) ||
+         (task->permission_terminal_launch && equal_fold(resolved, XJ380_TERMINAL_PATH)) ||
+         (__atomic_load_n(&process->permission_file_dialog, __ATOMIC_ACQUIRE) &&
+          under(resolved, "/system/resources")));
+    bool allowed = service_read || path_access(resolved, node && (node->type & file_dir), operation, mask, username,
+                                               application, process);
     free(resolved);
     if (!allowed && !permissions_file_error()) permissions_set_file_error(EACCES);
     return allowed;

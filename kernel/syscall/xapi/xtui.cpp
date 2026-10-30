@@ -1,4 +1,5 @@
 #include <input_method.h>
+#include <user/process_launch.h>
 #include <ahci/ahci.h>
 #include <efi/boot.h>
 #include <efi/efi.h>
@@ -430,12 +431,12 @@ void do_xapi_Run(char *path)
     char  *fpath = vfs_cwd_path_build(upath);
     free(upath);
     if (fpath == NULL) return;
-    runfile(fpath);
+    runfile(fpath, XPCS_VISITOR);
     switch_page_directory(caller_pagedir);
     free(fpath);
 }
 
-uint64_t do_xapi_RunArgs(char *path, char **argv)
+static uint64_t spawn_from_user(char *path, char **argv, ProcessCredentialSource source)
 {
     page_directory_t *caller_pagedir = get_current_task()->parent_group->pagedir;
     char *upath = NULL;
@@ -462,11 +463,23 @@ uint64_t do_xapi_RunArgs(char *path, char **argv)
         }
     }
 
-    ret = create_user_process_from_file(fpath, get_current_task()->parent_group, kargv);
+    ProcessLaunchOptions options;
+    options.credentials = source;
+    ret = create_user_process_with_options(fpath, get_current_task()->parent_group, kargv, options);
     switch_page_directory(caller_pagedir);
     p_xapi_free_argv(kargv);
     free(fpath);
     return (uint64_t)ret;
+}
+
+uint64_t do_xapi_RunArgs(char *path, char **argv)
+{
+    return spawn_from_user(path, argv, XPCS_VISITOR);
+}
+
+uint64_t do_xapi_SpawnInherited(char *path, char **argv)
+{
+    return spawn_from_user(path, argv, XPCS_INHERIT);
 }
 
 uint64_t do_xapi_MapMemory(uint64_t ptr, uint64_t size, uint32_t flags)

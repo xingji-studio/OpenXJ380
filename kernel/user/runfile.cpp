@@ -1,4 +1,5 @@
 #include "../build_settings.h"
+#include <user/process_launch.h>
 #include <ahci/ahci.h>
 #include <efi/boot.h>
 #include <efi/efi.h>
@@ -107,13 +108,32 @@ static int read_default_settings_language()
 static bool migrate_runfile_app(char *path, size_t capacity)
 {
     if (!memchr(path, '\0', capacity)) return false;
+    // Both Pinyin executables belong to one application. Recognize the old
+    // split layout without nesting an already-current shared-directory path.
+    const char *pinyin_paths[][2] = {
+        {"/apps/system/inmeth_pinyin.elf", "/apps/xingji-pinyin/inmeth_pinyin.elf"},
+        {"/apps/system/inmeth_pinyin/inmeth_pinyin.elf", "/apps/xingji-pinyin/inmeth_pinyin.elf"},
+        {"/apps/xingji-pinyin/inmeth_pinyin/inmeth_pinyin.elf", "/apps/xingji-pinyin/inmeth_pinyin.elf"},
+        {"/apps/xingji-pinyin/settings/settings.elf", "/apps/xingji-pinyin/settings.elf"},
+    };
+    for (const auto &relocation : pinyin_paths)
+    {
+        if (strcmp(path, relocation[0])) continue;
+        if (strlen(relocation[1]) >= capacity) return false;
+        vfs_node_t installed = vfs_open(relocation[1]);
+        if (!installed) return false;
+        bool executable = !(installed->type & file_dir);
+        vfs_close(installed);
+        if (!executable) return false;
+        strcpy(path, relocation[1]);
+        return true;
+    }
     const char *slash = strrchr(path, '/');
     const char *extension = strrchr(path, '.');
     if (!slash || !extension || extension <= slash + 1 || strcmp(extension, ".elf")) return false;
     size_t prefix = (size_t)(slash - path);
     bool flat = false;
-    const char *directories[] = {"/apps", "/apps/system", "/apps/builtin", "/apps/thirdparty",
-                                 "/apps/xingji-pinyin"};
+    const char *directories[] = {"/apps", "/apps/system", "/apps/builtin", "/apps/thirdparty"};
     for (const char *directory : directories)
         if (strlen(directory) == prefix && !strncmp(path, directory, prefix)) flat = true;
     if (!flat) return false;
@@ -226,12 +246,14 @@ void init_runfile()
     init_user_profile(current_user->name);
 }
 
-void runfile(char *path)
+void runfile(char *path, ProcessCredentialSource source)
 {
     // Preserve the caller's process hierarchy so terminal-backed children can
     // find the shell group that owns their input and output buffers.
     tcb_t caller = get_current_task();
     pcb_t launch_parent = caller != NULL ? caller->parent_group : NULL;
+    ProcessLaunchOptions options;
+    options.credentials = source;
 
     // 获取扩展名
     char exname[10];
@@ -244,7 +266,7 @@ void runfile(char *path)
     if (strcmp("elf", exname) == 0 || strcmp("epf", exname) == 0)
     {
         // 是可执行文件
-        create_user_process_from_file(path, launch_parent, NULL);
+        create_user_process_with_options(path, launch_parent, NULL, options);
         return;
     }
 
@@ -289,7 +311,7 @@ void runfile(char *path)
         {
             // 是可执行文件
             char *argv[2]    = {path, NULL};
-            create_user_process_from_file(item->runpath, launch_parent, argv);
+            create_user_process_with_options(item->runpath, launch_parent, argv, options);
             free(file_format);
             return;
         }
