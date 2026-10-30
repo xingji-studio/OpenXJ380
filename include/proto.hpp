@@ -38,6 +38,8 @@ void   write_serial_hex(unsigned long long hex);
 int    write_serial_fmt(const char *fmt, ...);
 void   write_serial_fmt_heapless(const char *fmt, ...);
 void   serial_wprintf(const char *fmt, ...);
+void   serial_log_config_set(uint64_t flags);
+uint64_t serial_log_config_get();
 size_t vwprintf(Writer *writer, const char *fmt, va_list args);
 int    sprintf(char *buf, const char *fmt, ...);
 

@@ -159,7 +159,8 @@ typedef struct vfs_filesystem {
     struct llist_header node;
 } *vfs_filesystem_t;
 
-struct vfs_node {           // vfs节点
+struct vfs_node {
+    uint64_t ime_protection; // Kernel-only resolved object policy, never open flags.           // vfs节点
     vfs_node_t parent;      // 父目录
     vfs_node_t linkto;      // 符号链接指向的节点
     char      *name;        // 名称

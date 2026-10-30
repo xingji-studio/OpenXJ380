@@ -217,6 +217,15 @@ static bool xhci_keyboard_usage_present(const uint8_t *report, uint8_t usage) {
     return false;
 }
 
+static bool xhci_keyboard_report_has_rollover(const uint8_t *report) {
+    for (size_t i = 2; i < 8; ++i) {
+        if (report[i] == 0x01U) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static uint8_t xhci_keyboard_translate_usage(uint8_t usage, bool shift,
                                              bool caps_lock) {
     if (usage >= 0x04 && usage <= 0x1DU) {
@@ -307,6 +316,57 @@ static void xhci_keyboard_update_modifier(bool pressed, uint8_t value) {
     keyboard_usb_key_event(value, value, pressed ? 1U : 0U);
 }
 
+static void xhci_keyboard_release_report(xhci_slot_state *slot) {
+    if (!slot || slot->hid.kind != XHCI_HID_KEYBOARD) {
+        return;
+    }
+
+    xhci_hid_state *hid = &slot->hid;
+    const struct
+    {
+        uint8_t mask;
+        uint8_t value;
+    } modifier_map[] = {
+        {0x11U, KEY_CTRL},
+        {0x22U, KEY_SHIFT},
+        {0x44U, KEY_ALT},
+        {0x08U, 0xE3U},
+        {0x80U, 0xE7U},
+    };
+
+    for (size_t i = 0; i < sizeof(modifier_map) / sizeof(modifier_map[0]); ++i)
+    {
+        if ((hid->prev_report[0] & modifier_map[i].mask) != 0)
+        {
+            xhci_keyboard_update_modifier(false, modifier_map[i].value);
+        }
+    }
+
+    for (size_t i = 2; i < sizeof(hid->prev_report); ++i)
+    {
+        uint8_t usage = hid->prev_report[i];
+        if (usage == 0 || usage == 0x01U) {
+            continue;
+        }
+
+        bool seen = false;
+        for (size_t j = 2; j < i; ++j)
+        {
+            if (hid->prev_report[j] == usage)
+            {
+                seen = true;
+                break;
+            }
+        }
+        if (!seen)
+        {
+            keyboard_usb_key_event(usage, 0, 0);
+        }
+    }
+
+    memset(hid->prev_report, 0, sizeof(hid->prev_report));
+}
+
 static void xhci_handle_keyboard_report(xhci_slot_state *slot,
                                         const uint8_t *report,
                                         uint32_t report_len) {
@@ -344,6 +404,14 @@ static void xhci_handle_keyboard_report(xhci_slot_state *slot,
             bool pressed = (current[0] & modifier_map[i].mask) != 0;
             xhci_keyboard_update_modifier(pressed, modifier_map[i].value);
         }
+    }
+
+    if (xhci_keyboard_report_has_rollover(current))
+    {
+        // ErrorRollOver means the key slots are incomplete. Keep the previous
+        // slots so a transient rollover report cannot synthesize releases.
+        hid->prev_report[0] = current[0];
+        return;
     }
 
     bool shift = (current[0] & 0x22U) != 0;
@@ -1383,6 +1451,11 @@ static void xhci_release_hid(xhci_slot_state *slot) {
         return;
     }
 
+    xhci_keyboard_release_report(slot);
+    if (slot->hid.kind == XHCI_HID_MOUSE)
+    {
+        mouse_inject_report(0, 0, 0, 0);
+    }
     if (slot->hid.report_buffer) {
         xhci_dma_free(slot->hid.report_buffer, slot->hid.report_buffer_phys,
                       slot->hid.report_buffer_len);

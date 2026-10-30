@@ -1,3 +1,4 @@
+#include <input_method.h>
 /**
  * Virtual File System Interface
  * 虚拟文件系统接口
@@ -103,12 +104,14 @@ static inline char *pathtok(char **sp) {
 
 static inline void do_open(vfs_node_t file) {
     if (file == NULL) return;
+    bool deleting = (file->type & file_delete) != 0;
     if (file->handle != NULL) {
         callbackof(file, stat)(file->handle, file);
     } else {
         if (file->parent == NULL || file->parent->handle == NULL) return;
         callbackof(file, open)(file->parent->handle, file->name, file);
     }
+    if (deleting) file->type |= file_delete;
 }
 
 static inline void do_update(vfs_node_t file) {
@@ -147,7 +150,22 @@ vfs_node_t vfs_child_append(vfs_node_t parent, const char *name, void *handle) {
 static vfs_node_t vfs_child_find(vfs_node_t parent, const char *name) {
     if (parent == NULL || name == NULL) return NULL;
     vfs_child_lock();
-    vfs_node_t child = (vfs_node_t)list_first(parent->child, data, streq(name, ((vfs_node_t)data)->name));
+    vfs_node_t child = (vfs_node_t)list_first(parent->child, data,
+                                               !(((vfs_node_t)data)->type & file_delete) &&
+                                               streq(name, ((vfs_node_t)data)->name));
+    vfs_child_unlock();
+    return child;
+}
+
+static vfs_node_t vfs_child_find_and_ref(vfs_node_t parent, const char *name)
+{
+    if (parent == NULL || name == NULL) return NULL;
+
+    vfs_child_lock();
+    vfs_node_t child = (vfs_node_t)list_first(parent->child, data,
+                                               !(((vfs_node_t)data)->type & file_delete) &&
+                                               streq(name, ((vfs_node_t)data)->name));
+    if (child != NULL) child->refcount++;
     vfs_child_unlock();
     return child;
 }
@@ -216,6 +234,7 @@ static char *vfs_alias_target_dup(const char *path)
 }
 
 errno_t vfs_mkdir(const char *name) {
+    if (!ime_vfs_access(NULL, name, IME_FILE_WRITE)) return VFS_STATUS_FAILED;
     if (name[0] != '/') return VFS_STATUS_FAILED;
     char      *path     = strdup(name + 1);
     char      *save_ptr = path;
@@ -254,6 +273,8 @@ err:
 }
 
 errno_t vfs_link(const char *name, const char *target_name) {
+    if (!ime_vfs_access(NULL, name, IME_FILE_WRITE) ||
+        !ime_vfs_access(NULL, target_name, IME_FILE_WRITE)) return VFS_STATUS_FAILED;
     vfs_node_t current = rootdir;
     char      *path    = strdup(name + 1);
 
@@ -307,6 +328,8 @@ err:
 }
 
 errno_t vfs_symlink(const char *name, const char *target_name) {
+    if (!ime_vfs_access(NULL, name, IME_FILE_WRITE) ||
+        !ime_vfs_access(NULL, target_name, IME_FILE_WRITE)) return VFS_STATUS_FAILED;
     vfs_node_t current = rootdir;
     char      *path    = strdup(name + 1);
 
@@ -362,6 +385,7 @@ err:
 }
 
 errno_t vfs_mkfile(const char *name) {
+    if (!ime_vfs_access(NULL, name, IME_FILE_WRITE)) return VFS_STATUS_FAILED;
     if (name[0] != '/') return VFS_STATUS_FAILED;
 
     // 分离路径和文件名
@@ -397,27 +421,70 @@ errno_t vfs_mkfile(const char *name) {
 }
 
 errno_t vfs_delete(vfs_node_t node) {
-    if (node == rootdir) return VFS_STATUS_FAILED;
-    if (node == NULL || node->parent == NULL) return VFS_STATUS_FAILED;
-    if ((node->type & file_dir) && node->child != NULL) return -ENOTEMPTY;
+    if (!ime_vfs_access(node, NULL, IME_FILE_REMOVE)) return VFS_STATUS_FAILED;
+    if (node == NULL || node == rootdir) return VFS_STATUS_FAILED;
 
+    vfs_child_lock();
+    vfs_node_t parent = node->parent;
+    if (parent == NULL || (node->type & file_delete) ||
+        ((node->type & file_dir) && node->child != NULL))
+    {
+        vfs_child_unlock();
+        return VFS_STATUS_FAILED;
+    }
+    node->type |= file_delete;
+    vfs_child_unlock();
+
+    if (node->handle == NULL) do_update(node);
+
+    errno_t res = VFS_STATUS_SUCCESS;
     if (!((node->type & file_symlink) && node->linkname != NULL))
     {
-        errno_t res = callbackof(node, del)(node->parent->handle, node);
-        if (res < 0) return res;
+        if (node->handle == NULL)
+        {
+            res = VFS_STATUS_FAILED;
+        }
+        else
+        {
+            res = callbackof(node, del)(parent->handle, node);
+        }
+    }
+
+    if (res < 0)
+    {
+        vfs_child_lock();
+        node->type &= (uint16_t)~file_delete;
+        vfs_child_unlock();
+        vfs_close(node);
+        return res;
     }
 
     vfs_child_lock();
-    node->parent->child = list_delete(node->parent->child, node);
+    parent->child = list_delete(parent->child, node);
+    node->parent = NULL;
     vfs_child_unlock();
 
-    node->parent = NULL;
-    node->handle = NULL;
-    vfs_free(node);
+    // Drop the directory-tree reference and the reference held by this
+    // delete caller. Any other open references keep the detached node alive.
+    if (node->refcount > 0) node->refcount--;
+    if (node->refcount > 0) node->refcount--;
+    if (node->refcount == 0)
+    {
+        if (node->handle != NULL && !(node->type & file_proxy))
+        {
+            callbackof(node, close)(node->handle);
+            node->handle = NULL;
+        }
+        free(node->name);
+        free(node->linkname);
+        free(node);
+    }
     return VFS_STATUS_SUCCESS;
 }
 
 errno_t vfs_rename(vfs_node_t node, const char *nw) {
+    if (!ime_vfs_access(node, NULL, IME_FILE_REMOVE) ||
+        !ime_vfs_access(NULL, nw, IME_FILE_WRITE)) return VFS_STATUS_FAILED;
     if (node == NULL || nw == NULL) return VFS_STATUS_FAILED;
     if ((node->type & file_symlink) && node->linkname != NULL)
     {
@@ -478,6 +545,7 @@ errno_t vfs_rename(vfs_node_t node, const char *nw) {
 }
 
 errno_t vfs_resize(vfs_node_t node, uint64_t size) {
+    if (!ime_vfs_access(node, NULL, IME_FILE_WRITE)) return VFS_STATUS_FAILED;
     if (node == NULL) return VFS_STATUS_FAILED;
     do_update(node);
     if (node->type == file_dir) return VFS_STATUS_FAILED;
@@ -487,6 +555,7 @@ errno_t vfs_resize(vfs_node_t node, uint64_t size) {
 }
 
 errno_t vfs_resize_fast(vfs_node_t node, uint64_t size) {
+    if (!ime_vfs_access(node, NULL, IME_FILE_WRITE)) return VFS_STATUS_FAILED;
     if (node == NULL) return VFS_STATUS_FAILED;
     if (node->type == file_dir) return VFS_STATUS_FAILED;
     callbackof(node, resize)(node->handle, size);
@@ -515,7 +584,9 @@ int vfs_regist(const char *name, vfs_callback_t callback, int register_id, uint6
 vfs_node_t vfs_do_search(vfs_node_t dir, const char *name) {
     if (dir == NULL || name == NULL) return NULL;
     vfs_child_lock();
-    vfs_node_t child = (vfs_node_t)list_first(dir->child, data, streq(name, ((vfs_node_t)data)->name));
+    vfs_node_t child = (vfs_node_t)list_first(dir->child, data,
+                                               !(((vfs_node_t)data)->type & file_delete) &&
+                                               streq(name, ((vfs_node_t)data)->name));
     vfs_child_unlock();
     return child;
 }
@@ -533,6 +604,7 @@ static vfs_node_t vfs_open_impl(const char *str, bool follow_final_symlink, bool
 
     char      *save_ptr = path;
     vfs_node_t current  = rootdir;
+    vfs_node_t acquired_current = NULL;
 
     for (char *buf = pathtok(&save_ptr); buf; buf = pathtok(&save_ptr)) {
         if (streq(buf, ".")) {
@@ -544,14 +616,11 @@ static vfs_node_t vfs_open_impl(const char *str, bool follow_final_symlink, bool
             continue;
         }
 
-        current = vfs_child_find(current, buf);
-        if (current == NULL) { goto err; }
-
-        bool final_component_had_handle = current->handle != NULL;
-        do_update(current);
         bool is_final_component = save_ptr == NULL || *save_ptr == '\0';
-        if (is_final_component && !final_component_had_handle && current->handle != NULL && current->refcount == 1)
-            current->refcount = 0;
+        current = is_final_component ? vfs_child_find_and_ref(current, buf) : vfs_child_find(current, buf);
+        if (current == NULL) { goto err; }
+        if (is_final_component) acquired_current = current;
+        do_update(current);
         if (is_final_component && !follow_final_symlink) break;
         if (current->type & file_symlink) {
             if (!current->parent) { goto err; }
@@ -562,6 +631,7 @@ static vfs_node_t vfs_open_impl(const char *str, bool follow_final_symlink, bool
             if (!dynamic_symlink) current->type = file_symlink | file_proxy;
 
             vfs_node_t target = dynamic_symlink ? NULL : current->linkto;
+            bool target_was_cached = target != NULL;
             if (target == NULL)
             {
                 char target_path[256];
@@ -597,16 +667,38 @@ static vfs_node_t vfs_open_impl(const char *str, bool follow_final_symlink, bool
             }
             if (!target) goto err;
 
+            if (is_final_component && target_was_cached)
+            {
+                bool target_reference_valid = true;
+                vfs_child_lock();
+                if (target->type & file_delete)
+                    target_reference_valid = false;
+                else
+                    target->refcount++;
+                vfs_child_unlock();
+                if (!target_reference_valid)
+                {
+                    vfs_close(current);
+                    acquired_current = NULL;
+                    goto err;
+                }
+            }
+            if (is_final_component)
+            {
+                vfs_close(current);
+                acquired_current = NULL;
+            }
+
             current = target;
             continue;
         }
     }
 
     free(path);
-    if (current != NULL) current->refcount++;
     return current;
 err:
     free(path);
+    if (acquired_current != NULL) vfs_close(acquired_current);
     if (allow_alias) {
         char *alias_target = vfs_alias_target_dup(str);
         if (alias_target != NULL) {
@@ -620,11 +712,15 @@ err:
 }
 
 vfs_node_t vfs_open(const char *str) {
-    return vfs_open_impl(str, true, true, 0);
+    vfs_node_t node = vfs_open_impl(str, true, true, 0);
+    if (node && !ime_vfs_access(node, NULL, IME_FILE_READ)) { vfs_close(node); return NULL; }
+    return node;
 }
 
 vfs_node_t vfs_open_no_follow(const char *str) {
-    return vfs_open_impl(str, false, true, 0);
+    vfs_node_t node = vfs_open_impl(str, false, true, 0);
+    if (node && !ime_vfs_access(node, NULL, IME_FILE_READ)) { vfs_close(node); return NULL; }
+    return node;
 }
 
 void vfs_update(vfs_node_t node) {
@@ -678,6 +774,7 @@ void *vfs_map(vfs_node_t node, uint64_t addr, uint64_t len, uint64_t prot, uint6
               uint64_t offset) {
     if (unlikely(node == NULL)) return NULL;
     if (unlikely(node->type == file_dir)) return NULL;
+    if (!ime_vfs_access(node, NULL, (prot & 2) ? IME_FILE_WRITE : IME_FILE_READ)) return NULL;
     return callbackof(node, map)(node->handle, (void *)addr, offset, len, prot, flags);
 }
 
@@ -762,13 +859,45 @@ errno_t vfs_close(vfs_node_t node) {
         return VFS_STATUS_SUCCESS;
     }
 
-    if (unlikely(node->handle == NULL)) return VFS_STATUS_SUCCESS;
+    if (unlikely(node->handle == NULL))
+    {
+        if ((node->type & file_delete) && node->refcount == 0)
+        {
+            free(node->name);
+            free(node->linkname);
+            free(node);
+        }
+        return VFS_STATUS_SUCCESS;
+    }
 
-    if ((node->type & file_socket) && node->refcount > 0) {
+    if (node->type & file_socket)
+    {
+        if (node->refcount > 0) return VFS_STATUS_SUCCESS;
+        if (node->type & file_delete)
+        {
+            callbackof(node, del)(node->parent != NULL ? node->parent->handle : NULL, node);
+            node->handle = NULL;
+            if (node->parent != NULL)
+            {
+                vfs_child_lock();
+                node->parent->child = list_delete(node->parent->child, node);
+                node->parent = NULL;
+                vfs_child_unlock();
+            }
+            free(node->name);
+            free(node->linkname);
+            free(node);
+        }
         return VFS_STATUS_SUCCESS;
     }
 
     if (node->type & file_proxy){
+         if ((node->type & file_delete) && node->refcount == 0)
+         {
+             free(node->name);
+             free(node->linkname);
+             free(node);
+         }
          return VFS_STATUS_SUCCESS;
     }
     if ((node->type & file_dir) && !(node->type & file_delete))
@@ -778,15 +907,24 @@ errno_t vfs_close(vfs_node_t node) {
     if (!(node->type & file_delete) && node->refcount > 0) {
         return VFS_STATUS_SUCCESS;
     }
-    if (node->type & file_delete && node->refcount <= 0) {
-        errno_t res = callbackof(node, del)(node->parent->handle, node);
-        if (res < 0) return res;
-        vfs_child_lock();
-        node->parent->child = list_delete(node->parent->child, node);
-        vfs_child_unlock();
+    if (node->type & file_delete)
+    {
+        if (node->refcount > 0) return VFS_STATUS_SUCCESS;
+        callbackof(node, close)(node->handle);
         node->handle = NULL;
-        vfs_free(node);
-    } else {
+        if (node->parent != NULL)
+        {
+            vfs_child_lock();
+            node->parent->child = list_delete(node->parent->child, node);
+            node->parent = NULL;
+            vfs_child_unlock();
+        }
+        free(node->name);
+        free(node->linkname);
+        free(node);
+    }
+    else
+    {
         callbackof(node, close)(node->handle);
         node->handle = NULL;
     }
@@ -824,6 +962,7 @@ void vfs_free_child(vfs_node_t vfs) {
 }
 
 errno_t vfs_mount(const char *src, vfs_node_t node) {
+    if (!ime_vfs_access(node, NULL, IME_FILE_MOUNT)) return VFS_STATUS_FAILED;
     if (node == NULL) return VFS_STATUS_FAILED;
     if (node->type != file_dir) return VFS_STATUS_FAILED;
     for (int i = 1; i < fs_nextid; i++) {
@@ -838,6 +977,7 @@ errno_t vfs_mount(const char *src, vfs_node_t node) {
 }
 
 size_t vfs_read(vfs_node_t file, void *addr, size_t offset, size_t size) {
+    if (!ime_vfs_access(file, NULL, IME_FILE_READ)) return VFS_STATUS_FAILED;
     if (file == NULL || addr == NULL) return VFS_STATUS_FAILED;
     do_update(file);
     if (file->type == file_dir) return VFS_STATUS_FAILED;
@@ -845,6 +985,7 @@ size_t vfs_read(vfs_node_t file, void *addr, size_t offset, size_t size) {
 }
 
 size_t vfs_write(vfs_node_t file, void *addr, size_t offset, size_t size) {
+    if (!ime_vfs_access(file, NULL, IME_FILE_WRITE)) return VFS_STATUS_FAILED;
     if (file == NULL || addr == NULL) return VFS_STATUS_FAILED;
     do_update(file);
     if (file->type == file_dir) return VFS_STATUS_FAILED;
@@ -854,12 +995,14 @@ size_t vfs_write(vfs_node_t file, void *addr, size_t offset, size_t size) {
 }
 
 size_t vfs_write_fast(vfs_node_t file, void *addr, size_t offset, size_t size) {
+    if (!ime_vfs_access(file, NULL, IME_FILE_WRITE)) return VFS_STATUS_FAILED;
     if (file == NULL || addr == NULL) return VFS_STATUS_FAILED;
     if (file->type == file_dir) return VFS_STATUS_FAILED;
     return callbackof(file, write)(file->handle, addr, offset, size);
 }
 
 errno_t vfs_ioctl(vfs_node_t device, size_t options, void *arg) {
+    if (!ime_vfs_access(device, NULL, IME_FILE_WRITE)) return VFS_STATUS_FAILED;
     if (device == NULL) return VFS_STATUS_FAILED;
     do_update(device);
     if (device->type == file_dir) return VFS_STATUS_FAILED;
@@ -873,6 +1016,7 @@ errno_t vfs_poll(vfs_node_t node, size_t event) {
 }
 
 errno_t vfs_unmount(const char *path) {
+    if (!ime_vfs_access(NULL, NULL, IME_FILE_MOUNT)) return VFS_STATUS_FAILED;
     vfs_node_t node = vfs_open(path);
     if (node == NULL) return VFS_STATUS_FAILED;
     if (node->type != file_dir) return VFS_STATUS_FAILED;

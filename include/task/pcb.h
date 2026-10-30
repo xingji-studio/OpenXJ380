@@ -138,6 +138,11 @@ struct process_control_block
     size_t   notify_pcor_tid;
     uint64_t notify_pcor_func;
     bool     notify_pcor_registered;
+    uint64_t ime_launch_generation;
+    uint32_t ime_role; // 0: application, 1: selected engine, 2: registry manager, 3: own IME settings
+    bool screen_secret; // Process-lifetime global capture prohibition.
+    bool screen_raw_mapped; // Live framebuffer mappings cannot be revoked by a syscall check.
+    pcb_t screen_capture_next; // Intrusive policy list, protected by the capture state lock.
 };
 #ifndef CONFIG_USER_ELF_HEADER_START
 #define CONFIG_USER_ELF_HEADER_START 0x0000300000000000UL
@@ -213,8 +218,13 @@ struct thread_control_block
     uint64_t eevdf_deadline;
     uint64_t eevdf_slice;
     uint64_t eevdf_last_start;
+    uint64_t runtime_ticks;
 
     bool owns_user_stack;
+    uint32_t ime_storage_depth; // Trusted filesystem I/O, not a user raw-device grant.
+    uint32_t ime_config_depth; // Kernel-only settings transaction scope.
+    uint64_t ime_launch_generation;
+    uint32_t ime_launch_role; // Consumed by a controlled loader invocation.
 };
 
 extern pcb_t kernel_group;

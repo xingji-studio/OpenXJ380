@@ -145,6 +145,10 @@ UINT64  xapi_RunArgs(WSTR path, WSTR argv[]);
 UINT64  xapi_PowerAction(UINT64 action);
 void 	xapi_FlushTime(void);
 
+// Syscall 7486: globally prohibit capture until this process (and marked fork children) exit.
+// Returns 0 on success; -EBUSY if live raw framebuffer mappings prevent safe protection.
+INT64 xapi_SetSecret(void);
+
 // 3-7
 void   *xapi_AllocateMemory(UINT64 size);
 void    xapi_FreeMemory(void *ptr);

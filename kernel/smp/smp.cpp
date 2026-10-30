@@ -23,7 +23,7 @@ extern size_t    now_tid;
 extern pcb_t kernel_group;
 
 extern bool smp_scheduler_lock;
-int         scheduler_is_ready = 0;
+volatile int scheduler_is_ready = 0;
 
 static tcb_t alloc_zeroed_tcb(void)
 {
@@ -84,7 +84,7 @@ extern "C" void apu_entry(uint64_t cpu_id, uint64_t tr)
     for (size_t i = 0; i < MAX_CPU_NUM; i++)
     {
         PROCESSOR_INFO *inter_info = &xsi->pcr_inf[i];
-        if (inter_info->lapic_id == lapic_id())
+        if (inter_info->scheduler_queue != NULL && inter_info->lapic_id == lapic_id())
         {
             info = inter_info;
             break;
@@ -171,7 +171,7 @@ extern "C" void apu_entry(uint64_t cpu_id, uint64_t tr)
 
     get_current_cpu()->current_task = apu_idle;
 
-    scheduler_is_ready++;
+    __atomic_fetch_add(&scheduler_is_ready, 1, __ATOMIC_RELEASE);
     spin_unlock(&apu_lock);
     enable_intr();
 
@@ -255,11 +255,14 @@ bool start_ap(uint32_t cs_number, uint32_t lapic_id, PROCESSOR_INFO *cpuinf)
 
 PROCESSOR_INFO *get_current_cpu()
 {
+    if (xsi == NULL) return NULL;
+
+    const uint64_t current_lapic_id = lapic_id();
     PROCESSOR_INFO *info = NULL;
     for (size_t i = 0; i < MAX_CPU_NUM; i++)
     {
         PROCESSOR_INFO *inter_info = &xsi->pcr_inf[i];
-        if (inter_info->lapic_id == lapic_id())
+        if (inter_info->scheduler_queue != NULL && inter_info->lapic_id == current_lapic_id)
         {
             info = inter_info;
             break;
@@ -270,23 +273,26 @@ PROCESSOR_INFO *get_current_cpu()
 
 uint64_t get_cpu_num()
 {
-    return xsi->cpu_count;
+    return xsi != NULL ? __atomic_load_n(&xsi->cpu_count, __ATOMIC_ACQUIRE) : 0;
 }
 
 uint64_t get_bsp()
 {
-    return xsi->bsp_lapic_id;
+    return xsi != NULL ? xsi->bsp_lapic_id : 0;
 }
 
 PROCESSOR_INFO *get_cpu(uint64_t id)
 {
+    if (xsi == NULL || id >= MAX_CPU_NUM) return NULL;
     PROCESSOR_INFO *cpu = &xsi->pcr_inf[id];
     return cpu;
 }
 
 void set_kernel_stack(uint64_t rsp)
 {
-    if (lapic_id() == xsi->bsp_lapic_id)
+    if (xsi == NULL) return;
+    const uint64_t current_lapic_id = lapic_id();
+    if (current_lapic_id == xsi->bsp_lapic_id)
     {
         extern tss_t tss0;
         tss0.rsp[0] = rsp;
@@ -296,7 +302,7 @@ void set_kernel_stack(uint64_t rsp)
     for (size_t i = 0; i < MAX_CPU_NUM; i++)
     {
         PROCESSOR_INFO *inter_info = &xsi->pcr_inf[i];
-        if (inter_info->lapic_id == lapic_id())
+        if (inter_info->scheduler_queue != NULL && inter_info->lapic_id == current_lapic_id)
         {
             info = inter_info;
             break;
@@ -316,6 +322,12 @@ void set_kernel_stack(uint64_t rsp)
 void init_smp(uint64_t MADT0)
 {
     xsi = (XSK_SMP_INFO *)malloc(sizeof(XSK_SMP_INFO));
+    if (xsi == NULL)
+    {
+        write_serial_string("SMP initialization failed: cannot allocate CPU state.\n");
+        while (true) asm volatile("hlt");
+    }
+    memset(xsi, 0, sizeof(XSK_SMP_INFO));
     write_serial_string("Initializing SMP...\n");
 
     uint8_t  bsp_lapic_id;

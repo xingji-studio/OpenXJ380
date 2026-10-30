@@ -1,3 +1,4 @@
+#include <screen_capture.h>
 #include "../build_settings.h"
 #include <cpu/fsgsbase.h>
 #include <cpu/msr.h>
@@ -13,6 +14,7 @@
 #include <proto.hpp>
 #include <rtc.h>
 #include <syscall/signal.h>
+#include <syscall/pxapi.h>
 #include <syscall/syscall.h>
 #include <task/poll.h>
 
@@ -127,6 +129,8 @@ static const char *debug_syscall_name(uint64_t nr)
     case SXAH_INSTALLER_LOG: return "sxah_installer_log";
     case SXAH_INSTALLER_START_OPTIONS: return "sxah_installer_start_options";
     case SXAH_INSTALLER_PRECHECK_OPTIONS: return "sxah_installer_precheck_options";
+    case SXAH_SET_LOG_CONFIG: return "sxah_set_log_config";
+    case SXAH_GET_LOG_CONFIG: return "sxah_get_log_config";
     case SYS_READLINKAT: return "readlinkat";
     case SYS_PSELECT6: return "pselect6";
     case SYS_PIPE2: return "pipe2";
@@ -659,6 +663,9 @@ extern "C" uint64_t c_syscall_handler(struct X64_REGS *regs, uint64_t user_rsp)
     case XAPI_GET_PIC_SIZE: case XAPI_CALC_TEXT_WIDTH:
         regs->rax = (uint64_t)-ENOSYS;
         break;
+    case XAPI_SET_SECRET:
+        regs->rax = (uint64_t)screen_capture_set_secret();
+        break;
     case XAPI_GET_VERSION: do_xapi_GetSystemVersion(regs->rdi); break;
     case XAPI_GET_TIME: regs->rax = (uint64_t)do_xapi_GetTime(); break;
     case XAPI_GET_CURRENT_USER: do_xapi_GetCurrentUser(regs->rdi); break;
@@ -704,6 +711,16 @@ extern "C" uint64_t c_syscall_handler(struct X64_REGS *regs, uint64_t user_rsp)
     case SXAH_INSTALLER_PROGRESS: regs->rax = do_xapi_InstallerProgress(regs->rdi); break;
     case SXAH_INSTALLER_RESCUE: regs->rax = do_xapi_InstallerRescue(regs->rdi, regs->rsi, regs->rdx); break;
     case SXAH_INSTALLER_LOG: regs->rax = do_xapi_InstallerLog(regs->rdi); break;
+    case SXAH_SET_LOG_CONFIG:
+        if ((regs->rdi & ~LOG_CONFIG_VALID_MASK) != 0)
+        {
+            regs->rax = (uint64_t)-EINVAL;
+            break;
+        }
+        serial_log_config_set(regs->rdi);
+        regs->rax = 0;
+        break;
+    case SXAH_GET_LOG_CONFIG: regs->rax = serial_log_config_get(); break;
 
     default:
         regs->rax = (uint64_t)-ENOSYS;

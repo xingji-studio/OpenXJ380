@@ -1,3 +1,4 @@
+#include <input_method.h>
 #define ALL_IMPLEMENTATION
 #include "errno.h"
 #include "fs/fatfs/ff.h"
@@ -35,9 +36,13 @@ static mutex_t fatfs_operate_lock;
 
 static inline void fatfs_lock() {
     mutex_lock(&fatfs_operate_lock);
+    tcb_t task = get_current_task();
+    if (task) ++task->ime_storage_depth;
 }
 
 static inline void fatfs_unlock() {
+    tcb_t task = get_current_task();
+    if (task) --task->ime_storage_depth;
     mutex_unlock(&fatfs_operate_lock);
 }
 
@@ -129,12 +134,57 @@ int fatfs_mkdir(void *parent, const char *name, vfs_node_t node) {
     return 0;
 }
 
+// f_stat on an SFN path can omit its long filename. Enumerate the root's
+// directory entries, whose FILINFO contains both names, before any destructive
+// open. Do this under fatfs_operate_lock, using FatFs directly (no VFS recursion).
+static bool fatfs_name_equal(const char *a, const char *b);
+
+static void fatfs_mark_ime_protection(vfs_node_t node, const char *path, const FILINFO *info)
+{
+    ime_vfs_resolved_name(node, info->fname);
+    if (node->parent != rootdir) return;
+    char *parent_path = strdup(path);
+    if (!parent_path)
+    {
+        ime_vfs_resolved_name(node, "settings.json");
+        return;
+    }
+    char *slash = strrchr(parent_path, '/');
+    if (slash) *slash = 0;
+    DIR directory;
+    FILINFO entry;
+    bool resolved = false;
+    if (f_opendir(&directory, parent_path) == FR_OK)
+    {
+        while (f_readdir(&directory, &entry) == FR_OK && entry.fname[0])
+        {
+            if (fatfs_name_equal(node->name, entry.fname) || fatfs_name_equal(node->name, entry.altname))
+            {
+                ime_vfs_resolved_name(node, entry.fname);
+                resolved = true;
+                break;
+            }
+        }
+        f_closedir(&directory);
+    }
+    // Fail closed when the existing file cannot be identified, rather than
+    // allowing an unresolved alias to overwrite a protected root entry.
+    if (!resolved) ime_vfs_resolved_name(node, "settings.json");
+    free(parent_path);
+}
+
 int fatfs_mkfile(void *parent, const char *name, vfs_node_t node) {
     fatfs_lock();
 
     file_t p        = (file_t)parent;
     char  *new_path = (char*)malloc(strlen(p->path) + strlen((char *)name) + 1 + 1);
     sprintf(new_path, "%s/%s", p->path, name);
+    FILINFO existing;
+    if (f_stat(new_path, &existing) == FR_OK) fatfs_mark_ime_protection(node, new_path, &existing);
+    if (!ime_vfs_access(node, NULL, IME_FILE_WRITE))
+    {
+        free(new_path); fatfs_unlock(); return -EACCES;
+    }
     FIL fp;
     FRESULT res = f_open(&fp, new_path, FA_CREATE_ALWAYS | FA_WRITE);
     if (res != FR_OK) 
@@ -197,6 +247,8 @@ size_t fatfs_readfile(file_t file, void *addr, size_t offset, size_t size) {
     res = f_lseek(fp, offset);
     if (res != FR_OK) 
     {
+        write_serial_fmt("fatfs_readfile: seek path=%s offset=%zu size=%zu res=%d\n",
+                         file->path != NULL ? file->path : "<unknown>", offset, size, res);
         if (temp_clmt != NULL) {
             fp->cltbl = NULL;
             free(temp_clmt);
@@ -204,7 +256,7 @@ size_t fatfs_readfile(file_t file, void *addr, size_t offset, size_t size) {
         fatfs_unlock();
         return -1;
     }
-    uint32_t n;
+    uint32_t n = 0;
     res = f_read(fp, addr, size, &n);
     if (temp_clmt != NULL) {
         fp->cltbl = NULL;
@@ -212,8 +264,17 @@ size_t fatfs_readfile(file_t file, void *addr, size_t offset, size_t size) {
     }
     if (res != FR_OK) 
     {
+        write_serial_fmt("fatfs_readfile: read path=%s offset=%zu size=%zu got=%u res=%d\n",
+                         file->path != NULL ? file->path : "<unknown>", offset, size, n, res);
         fatfs_unlock();
         return -1;
+    }
+    uint64_t file_size = (uint64_t)fp->obj.objsize;
+    bool     reached_eof = (uint64_t)offset >= file_size ||
+                       (uint64_t)n >= file_size - (uint64_t)offset;
+    if (n != size && !reached_eof) {
+        write_serial_fmt("fatfs_readfile: short read path=%s offset=%zu size=%zu got=%u res=%d\n",
+                         file->path != NULL ? file->path : "<unknown>", offset, size, n, res);
     }
     fatfs_unlock();
     return n;
@@ -245,8 +306,19 @@ size_t fatfs_writefile(file_t file, const void *addr, size_t offset, size_t size
             return -1;
         }
     }
-    uint32_t n;
+    uint32_t n = 0;
     res = f_write(fp, addr, size, &n);
+    if (res == FR_OK)
+    {
+        FRESULT sync_res = f_sync(fp);
+        if (sync_res != FR_OK)
+        {
+            write_serial_fmt("fatfs_writefile: sync path=%s offset=%zu size=%zu wrote=%u res=%d\n",
+                             file->path != NULL ? file->path : "<null>", offset, size, n, sync_res);
+            fatfs_unlock();
+            return -1;
+        }
+    }
     if (res != FR_OK) 
     {
         write_serial_fmt("fatfs_writefile: write path=%s offset=%zu size=%zu wrote=%u res=%d\n",
@@ -264,6 +336,7 @@ static uint64_t ino = 2;
 static bool fatfs_should_prune_child(vfs_node_t node) {
     if (node == NULL) return false;
     if (node->is_mount) return false;
+    if (node->refcount > 1) return false;
     return (node->type & (file_none | file_dir)) != 0;
 }
 
@@ -318,10 +391,22 @@ static void fatfs_apply_filinfo(vfs_node_t node, const FILINFO *fno) {
 
 void fatfs_open(void *parent, const char *name, vfs_node_t node) {
     fatfs_lock();
-    
+
+    if (parent == NULL || name == NULL || node == NULL)
+    {
+        fatfs_unlock();
+        return;
+    }
     file_t p        = (file_t)parent;
     char  *new_path = (char*)malloc(strlen(p->path) + strlen((char *)name) + 1 + 1);
     file_t nw      = (file_t)malloc(sizeof(struct file));
+    if (new_path == NULL || nw == NULL)
+    {
+        free(new_path);
+        free(nw);
+        fatfs_unlock();
+        return;
+    }
     sprintf(new_path, "%s/%s", p->path, name);
     void   *fp = NULL;
     FILINFO fno;
@@ -332,13 +417,31 @@ void fatfs_open(void *parent, const char *name, vfs_node_t node) {
         fatfs_unlock();
         return;
     }
+    fatfs_mark_ime_protection(node, new_path, &fno);
     fatfs_apply_filinfo(node, &fno);
     if (fno.fattrib & AM_DIR) {
         // node.
         node->type = file_dir;
         nw->is_dir = true;
         fp         = malloc(sizeof(DIR));
+        if (fp == NULL)
+        {
+            free(new_path);
+            free(nw);
+            node->handle = NULL;
+            fatfs_unlock();
+            return;
+        }
         res        = f_opendir((DIR*)fp, new_path);
+        if (res != FR_OK)
+        {
+            free(fp);
+            free(new_path);
+            free(nw);
+            node->handle = NULL;
+            fatfs_unlock();
+            return;
+        }
         for (;;) {
             // 读取目录下的内容，再读会自动读下一个文件
             res = f_readdir((DIR*)fp, &fno);
@@ -368,7 +471,26 @@ void fatfs_open(void *parent, const char *name, vfs_node_t node) {
         node->type = file_none;
         nw->is_dir = false;
         fp         = malloc(sizeof(FIL));
-        res        = f_open((FIL*)fp, new_path, FA_READ | FA_WRITE);
+        if (fp == NULL)
+        {
+            free(new_path);
+            free(nw);
+            node->handle = NULL;
+            fatfs_unlock();
+            return;
+        }
+        res = f_open((FIL*)fp, new_path, FA_READ | FA_WRITE);
+        if (res != FR_OK)
+        {
+            write_serial_fmt("fatfs_open: f_open failed path=%s res=%d\n", new_path, (int)res);
+            free(fp);
+            free(new_path);
+            free(nw);
+            node->handle = NULL;
+            node->size = 0;
+            fatfs_unlock();
+            return;
+        }
         if (node->inode == 0) node->inode = ino++;
         node->size  = f_size((FIL *)fp);
         node->blksz = PAGE_SIZE;
@@ -506,8 +628,13 @@ void fatfs_unmount(void *root) {
 
 int fatfs_stat(void *handle, vfs_node_t node) {
     fatfs_lock();
-    
-    file_t  f = (file_t)handle;
+
+    file_t f = (file_t)handle;
+    if (f == NULL || f->path == NULL || node == NULL || node->root == NULL)
+    {
+        fatfs_unlock();
+        return -EINVAL;
+    }
     FILINFO fno;
     FRESULT res = f_stat(f->path, &fno);
     if (res != FR_OK) 
@@ -520,7 +647,18 @@ int fatfs_stat(void *handle, vfs_node_t node) {
     if (fno.fattrib & AM_DIR) {
         node->type = file_dir;
         DIR *fp    = (DIR*)malloc(sizeof(DIR));
+        if (fp == NULL)
+        {
+            fatfs_unlock();
+            return -ENOMEM;
+        }
         res        = f_opendir(fp, f->path);
+        if (res != FR_OK)
+        {
+            free(fp);
+            fatfs_unlock();
+            return -1;
+        }
         vfs_child_lock();
         list_foreach(node->child, child_node0) {
             vfs_node_t e_child = (vfs_node_t)child_node0->data;
@@ -583,8 +721,13 @@ int fatfs_stat(void *handle, vfs_node_t node) {
 
 int fatfs_delete(file_t parent, vfs_node_t node) {
     fatfs_lock();
-    
+
     file_t file = (file_t)node->handle;
+    if (file == NULL || file->path == NULL)
+    {
+        fatfs_unlock();
+        return -EINVAL;
+    }
 
     FRESULT res = f_unlink(file->path);
     
@@ -668,6 +811,7 @@ vfs_node_t fatfs_dup(vfs_node_t node) {
     copy->size        = node->size;
     copy->linkname    = node->linkname == NULL ? NULL : strdup(node->linkname);
     copy->flags       = node->flags;
+    copy->ime_protection = node->ime_protection;
     copy->permissions = node->permissions;
     copy->owner       = node->owner;
     copy->child       = node->child;

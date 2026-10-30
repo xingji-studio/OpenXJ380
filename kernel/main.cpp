@@ -35,6 +35,7 @@
 #include <syscall/pxapi.h>
 #include <syscall/syscall.h>
 #include <task/pcb.h>
+#include <task/scheduler.h>
 #include <user/runfile.h>
 #include <user/settings.h>
 #include <user/info_register.h>
@@ -44,7 +45,7 @@
 
 const FrameBufferConfig *fbc_addr;
 
-extern int           scheduler_is_ready;
+extern volatile int  scheduler_is_ready;
 extern XSK_SMP_INFO *xsi;
 #define NULL 0
 uint64_t *saved_mtrrs;
@@ -54,6 +55,7 @@ bool      no_interrupt = false;
 static OpenXJ380MouseInterruptHook g_openxj380_mouse_hook = NULL;
 static OpenXJ380KeyboardInterruptHook g_openxj380_keyboard_hook = NULL;
 static OpenXJ380SyscallHook g_openxj380_syscall_hook = NULL;
+static OpenXJ380ProcessExitHook g_openxj380_process_exit_hook = NULL;
 extern EFI_SYSTEM_TABLE *EFI_ST;
 extern BOOT_CONFIG *EFI_BC;
 
@@ -186,6 +188,42 @@ extern "C" bool OpenXJ380Socket_DispatchSyscall(uint64_t syscall_number, struct 
 #endif
 }
 
+extern "C" int OpenXJ380Socket_RegisterProcessExitHook(OpenXJ380ProcessExitHook hook)
+{
+#if !OPENXJ380_GUI_DISABLED
+    if (hook == NULL) return -1;
+    OpenXJ380ProcessExitHook expected = NULL;
+    return __atomic_compare_exchange_n(&g_openxj380_process_exit_hook, &expected, hook, false, __ATOMIC_RELEASE,
+                                       __ATOMIC_RELAXED)
+               ? 0
+               : -1;
+#else
+    (void)hook;
+    return -1;
+#endif
+}
+
+extern "C" void OpenXJ380Socket_UnregisterProcessExitHook(OpenXJ380ProcessExitHook hook)
+{
+#if !OPENXJ380_GUI_DISABLED
+    OpenXJ380ProcessExitHook expected = hook;
+    __atomic_compare_exchange_n(&g_openxj380_process_exit_hook, &expected, NULL, false, __ATOMIC_RELEASE,
+                                __ATOMIC_RELAXED);
+#else
+    (void)hook;
+#endif
+}
+
+extern "C" void OpenXJ380Socket_NotifyProcessExit(void *process)
+{
+#if !OPENXJ380_GUI_DISABLED
+    OpenXJ380ProcessExitHook hook = __atomic_load_n(&g_openxj380_process_exit_hook, __ATOMIC_ACQUIRE);
+    if (hook != NULL && process != NULL) hook(process);
+#else
+    (void)process;
+#endif
+}
+
 EXPORT_SYMBOL(OpenXJ380Socket_RegisterMouseHook);
 EXPORT_SYMBOL(OpenXJ380Socket_RegisterKeyboardHook);
 EXPORT_SYMBOL(OpenXJ380Socket_MouseInterrupte);
@@ -196,6 +234,9 @@ EXPORT_SYMBOL(OpenXJ380Socket_FramebufferConfig);
 EXPORT_SYMBOL(OpenXJ380Socket_PowerAction);
 EXPORT_SYMBOL(OpenXJ380Socket_RegisterSyscallHook);
 EXPORT_SYMBOL(OpenXJ380Socket_UnregisterSyscallHook);
+EXPORT_SYMBOL(OpenXJ380Socket_RegisterProcessExitHook);
+EXPORT_SYMBOL(OpenXJ380Socket_UnregisterProcessExitHook);
+EXPORT_SYMBOL(OpenXJ380Socket_NotifyProcessExit);
 
 extern bool allow_to_flush;
 extern void ahci_set_accel(bool enabled);
@@ -221,29 +262,70 @@ static char busybox_alias_applets[][16] = {
 };//暴力枚举这一块，好像只能这么做了
   //Maybe we can try to load this applet when vfs inited.
 
+static int load_busybox_alias_applets()
+{
+    vfs_node_t vfp = vfs_open("/etc/busybox/alias/applets.csv");
+    if(!vfp) return -1;
+    char csv[1024] /* = malloc(vfs -> size) */;
+    char * csv_pointer = csv;
+    memset(csv, 0, 1024 /* vfs -> size / sizeof(char) */);
+    int idx = 0, i = 0;
+    
+    if(vfp -> size >= sizeof(csv)) {
+        idx = -2;
+        goto cleanup;
+    }
+    vfs_read(vfp, csv, 0, vfp -> size);
+
+    while(true) {
+        int j = 0;
+        while(true) {
+            switch(*csv_pointer)
+            {
+            case ',':
+            case '\r':
+            case '\n':
+                csv_pointer++;
+                busybox_alias_applets[i][j] = '\0';
+                goto finish_load;
+            case '\0':
+                busybox_alias_applets[i][j] = '\0';
+                goto finish;
+            default:
+                busybox_alias_applets[i][j] = *csv_pointer;
+                csv_pointer++;
+                j++;
+            }
+        }
+    finish_load:
+        i++;
+    }
+
+finish:
+    i++;
+    busybox_alias_applets[i][0] = '\0'; 
+cleanup:
+    vfs_close(vfp);
+    /* free(csv); */
+    return idx;
+}
+
+/*
 static void load_busybox_alias_applets()
 {
-    if (current_user == NULL) return;
-
-    char setfile_path[256];
-    memset(setfile_path, 0, 256);
-    strcat(setfile_path, "/etc/busybox/alias/applets.dat");
+    char setfile_path[32] = "/etc/busybox/alias/applets.dat";
     vfs_node_t vfp = vfs_open(setfile_path);
     if (!vfp) return;
-    char tmp[1024];
-    if (vfp->size >= sizeof(tmp))
-    {
-        vfs_close(vfp);
-        return;
-    }
-    vfs_read(vfp, tmp, 0, vfp->size);
-    char alias[8];
-    memset(alias, 0, 8);
+    char csv[1024];
+    char alias[9];
     int applet_index = 0, alias_index = 0;
     const int applet_count = sizeof(busybox_alias_applets) / sizeof(busybox_alias_applets[0]);
+    if (vfp->size >= sizeof(csv)) goto cleanup;
+    vfs_read(vfp, csv, 0, vfp->size);
+    memset(alias, 0, 9);
     for (uint64_t i = 0; i < vfp->size && applet_index < applet_count - 1; i++)
     {
-        if (tmp[i] == ',')
+        if (csv[i] == ',')
         {
             strcpy(busybox_alias_applets[applet_index], alias);
             applet_index++;
@@ -251,12 +333,14 @@ static void load_busybox_alias_applets()
             memset(alias, 0, sizeof(alias));
             continue;
         }
-        if (alias_index < sizeof(alias) - 1) alias[alias_index++] = tmp[i];
+        if (alias_index < sizeof(alias) - 1) alias[alias_index++] = csv[i];
     }
     if (alias_index > 0 && applet_index < applet_count - 1) strcpy(busybox_alias_applets[applet_index], alias);
 
+cleanup:
     vfs_close(vfp);
 }
+*/
 
 static const char *busybox_binary_path = "/apps/busybox";
 
@@ -435,8 +519,6 @@ extern "C" void KernelMain(const FrameBufferConfig &fbc, EFI_SYSTEM_TABLE &Syste
     console_init(fbc);
     no_interrupt = true;
     disable_intr();
-    disable_scheduler();
-
     EFI_ST = &SystemTable;
     EFI_BC = &BootConfig;
 
@@ -543,8 +625,6 @@ extern "C" void KernelMain(const FrameBufferConfig &fbc, EFI_SYSTEM_TABLE &Syste
 
     memset(phys_to_virt(get_cr3()), 0, PAGE_SIZE / 2);
 
-    disable_scheduler();
-
 #if CONFIG_KERNEL_BUILTIN_XHCI && !OPENXJ380_INPUT_OUTPUT_DISABLED
     xhci_start_workers();
 #endif
@@ -581,7 +661,9 @@ extern "C" void KernelMain(const FrameBufferConfig &fbc, EFI_SYSTEM_TABLE &Syste
     while (true)
     {
         __asm__ volatile("pause");
-        if (scheduler_is_ready == xsi->cpu_count) break;
+        if (__atomic_load_n(&scheduler_is_ready, __ATOMIC_ACQUIRE) ==
+            __atomic_load_n(&xsi->cpu_count, __ATOMIC_ACQUIRE))
+            break;
     }
 
     init_reaper();
@@ -607,7 +689,7 @@ extern "C" void KernelMain(const FrameBufferConfig &fbc, EFI_SYSTEM_TABLE &Syste
     // create_user_thread((void *)utsk, NULL, (char *)"test_task2", ugp);
 
 
-    enable_scheduler();
+    scheduler_start();
     open_interrupt;
     no_interrupt = false;
 
@@ -624,7 +706,6 @@ extern "C" void KernelMain(const FrameBufferConfig &fbc, EFI_SYSTEM_TABLE &Syste
         if (!no_interrupt)
         {
             enable_intr();
-            enable_scheduler();
         }
 
         __asm__ __volatile__("pause");

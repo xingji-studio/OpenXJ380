@@ -1,3 +1,4 @@
+#include <input_method.h>
 #include <syscall/syscall.h>
 #include <proto.hpp>
 #include <fs/vfs/vfs.h>
@@ -347,10 +348,10 @@ static int64_t write_from_user_buffer(fd_file_handle *handle, const uint8_t *buf
             signal_send_process(process, SIGPIPE);
             return total > 0 ? (int64_t)total : -EPIPE;
         }
-        if (wrote == (size_t)VFS_STATUS_FAILED)
+        if ((ssize_t)wrote < 0)
         {
             free(bounce);
-            return total > 0 ? (int64_t)total : -EIO;
+            return total > 0 ? (int64_t)total : wrote == (size_t)VFS_STATUS_FAILED ? -EIO : (int64_t)wrote;
         }
         if (!(handle->node->type & file_pipe) && handle->node->size != (uint64_t)-1) handle->offset += wrote;
         total += wrote;
@@ -500,10 +501,10 @@ static int64_t read_to_user_buffer(fd_file_handle *handle, uint8_t *buffer, size
         else
         {
             size_t got = vfs_read(handle->node, bounce, offset + total, chunk);
-            if (got == (size_t)VFS_STATUS_FAILED)
+            if ((ssize_t)got < 0)
             {
                 free(bounce);
-                return total > 0 ? (int64_t)total : -EIO;
+                return total > 0 ? (int64_t)total : got == (size_t)VFS_STATUS_FAILED ? -EIO : (int64_t)got;
             }
             read_now = (ssize_t)got;
         }
@@ -610,7 +611,7 @@ static ipc_message_t wait4_pop_exit_message(pcb_t parent, long pid, bool wait)
 
             if (message->type == IPC_MSG_TYPE_EPID && (pid == -1 || message->pid == pid)) return message;
 
-            message->index = lock_queue_enqueue(parent->ipc_queue, message);
+            lock_queue_enqueue(parent->ipc_queue, message);
         }
 
         if (!wait) return NULL;
@@ -2185,6 +2186,15 @@ sys_(mmap, uint64_t addr, size_t length, uint64_t prot, uint64_t flags, int fd,
 
     if (!(flags & MAP_ANONYMOUS)) {
         uint64_t ret = (uint64_t)vfs_map(file_handle->node, start_addr, aligned_len, prot, flags, offset);
+        if (ret == 0)
+        {
+            // A denied device mapping must not look like a successful mapping at
+            // address zero, nor leave an unmapped reservation in the VMA list.
+            vma_remove(mgr, vma);
+            vma_free(vma);
+            mm_op_lock_release();
+            return SYSCALL_FAULT_((file_handle->node->type & file_fbdev) ? EACCES : ENOMEM);
+        }
         mm_op_lock_release();
         return ret;
     }
@@ -2583,7 +2593,7 @@ static uint64_t poll_kernel_fds(struct pollfd *fds_user, size_t nfds, size_t tim
             }
         }
 
-        // sigexit = signals_pending_quick(get_current_task());
+        sigexit = signals_pending_quick(get_current_task());
 
         if (ready > 0 || sigexit) break;
 
@@ -3864,19 +3874,7 @@ sys_(unlinkat)
         return SYSCALL_FAULT_(ENOTDIR);
     }
 
-    uint64_t ret;
-    if (node->refcount > 1)
-    {
-        node->refcount--;
-        ret = 0;
-    }
-    else
-    {
-        ret = vfs_delete(node) == VFS_STATUS_SUCCESS ? 0 : SYSCALL_FAULT_(ENOENT);
-        node = NULL;
-    }
-
-    if (node != NULL) vfs_close(node);
+    uint64_t ret = vfs_delete(node) == VFS_STATUS_SUCCESS ? 0 : SYSCALL_FAULT_(ENOENT);
     free(path);
     return ret;
 }
@@ -4351,6 +4349,8 @@ sys_(rename, char *oldpath, char *newpath)
         free(nnewpath);
         return SYSCALL_FAULT_(ENOMEM);
     }
+    if (!ime_vfs_access(NULL, noldpath, IME_FILE_REMOVE) || !ime_vfs_access(NULL, nnewpath, IME_FILE_WRITE))
+    { free(noldpath); free(nnewpath); return SYSCALL_FAULT_(EACCES); }
     vfs_node_t oldnode  = vfs_open_no_follow(noldpath);
     if (!oldnode)
     {
@@ -4361,11 +4361,28 @@ sys_(rename, char *oldpath, char *newpath)
     vfs_node_t newnode = vfs_open_no_follow(nnewpath);
     if (newnode == oldnode)
     {
+        vfs_close(newnode);
+        vfs_close(oldnode);
         free(noldpath);
         free(nnewpath);
         return 0;
     }
-    if (newnode) { vfs_delete(newnode); }
+    if (!ime_vfs_access(oldnode, NULL, IME_FILE_REMOVE) ||
+        (newnode && !ime_vfs_access(newnode, NULL, IME_FILE_REMOVE)))
+    {
+        if (newnode) vfs_close(newnode);
+        vfs_close(oldnode);
+        free(noldpath);
+        free(nnewpath);
+        return SYSCALL_FAULT_(EACCES);
+    }
+    if (newnode && vfs_delete(newnode) != VFS_STATUS_SUCCESS)
+    {
+        vfs_close(oldnode);
+        free(noldpath);
+        free(nnewpath);
+        return SYSCALL_FAULT_(EACCES);
+    }
     size_t     ret    = vfs_rename(oldnode, nnewpath) == VFS_STATUS_SUCCESS ? 0 : SYSCALL_FAULT_(ENOENT);
     char      *parent = get_parent_path(nnewpath);
     vfs_node_t parent_dir = vfs_open(parent);
@@ -4378,6 +4395,7 @@ sys_(rename, char *oldpath, char *newpath)
     vfs_close(parent_dir); // 更新父目录的信息
     free(parent);
 end_rename:
+    vfs_close(oldnode);
     free(noldpath);
     free(nnewpath);
     return ret;
@@ -4398,6 +4416,14 @@ sys_(renameat, int olddirfd, char *oldpath, int newdirfd, char *newpath)
         return SYSCALL_FAULT_((int)-path_ret);
     }
 
+    if (!ime_vfs_access(NULL, resolved_old, IME_FILE_REMOVE) ||
+        !ime_vfs_access(NULL, resolved_new, IME_FILE_WRITE))
+    {
+        free(resolved_old);
+        free(resolved_new);
+        return SYSCALL_FAULT_(EACCES);
+    }
+
     vfs_node_t oldnode = vfs_open_no_follow(resolved_old);
     if (!oldnode)
     {
@@ -4409,11 +4435,28 @@ sys_(renameat, int olddirfd, char *oldpath, int newdirfd, char *newpath)
     vfs_node_t newnode = vfs_open_no_follow(resolved_new);
     if (newnode == oldnode)
     {
+        vfs_close(newnode);
+        vfs_close(oldnode);
         free(resolved_old);
         free(resolved_new);
         return 0;
     }
-    if (newnode) { vfs_delete(newnode); }
+    if (!ime_vfs_access(oldnode, NULL, IME_FILE_REMOVE) ||
+        (newnode && !ime_vfs_access(newnode, NULL, IME_FILE_REMOVE)))
+    {
+        if (newnode) vfs_close(newnode);
+        vfs_close(oldnode);
+        free(resolved_old);
+        free(resolved_new);
+        return SYSCALL_FAULT_(EACCES);
+    }
+    if (newnode && vfs_delete(newnode) != VFS_STATUS_SUCCESS)
+    {
+        vfs_close(oldnode);
+        free(resolved_old);
+        free(resolved_new);
+        return SYSCALL_FAULT_(EACCES);
+    }
 
     uint64_t ret = vfs_rename(oldnode, resolved_new) == VFS_STATUS_SUCCESS ? 0 : SYSCALL_FAULT_(ENOENT);
     vfs_close(oldnode);
@@ -5219,6 +5262,7 @@ sys_(mincore, uint64_t addr, uint64_t size, uint64_t vec)
 
 sys_(pivot_root, char *new_root, char *put_old)
 {
+    if (!ime_vfs_access(NULL, NULL, IME_FILE_MOUNT)) return SYSCALL_FAULT_(EPERM);
     //TODO 未经测试和验证的实现
     vfs_node_t nroot = vfs_open(new_root);
     vfs_node_t src_root;

@@ -117,7 +117,9 @@ static size_t blk_direct_span_bytes(const void *buffer, size_t max_bytes) {
 
     uint64_t base_virt = (uint64_t)buffer;
     uint64_t base_phys = page_virt_to_phys(base_virt);
-    if (base_phys == 0) {
+    // VMware's virtual AHCI rejects otherwise valid PRDs whose first address
+    // is not page aligned. Use the page-aligned bounce buffer in that case.
+    if (base_phys == 0 || (base_phys & (PAGE_SIZE - 1)) != 0) {
         return 0;
     }
 

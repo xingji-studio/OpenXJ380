@@ -1,12 +1,14 @@
 #include <cpu/longm.h>
 #include <proto.hpp>
 #include <stdint.h>
+#include <task/scheduler.h>
 
 void do_wsod(const char *err_code, struct X64_REGS *regs)
 {
     // TODO: WSOD
 
     disable_intr();
+    scheduler_stop();
     while (1)
     {
         __asm__("pause");
@@ -18,6 +20,7 @@ void no_regs_wsod(const char *err_code)
     // TODO: WSOD
 
     disable_intr();
+    scheduler_stop();
     while (1)
     {
         __asm__ __volatile__("pause");
@@ -52,7 +55,7 @@ void wsod_divide_error(struct X64_REGS *regs, uint64_t error_code)
 
 void wsod_undefined_opcode(struct X64_REGS *regs, uint64_t error_code)
 {
-    disable_scheduler();
+    scheduler_stop();
 
     write_serial_string("Undefined opcode at RIP: ");
     write_serial_hex(regs->rip);
@@ -111,7 +114,7 @@ void wsod_system_kernel_error(struct X64_REGS *regs, uint64_t error_code)
 // 一般保护性异常
 void wsod_general_protection(struct X64_REGS *regs, uint64_t error_code)
 {
-    disable_scheduler();
+    scheduler_stop();
 
     write_serial_string("Fault Thread Name: ");
     write_serial_string(get_current_task()->name);

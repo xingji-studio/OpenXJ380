@@ -162,6 +162,8 @@ void switch_process_page_directory(page_directory_t *dir);
  */
 uint64_t page_alloc_random(page_directory_t *directory, uint64_t length, uint64_t flags);
 uint64_t page_reserve_user_range(page_directory_t *directory, uint64_t length);
+struct process_control_block;
+uint64_t page_reserve_process_user_range(struct process_control_block *owner, uint64_t length);
 
 /**
  * 释放一段页映射 (未使用 alloc_frames 的页不可使用此方法取消映射)

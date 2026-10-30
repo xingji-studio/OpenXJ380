@@ -346,8 +346,8 @@ ENTRY(syscall_handler)
 ENTRY(ret_from_syscall)
     movq RIP(%rsp), %rcx
     movq RFLAGS(%rsp), %r11
-    movq %gs:CPU_CURRENT_TASK, %rax
-    movq THREAD_SYSCALL_USER_RSP(%rax), %rax
+    // Signal delivery and sigreturn may replace the saved user stack.
+    movq OLD_RSP(%rsp), %rax
     movq %rax, %gs:CPU_SYSCALL_USER_RSP
 
     movq R15(%rsp), %r15

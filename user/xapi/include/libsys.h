@@ -366,3 +366,20 @@ uint64_t enter_syscall(uint64_t syscall_number, uint64_t arg1, uint64_t arg2, ui
 #ifdef __cplusplus
 }
 #endif
+
+// Input method ABI v1. MSG_CHAR continues to carry one packed UTF-8 character.
+#define XAPI_IME_REGISTER         7474
+#define XAPI_IME_ENUM             7475
+#define XAPI_IME_GET_STATE        7476
+#define XAPI_IME_SET_ACTIVE       7477
+#define XAPI_IME_UNREGISTER       7478
+#define XAPI_IME_ATTACH           7479
+#define XAPI_IME_GET_EVENT        7480
+#define XAPI_IME_REPLY_EVENT      7481
+#define XAPI_IME_UPDATE_UI        7482
+#define XAPI_IME_SET_MODE         7483
+#define XAPI_IME_SET_CONTEXT      7484
+#define XAPI_IME_USER_DATA        7485
+
+// Process-lifetime global screen capture protection.
+#define XAPI_SET_SECRET           7486

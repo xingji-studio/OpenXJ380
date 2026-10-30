@@ -5,6 +5,7 @@
 #include "mm/heap.h"
 #include "krlibc.h"
 #include <proto.hpp>
+#include <smp/smp.h>
 
 // 创建互斥锁
 void mutex_create(mutex_t* mtx,bool recursive) {
@@ -103,6 +104,56 @@ int mutex_trylock(mutex_t *mutex) {
     return -EBUSY;
 }
 
+/*
+ * The caller holds the mutex metadata lock, and its process-exit hook must
+ * clear this owner before freeing the TCB. A killed thread may still be
+ * finishing a kernel call on another CPU; never steal its lock until it has
+ * actually stopped executing. Terminal tasks cannot become runnable again.
+ */
+static bool mutex_owner_has_stopped_locked(tcb_t owner)
+{
+    if (owner == NULL) return false;
+    TaskStatus status = __atomic_load_n(&owner->status, __ATOMIC_ACQUIRE);
+    if (status != DEATH && status != OUT) return false;
+
+    size_t count = get_cpu_num();
+    if (count > MAX_CPU_NUM) count = MAX_CPU_NUM;
+    for (size_t i = 0; i < count; i++)
+    {
+        PROCESSOR_INFO *cpu = get_cpu(i);
+        if (cpu != NULL && __atomic_load_n(&cpu->current_task, __ATOMIC_ACQUIRE) == owner) return false;
+    }
+    return true;
+}
+
+int mutex_lock_recoverable(mutex_t *mutex, bool *recovered)
+{
+    if (recovered != NULL) *recovered = false;
+    for (;;)
+    {
+        int result = mutex_trylock(mutex);
+        if (result != -EBUSY) return result;
+
+        bool abandoned = false;
+        spin_lock(&mutex->lock);
+        if (mutex->state == MUTEX_LOCKED && mutex_owner_has_stopped_locked(mutex->owner))
+        {
+            mutex->owner = NULL;
+            mutex->rcc = 0;
+            mutex->state = MUTEX_UNLOCKED;
+            abandoned = true;
+            if (recovered != NULL) *recovered = true;
+        }
+        spin_unlock(&mutex->lock);
+
+        if (!abandoned)
+        {
+            scheduler_yield();
+            cpu_relax();
+        }
+    }
+}
+
 // 释放互斥锁
 int mutex_unlock(mutex_t *mutex) {
     if (mutex == NULL) return -EINVAL;
@@ -186,4 +237,31 @@ tcb_t mutex_get_owner(mutex_t *mutex) {
     spin_unlock(&mutex->lock);
     
     return owner;
+}
+
+/*
+ * Process teardown happens before a TCB is freed, which gives subsystems that
+ * own process-scoped mutexes one last safe point to release an abandoned lock.
+ * Do not release a lock held by a live thread: doing so would let two threads
+ * mutate the protected state concurrently.
+ */
+bool mutex_abort_for_process(mutex_t *mutex, pcb_t process)
+{
+    if (mutex == NULL || process == NULL) return false;
+
+    bool released = false;
+    spin_lock(&mutex->lock);
+
+    tcb_t owner = mutex->owner;
+    if (mutex->state == MUTEX_LOCKED && owner != NULL && owner->parent_group == process &&
+        mutex_owner_has_stopped_locked(owner))
+    {
+        mutex->owner = NULL;
+        mutex->rcc = 0;
+        mutex->state = MUTEX_UNLOCKED;
+        released = true;
+    }
+
+    spin_unlock(&mutex->lock);
+    return released;
 }

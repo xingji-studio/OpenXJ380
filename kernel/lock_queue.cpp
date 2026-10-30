@@ -90,11 +90,14 @@ size_t lock_queue_enqueue(lock_queue *q, void *data)
         free(new_node);
         return (size_t)-1;
     }
-    new_node->index = q->next_index++;
+    size_t index = q->next_index++;
+    new_node->index = index;
     queue_append_node(q, new_node);
     spin_unlock(&q->lock);
 
-    return new_node->index;
+    // The node is visible to consumers after unlock and may already be freed.
+    // Return the index copied while locked; never dereference new_node here.
+    return index;
 }
 
 size_t queue_enqueue(lock_queue *q, void *data)
@@ -114,11 +117,12 @@ size_t queue_enqueue(lock_queue *q, void *data)
         free(new_node);
         return (size_t)-1;
     }
-    new_node->index = q->next_index++;
+    size_t index = q->next_index++;
+    new_node->index = index;
     queue_append_node(q, new_node);
     spin_unlock(&q->lock);
 
-    return new_node->index;
+    return index;
 }
 
 size_t queue_enqueue_lowest(lock_queue *q, void *data)
@@ -159,7 +163,7 @@ size_t queue_enqueue_lowest(lock_queue *q, void *data)
     if (id >= q->next_index && id != (size_t)-1) q->next_index = id + 1;
     spin_unlock(&q->lock);
 
-    return new_node->index;
+    return id;
 }
 
 size_t queue_enqueue_ref(lock_queue *q, void *data, lock_node **out_node)
@@ -181,12 +185,15 @@ size_t queue_enqueue_ref(lock_queue *q, void *data, lock_node **out_node)
         free(new_node);
         return (size_t)-1;
     }
-    new_node->index = q->next_index++;
+    size_t index = q->next_index++;
+    new_node->index = index;
     queue_append_node(q, new_node);
+    // Publish the optional node handle under the queue lock for consumers that
+    // can remove the node immediately after publication.
+    if (out_node != NULL) *out_node = new_node;
     spin_unlock(&q->lock);
 
-    if (out_node != NULL) *out_node = new_node;
-    return new_node->index;
+    return index;
 }
 
 size_t queue_enqueue_id(lock_queue *q, void *data, size_t id)
@@ -215,7 +222,7 @@ size_t queue_enqueue_id(lock_queue *q, void *data, size_t id)
     if (id >= q->next_index && id != (size_t)-1) q->next_index = id + 1;
     spin_unlock(&q->lock);
 
-    return new_node->index;
+    return id;
 }
 
 void *queue_get(lock_queue *q, size_t index)
@@ -282,6 +289,13 @@ void *queue_remove_node(lock_queue *q, lock_node *node)
     if (q == NULL || node == NULL) return NULL;
 
     spin_lock(&q->lock);
+    lock_node *current = q->head;
+    while (current != NULL && current != node) current = current->next;
+    if (current == NULL)
+    {
+        spin_unlock(&q->lock);
+        return NULL;
+    }
     void *handle = queue_remove_locked(q, node);
     spin_unlock(&q->lock);
     return handle;
