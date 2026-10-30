@@ -740,7 +740,7 @@ def main() -> None:
     # an always-dirty phony input so an existing image is refreshed on every
     # request, including `complete`, rather than being skipped by Ninja.
     n.build("always_stage_licenses", "phony", use_default_order_only=False)
-    image_deps = all_deps + manifest_inputs + ["always_stage_licenses"]
+    image_deps = all_deps + manifest_inputs + ["always_stage_licenses", "tools/make_disk_image.py"]
     n.build(
         ["vdisk", "XJ380.img"],
         "python_cmd",

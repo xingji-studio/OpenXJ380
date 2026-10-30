@@ -198,7 +198,8 @@ def copy_system_apps(root: Path) -> None:
 
 
 def copy_common_assets(root: Path) -> None:
-    return
+    mkdir(root / "system/docs")
+    cp(ROOT / "docs/EXT4.md", root / "system/docs")
 
 
 def copy_modules(root: Path) -> None:
@@ -252,7 +253,7 @@ def fix_links(root: Path) -> None:
 
 def stage_full_system(root: Path, *, include_linux_compat: bool) -> None:
     stage_base(root)
-    cp(ROOT / "out/BOOTX64.efi", root / "EFI/BOOT")
+    cp(ROOT / "out/BOOTX64.efi", root / "EFI/BOOT/BOOTX64.EFI")
     cp(ROOT / "out/kernel.krl", root / "system")
     copy_system_apps(root)
     if include_linux_compat:
@@ -296,20 +297,25 @@ def installer_prepare() -> None:
     prepare()
 
 
-def vdisk(*, complete: bool) -> None:
-    image = ROOT / "XJ380.img"
-    image.unlink(missing_ok=True)
+def vdisk(*, complete: bool, filesystem: str | None = None, image_path: Path | None = None) -> None:
+    filesystem = filesystem or env("VDISK_FS", "fat32")
+    if filesystem not in ("fat32", "ext4"):
+        raise SystemExit("VDISK_FS must be fat32 or ext4")
+    if filesystem == "ext4":
+        raise SystemExit("ext4 system images are disabled: a license-compatible kernel driver is not available")
+    image = ROOT / (image_path or Path(env("VDISK_IMAGE", "XJ380.img")))
     vdisk_root = Path(env("VDISK_ROOT", f"/tmp/xj380-vdisk-{os.getuid()}/XJ380"))
+    if image.resolve().is_relative_to(vdisk_root.resolve()):
+        raise SystemExit("VDISK_IMAGE must be outside VDISK_ROOT")
     reset_dir(vdisk_root, explain_fix=True)
-    run(["dd", "if=/dev/zero", f"of={image}", "bs=1M", f"count={env('VDISK_SIZE_MIB', '3072')}"])
-    sudo = env("VDISK_SUDO", "").strip()
-    shell(f'{sudo + " " if sudo else ""}sgdisk XJ380.img -n 1:2048 -t 1:ef00')
-    shell(
-        f'{sudo + " " if sudo else ""}mkfs.vfat -F 32 --offset 2048 -S 512 '
-        f'XJ380.img $(( {env("VDISK_FAT_MIB", "3072")} * 1024 ))'
-    )
     stage_full_system(vdisk_root, include_linux_compat=complete)
-    shell(f'mcopy -o -s -i XJ380.img@@$((2048*512)) "{vdisk_root}"/* ::')
+    command = [sys.executable, str(ROOT / "tools/make_disk_image.py"),
+               "--root", str(vdisk_root), "--image", str(image), "--fs", filesystem,
+               "--size-mib", env("VDISK_SIZE_MIB", "3072"), "--esp-mib", env("VDISK_ESP_MIB", "64"),
+               "--sudo", env("VDISK_SUDO", "")]
+    if filesystem == "fat32" and os.environ.get("VDISK_FAT_MIB"):
+        command += ["--fat-mib", os.environ["VDISK_FAT_MIB"]]
+    run(command)
     reset_dir(vdisk_root, explain_fix=True)
 
 
@@ -352,7 +358,7 @@ def installer_iso() -> None:
 
 def vmdk() -> None:
     (ROOT / "XJ380.vmdk").unlink(missing_ok=True)
-    run(["qemu-img", "convert", "-O", "vmdk", "XJ380.img", "XJ380.vmdk"])
+    run(["qemu-img", "convert", "-O", "vmdk", env("VDISK_IMAGE", "XJ380.img"), "XJ380.vmdk"])
 
 
 def qemu_cmd() -> str:
@@ -361,14 +367,15 @@ def qemu_cmd() -> str:
     if env_bool("SUDO", "1"):
         sudo_cmd = f"sudo -E env DISPLAY={os.environ.get('DISPLAY', '')} XAUTHORITY={os.environ.get('XAUTHORITY', '')} "
     kvm_flag = "--enable-kvm -cpu host" if env_bool("KVM", "1") else "-cpu max"
+    image = shlex.quote(env("VDISK_IMAGE", "XJ380.img").replace(",", ",,"))
     if env_bool("USB_BOOT", "0"):
         storage = (
-            "-drive if=none,id=usbdisk,file=XJ380.img,index=0,format=raw "
+            f"-drive if=none,id=usbdisk,file={image},index=0,format=raw "
             "-device usb-storage,bus=xhci.0,port=3,drive=usbdisk,bootindex=0"
         )
     else:
         storage = (
-            "-drive if=none,id=harddisk,file=XJ380.img,index=0,format=raw "
+            f"-drive if=none,id=harddisk,file={image},index=0,format=raw "
             "-device ahci,id=ahci -device ide-hd,bus=ahci.0,drive=harddisk,bootindex=0"
         )
     firmware = shlex.quote(str(ovmf_firmware()))
@@ -579,6 +586,9 @@ def check_tools() -> None:
     check_required_tool(missing, "sgdisk", ["sgdisk"], "创建 GPT/EFI 分区", "sudo apt install gdisk")
     check_required_tool(missing, "mkfs.vfat", ["mkfs.vfat"], "格式化 FAT32 EFI 分区",
                         "sudo apt install dosfstools")
+    if env("VDISK_FS", "fat32") == "ext4":
+        check_required_tool(missing, "mke2fs", ["mke2fs"], "创建并填充 ext4 系统分区", "sudo apt install e2fsprogs")
+        check_required_tool(missing, "e2fsck", ["e2fsck"], "校验 ext4 系统分区", "sudo apt install e2fsprogs")
     check_required_tool(missing, "qemu-system-x86_64", ["qemu-system-x86_64"], "运行 XJ380 / installer",
                         "sudo apt install qemu-system-x86")
     check_required_tool(missing, "qemu-img", ["qemu-img"], "生成 VMDK 镜像", "sudo apt install qemu-utils")
@@ -636,15 +646,19 @@ def graph() -> None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("command")
+    parser.add_argument("--fs", choices=("fat32", "ext4"), help="filesystem for vdisk/complete (or VDISK_FS)")
+    parser.add_argument("--image", type=Path, help="output for vdisk/complete (or VDISK_IMAGE)")
     args = parser.parse_args()
+    if (args.fs or args.image) and args.command not in ("vdisk", "complete"):
+        parser.error("--fs and --image apply only to vdisk and complete")
 
     commands = {
         "prepare": prepare,
         "installer-prepare": installer_prepare,
         "stage-selfhost-user": lambda: stage_selfhost_user(Path(env("VDISK_ROOT", f"/tmp/xj380-vdisk-{os.getuid()}/XJ380"))),
         "stage-linux-compat": lambda: stage_linux_compat(Path(env("VDISK_ROOT", f"/tmp/xj380-vdisk-{os.getuid()}/XJ380"))),
-        "vdisk": lambda: vdisk(complete=False),
-        "complete": lambda: vdisk(complete=True),
+        "vdisk": lambda: vdisk(complete=False, filesystem=args.fs, image_path=args.image),
+        "complete": lambda: vdisk(complete=True, filesystem=args.fs, image_path=args.image),
         "installer-system-stage": installer_system_stage,
         "installer-root-stage": installer_root_stage,
         "installer-iso": installer_iso,
