@@ -1,3 +1,5 @@
+#include <user/permissions.h>
+#include <mm/uaccess.h>
 #include <screen_capture.h>
 #include "../build_settings.h"
 #include <cpu/fsgsbase.h>
@@ -668,6 +670,21 @@ extern "C" uint64_t c_syscall_handler(struct X64_REGS *regs, uint64_t user_rsp)
         break;
     case XAPI_GET_VERSION: do_xapi_GetSystemVersion(regs->rdi); break;
     case XAPI_GET_TIME: regs->rax = (uint64_t)do_xapi_GetTime(); break;
+    case XAPI_LIFT_PERMISSIONS:
+        regs->rax = (uint64_t)(int64_t)(regs->rdi > XUT_Custom ? -EINVAL : permissions_lift((UserType)regs->rdi));
+        break;
+    case XAPI_GET_CURRENT_PERMISSIONS:
+    {
+        UserPermisson value = user_permissions_from_mask(permissions_current_mask());
+        tcb_t caller = get_current_task();
+        regs->rax = caller && caller->parent_group &&
+            copy_to_user_pagedir(caller->parent_group->pagedir, (void *)regs->rdi, &value, sizeof(value)) ?
+                0 : (uint64_t)-EFAULT;
+        break;
+    }
+    case XAPI_REQUEST_PERMISSIONS:
+        regs->rax = (uint64_t)(int64_t)(regs->rdi > XPERM_ALL ? -EINVAL : permissions_request(regs->rdi));
+        break;
     case XAPI_GET_CURRENT_USER: do_xapi_GetCurrentUser(regs->rdi); break;
     case XAPI_SLEEP: do_xapi_Sleep(regs->rdi); break;
     case XAPI_BROKEN: do_xapi_Broken((char *)regs->rdi); break;

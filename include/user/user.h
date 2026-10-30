@@ -4,25 +4,7 @@
 
 #include "./settings.h"
 
-typedef enum
-{
-    XUT_Root,
-    XUT_System,
-    XUT_Admin,
-    XUT_Visitor,
-    XUT_Custom
-} UserType;
-
-typedef struct
-{
-    bool ReadFile;          // 读取普通文件
-    bool WriteFile;         // 写入普通文件
-    bool ChangeSettings;    // 更改系统设置
-    bool VisitAnotherDir;   // 访问其他目录
-    bool VisitSysDir;       // 访问系统目录
-    bool ReadSysFile;       // 读取系统文件
-    bool WriteSysFile;      // 写入系统文件
-} UserPermisson;
+#include "permission_types.h"
 
 typedef struct
 {

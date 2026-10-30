@@ -155,11 +155,12 @@ void do_xapi_GetSystemVersion(uint64_t str)
 
 void do_xapi_GetCurrentUser(uint64_t dst)
 {
-    if (dst == 0 || current_user == NULL) return;
+    UserInfo *user = task_effective_user();
+    if (dst == 0 || user == NULL) return;
     xapi_type_UserInfo info;
     memset(&info, 0, sizeof(info));
-    strncpy(info.name, current_user->name, sizeof(info.name) - 1);
-    info.user_type = current_user->user_type;
+    strncpy(info.name, user->name, sizeof(info.name) - 1);
+    info.user_type = user->user_type;
     copy_to_user_pagedir(xapi_current_pagedir(), (void *)dst, &info, sizeof(info));
 }
 

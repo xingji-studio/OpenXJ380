@@ -1,4 +1,5 @@
 #include <input_method.h>
+#include <user/permissions.h>
 #include "../build_settings.h"
 #include <ahci/ahci.h>
 #include <efi/boot.h>
@@ -90,6 +91,8 @@ uint32_t user_gid(const UserInfo *user)
 UserInfo *task_effective_user()
 {
     tcb_t task = get_current_task();
+    if (task != NULL && task->task_level == TASK_APPLICATION_LEVEL && task->parent_group != NULL)
+        return &task->parent_group->permission_user;
     if (task != NULL && task->user_info != NULL) return task->user_info;
     if (current_user != NULL) return current_user;
     return &root_user;
@@ -197,12 +200,22 @@ static bool user_registry_first_user_matches(const UserRegisterList *registry, c
     return false;
 }
 
+// Authentication may read its fixed account database regardless of the caller's SR bit.
+// The scope is kernel-only and never survives a return into application code.
+struct UserRegistryScope
+{
+    tcb_t task;
+    UserRegistryScope() : task(get_current_task()) { if (task) ++task->ime_config_depth; }
+    ~UserRegistryScope() { if (task) --task->ime_config_depth; }
+};
+
 static bool load_user_registry(UserRegisterList *registry, size_t *bytes_read)
 {
     if (registry == NULL) return false;
     memset(registry, 0, sizeof(UserRegisterList));
     if (bytes_read != NULL) *bytes_read = 0;
 
+    UserRegistryScope scope;
     vfs_node_t node = vfs_open("/system/config/usereg.dat");
     if (node == NULL) return false;
 
@@ -214,6 +227,7 @@ static bool load_user_registry(UserRegisterList *registry, size_t *bytes_read)
 
 static bool write_first_user_registry(const char *username, const char *password)
 {
+    UserRegistryScope scope;
     if (username == NULL || password == NULL) return false;
 
     vfs_mkdir("/system");
@@ -248,12 +262,10 @@ static void set_current_user_from_info(UserInfo *info)
     if (info == NULL) return;
     if (current_user == NULL) current_user = (UserInfo *)malloc(sizeof(UserInfo));
     if (current_user == NULL) return;
-    memset(current_user, 0, sizeof(UserInfo));
-    strcpy(current_user->name, info->name);
-    strcpy(current_user->password, info->password);
-    current_user->user_type = info->user_type;
-    current_user->envc      = 3;
-    current_user->envp      = current_user_envp;
+    UserInfo snapshot = *info;
+    snapshot.envc = 3;
+    snapshot.envp = current_user_envp;
+    permissions_session_publish(&snapshot);
 }
 
 bool user_session_is_ready()

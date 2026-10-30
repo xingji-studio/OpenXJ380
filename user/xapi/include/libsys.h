@@ -383,3 +383,7 @@ uint64_t enter_syscall(uint64_t syscall_number, uint64_t arg1, uint64_t arg2, ui
 
 // Process-lifetime global screen capture protection.
 #define XAPI_SET_SECRET           7486
+
+#define XAPI_LIFT_PERMISSIONS 7496
+#define XAPI_GET_CURRENT_PERMISSIONS 7497
+#define XAPI_REQUEST_PERMISSIONS 7498

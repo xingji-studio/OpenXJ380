@@ -140,6 +140,8 @@ struct process_control_block
     bool     notify_pcor_registered;
     uint64_t ime_launch_generation;
     uint32_t ime_role; // 0: application, 1: selected engine, 2: registry manager, 3: own IME settings
+    UserInfo permission_user; // Process-owned identity; never aliases the login account.
+    uint64_t permission_revision;
     bool screen_secret; // Process-lifetime global capture prohibition.
     bool screen_raw_mapped; // Live framebuffer mappings cannot be revoked by a syscall check.
     pcb_t screen_capture_next; // Intrusive policy list, protected by the capture state lock.

@@ -1,3 +1,4 @@
+#include <user/permissions.h>
 #include "ime_internal.h"
 #include <errno.h>
 #include <fs/vfs/vfs.h>
@@ -203,6 +204,7 @@ bool ime_vfs_access(vfs_node_t node, const char *path, ImeFileOperation operatio
 {
     tcb_t task = get_current_task();
     if (!task || task->task_level != TASK_APPLICATION_LEVEL || task->ime_config_depth) return true;
+    if (!permissions_file_access(node, path, operation)) return false;
     if (operation == IME_FILE_MOUNT || (node && (node->type & file_block) && !task->ime_storage_depth)) return false;
     uint64_t protection = node_policy(node);
     if (path)

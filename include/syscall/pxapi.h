@@ -380,3 +380,7 @@ uint64_t message_ask(uint64_t msg_type_p, uint64_t hdatap, uint64_t ldatap, uint
 
 // Process-lifetime global screen capture protection.
 #define XAPI_SET_SECRET           7486
+
+#define XAPI_LIFT_PERMISSIONS 7496
+#define XAPI_GET_CURRENT_PERMISSIONS 7497
+#define XAPI_REQUEST_PERMISSIONS 7498
