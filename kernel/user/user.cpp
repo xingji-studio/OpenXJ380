@@ -934,7 +934,18 @@ int create_user_process_from_file(char *path, pcb_t pcb, char *argv[])
         write_serial_fmt("Create User Process Failed. Reason: Cannot Create Process Group.\n");
         return -ENOMEM;
     }
-    group->exe_path = strdup(path);
+    vfs_node_t executable_node = vfs_open(path);
+    char executable_directory[4096];
+    int directory_error = executable_node ?
+        permissions_executable_directory(executable_node, executable_directory, sizeof(executable_directory)) : -ENOENT;
+    group->exe_path = executable_node ? vfs_get_fullpath(executable_node) : NULL;
+    if (executable_node) vfs_close(executable_node);
+    if (directory_error < 0)
+    {
+        kill_proc(group, 0, false);
+        return directory_error;
+    }
+    permissions_process_exec(group, executable_directory);
     if (group->exe_path == NULL)
     {
         write_serial_fmt("Create User Process Failed. Reason: Cannot Copy Exec Path.\n");

@@ -1,3 +1,4 @@
+#include <user/permissions.h>
 #include <input_method.h>
 /**
  * Virtual File System Interface
@@ -22,6 +23,36 @@
 #include <device.h>
 #include <task/poll.h>
 #include <rng.h>
+
+bool vfs_check_access(vfs_node_t node, const char *path, int operation)
+{
+    permissions_clear_file_error();
+    if (ime_vfs_access(node, path, (ImeFileOperation)operation)) return true;
+    if (!permissions_file_error()) permissions_set_file_error(EACCES);
+    return false;
+}
+
+int vfs_last_error()
+{
+    int error = permissions_file_error();
+    return error ? error : EIO;
+}
+
+static bool check_child_creation(vfs_node_t parent, const char *name)
+{
+    char *base = vfs_get_fullpath(parent);
+    if (!base) return false;
+    size_t capacity = strlen(base) + strlen(name) + 2;
+    char *path = (char *)malloc(capacity);
+    if (!path) { free(base); return false; }
+    snprintf(path, capacity, "%s/%s", base, name);
+    char *canonical = normalize_path(path);
+    bool allowed = canonical && vfs_check_access(NULL, canonical, IME_FILE_WRITE);
+    free(canonical);
+    free(path);
+    free(base);
+    return allowed;
+}
 
 vfs_node_t rootdir = NULL;
 
@@ -234,7 +265,8 @@ static char *vfs_alias_target_dup(const char *path)
 }
 
 errno_t vfs_mkdir(const char *name) {
-    if (!ime_vfs_access(NULL, name, IME_FILE_WRITE)) return VFS_STATUS_FAILED;
+    permissions_clear_file_error();
+    if (!vfs_check_access(NULL, name, IME_FILE_WRITE)) return VFS_STATUS_FAILED;
     if (name[0] != '/') return VFS_STATUS_FAILED;
     char      *path     = strdup(name + 1);
     char      *save_ptr = path;
@@ -254,6 +286,7 @@ errno_t vfs_mkdir(const char *name) {
 
     upd:
         if (current == NULL) {
+            if (!check_child_creation(father, buf)) goto err;
             current       = vfs_node_alloc(father, buf);
             current->type = file_dir;
             callbackof(father, mkdir)(father->handle, buf, current);
@@ -273,8 +306,17 @@ err:
 }
 
 errno_t vfs_link(const char *name, const char *target_name) {
-    if (!ime_vfs_access(NULL, name, IME_FILE_WRITE) ||
-        !ime_vfs_access(NULL, target_name, IME_FILE_WRITE)) return VFS_STATUS_FAILED;
+    permissions_clear_file_error();
+    if (!name || !target_name || name[0] != '/' || !name[1]) return VFS_STATUS_FAILED;
+    if (!vfs_check_access(NULL, name, IME_FILE_WRITE)) return VFS_STATUS_FAILED;
+    vfs_node_t source = vfs_open(target_name);
+    if (!source) return VFS_STATUS_FAILED;
+    if ((source->type & file_dir) || !vfs_check_access(source, NULL, IME_FILE_READ) ||
+        !permissions_file_link(source, name))
+    {
+        vfs_close(source);
+        return VFS_STATUS_FAILED;
+    }
     vfs_node_t current = rootdir;
     char      *path    = strdup(name + 1);
 
@@ -290,6 +332,7 @@ errno_t vfs_link(const char *name, const char *target_name) {
 
     if (strlen(path) == 0) {
         free(path);
+        vfs_close(source);
         return -ENOENT;
     }
     vfs_node_t node ;
@@ -302,6 +345,7 @@ errno_t vfs_link(const char *name, const char *target_name) {
         }
         vfs_node_t new_current = vfs_child_find(current, buf);
         if (new_current == NULL) {
+            if (!check_child_creation(current, buf)) goto err;
             new_current       = vfs_node_alloc(current, buf);
             new_current->type = file_dir;
             callbackof(current, mkdir)(current->handle, buf, new_current);
@@ -313,10 +357,11 @@ errno_t vfs_link(const char *name, const char *target_name) {
     }
 
 create:
+    if (!check_child_creation(current, filename)) goto err;
     node = vfs_child_append(current, filename, NULL);
     node->type      = file_none;
     callbackof(current, link)(current->handle, target_name, node);
-    node->linkto = vfs_open(target_name);
+    node->linkto = source;
 
     free(path);
 
@@ -324,12 +369,13 @@ create:
 
 err:
     free(path);
+    vfs_close(source);
     return VFS_STATUS_FAILED;
 }
 
 errno_t vfs_symlink(const char *name, const char *target_name) {
-    if (!ime_vfs_access(NULL, name, IME_FILE_WRITE) ||
-        !ime_vfs_access(NULL, target_name, IME_FILE_WRITE)) return VFS_STATUS_FAILED;
+    permissions_clear_file_error();
+    if (!vfs_check_access(NULL, name, IME_FILE_WRITE)) return VFS_STATUS_FAILED;
     vfs_node_t current = rootdir;
     char      *path    = strdup(name + 1);
 
@@ -357,6 +403,7 @@ errno_t vfs_symlink(const char *name, const char *target_name) {
         }
         vfs_node_t new_current = vfs_child_find(current, buf);
         if (new_current == NULL) {
+            if (!check_child_creation(current, buf)) goto err;
             new_current       = vfs_node_alloc(current, buf);
             new_current->type = file_dir;
             callbackof(current, mkdir)(current->handle, buf, new_current);
@@ -368,6 +415,7 @@ errno_t vfs_symlink(const char *name, const char *target_name) {
     }
 
 create:
+    if (!check_child_creation(current, filename)) goto err;
     node = vfs_child_append(current, filename, NULL);
     node->type      = file_symlink;
     node->linkname  = strdup(target_name);
@@ -385,7 +433,8 @@ err:
 }
 
 errno_t vfs_mkfile(const char *name) {
-    if (!ime_vfs_access(NULL, name, IME_FILE_WRITE)) return VFS_STATUS_FAILED;
+    permissions_clear_file_error();
+    if (!vfs_check_access(NULL, name, IME_FILE_WRITE)) return VFS_STATUS_FAILED;
     if (name[0] != '/') return VFS_STATUS_FAILED;
 
     // 分离路径和文件名
@@ -412,6 +461,7 @@ errno_t vfs_mkfile(const char *name) {
 
     if (parent == NULL || parent->type != file_dir) { return VFS_STATUS_FAILED; }
 
+    if (!check_child_creation(parent, filename)) { vfs_close(parent); free(fullpath); return VFS_STATUS_FAILED; }
     // 创建文件
     vfs_node_t node = vfs_child_append(parent, filename, NULL);
     node->type      = file_none;
@@ -421,7 +471,8 @@ errno_t vfs_mkfile(const char *name) {
 }
 
 errno_t vfs_delete(vfs_node_t node) {
-    if (!ime_vfs_access(node, NULL, IME_FILE_REMOVE)) return VFS_STATUS_FAILED;
+    permissions_clear_file_error();
+    if (!vfs_check_access(node, NULL, IME_FILE_REMOVE)) return VFS_STATUS_FAILED;
     if (node == NULL || node == rootdir) return VFS_STATUS_FAILED;
 
     vfs_child_lock();
@@ -483,8 +534,10 @@ errno_t vfs_delete(vfs_node_t node) {
 }
 
 errno_t vfs_rename(vfs_node_t node, const char *nw) {
-    if (!ime_vfs_access(node, NULL, IME_FILE_REMOVE) ||
-        !ime_vfs_access(NULL, nw, IME_FILE_WRITE)) return VFS_STATUS_FAILED;
+    permissions_clear_file_error();
+    if (!vfs_check_access(node, NULL, IME_FILE_REMOVE) ||
+        !vfs_check_access(NULL, nw, IME_FILE_WRITE) ||
+        !permissions_file_move(node, nw)) return VFS_STATUS_FAILED;
     if (node == NULL || nw == NULL) return VFS_STATUS_FAILED;
     if ((node->type & file_symlink) && node->linkname != NULL)
     {
@@ -545,7 +598,8 @@ errno_t vfs_rename(vfs_node_t node, const char *nw) {
 }
 
 errno_t vfs_resize(vfs_node_t node, uint64_t size) {
-    if (!ime_vfs_access(node, NULL, IME_FILE_WRITE)) return VFS_STATUS_FAILED;
+    permissions_clear_file_error();
+    if (!vfs_check_access(node, NULL, IME_FILE_WRITE)) return VFS_STATUS_FAILED;
     if (node == NULL) return VFS_STATUS_FAILED;
     do_update(node);
     if (node->type == file_dir) return VFS_STATUS_FAILED;
@@ -555,7 +609,8 @@ errno_t vfs_resize(vfs_node_t node, uint64_t size) {
 }
 
 errno_t vfs_resize_fast(vfs_node_t node, uint64_t size) {
-    if (!ime_vfs_access(node, NULL, IME_FILE_WRITE)) return VFS_STATUS_FAILED;
+    permissions_clear_file_error();
+    if (!vfs_check_access(node, NULL, IME_FILE_WRITE)) return VFS_STATUS_FAILED;
     if (node == NULL) return VFS_STATUS_FAILED;
     if (node->type == file_dir) return VFS_STATUS_FAILED;
     callbackof(node, resize)(node->handle, size);
@@ -592,6 +647,8 @@ vfs_node_t vfs_do_search(vfs_node_t dir, const char *name) {
 }
 
 static constexpr unsigned VFS_MAX_LINK_DEPTH = 40;
+
+static size_t vfs_readlink_internal(vfs_node_t node, char *buf, size_t bufsize);
 
 static vfs_node_t vfs_open_impl(const char *str, bool follow_final_symlink, bool allow_alias, unsigned link_depth) {
     if (unlikely(str == NULL)) return NULL;
@@ -635,7 +692,7 @@ static vfs_node_t vfs_open_impl(const char *str, bool follow_final_symlink, bool
             if (target == NULL)
             {
                 char target_path[256];
-                size_t len = vfs_readlink(current, target_path, sizeof(target_path) - 1);
+                size_t len = vfs_readlink_internal(current, target_path, sizeof(target_path) - 1);
                 if (len == (size_t)VFS_STATUS_FAILED || len == 0 || len >= sizeof(target_path)) goto err;
                 target_path[len] = '\0';
                 if (target_path[0] == '/')
@@ -712,14 +769,16 @@ err:
 }
 
 vfs_node_t vfs_open(const char *str) {
+    permissions_clear_file_error();
     vfs_node_t node = vfs_open_impl(str, true, true, 0);
-    if (node && !ime_vfs_access(node, NULL, IME_FILE_READ)) { vfs_close(node); return NULL; }
+    if (node && !vfs_check_access(node, NULL, IME_FILE_LOOKUP)) { vfs_close(node); return NULL; }
     return node;
 }
 
 vfs_node_t vfs_open_no_follow(const char *str) {
+    permissions_clear_file_error();
     vfs_node_t node = vfs_open_impl(str, false, true, 0);
-    if (node && !ime_vfs_access(node, NULL, IME_FILE_READ)) { vfs_close(node); return NULL; }
+    if (node && !vfs_check_access(node, NULL, IME_FILE_LOOKUP)) { vfs_close(node); return NULL; }
     return node;
 }
 
@@ -772,9 +831,10 @@ void set_rootdir(vfs_node_t node) {
 
 void *vfs_map(vfs_node_t node, uint64_t addr, uint64_t len, uint64_t prot, uint64_t flags,
               uint64_t offset) {
+    permissions_clear_file_error();
     if (unlikely(node == NULL)) return NULL;
     if (unlikely(node->type == file_dir)) return NULL;
-    if (!ime_vfs_access(node, NULL, (prot & 2) ? IME_FILE_WRITE : IME_FILE_READ)) return NULL;
+    if (!vfs_check_access(node, NULL, (prot & 2) ? ((prot & 1) ? IME_FILE_READ_WRITE : IME_FILE_WRITE) : IME_FILE_READ)) return NULL;
     return callbackof(node, map)(node->handle, (void *)addr, offset, len, prot, flags);
 }
 
@@ -962,7 +1022,7 @@ void vfs_free_child(vfs_node_t vfs) {
 }
 
 errno_t vfs_mount(const char *src, vfs_node_t node) {
-    if (!ime_vfs_access(node, NULL, IME_FILE_MOUNT)) return VFS_STATUS_FAILED;
+    if (!vfs_check_access(node, NULL, IME_FILE_MOUNT)) return VFS_STATUS_FAILED;
     if (node == NULL) return VFS_STATUS_FAILED;
     if (node->type != file_dir) return VFS_STATUS_FAILED;
     for (int i = 1; i < fs_nextid; i++) {
@@ -977,7 +1037,8 @@ errno_t vfs_mount(const char *src, vfs_node_t node) {
 }
 
 size_t vfs_read(vfs_node_t file, void *addr, size_t offset, size_t size) {
-    if (!ime_vfs_access(file, NULL, IME_FILE_READ)) return VFS_STATUS_FAILED;
+    permissions_clear_file_error();
+    if (!vfs_check_access(file, NULL, IME_FILE_READ)) return VFS_STATUS_FAILED;
     if (file == NULL || addr == NULL) return VFS_STATUS_FAILED;
     do_update(file);
     if (file->type == file_dir) return VFS_STATUS_FAILED;
@@ -985,7 +1046,8 @@ size_t vfs_read(vfs_node_t file, void *addr, size_t offset, size_t size) {
 }
 
 size_t vfs_write(vfs_node_t file, void *addr, size_t offset, size_t size) {
-    if (!ime_vfs_access(file, NULL, IME_FILE_WRITE)) return VFS_STATUS_FAILED;
+    permissions_clear_file_error();
+    if (!vfs_check_access(file, NULL, IME_FILE_WRITE)) return VFS_STATUS_FAILED;
     if (file == NULL || addr == NULL) return VFS_STATUS_FAILED;
     do_update(file);
     if (file->type == file_dir) return VFS_STATUS_FAILED;
@@ -995,14 +1057,16 @@ size_t vfs_write(vfs_node_t file, void *addr, size_t offset, size_t size) {
 }
 
 size_t vfs_write_fast(vfs_node_t file, void *addr, size_t offset, size_t size) {
-    if (!ime_vfs_access(file, NULL, IME_FILE_WRITE)) return VFS_STATUS_FAILED;
+    permissions_clear_file_error();
+    if (!vfs_check_access(file, NULL, IME_FILE_WRITE)) return VFS_STATUS_FAILED;
     if (file == NULL || addr == NULL) return VFS_STATUS_FAILED;
     if (file->type == file_dir) return VFS_STATUS_FAILED;
     return callbackof(file, write)(file->handle, addr, offset, size);
 }
 
 errno_t vfs_ioctl(vfs_node_t device, size_t options, void *arg) {
-    if (!ime_vfs_access(device, NULL, IME_FILE_WRITE)) return VFS_STATUS_FAILED;
+    permissions_clear_file_error();
+    if (!vfs_check_access(device, NULL, IME_FILE_WRITE)) return VFS_STATUS_FAILED;
     if (device == NULL) return VFS_STATUS_FAILED;
     do_update(device);
     if (device->type == file_dir) return VFS_STATUS_FAILED;
@@ -1016,7 +1080,7 @@ errno_t vfs_poll(vfs_node_t node, size_t event) {
 }
 
 errno_t vfs_unmount(const char *path) {
-    if (!ime_vfs_access(NULL, NULL, IME_FILE_MOUNT)) return VFS_STATUS_FAILED;
+    if (!vfs_check_access(NULL, NULL, IME_FILE_MOUNT)) return VFS_STATUS_FAILED;
     vfs_node_t node = vfs_open(path);
     if (node == NULL) return VFS_STATUS_FAILED;
     if (node->type != file_dir) return VFS_STATUS_FAILED;
@@ -1039,7 +1103,7 @@ errno_t vfs_unmount(const char *path) {
     return VFS_STATUS_FAILED;
 }
 
-size_t vfs_readlink(vfs_node_t node, char *buf, size_t bufsize) {
+static size_t vfs_readlink_internal(vfs_node_t node, char *buf, size_t bufsize) {
     if (node != NULL && node->linkname != NULL) {
         size_t link_size = strlen(node->linkname);
         size_t copy_size = MIN(link_size, bufsize);
@@ -1048,6 +1112,13 @@ size_t vfs_readlink(vfs_node_t node, char *buf, size_t bufsize) {
     }
     size_t ret = callbackof(node, readlink)(node, buf, 0, bufsize);
     return ret;
+}
+
+size_t vfs_readlink(vfs_node_t node, char *buf, size_t bufsize)
+{
+    permissions_clear_file_error();
+    if (!vfs_check_access(node, NULL, IME_FILE_READ)) return VFS_STATUS_FAILED;
+    return vfs_readlink_internal(node, buf, bufsize);
 }
 
 void *general_map(vfs_read_t read_callback, void *file, uint64_t addr, uint64_t len, uint64_t prot,
@@ -1191,50 +1262,29 @@ char *at_resolve_pathname(int dirfd, char *pathname) {
 char *normalize_path(const char *path)
 {
     if (!path) return NULL;
-
-    size_t len    = strlen(path);
-    char  *result = (char *)malloc(len + 1);
+    size_t capacity = strlen(path) + 2;
+    char *result = (char *)malloc(capacity);
     if (!result) return NULL;
-
-    char *dup = strdup(path);
-    if (!dup)
+    size_t used = 1;
+    result[0] = '/';
+    for (const char *cursor = path; *cursor;)
     {
-        free(result);
-        return NULL;
-    }
-
-    strcpy(result, "/");
-    if (strcmp(path, "/") == 0)
-    {
-        free(dup);
-        return result;
-    }
-
-    char *start = dup;
-    if (*start == '/') start++;
-
-    char *token = strtok(start, "/");
-    while (token)
-    {
-        if (strcmp(token, ".") == 0) {}
-        else if (strcmp(token, "..") == 0)
+        while (*cursor == '/' || *cursor == '\\') ++cursor;
+        const char *start = cursor;
+        while (*cursor && *cursor != '/' && *cursor != '\\') ++cursor;
+        size_t length = (size_t)(cursor - start);
+        if (!length || (length == 1 && start[0] == '.')) continue;
+        if (length == 2 && start[0] == '.' && start[1] == '.')
         {
-            char *last_slash = strrchr(result, '/');
-            if (last_slash != result)
-                *last_slash = '\0';
-            else
-                result[1] = '\0';
+            while (used > 1 && result[used - 1] != '/') --used;
+            if (used > 1) --used;
+            continue;
         }
-        else
-        {
-            if (result[strlen(result) - 1] != '/') strcat(result, "/");
-            strcat(result, token);
-        }
-
-        token = strtok(NULL, "/");
+        if (used > 1) result[used++] = '/';
+        memcpy(result + used, start, length);
+        used += length;
     }
-
-    free(dup);
+    result[used] = 0;
     return result;
 }
 char *vfs_cwd_path_build(char *src) {

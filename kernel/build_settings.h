@@ -112,7 +112,7 @@
 
 #ifndef CONFIG_KERNEL_DEFAULT_USER_APP
 // User application launched automatically when auto-start is enabled.
-#define CONFIG_KERNEL_DEFAULT_USER_APP "/apps/system/shell.elf"
+#define CONFIG_KERNEL_DEFAULT_USER_APP "/apps/system/shell/shell.elf"
 #endif
 
 #ifndef CONFIG_KERNEL_BOOT_LOGO

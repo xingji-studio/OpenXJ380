@@ -142,6 +142,7 @@ struct process_control_block
     uint32_t ime_role; // 0: application, 1: selected engine, 2: registry manager, 3: own IME settings
     UserInfo permission_user; // Process-owned identity; never aliases the login account.
     uint64_t permission_revision;
+    char permission_directory[4096]; // Canonical executable parent; independent of cwd.
     bool screen_secret; // Process-lifetime global capture prohibition.
     bool screen_raw_mapped; // Live framebuffer mappings cannot be revoked by a syscall check.
     pcb_t screen_capture_next; // Intrusive policy list, protected by the capture state lock.
@@ -224,6 +225,8 @@ struct thread_control_block
 
     bool owns_user_stack;
     uint32_t ime_storage_depth; // Trusted filesystem I/O, not a user raw-device grant.
+    int file_access_error; // Per-thread VFS error; no global errno race.
+    const char *permission_profile_owner; // Scoped authenticated profile service; kernel-owned storage.
     uint32_t ime_config_depth; // Kernel-only settings transaction scope.
     uint64_t ime_launch_generation;
     uint32_t ime_launch_role; // Consumed by a controlled loader invocation.

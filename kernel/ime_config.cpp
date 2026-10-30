@@ -203,9 +203,13 @@ static uint64_t node_policy(vfs_node_t node)
 bool ime_vfs_access(vfs_node_t node, const char *path, ImeFileOperation operation)
 {
     tcb_t task = get_current_task();
-    if (!task || task->task_level != TASK_APPLICATION_LEVEL || task->ime_config_depth) return true;
+    if (!task || task->task_level != TASK_APPLICATION_LEVEL) return true;
+    if (task->ime_config_depth && !task->permission_profile_owner) return true;
     if (!permissions_file_access(node, path, operation)) return false;
+    if (task->permission_profile_owner) return true;
     if (operation == IME_FILE_MOUNT || (node && (node->type & file_block) && !task->ime_storage_depth)) return false;
+    bool mutation = operation == IME_FILE_WRITE || operation == IME_FILE_REMOVE ||
+                    operation == IME_FILE_MOUNT || operation == IME_FILE_READ_WRITE;
     uint64_t protection = node_policy(node);
     if (path)
     {
@@ -227,7 +231,7 @@ bool ime_vfs_access(vfs_node_t node, const char *path, ImeFileOperation operatio
             }
             *slash = '/';
         }
-        if (variable_anchor && operation != IME_FILE_READ)
+        if (variable_anchor && mutation)
         {
             vfs_node_t target = vfs_open(normalized);
             if (target)
@@ -239,7 +243,7 @@ bool ime_vfs_access(vfs_node_t node, const char *path, ImeFileOperation operatio
         free(normalized);
     }
     if (protection & PRIVATE_NODE) return false;
-    return operation == IME_FILE_READ || !(protection & (READ_ONLY_NODE | ANCHOR_NODE));
+    return !mutation || !(protection & (READ_ONLY_NODE | ANCHOR_NODE));
 }
 
 bool ime_valid_id(const char *id)

@@ -1,3 +1,4 @@
+#include <input_method.h>
 #include <ahci/ahci.h>
 #include <efi/boot.h>
 #include <efi/efi.h>
@@ -52,7 +53,7 @@ static ssize_t xfile_write_from_user(vfs_node_t node, const void *buffer, size_t
         if (wrote == (size_t)VFS_STATUS_FAILED)
         {
             free(bounce);
-            return total > 0 ? (ssize_t)total : -EIO;
+            return total > 0 ? (ssize_t)total : -vfs_last_error();
         }
 
         total += wrote;
@@ -90,7 +91,7 @@ static ssize_t xfile_read_to_user(vfs_node_t node, void *buffer, size_t offset, 
         if (got == (size_t)VFS_STATUS_FAILED)
         {
             free(bounce);
-            return total > 0 ? (ssize_t)total : -EIO;
+            return total > 0 ? (ssize_t)total : -vfs_last_error();
         }
         if (got == 0) break;
 
@@ -139,8 +140,9 @@ uint64_t do_xapi_OpenFile(uint64_t path)
     strncpy(local.path, fpath, sizeof(local.path) - 1);
 
     vfs_node_t f = vfs_open(fpath);
-    if (!f)
+    if (!f || !vfs_check_access(f, NULL, IME_FILE_READ))
     {
+        if (f) vfs_close(f);
         free(fpath);
         unmap_page_range(pagedir, fsptr_addr, sizeof(XFILE));
         return 0;
@@ -255,6 +257,7 @@ void do_xapi_SearchFile(uint64_t path, uint64_t count, XAPIT_DirNode **dir)
     }
 
     vfs_node_t v = vfs_open(fpath);
+    if (v && !vfs_check_access(v, NULL, IME_FILE_LIST)) { vfs_close(v); v = NULL; }
     if (!v || !(v->type & file_dir))
     {
         fcount = -1;
@@ -405,7 +408,7 @@ uint64_t do_xapi_WriteFile(struct X64_REGS *regs)
         if (create_ret < 0)
         {
             free(fpath);
-            return (uint64_t)-ENOENT;
+            return (uint64_t)-vfs_last_error();
         }
         node = vfs_open(fpath);
         if (!node)

@@ -50,13 +50,21 @@ void permissions_process_init(pcb_t process, pcb_t parent)
     // Passwords are account data and must never be copied into process credentials.
     memset(process->permission_user.password, 0, sizeof(process->permission_user.password));
     process->permission_revision = 1;
+    if (parent && parent != kernel_group)
+        memcpy(process->permission_directory, parent->permission_directory, sizeof(process->permission_directory));
+    else process->permission_directory[0] = 0;
     spin_unlock(&permission_lock);
 }
 
-void permissions_process_exec(pcb_t process)
+void permissions_process_exec(pcb_t process, const char *directory)
 {
     spin_lock(&permission_lock);
-    __atomic_add_fetch(&process->permission_revision, 1ULL, __ATOMIC_RELEASE); // Invalidate consent for the previous executable.
+    if (directory)
+    {
+        strncpy(process->permission_directory, directory, sizeof(process->permission_directory) - 1);
+        process->permission_directory[sizeof(process->permission_directory) - 1] = 0;
+    }
+    __atomic_add_fetch(&process->permission_revision, 1ULL, __ATOMIC_RELEASE); // Invalidate previous consent.
     spin_unlock(&permission_lock);
 }
 
@@ -317,88 +325,303 @@ int permissions_request(uint8_t requested)
     return request_permissions(requested, XUT_Custom, true);
 }
 
+static bool prefix_fold(const char *path, const char *prefix)
+{
+    for (size_t i = 0; prefix[i]; ++i)
+    {
+        unsigned char a = path[i], b = prefix[i];
+        if (a >= 'A' && a <= 'Z') a += 'a' - 'A';
+        if (b >= 'A' && b <= 'Z') b += 'a' - 'A';
+        if (!a || a != b) return false;
+    }
+    return true;
+}
+
+static bool equal_fold(const char *a, const char *b)
+{
+    return prefix_fold(a, b) && strlen(a) == strlen(b);
+}
+
 static bool under(const char *path, const char *directory)
 {
     size_t n = strlen(directory);
-    // FAT is case-insensitive; a differently cased spelling must not bypass policy.
-    for (size_t i = 0; i < n; ++i)
-    {
-        unsigned char a = path[i], b = directory[i];
-        if (a >= 'A' && a <= 'Z') a += 'a' - 'A';
-        if (b >= 'A' && b <= 'Z') b += 'a' - 'A';
-        if (a != b || !a) return false;
-    }
-    return path[n] == '/' || path[n] == '\0';
+    if (!n) return false;
+    if (n == 1 && directory[0] == '/') return path[0] == '/';
+    return prefix_fold(path, directory) && (path[n] == '/' || !path[n]);
 }
 
-static bool path_access(const char *path, bool directory, int operation, uint8_t mask, const char *user)
+static PermissionFolderPolicy folder_policy;
+
+void permissions_set_folder_policy(PermissionFolderPolicy policy)
 {
-    bool write = operation != IME_FILE_READ;
-    bool system = under(path, "/system") || under(path, "/config") || under(path, "/boot") || under(path, "/mod");
-    // Shared UI assets are ordinary readable data. Their system-owned location
-    // must not force every Admin desktop/app to acquire SR merely to draw itself.
-    bool public_asset = under(path, "/system/resources") || under(path, "/system/icon") ||
-        under(path, "/system/font") || under(path, "/system/theme") || under(path, "/system/foxland");
-    uint8_t required = directory ? 0 : (write ? XPERM_W : XPERM_R);
-    if (directory && write) required |= XPERM_W;
-    if (system)
+    __atomic_store_n(&folder_policy, policy, __ATOMIC_RELEASE);
+}
+
+int permissions_file_error()
+{
+    tcb_t task = get_current_task();
+    return task ? task->file_access_error : 0;
+}
+
+void permissions_clear_file_error()
+{
+    tcb_t task = get_current_task();
+    if (task) task->file_access_error = 0;
+}
+
+void permissions_set_file_error(int error)
+{
+    tcb_t task = get_current_task();
+    if (task) task->file_access_error = error;
+}
+
+PermissionProfileScope::PermissionProfileScope(const char *username) : task(get_current_task()), previous(NULL), owner{}
+{
+    if (!task) return;
+    if (username && username[0] && strlen(username) < sizeof(owner) &&
+        !strchr(username, '/') && !strchr(username, '\\') && strcmp(username, ".") && strcmp(username, ".."))
+        strcpy(owner, username);
+    previous = task->permission_profile_owner;
+    task->permission_profile_owner = owner;
+}
+
+PermissionProfileScope::~PermissionProfileScope()
+{
+    if (task) task->permission_profile_owner = previous;
+}
+
+int permissions_executable_directory(vfs_node_t executable, char *out, size_t capacity)
+{
+    if (!executable || !out || !capacity) return -EINVAL;
+    char *path = vfs_get_fullpath(executable);
+    if (!path) return -ENOMEM;
+    char *slash = strrchr(path, '/');
+    if (!slash) { free(path); return -EINVAL; }
+    size_t length = slash == path ? 1 : (size_t)(slash - path);
+    if (length >= capacity) { free(path); return -ENAMETOOLONG; }
+    memcpy(out, path, length);
+    out[length] = 0;
+    free(path);
+    return 0;
+}
+
+static bool system_path(const char *path)
+{
+    // The requested resources prefix is ordinary data, even though it lives
+    // below /system. No SV/SR/SW requirements are inherited from that parent.
+    return !prefix_fold(path, "/system/resources") && (under(path, "/system") || under(path, "/EFI"));
+}
+
+static bool path_access(const char *path, bool directory, int operation, uint8_t mask,
+                        const char *user, const char *application, pcb_t process = NULL)
+{
+    if (operation == IME_FILE_LOOKUP) return true; // Internal name lookup exposes no contents or listing.
+    if (operation == IME_FILE_MOUNT) return false;
+    bool write = operation == IME_FILE_WRITE || operation == IME_FILE_REMOVE || operation == IME_FILE_READ_WRITE;
+    bool read = operation == IME_FILE_READ || operation == IME_FILE_READ_WRITE;
+    bool metadata = operation == IME_FILE_STAT || operation == IME_FILE_LIST;
+    if (!write && !read && !metadata) return false;
+
+    if (under(path, "/users"))
     {
-        required |= XPERM_SV;
-        if (write) required |= XPERM_SW;
-        else if (!directory && !public_asset) required |= XPERM_SR;
-        if (write && (under(path, "/config") || under(path, "/system/config"))) required |= XPERM_CS;
+        const char *owner = path + strlen("/users/");
+        if (strlen(path) > strlen("/users/"))
+        {
+            const char *slash = strchr(owner, '/');
+            if (slash && equal_fold(slash, "/settings.json"))
+            {
+                size_t length = (size_t)(slash - owner);
+                // Neither NV nor a broad executable directory may authorize another account's settings.
+                return strlen(user) == length && prefix_fold(owner, user) && (mask & XPERM_CS);
+            }
+        }
     }
-    if (!(mask & XPERM_NV) && strcmp(path, "/") != 0)
+    uint8_t required;
+    if (system_path(path))
     {
-        // Directory traversal to one's own home remains possible without NV.
-        char home[80];
-        snprintf(home, sizeof(home), "/users/%s", user);
-        if (!under(path, home) && !(directory && strcmp(path, "/users") == 0)) return false;
+        required = metadata || (directory && read) ? (uint8_t)XPERM_SV :
+            (uint8_t)((read ? XPERM_SR : 0) | (write ? XPERM_SW : 0));
+        if (directory && write) required |= XPERM_SW;
+    }
+    else if (under(path, application))
+        required = (write ? XPERM_W : 0) | ((read || metadata) ? XPERM_R : 0);
+    else
+    {
+        PermissionFolderPolicy policy = __atomic_load_n(&folder_policy, __ATOMIC_ACQUIRE);
+        PermissionFolderDecision decision = policy ? policy(process, path, operation) : XFD_DEFAULT;
+        if (decision == XFD_ALLOW) return true;
+        if (decision == XFD_DENY || decision == XFD_CONFIRM)
+        {
+            permissions_set_file_error(decision == XFD_CONFIRM ? EAGAIN : EACCES);
+            return false;
+        }
+        required = XPERM_NV;
     }
     return (mask & required) == required;
 }
 
-bool permissions_file_access(vfs_node_t node, const char *path, int operation)
+static char *canonical_target(const char *path)
+{
+    // Resolve the existing parent before authorizing creation/rename. A symlink
+    // below an ordinary directory must not disguise an EFI/system destination.
+    char *absolute = vfs_cwd_path_build((char *)path);
+    if (!absolute) return NULL;
+    char *slash = strrchr(absolute, '/');
+    if (!slash || slash == absolute || !slash[1]) return absolute;
+    char *leaf = strdup(slash + 1);
+    if (!leaf) { free(absolute); return NULL; }
+    *slash = 0;
+    vfs_node_t parent = vfs_open(absolute);
+    *slash = '/';
+    if (!parent) { free(leaf); return absolute; }
+    char *resolved = vfs_get_fullpath(parent);
+    vfs_close(parent);
+    if (!resolved) { free(leaf); free(absolute); return NULL; }
+    size_t size = strlen(resolved) + strlen(leaf) + 2;
+    char *joined = (char *)malloc(size);
+    if (joined) snprintf(joined, size, "%s/%s", resolved, leaf);
+    char *normalized = joined ? normalize_path(joined) : NULL;
+    free(joined);
+    free(resolved);
+    free(leaf);
+    free(absolute);
+    return normalized;
+}
+
+static bool file_access(vfs_node_t node, const char *path, int operation, unsigned link_depth)
 {
     tcb_t task = get_current_task();
-    if (!task || task->task_level != TASK_APPLICATION_LEVEL || task->ime_config_depth) return true;
-    uint8_t mask = permissions_current_mask();
-    if (mask == XPERM_ALL) return true;
-    if (operation == IME_FILE_MOUNT) return false;
-    // Anonymous IPC descriptors have no filesystem location, but still require R/W.
-    if (!path && (!node || !node->parent))
-        return permissions_have(operation == IME_FILE_READ ? XPERM_R : XPERM_W);
-    char username[64];
-    spin_lock(&permission_lock);
-    memcpy(username, task->parent_group->permission_user.name, sizeof(username));
-    spin_unlock(&permission_lock);
-    username[sizeof(username) - 1] = '\0';
-    bool allowed = true;
-    if (path)
+    if (!task || task->task_level != TASK_APPLICATION_LEVEL) return true;
+    if (operation == IME_FILE_LOOKUP) return true;
+    if (operation == IME_FILE_MOUNT) { permissions_set_file_error(EACCES); return false; }
+    // Filesystem callbacks already authorized the file operation. Their scoped
+    // backend block I/O must not additionally require NV on /dev or /disk.
+    // A direct application device access has no storage scope and stays denied
+    // by the normal category policy and IME raw-device guard.
+    if (node && (node->type & file_block) && task->ime_storage_depth) return true;
+    // A hard link cannot turn a protected file into an ordinary writable file.
+    // Unlinking removes only the directory entry, so it checks that entry alone.
+    if (node && node->linkto && !(node->type & file_symlink) && operation != IME_FILE_REMOVE)
     {
-        char *joined = NULL;
-        if (path[0] != '/' && task->cwd)
+        if (link_depth >= 40 || !file_access(node->linkto, NULL, operation, link_depth + 1))
         {
-            char *base = vfs_get_fullpath(task->cwd);
-            if (!base) return false;
-            size_t size = strlen(base) + strlen(path) + 2;
-            joined = (char *)malloc(size);
-            if (joined) snprintf(joined, size, "%s/%s", base, path);
-            free(base);
-            if (!joined) return false;
+            permissions_set_file_error(EACCES);
+            return false;
         }
-        char *normalized = normalize_path(joined ? joined : path);
-        free(joined);
-        if (!normalized) return false;
-        allowed = path_access(normalized, false, operation, mask, username);
-        free(normalized);
     }
-    if (allowed && node)
+    if (task->permission_profile_owner)
     {
-        char *resolved = vfs_get_fullpath(node);
-        if (!resolved) return false;
-        allowed = path_access(resolved, (node->type & file_dir) != 0, operation, mask, username);
+        // Authenticate first, then authorize only these fixed destinations.
+        // Resolved nodes keep a settings symlink from reaching system/other-user data.
+        char *resolved = node ? vfs_get_fullpath(node) : path ? canonical_target(path) : NULL;
+        char base[96];
+        snprintf(base, sizeof(base), "/users/%s", task->permission_profile_owner);
+        const char *leaf = resolved && under(resolved, base) ? resolved + strlen(base) : NULL;
+        bool allowed = resolved && task->permission_profile_owner[0] &&
+            (equal_fold(resolved, "/users") || (leaf && (!leaf[0] || equal_fold(leaf, "/desktop") ||
+                equal_fold(leaf, "/settings.json") || equal_fold(leaf, "/settings.dat") ||
+                equal_fold(leaf, "/runfile.dat"))) ||
+             (equal_fold(resolved, "/system/config/language.dat") &&
+                (operation == IME_FILE_READ || operation == IME_FILE_STAT)));
         free(resolved);
+        if (!allowed) permissions_set_file_error(EACCES);
+        return allowed;
     }
+    if (task->ime_config_depth) return true;
+    if (!path && node && node != rootdir &&
+        (node->type & (file_pipe | file_socket | file_stream | file_ptmx | file_pts)))
+    {
+        // Anonymous IPC endpoints are detached from the
+        // mounted namespace. Named FIFOs/devices still use their real category.
+        vfs_node_t ancestor = node;
+        while (ancestor->parent) ancestor = ancestor->parent;
+        if (ancestor != rootdir) return true;
+    }
+    char username[64], application[4096];
+    spin_lock(&permission_lock);
+    pcb_t process = task->parent_group;
+    uint8_t mask = mask_of(&process->permission_user);
+    memcpy(username, process->permission_user.name, sizeof(username));
+    memcpy(application, process->permission_directory, sizeof(application));
+    spin_unlock(&permission_lock);
+    username[sizeof(username) - 1] = 0;
+    application[sizeof(application) - 1] = 0;
+    char *resolved = node ? vfs_get_fullpath(node) : path ? canonical_target(path) : NULL;
+    if (!resolved) { permissions_set_file_error(EACCES); return false; }
+    bool allowed = path_access(resolved, node && (node->type & file_dir), operation, mask, username,
+                               application, process);
+    free(resolved);
+    if (!allowed && !permissions_file_error()) permissions_set_file_error(EACCES);
     return allowed;
+}
+
+bool permissions_file_access(vfs_node_t node, const char *path, int operation)
+{
+    return file_access(node, path, operation, 0);
+}
+
+static int transfer_category(const char *path, const char *application)
+{
+    if (prefix_fold(path, "/users/"))
+    {
+        const char *slash = strchr(path + strlen("/users/"), '/');
+        if (slash && equal_fold(slash, "/settings.json")) return 3;
+    }
+    return system_path(path) ? 0 : under(path, application) ? 1 : 2;
+}
+
+static bool file_transfer(vfs_node_t node, const char *destination, bool hard_link)
+{
+    permissions_clear_file_error();
+    tcb_t task = get_current_task();
+    if (!task || task->task_level != TASK_APPLICATION_LEVEL || task->ime_config_depth) return true;
+    if (!node || !destination) return false;
+    char *source = vfs_get_fullpath(node);
+    char *target = canonical_target(destination);
+    if (!source || !target)
+    {
+        free(source);
+        free(target);
+        permissions_set_file_error(EACCES);
+        return false;
+    }
+    // Account directory names are part of the CS boundary. Moving an ancestor
+    // must not make another account's settings.json accessible through NV.
+    bool account_root = equal_fold(source, "/users") ||
+        (prefix_fold(source, "/users/") && !strchr(source + strlen("/users/"), '/'));
+    bool allowed = !((node->type & file_dir) && account_root);
+    char application[4096], username[64];
+    spin_lock(&permission_lock);
+    pcb_t process = task->parent_group;
+    uint8_t mask = mask_of(&process->permission_user);
+    memcpy(application, process->permission_directory, sizeof(application));
+    memcpy(username, process->permission_user.name, sizeof(username));
+    spin_unlock(&permission_lock);
+    application[sizeof(application) - 1] = 0;
+    username[sizeof(username) - 1] = 0;
+    int from = transfer_category(source, application);
+    int to = transfer_category(target, application);
+    if (allowed && from != to)
+    {
+        // A persistent hard link would lose its source path on remount. Keep
+        // links within a category until the filesystem can persist that policy.
+        if (hard_link) allowed = false;
+        // A move across categories exports the data, just like a copy. For a
+        // system directory this needs SR; SV alone only reveals its listing.
+        else allowed = path_access(source, false, IME_FILE_READ, mask, username, application, process);
+    }
+    free(source);
+    free(target);
+    if (!allowed && !permissions_file_error()) permissions_set_file_error(EACCES);
+    return allowed;
+}
+
+bool permissions_file_move(vfs_node_t node, const char *destination)
+{
+    return file_transfer(node, destination, false);
+}
+
+bool permissions_file_link(vfs_node_t node, const char *destination)
+{
+    return file_transfer(node, destination, true);
 }

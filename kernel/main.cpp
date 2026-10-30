@@ -342,7 +342,7 @@ cleanup:
 }
 */
 
-static const char *busybox_binary_path = "/apps/busybox";
+static const char *busybox_binary_path = "/apps/busybox/busybox";
 
 static void setup_xbps_vfs_aliases()
 {
@@ -680,7 +680,7 @@ extern "C" void KernelMain(const FrameBufferConfig &fbc, EFI_SYSTEM_TABLE &Syste
         write_serial_string("AHCI: keeping conservative IO path on vmware/real hardware\n");
     }
     user_session_use_login();
-    create_user_process_from_file((char *)"/apps/system/shell.elf", NULL, NULL);
+    create_user_process_from_file((char *)"/apps/system/shell/shell.elf", NULL, NULL);
 
     // delay_s_hp(60);
 

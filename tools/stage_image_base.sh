@@ -25,7 +25,7 @@ mkdir -p \
     "$root/lib64" \
     "$root/media" \
     "$root/mnt" \
-    "$root/mod" \
+    "$root/system/mod" \
     "$root/opt" \
     "$root/proc" \
     "$root/root" \

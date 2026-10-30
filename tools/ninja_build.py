@@ -147,10 +147,12 @@ def stage_linux_compat(root: Path) -> None:
         cp(f"/lib/{triple}/libc.so.6", root / "lib64/libc.so.6")
 
     if env_bool("IMAGE_BUSYBOX", "1"):
-        cp(env("APP_BUSYBOX", "resources/apps/busybox"), root / "apps/busybox")
+        mkdir(root / "apps/busybox")
+        cp(env("APP_BUSYBOX", "resources/apps/busybox"), root / "apps/busybox/busybox")
     if (ROOT / "lolcat_100.0.1-3_all.deb").exists():
         cp(ROOT / "lolcat_100.0.1-3_all.deb", root / "apps/lolcat.deb")
-    cp(env("APP_FASTFETCH", "resources/apps/fastfetch"), root / "apps/fastfetch")
+    mkdir(root / "apps/fastfetch")
+    cp(env("APP_FASTFETCH", "resources/apps/fastfetch"), root / "apps/fastfetch/fastfetch")
 
     stage_env = {
         "IMAGE_TOOLCHAIN": env("IMAGE_TOOLCHAIN", "clang"),
@@ -190,8 +192,9 @@ def stage_linux_compat(root: Path) -> None:
 
 
 def copy_system_apps(root: Path) -> None:
-    system = root / "apps/system"
-    cp(ROOT / "out/shell.elf", system)
+    system = root / "apps/system/shell"
+    mkdir(system)
+    cp(ROOT / "out/shell.elf", system / "shell.elf")
 
 
 def copy_common_assets(root: Path) -> None:
@@ -201,11 +204,11 @@ def copy_common_assets(root: Path) -> None:
 def copy_modules(root: Path) -> None:
     builtin_xhci = env_bool("BUILTIN_XHCI", "1")
     for sys_file in sorted((ROOT / "out").glob("*.sys")):
-        rm_rf(root / "mod" / f"{sys_file.stem}.km")
+        rm_rf(root / "system/mod" / f"{sys_file.stem}.km")
         if builtin_xhci and sys_file.name == "xhci.sys":
-            rm_rf(root / "mod" / sys_file.name)
+            rm_rf(root / "system/mod" / sys_file.name)
             continue
-        cp(sys_file, root / "mod")
+        cp(sys_file, root / "system/mod")
 
 
 def copy_license_material(root: Path, *, complete: bool) -> None:
@@ -328,7 +331,7 @@ def installer_root_stage() -> None:
         "tmp",
     ):
         mkdir(root / rel)
-    cp(ROOT / "out/shell.elf", root / "apps/system/shell.elf")
+    copy_system_apps(root)
     run(["python3", env("MAKE_PAK", "tools/make_pak.py"), str(root), env("INSTALLER_ROOT_PAK", "out/installer-root.pak")])
 
 

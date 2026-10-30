@@ -1,3 +1,4 @@
+#include <user/permissions.h>
 #include <input_method.h>
 #include <syscall/syscall.h>
 #include <proto.hpp>
@@ -169,6 +170,7 @@ static int copy_string_from_user(char **out, const char *src, size_t max_len)
 
 static uint64_t fill_stat_from_node(vfs_node_t node, struct stat *out)
 {
+    if (!vfs_check_access(node, NULL, IME_FILE_STAT)) return SYSCALL_FAULT_(vfs_last_error());
     if (node == NULL || out == NULL) return SYSCALL_FAULT_(EINVAL);
     memset(out, 0, sizeof(*out));
     uint64_t ctime_ns = node->createtime;
@@ -261,6 +263,7 @@ static uint64_t copy_stat_to_user(struct stat *user_stat, const struct stat *kst
 static uint64_t statfs_kernel_node(vfs_node_t node, struct statfs *buf)
 {
     if (node == NULL || buf == NULL) return SYSCALL_FAULT_(EINVAL);
+    if (!vfs_check_access(node, NULL, IME_FILE_STAT)) return SYSCALL_FAULT_(vfs_last_error());
     vfs_filesystem_t filesystem = get_filesystem_node(node);
     if (filesystem == NULL) return SYSCALL_FAULT_(EINVAL);
 
@@ -351,7 +354,7 @@ static int64_t write_from_user_buffer(fd_file_handle *handle, const uint8_t *buf
         if ((ssize_t)wrote < 0)
         {
             free(bounce);
-            return total > 0 ? (int64_t)total : wrote == (size_t)VFS_STATUS_FAILED ? -EIO : (int64_t)wrote;
+            return total > 0 ? (int64_t)total : wrote == (size_t)VFS_STATUS_FAILED ? -vfs_last_error() : (int64_t)wrote;
         }
         if (!(handle->node->type & file_pipe) && handle->node->size != (uint64_t)-1) handle->offset += wrote;
         total += wrote;
@@ -504,7 +507,7 @@ static int64_t read_to_user_buffer(fd_file_handle *handle, uint8_t *buffer, size
             if ((ssize_t)got < 0)
             {
                 free(bounce);
-                return total > 0 ? (int64_t)total : got == (size_t)VFS_STATUS_FAILED ? -EIO : (int64_t)got;
+                return total > 0 ? (int64_t)total : got == (size_t)VFS_STATUS_FAILED ? -vfs_last_error() : (int64_t)got;
             }
             read_now = (ssize_t)got;
         }
@@ -538,7 +541,7 @@ static int64_t pipe_read_to_user_buffer(fd_file_handle *handle, uint8_t *buffer,
     if (got == (size_t)VFS_STATUS_FAILED)
     {
         free(bounce);
-        return -EIO;
+        return -vfs_last_error();
     }
 
     if (got != 0 && !copy_to_user_pagedir(current_user_pagedir(), buffer, bounce, got))
@@ -688,6 +691,11 @@ static uint64_t open_kernel_path(char *path0, uint64_t flags, uint64_t mode)
     if (normalized_path == NULL) return SYSCALL_FAULT_(ENOMEM);
 
     vfs_node_t node = vfs_open(path0);
+    if (node == NULL && permissions_file_error())
+    {
+        free(normalized_path);
+        return SYSCALL_FAULT_(vfs_last_error());
+    }
     if (node == NULL)
     {
         if (flags & O_CREAT)
@@ -709,9 +717,20 @@ static uint64_t open_kernel_path(char *path0, uint64_t flags, uint64_t mode)
         else
         err:
             free(normalized_path);
-        return SYSCALL_FAULT_(ENOENT);
+        return SYSCALL_FAULT_(permissions_file_error() ? vfs_last_error() : ENOENT);
     }
 next:
+    int access_mode = (flags & O_PATH) ? IME_FILE_STAT :
+        (flags & O_ACCMODE) == O_WRONLY ? IME_FILE_WRITE :
+        (flags & O_ACCMODE) == O_RDWR ? IME_FILE_READ_WRITE :
+        (node->type & file_dir) ? IME_FILE_LIST : IME_FILE_READ;
+    if (!vfs_check_access(node, NULL, access_mode))
+    {
+        int error = vfs_last_error();
+        vfs_close(node);
+        free(normalized_path);
+        return SYSCALL_FAULT_(error);
+    }
     vfs_update(node);
     if (!(node->type & (file_dir | file_symlink)) && node->handle == NULL)
     {
@@ -2462,6 +2481,7 @@ sys_(getcwd, char *buffer, size_t length)
 
 static uint64_t set_current_cwd(vfs_node_t node, char *normalized_path)
 {
+    if (!vfs_check_access(node, NULL, IME_FILE_LIST)) return SYSCALL_FAULT_(vfs_last_error());
     if (node == NULL || normalized_path == NULL) return SYSCALL_FAULT_(EINVAL);
     if (!(node->type & file_dir)) return SYSCALL_FAULT_(ENOTDIR);
 
@@ -2536,7 +2556,13 @@ sys_(fchdir, int fd)
     if (unlikely(normalized_path == NULL)) return SYSCALL_FAULT_(ENOENT);
 
     handle->node->refcount++;
-    return set_current_cwd(handle->node, normalized_path);
+    uint64_t ret = set_current_cwd(handle->node, normalized_path);
+    if ((int64_t)ret < 0)
+    {
+        vfs_close(handle->node);
+        free(normalized_path);
+    }
+    return ret;
 }
 
 sys_(exit_group, int exit_code)
@@ -3250,7 +3276,7 @@ sys_(mkdir, char *name, uint64_t mode)
     char  *npath = vfs_cwd_path_build(user_path);
     free(user_path);
     if (npath == NULL) return SYSCALL_FAULT_(ENOMEM);
-    size_t ret   = vfs_mkdir(npath) == VFS_STATUS_FAILED ? SYSCALL_FAULT_(EIO) : 0;
+    size_t ret   = vfs_mkdir(npath) == VFS_STATUS_FAILED ? SYSCALL_FAULT_(vfs_last_error()) : 0;
     if (ret == 0)
     {
         vfs_node_t node = vfs_open(npath);
@@ -3549,6 +3575,7 @@ sys_(getdents, int fd, struct dirent *dents, size_t size)
     fd_file_handle *handle =  (fd_file_handle*)queue_get(get_current_task()->parent_group->file_open, fd);
     if (unlikely(handle == NULL)) { return SYSCALL_FAULT_(EBADF); }
     if (handle->node->type != file_dir) { return SYSCALL_FAULT_(ENOTDIR); }
+    if (!vfs_check_access(handle->node, NULL, IME_FILE_LIST)) return SYSCALL_FAULT_(vfs_last_error());
     size_t   child_count   = (uint64_t)list_length(handle->node->child);
     size_t   max_dents_num = size / sizeof(struct dirent);
     size_t   read_count    = 0;
@@ -3600,6 +3627,7 @@ sys_(getdents64, int fd, void *dents, size_t size)
     fd_file_handle *handle = (fd_file_handle *)queue_get(get_current_task()->parent_group->file_open, fd);
     if (unlikely(handle == NULL)) { return SYSCALL_FAULT_(EBADF); }
     if (handle->node->type != file_dir) { return SYSCALL_FAULT_(ENOTDIR); }
+    if (!vfs_check_access(handle->node, NULL, IME_FILE_LIST)) return SYSCALL_FAULT_(vfs_last_error());
 
     size_t written = 0;
     size_t offset = 0;
@@ -3729,16 +3757,18 @@ sys_(pipe2, int *pipefd, uint64_t flags)
     char buf[16];
     sprintf(buf, "pipe%d", pipefd_id++);
 
-    vfs_node_t node_input = vfs_node_alloc(pipefs_root, buf);
+    // Anonymous pipe ends are descriptor-owned, outside the mounted namespace.
+    // Publishing them under /pipe would impose NV and expose guessed names.
+    vfs_node_t node_input = vfs_node_alloc(NULL, buf);
     node_input->type      = file_pipe;
     node_input->fsid      = pipefs_id;
-    pipefs_root->mode = 0700;
+    node_input->root      = pipefs_root;
 
     sprintf(buf, "pipe%d", pipefd_id++);
-    vfs_node_t node_output = vfs_node_alloc(pipefs_root, buf);
+    vfs_node_t node_output = vfs_node_alloc(NULL, buf);
     node_output->type      = file_pipe;
     node_output->fsid      = pipefs_id;
-    pipefs_root->mode = 0700;
+    node_output->root      = pipefs_root;
 
     uint64_t pipe_inode = pipe_inode_next++;
     node_input->inode   = pipe_inode;
@@ -3822,7 +3852,7 @@ sys_(unlink)
         free(npath);
         return SYSCALL_FAULT_(ENOTDIR);
     }
-    size_t ret = vfs_delete(node) == VFS_STATUS_SUCCESS ? 0 : SYSCALL_FAULT_(ENOENT);
+    size_t ret = vfs_delete(node) == VFS_STATUS_SUCCESS ? 0 : SYSCALL_FAULT_(vfs_last_error());
     free(npath);
     return ret;
 }
@@ -3846,7 +3876,7 @@ sys_(rmdir)
         free(n_name);
         return SYSCALL_FAULT_(ENOTDIR);
     }
-    size_t ret = vfs_delete(node);
+    size_t ret = vfs_delete(node) == VFS_STATUS_SUCCESS ? 0 : SYSCALL_FAULT_(vfs_last_error());
     free(n_name);
     return ret;
 }
@@ -3874,9 +3904,23 @@ sys_(unlinkat)
         return SYSCALL_FAULT_(ENOTDIR);
     }
 
-    uint64_t ret = vfs_delete(node) == VFS_STATUS_SUCCESS ? 0 : SYSCALL_FAULT_(ENOENT);
+    uint64_t ret = vfs_delete(node) == VFS_STATUS_SUCCESS ? 0 : SYSCALL_FAULT_(vfs_last_error());
     free(path);
     return ret;
+}
+
+static uint64_t access_kernel_path(const char *path, uint64_t mode, bool no_follow = false)
+{
+    if (mode & ~7ULL) return SYSCALL_FAULT_(EINVAL);
+    vfs_node_t node = no_follow ? vfs_open_no_follow(path) : vfs_open(path);
+    if (!node) return SYSCALL_FAULT_(permissions_file_error() ? vfs_last_error() : ENOENT);
+    // There is no separate execute bit in the seven-capability model. Checking
+    // execute/search requires the ability to read the executable or list the directory.
+    int operation = (mode & 2) ? ((mode & 5) ? IME_FILE_READ_WRITE : IME_FILE_WRITE) :
+        (mode & 5) ? ((node->type & file_dir) ? IME_FILE_LIST : IME_FILE_READ) : IME_FILE_STAT;
+    uint64_t result = vfs_check_access(node, NULL, operation) ? 0 : SYSCALL_FAULT_(vfs_last_error());
+    vfs_close(node);
+    return result;
 }
 
 sys_(access, char *filename)
@@ -3890,8 +3934,7 @@ sys_(access, char *filename)
     free(user_path);
     if (path == NULL) return SYSCALL_FAULT_(ENOMEM);
 
-    struct stat buf;
-    uint64_t stat_ret = stat_kernel_path(path, &buf);
+    uint64_t stat_ret = access_kernel_path(path, arg1);
     if (busybox_debug_current_linux_abi())
     {
         write_serial_fmt("[busybox-debug] access path=%s ret=%lld\n", path, (long long)stat_ret);
@@ -3905,15 +3948,13 @@ sys_(faccessat)
     int      dirfd    = arg0;
     char    *pathname = (char *)arg1;
     uint64_t mode     = arg2;
-    (void)mode;
     if (pathname == NULL) return SYSCALL_FAULT_(EINVAL);
 
     char *resolved = NULL;
     int path_ret = resolve_user_path_at(dirfd, pathname, &resolved);
     if (path_ret < 0) return SYSCALL_FAULT_((int)-path_ret);
 
-    struct stat buf;
-    uint64_t ret = stat_kernel_path(resolved, &buf);
+    uint64_t ret = access_kernel_path(resolved, mode);
     if (busybox_debug_current_linux_abi())
     {
         write_serial_fmt("[busybox-debug] faccessat dirfd=%d path=%s mode=0x%llx ret=%lld\n",
@@ -3934,16 +3975,13 @@ sys_(faccessat2)
     char    *pathname = (char *)arg1;
     uint64_t mode     = arg2;
     uint64_t flag     = arg3;
-    (void)mode;
-    (void)flag;
     if (pathname == NULL) return SYSCALL_FAULT_(EINVAL);
 
     char *resolved = NULL;
     int path_ret = resolve_user_path_at(dirfd, pathname, &resolved);
     if (path_ret < 0) return SYSCALL_FAULT_((int)-path_ret);
 
-    struct stat buf;
-    uint64_t ret = stat_kernel_path(resolved, &buf);
+    uint64_t ret = access_kernel_path(resolved, mode, flag & AT_SYMLINK_NOFOLLOW);
     if (busybox_debug_current_linux_abi())
     {
         write_serial_fmt("[busybox-debug] faccessat2 dirfd=%llu path=%s mode=0x%llx flags=0x%llx ret=%lld\n",
@@ -3988,7 +4026,7 @@ sys_(mkdirat, int dirfd, char *pathname, uint64_t mode)
 
     errno_t ret = vfs_mkdir(resolved);
     free(resolved);
-    return ret == VFS_STATUS_SUCCESS ? 0 : SYSCALL_FAULT_(EIO);
+    return ret == VFS_STATUS_SUCCESS ? 0 : SYSCALL_FAULT_(vfs_last_error());
 }
 
 sys_(flistxattr, int fd, char *list, size_t size)
@@ -4043,7 +4081,7 @@ sys_(copy_file_range, int fd_in, uint64_t *off_in, int fd_out, uint64_t *off_out
         if (got == (size_t)VFS_STATUS_FAILED)
         {
             free(buffer);
-            return copy_total > 0 ? copy_total : SYSCALL_FAULT_(EIO);
+            return copy_total > 0 ? copy_total : SYSCALL_FAULT_(vfs_last_error());
         }
         if (got == 0) break;
 
@@ -4051,7 +4089,7 @@ sys_(copy_file_range, int fd_in, uint64_t *off_in, int fd_out, uint64_t *off_out
         if (wrote == (size_t)VFS_STATUS_FAILED)
         {
             free(buffer);
-            return copy_total > 0 ? copy_total : SYSCALL_FAULT_(EIO);
+            return copy_total > 0 ? copy_total : SYSCALL_FAULT_(vfs_last_error());
         }
         if (wrote == 0) break;
 
@@ -4349,8 +4387,8 @@ sys_(rename, char *oldpath, char *newpath)
         free(nnewpath);
         return SYSCALL_FAULT_(ENOMEM);
     }
-    if (!ime_vfs_access(NULL, noldpath, IME_FILE_REMOVE) || !ime_vfs_access(NULL, nnewpath, IME_FILE_WRITE))
-    { free(noldpath); free(nnewpath); return SYSCALL_FAULT_(EACCES); }
+    if (!vfs_check_access(NULL, noldpath, IME_FILE_REMOVE) || !vfs_check_access(NULL, nnewpath, IME_FILE_WRITE))
+    { free(noldpath); free(nnewpath); return SYSCALL_FAULT_(vfs_last_error()); }
     vfs_node_t oldnode  = vfs_open_no_follow(noldpath);
     if (!oldnode)
     {
@@ -4367,23 +4405,24 @@ sys_(rename, char *oldpath, char *newpath)
         free(nnewpath);
         return 0;
     }
-    if (!ime_vfs_access(oldnode, NULL, IME_FILE_REMOVE) ||
-        (newnode && !ime_vfs_access(newnode, NULL, IME_FILE_REMOVE)))
+    if (!permissions_file_move(oldnode, nnewpath) ||
+        !vfs_check_access(oldnode, NULL, IME_FILE_REMOVE) ||
+        (newnode && !vfs_check_access(newnode, NULL, IME_FILE_REMOVE)))
     {
         if (newnode) vfs_close(newnode);
         vfs_close(oldnode);
         free(noldpath);
         free(nnewpath);
-        return SYSCALL_FAULT_(EACCES);
+        return SYSCALL_FAULT_(vfs_last_error());
     }
     if (newnode && vfs_delete(newnode) != VFS_STATUS_SUCCESS)
     {
         vfs_close(oldnode);
         free(noldpath);
         free(nnewpath);
-        return SYSCALL_FAULT_(EACCES);
+        return SYSCALL_FAULT_(vfs_last_error());
     }
-    size_t     ret    = vfs_rename(oldnode, nnewpath) == VFS_STATUS_SUCCESS ? 0 : SYSCALL_FAULT_(ENOENT);
+    size_t     ret    = vfs_rename(oldnode, nnewpath) == VFS_STATUS_SUCCESS ? 0 : SYSCALL_FAULT_(vfs_last_error());
     char      *parent = get_parent_path(nnewpath);
     vfs_node_t parent_dir = vfs_open(parent);
     if (!parent_dir)
@@ -4416,12 +4455,12 @@ sys_(renameat, int olddirfd, char *oldpath, int newdirfd, char *newpath)
         return SYSCALL_FAULT_((int)-path_ret);
     }
 
-    if (!ime_vfs_access(NULL, resolved_old, IME_FILE_REMOVE) ||
-        !ime_vfs_access(NULL, resolved_new, IME_FILE_WRITE))
+    if (!vfs_check_access(NULL, resolved_old, IME_FILE_REMOVE) ||
+        !vfs_check_access(NULL, resolved_new, IME_FILE_WRITE))
     {
         free(resolved_old);
         free(resolved_new);
-        return SYSCALL_FAULT_(EACCES);
+        return SYSCALL_FAULT_(vfs_last_error());
     }
 
     vfs_node_t oldnode = vfs_open_no_follow(resolved_old);
@@ -4441,24 +4480,25 @@ sys_(renameat, int olddirfd, char *oldpath, int newdirfd, char *newpath)
         free(resolved_new);
         return 0;
     }
-    if (!ime_vfs_access(oldnode, NULL, IME_FILE_REMOVE) ||
-        (newnode && !ime_vfs_access(newnode, NULL, IME_FILE_REMOVE)))
+    if (!permissions_file_move(oldnode, resolved_new) ||
+        !vfs_check_access(oldnode, NULL, IME_FILE_REMOVE) ||
+        (newnode && !vfs_check_access(newnode, NULL, IME_FILE_REMOVE)))
     {
         if (newnode) vfs_close(newnode);
         vfs_close(oldnode);
         free(resolved_old);
         free(resolved_new);
-        return SYSCALL_FAULT_(EACCES);
+        return SYSCALL_FAULT_(vfs_last_error());
     }
     if (newnode && vfs_delete(newnode) != VFS_STATUS_SUCCESS)
     {
         vfs_close(oldnode);
         free(resolved_old);
         free(resolved_new);
-        return SYSCALL_FAULT_(EACCES);
+        return SYSCALL_FAULT_(vfs_last_error());
     }
 
-    uint64_t ret = vfs_rename(oldnode, resolved_new) == VFS_STATUS_SUCCESS ? 0 : SYSCALL_FAULT_(ENOENT);
+    uint64_t ret = vfs_rename(oldnode, resolved_new) == VFS_STATUS_SUCCESS ? 0 : SYSCALL_FAULT_(vfs_last_error());
     vfs_close(oldnode);
     free(resolved_old);
     free(resolved_new);
@@ -4483,7 +4523,7 @@ sys_(symlink, char *name, char *nw)
     errno_t ret = vfs_symlink(knw, kname);
     free(kname);
     free(knw);
-    return ret;
+    return ret == VFS_STATUS_SUCCESS ? 0 : SYSCALL_FAULT_(vfs_last_error());
 }
 
 sys_(symlinkat, char *target, int newdirfd, char *linkpath)
@@ -4505,7 +4545,7 @@ sys_(symlinkat, char *target, int newdirfd, char *linkpath)
     errno_t ret = vfs_symlink(klinkpath, ktarget);
     free(ktarget);
     free(klinkpath);
-    return ret;
+    return ret == VFS_STATUS_SUCCESS ? 0 : SYSCALL_FAULT_(vfs_last_error());
 }
 
 sys_(link, char *name, char *nw)
@@ -4517,11 +4557,11 @@ sys_(link, char *name, char *nw)
     if (path_ret < 0) return SYSCALL_FAULT_((int)-path_ret);
     path_ret = resolve_user_path_at(AT_FDCWD, nw, &knw);
     if (path_ret < 0) { free(kname); return SYSCALL_FAULT_((int)-path_ret); }
-    errno_t ret = vfs_link(kname, knw);
+    errno_t ret = vfs_link(knw, kname);
     free(kname);
     free(knw);
 
-    return ret;
+    return ret == VFS_STATUS_SUCCESS ? 0 : SYSCALL_FAULT_(vfs_last_error());
 }
 
 sys_(linkat, int olddirfd, char *oldpath, int newdirfd, char *newpath, int flags)
@@ -4540,10 +4580,10 @@ sys_(linkat, int olddirfd, char *oldpath, int newdirfd, char *newpath, int flags
         return SYSCALL_FAULT_((int)-path_ret);
     }
 
-    errno_t ret = vfs_link(resolved_old, resolved_new);
+    errno_t ret = vfs_link(resolved_new, resolved_old);
     free(resolved_old);
     free(resolved_new);
-    return ret;
+    return ret == VFS_STATUS_SUCCESS ? 0 : SYSCALL_FAULT_(vfs_last_error());
 }
 
 sys_(umount2)
@@ -4601,7 +4641,7 @@ sys_(readlink)
     if (read == (size_t)VFS_STATUS_FAILED)
     {
         free(kbuf);
-        return SYSCALL_FAULT_(EIO);
+        return SYSCALL_FAULT_(vfs_last_error());
     }
     if (!copy_to_user_pagedir(current_user_pagedir(), buf, kbuf, read))
     {
@@ -4642,7 +4682,7 @@ sys_(readlinkat, int dirfd, char *path, char *buf, size_t size)
     if (read == (size_t)VFS_STATUS_FAILED)
     {
         free(kbuf);
-        return SYSCALL_FAULT_(EIO);
+        return SYSCALL_FAULT_(vfs_last_error());
     }
     if (!copy_to_user_pagedir(current_user_pagedir(), buf, kbuf, read))
     {
@@ -4688,7 +4728,7 @@ sys_(ftruncate, int fd, uint64_t length)
     fd_file_handle *handle = (fd_file_handle *)queue_get(get_current_task()->parent_group->file_open, fd);
     if (handle == NULL || handle->node == NULL) return SYSCALL_FAULT_(EBADF);
     if (handle->node->type == file_dir) return SYSCALL_FAULT_(EISDIR);
-    if (vfs_resize(handle->node, length) != VFS_STATUS_SUCCESS) return SYSCALL_FAULT_(EIO);
+    if (vfs_resize(handle->node, length) != VFS_STATUS_SUCCESS) return SYSCALL_FAULT_(vfs_last_error());
     if (handle->offset > length) handle->offset = length;
     return 0;
 }
@@ -4962,6 +5002,12 @@ sys_(chmod, char *path, uint64_t mode)
     }
     free(resolved);
     if (node == NULL) return SYSCALL_FAULT_(ENOENT);
+    if (!vfs_check_access(node, NULL, IME_FILE_WRITE))
+    {
+        int error = vfs_last_error();
+        vfs_close(node);
+        return SYSCALL_FAULT_(error);
+    }
 
     node->mode = (uint16_t)((node->mode & ~07777) | (mode & 07777));
     vfs_close(node);
@@ -4973,6 +5019,7 @@ sys_(fchmod, int fd, uint64_t mode)
     if (fd < 0) return SYSCALL_FAULT_(EBADF);
     fd_file_handle *handle = (fd_file_handle *)queue_get(get_current_task()->parent_group->file_open, fd);
     if (handle == NULL || handle->node == NULL) return SYSCALL_FAULT_(EBADF);
+    if (!vfs_check_access(handle->node, NULL, IME_FILE_WRITE)) return SYSCALL_FAULT_(vfs_last_error());
     handle->node->mode = (uint16_t)((handle->node->mode & ~07777) | (mode & 07777));
     return 0;
 }
@@ -4994,6 +5041,7 @@ sys_(fchown, int fd, uint32_t owner, uint32_t group)
     if (fd < 0) return SYSCALL_FAULT_(EBADF);
     fd_file_handle *handle = (fd_file_handle *)queue_get(get_current_task()->parent_group->file_open, fd);
     if (handle == NULL || handle->node == NULL) return SYSCALL_FAULT_(EBADF);
+    if (!vfs_check_access(handle->node, NULL, IME_FILE_WRITE)) return SYSCALL_FAULT_(vfs_last_error());
     apply_node_owner(handle->node, owner, group);
     return 0;
 }
@@ -5009,6 +5057,12 @@ sys_(fchownat, int dirfd, char *pathname, uint32_t owner, uint32_t group, int fl
     vfs_node_t node = (flags & AT_SYMLINK_NOFOLLOW) ? vfs_open_no_follow(resolved) : vfs_open(resolved);
     free(resolved);
     if (node == NULL) return SYSCALL_FAULT_(ENOENT);
+    if (!vfs_check_access(node, NULL, IME_FILE_WRITE))
+    {
+        int error = vfs_last_error();
+        vfs_close(node);
+        return SYSCALL_FAULT_(error);
+    }
 
     apply_node_owner(node, owner, group);
     vfs_close(node);
@@ -5035,6 +5089,12 @@ sys_(fchmodat, int dirfd, char *pathname, uint64_t mode, int flags)
     }
     free(resolved);
     if (node == NULL) return SYSCALL_FAULT_(ENOENT);
+    if (!vfs_check_access(node, NULL, IME_FILE_WRITE))
+    {
+        int error = vfs_last_error();
+        vfs_close(node);
+        return SYSCALL_FAULT_(error);
+    }
 
     node->mode = (uint16_t)((node->mode & ~07777) | (mode & 07777));
     vfs_close(node);
@@ -5085,6 +5145,12 @@ sys_(utimensat, int dirfd, char *pathname, const struct timespec *times, int fla
         free(resolved);
     }
     if (node == NULL) return SYSCALL_FAULT_(ENOENT);
+    if (!vfs_check_access(node, NULL, IME_FILE_WRITE))
+    {
+        int error = vfs_last_error();
+        if (close_node) vfs_close(node);
+        return SYSCALL_FAULT_(error);
+    }
 
     uint64_t now = realtime_ns();
     if (times == NULL)
@@ -5152,6 +5218,12 @@ sys_(utimes, char *filename, const struct timeval *times)
     vfs_node_t node = vfs_open(resolved);
     free(resolved);
     if (node == NULL) return SYSCALL_FAULT_(ENOENT);
+    if (!vfs_check_access(node, NULL, IME_FILE_WRITE))
+    {
+        int error = vfs_last_error();
+        vfs_close(node);
+        return SYSCALL_FAULT_(error);
+    }
 
     if (times != NULL)
     {
@@ -5334,12 +5406,12 @@ sys_(sendfile, int out_fd, int in_fd, uint64_t *offset_ptr, size_t count)
         size_t bytes_read;
         size_t bytes_written;
         bytes_read = vfs_read(in_handle->node, buffer, current_offset, bytes_to_read);
-        if (bytes_read <= 0)
+        if (bytes_read == 0 || (ssize_t)bytes_read < 0)
         {
             if (bytes_read == (size_t)VFS_STATUS_FAILED && total_sent == 0)
             {
                 free(buffer);
-                return SYSCALL_FAULT_(EIO);
+                return SYSCALL_FAULT_(vfs_last_error());
             }
             break;
         }
@@ -5349,7 +5421,7 @@ sys_(sendfile, int out_fd, int in_fd, uint64_t *offset_ptr, size_t count)
             if (total_sent == 0)
             {
                 free(buffer);
-                return SYSCALL_FAULT_(EIO);
+                return SYSCALL_FAULT_(vfs_last_error());
             }
             break;
         }

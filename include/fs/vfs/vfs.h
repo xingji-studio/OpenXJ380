@@ -375,3 +375,7 @@ char *vfs_get_fullpath(vfs_node_t node);
 char *at_resolve_pathname(int dirfd, char *pathname);
 char *vfs_cwd_path_build(char *src); // 构建当前工作目录的路径
 bool  vfs_init();
+
+// Authorization is separate from internal name lookup.
+bool vfs_check_access(vfs_node_t node, const char *path, int operation);
+int vfs_last_error();

@@ -1415,6 +1415,19 @@ uint64_t process_execve(char *path, char **argv, char **envp)
         return (uint64_t)shebang_ret;
     }
 
+    char executable_directory[4096];
+    int directory_error = permissions_executable_directory(node, executable_directory, sizeof(executable_directory));
+    if (directory_error < 0)
+    {
+        vfs_close(node);
+        free(norm_path);
+        free(kpath);
+        free_envp(kargv);
+        free_envp(kenvp);
+        restore_runtime_state(scheduler_depth, is_sti);
+        return (uint64_t)directory_error;
+    }
+
     // ELF reads can wait for filesystem mutexes. Stage the image privately with
     // scheduling available; only the final publication needs serialization.
     page_directory_t *new_page_dir = clone_page_directory(get_kernel_pagedir(), false);
@@ -1496,7 +1509,7 @@ uint64_t process_execve(char *path, char **argv, char **envp)
             return (uint64_t)-ENOMEM;
         }
     }
-    new_exe_path = strdup(norm_path);
+    new_exe_path = vfs_get_fullpath(node);
     if (new_exe_path == NULL)
     {
         vfs_close(node);
@@ -1652,7 +1665,7 @@ uint64_t process_execve(char *path, char **argv, char **envp)
      * naming the new image. Do not move ELF/VFS work or heap allocation under
      * create_thread_lock or this scheduler-disabled section.
      */
-    permissions_process_exec(process);
+    permissions_process_exec(process, executable_directory);
     bool was_vfork = process->vfork;
     lock_queue *old_virt_queue = process->virt_queue;
     vma_manager_t old_vma_manager = process->vma_manager;

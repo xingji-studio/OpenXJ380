@@ -21,6 +21,7 @@
 #include <user/user.h>
 #include <user/runfile.h>
 #include <user/settings.h>
+#include <user/permissions.h>
 
 extern UserInfo *current_user;
 
@@ -41,14 +42,7 @@ bool init_user_dirs(const char *username)
     if (username == NULL || username[0] == '\0' || strchr(username, '/') || strchr(username, '\\') ||
         !strcmp(username, ".") || !strcmp(username, "..")) return false;
 
-    // Profile creation is a trusted kernel operation. Ordinary VFS callers
-    // cannot replace account directories that anchor private IME data.
-    struct ProfileScope
-    {
-        tcb_t task;
-        ProfileScope() : task(get_current_task()) { if (task) ++task->ime_config_depth; }
-        ~ProfileScope() { if (task) --task->ime_config_depth; }
-    } scope;
+    PermissionProfileScope scope(username);
     vfs_mkdir("/users");
 
     char user_folder_path[256];
@@ -68,14 +62,16 @@ static bool write_file_if_empty(const char *path, const void *data, size_t size)
     vfs_node_t existing = vfs_open_no_follow(path);
     if (existing != NULL)
     {
+        if (existing->type & file_symlink) { vfs_close(existing); return false; }
         bool already_initialized = !(existing->type & file_dir) && existing->size > 0;
         vfs_close(existing);
         if (already_initialized) return true;
     }
 
     if (vfs_mkfile(path) != EOK) return false;
-    vfs_node_t file = vfs_open(path);
+    vfs_node_t file = vfs_open_no_follow(path);
     if (file == NULL) return false;
+    if (file->type & file_symlink) { vfs_close(file); return false; }
 
     vfs_resize(file, 0);
     size_t wrote = vfs_write(file, (void *)data, 0, size);
@@ -108,6 +104,40 @@ static int read_default_settings_language()
     return normalize_settings_language(language);
 }
 
+static bool migrate_runfile_app(char *path, size_t capacity)
+{
+    if (!memchr(path, '\0', capacity)) return false;
+    const char *slash = strrchr(path, '/');
+    const char *extension = strrchr(path, '.');
+    if (!slash || !extension || extension <= slash + 1 || strcmp(extension, ".elf")) return false;
+    size_t prefix = (size_t)(slash - path);
+    bool flat = false;
+    const char *directories[] = {"/apps", "/apps/system", "/apps/builtin", "/apps/thirdparty",
+                                 "/apps/xingji-pinyin"};
+    for (const char *directory : directories)
+        if (strlen(directory) == prefix && !strncmp(path, directory, prefix)) flat = true;
+    if (!flat) return false;
+    char relocated[256];
+    size_t stem_length = (size_t)(extension - slash - 1);
+    size_t leaf_length = strlen(slash + 1);
+    size_t length = prefix + stem_length + leaf_length + 2;
+    if (length >= sizeof(relocated) || length >= capacity) return false;
+    // The kernel formatter does not apply string precision. Construct these
+    // bounded components directly rather than relying on host printf behavior.
+    memcpy(relocated, path, prefix);
+    relocated[prefix] = '/';
+    memcpy(relocated + prefix + 1, slash + 1, stem_length);
+    relocated[prefix + stem_length + 1] = '/';
+    memcpy(relocated + prefix + stem_length + 2, slash + 1, leaf_length + 1);
+    vfs_node_t installed = vfs_open(relocated);
+    if (!installed) return false; // Preserve unknown/user-defined associations.
+    bool executable = !(installed->type & file_dir);
+    vfs_close(installed);
+    if (!executable) return false;
+    strcpy(path, relocated);
+    return true;
+}
+
 bool init_user_runfile(const char *username)
 {
     if (!init_user_dirs(username)) return false;
@@ -115,33 +145,52 @@ bool init_user_runfile(const char *username)
     char runfile_setfile_path[256];
     if (!make_user_path(runfile_setfile_path, sizeof(runfile_setfile_path), username, "/runfile.dat")) return false;
 
+    vfs_node_t existing = vfs_open_no_follow(runfile_setfile_path);
+    if (existing && (existing->type & file_symlink)) { vfs_close(existing); return false; }
+    if (existing && existing->size == sizeof(RunfileSettings_Format))
+    {
+        RunfileSettings_Format *stored = (RunfileSettings_Format *)malloc(sizeof(RunfileSettings_Format));
+        bool ok = stored && vfs_read(existing, stored, 0, sizeof(*stored)) == sizeof(*stored);
+        bool changed = false;
+        if (ok)
+        {
+            for (RunfileSettings_Item &item : stored->items)
+                changed |= migrate_runfile_app(item.runpath, sizeof(item.runpath));
+            if (changed) ok = vfs_write(existing, stored, 0, sizeof(*stored)) == sizeof(*stored);
+        }
+        free(stored);
+        vfs_close(existing);
+        return ok;
+    }
+    if (existing) vfs_close(existing);
+
     char settings_file_buffer[sizeof(RunfileSettings_Format)];
     memset(settings_file_buffer, 0, sizeof(settings_file_buffer));
     RunfileSettings_Format *file_format = (RunfileSettings_Format *)settings_file_buffer;
 
     strcpy(file_format->items[0].exname,   "txt");
     strcpy(file_format->items[0].describe, "文本文件");
-    strcpy(file_format->items[0].runpath,  "/apps/builtin/texter.elf");
+    strcpy(file_format->items[0].runpath,  "/apps/builtin/texter/texter.elf");
 
     strcpy(file_format->items[1].exname,   "inf");
     strcpy(file_format->items[1].describe, "配置文件");
-    strcpy(file_format->items[1].runpath,  "/apps/builtin/texter.elf");
+    strcpy(file_format->items[1].runpath,  "/apps/builtin/texter/texter.elf");
 
     strcpy(file_format->items[2].exname,   "png");
     strcpy(file_format->items[2].describe, "PNG 图片文件");
-    strcpy(file_format->items[2].runpath,  "/apps/builtin/picturer.elf");
+    strcpy(file_format->items[2].runpath,  "/apps/builtin/picturer/picturer.elf");
 
     strcpy(file_format->items[3].exname,   "jpg");
     strcpy(file_format->items[3].describe, "JPEG 图片文件");
-    strcpy(file_format->items[3].runpath,  "/apps/builtin/picturer.elf");
+    strcpy(file_format->items[3].runpath,  "/apps/builtin/picturer/picturer.elf");
 
     strcpy(file_format->items[4].exname,   "bmp");
     strcpy(file_format->items[4].describe, "位图文件");
-    strcpy(file_format->items[4].runpath,  "/apps/builtin/picturer.elf");
+    strcpy(file_format->items[4].runpath,  "/apps/builtin/picturer/picturer.elf");
 
     strcpy(file_format->items[5].exname,   "xtb");
     strcpy(file_format->items[5].describe, "XJ380 块状文本标记文本文件");
-    strcpy(file_format->items[5].runpath,  "/apps/builtin/texter.elf");
+    strcpy(file_format->items[5].runpath,  "/apps/builtin/texter/texter.elf");
 
     return write_file_if_empty(runfile_setfile_path, settings_file_buffer, sizeof(settings_file_buffer));
 }
@@ -166,6 +215,8 @@ bool init_user_settings(const char *username)
 
 bool init_user_profile(const char *username)
 {
+    PermissionProfileScope scope(username);
+
     return init_user_dirs(username) && init_user_runfile(username) && init_user_settings(username);
 }
 
