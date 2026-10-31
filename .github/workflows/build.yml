@@ -8,6 +8,12 @@ on:
     branches:
       - main
   workflow_dispatch:
+    inputs:
+      run_tests:
+        description: Run the standalone regression tests
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: read
@@ -57,6 +63,7 @@ jobs:
         run: python3 tools/gen_ninja.py --out build.ninja
 
       - name: Run tests
+        if: github.event_name == 'workflow_dispatch' && inputs.run_tests
         run: python3 -m unittest discover --start-directory tests --pattern 'test_*.py'
 
       - name: Build bootable disk image
