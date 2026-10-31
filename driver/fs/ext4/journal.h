@@ -43,6 +43,8 @@ struct JournalWorkspace
     uint64_t targets[kMaximumBlocks];
     uint32_t index[kIndexSlots];
     uint16_t mapping_index[kIndexSlots];
+    // Bounded gather buffer for contiguous log/checkpoint requests (64 KiB max).
+    uint8_t transfer[16 * 4096];
 };
 
 struct JournalDevice
@@ -65,6 +67,10 @@ struct JournalDevice
     // an overlay without requiring the torn home copies to validate first.
     bool (*validate_transaction)(void *context, const JournalTransaction &transaction);
     JournalWorkspace *workspace;
+    // Explicit opt-in: read still takes one block; write may take this many
+    // contiguous physical blocks. Zero/one retains the original single-block
+    // contract. A failed multi-block write may have persisted any subset.
+    uint32_t maximum_transfer_blocks;
 };
 
 struct BlockUpdate
@@ -119,6 +125,9 @@ private:
 
     int fetch(uint64_t block, void *output);
     int store(uint64_t block, const void *input);
+    int store_run(uint64_t block, const void *input, unsigned count);
+    unsigned transfer_limit() const;
+    int write_updates(const BlockUpdate *updates, unsigned count, bool log, uint8_t *single);
     int barrier();
     int clear();
     bool valid_target(uint64_t block) const;

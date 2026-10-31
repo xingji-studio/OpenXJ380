@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Original bounded writer, based on on-disk format facts, not upstream code.
+// Original bounded writer. Later I/O design references are recorded in REFERENCES.json.
 #include "write.h"
 #include <errno.h>
 
@@ -241,43 +241,30 @@ bool WriteSession::home_read(void *context, uint64_t offset, void *output, Size 
 
 bool WriteSession::read_home(uint64_t offset, void *output, Size bytes)
 {
-    const uint32_t size = volume_.block_size_;
-    if (volume_.ready_ && size && bytes <= size - offset % size)
-    {
-        uint64_t physical = offset / size;
-        uint64_t first = uint64_t(volume_.first_data_block_) + 1;
-        uint64_t count = (uint64_t(volume_.groups_) * volume_.descriptor_size_ + size - 1) / size;
-        if (physical >= first && physical - first < count)
-        {
-            if (!gdt_cache_valid_ || gdt_cache_block_ != physical)
-            {
-                gdt_cache_valid_ = false;
-                if (!device_.read(device_.context, physical * size, gdt_cache_, size)) return false;
-                gdt_cache_block_ = physical;
-                gdt_cache_valid_ = true;
-            }
-            copy(output, gdt_cache_ + offset % size, bytes);
-            return true;
-        }
-    }
-    return device_.read(device_.context, offset, output, bytes);
+    if (failed_) return false;
+    bool ok = workspace_->read_cache.read(device_.read, device_.context, device_.bytes,
+                                          volume_.ready_ ? volume_.block_size_ : 0, offset, output, bytes);
+    if (!ok) { workspace_->read_cache.reset(); failed_ = true; }
+    return ok;
 }
 
 bool WriteSession::journal_read(void *context, uint64_t block, void *data, uint32_t bytes)
 {
     auto *session = static_cast<WriteSession *>(context);
     return block < session->volume_.blocks_ && bytes == session->volume_.block_size_ &&
-           session->device_.read(session->device_.context, block * bytes, data, bytes);
+           session->read_home(block * bytes, data, bytes);
 }
 
 bool WriteSession::journal_write(void *context, uint64_t block, const void *data, uint32_t bytes)
 {
     auto *session = static_cast<WriteSession *>(context);
-    if (session->failed_ || block >= session->volume_.blocks_ || bytes != session->volume_.block_size_) return false;
-    // Checkpoint/replay may replace the primary descriptor table. The cache
-    // never survives a writer request, including a request that fails late.
-    session->gdt_cache_valid_ = false;
-    bool ok = session->device_.write(session->device_.context, block * bytes, data, bytes);
+    uint32_t size = session->volume_.block_size_;
+    if (session->failed_ || !size || !bytes || bytes % size ||
+        bytes / size > Journal::kMaximumUpdates || block >= session->volume_.blocks_ ||
+        bytes / size > session->volume_.blocks_ - block) return false;
+    uint64_t offset = block * size;
+    session->workspace_->read_cache.invalidate(offset, bytes, size);
+    bool ok = session->device_.write(session->device_.context, offset, data, bytes);
     if (!ok) session->failed_ = true;
     return ok;
 }
@@ -947,6 +934,7 @@ int WriteSession::set_recovery(bool enabled)
     uint8_t *block = workspace_->blocks[0];
     if (!device_.read(device_.context, offset, block, size)) return stop(-EIO);
     copy(block + 1024 % size, super_, sizeof(super_));
+    workspace_->read_cache.invalidate(offset, size, size);
     if (!device_.write(device_.context, offset, block, size) || !device_.flush(device_.context)) return stop(-EIO);
     volume_.incompat_ = enabled ? features | 4U : features & ~4U;
     return 0;
@@ -961,7 +949,7 @@ int WriteSession::open(const WriteDevice &device, WriteWorkspace &workspace,
     if (!device.read || !device.write || !device.flush) return -EINVAL;
     device_ = device;
     workspace_ = &workspace;
-    gdt_cache_valid_ = false;
+    workspace_->read_cache.reset();
     initial_validator_ = validator;
     initial_validator_context_ = validator_context;
     initial_validated_ = false;
@@ -995,6 +983,7 @@ int WriteSession::open(const WriteDevice &device, WriteWorkspace &workspace,
     JournalDevice journal_device = {};
     journal_device.context = this;
     journal_device.workspace = &workspace.journal;
+    journal_device.maximum_transfer_blocks = Journal::kMaximumUpdates;
     journal_device.read = journal_read;
     journal_device.write = journal_write;
     journal_device.flush = journal_flush;

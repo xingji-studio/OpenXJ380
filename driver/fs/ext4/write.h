@@ -5,6 +5,7 @@
 #include "journal.h"
 #include "attributes.h"
 #include "directory_index.h"
+#include "io_cache.h"
 
 namespace xjext4 {
 
@@ -37,6 +38,7 @@ struct WriteWorkspace
     uint8_t blocks[16][4096];
     JournalWorkspace journal;
     DirectoryIndexWorkspace directory;
+    ReadCache read_cache;
 };
 
 // Bounded journaled mutations. Each transaction has at most sixteen complete
@@ -133,9 +135,6 @@ private:
     uint32_t held_orphan_count_;
     uint8_t bitmap_cache_[4096];
     uint8_t descriptor_cache_[4096];
-    uint8_t gdt_cache_[4096];
-    uint64_t gdt_cache_block_;
-    bool gdt_cache_valid_;
     uint32_t metadata_count_;
     uint32_t journal_blocks_;
     uint64_t journal_first_;

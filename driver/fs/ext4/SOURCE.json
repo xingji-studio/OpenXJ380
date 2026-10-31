@@ -46,13 +46,18 @@
       "spdx": "Apache-2.0"
     },
     {
+      "path": "io_cache.h",
+      "sha256": "f181bb4c9738fec66e077c945a3530167e013bfb9cc0fe1c8b8604cf53a4c4f9",
+      "spdx": "Apache-2.0"
+    },
+    {
       "path": "journal.cpp",
-      "sha256": "332c8eb10004303dd7b5452be792633149863d218ae4bdc023986b2bdd89e3e4",
+      "sha256": "52981115929336ed881e031b1bca26310d27c75ac9f1abed84c03bb49470b6ee",
       "spdx": "Apache-2.0"
     },
     {
       "path": "journal.h",
-      "sha256": "479b176d14e5c89f10536fd4692d3e224b82bc4ae15c9ed5f72e1f0b53b606cc",
+      "sha256": "c5155950135488e64d3cbf16134200667023400bc1448fce041a408b59b324ad",
       "spdx": "Apache-2.0"
     },
     {
@@ -82,12 +87,12 @@
     },
     {
       "path": "write.cpp",
-      "sha256": "e666fd7c03f0b71327ee300990f89db7b39f09f9df9aa672c08b86465ac242a9",
+      "sha256": "5933785524228e2ecfc1bb9b92c373e196b33d8c68f3062caa23a8913f9c95a7",
       "spdx": "Apache-2.0"
     },
     {
       "path": "write.h",
-      "sha256": "502b13f24b267d8b252f9a55c411a6f5b970e75b591615e5546566e21caea869",
+      "sha256": "7dc2096a32860bb74d4e2cff9c6d637db75118552edf8da372bd0e1d29945a87",
       "spdx": "Apache-2.0"
     },
     {

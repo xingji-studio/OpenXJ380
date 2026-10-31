@@ -38,3 +38,13 @@ netserver continues to link the separately licensed BSD-3-Clause lwIP source.
 `include/efi/fbc.h` contains portions derived from MikanOS and retains the
 Apache-2.0 attribution in the source file. The MikanOS source record is kept in
 `third_party/mikanos-hankaku/SOURCE.md`.
+
+## Native ext4 BSD design references
+
+The native ext4 cache/block-I/O/journal design review consults three lwext4
+files bearing BSD-3-Clause notices. No lwext4 implementation code or library is
+copied, translated or linked. The observed upstream copyrights, conditions and
+disclaimer are retained in `driver/fs/ext4/LWEXT4_BSD_NOTICE.txt` in OpenXJ380;
+`driver/fs/ext4/REFERENCES.json` records the consulted views and retrieval limits.
+Both are distributed under `/system/licenses/native-ext4`. The native source
+remains Apache-2.0; upstream GPL extent/xattr implementations remain excluded.

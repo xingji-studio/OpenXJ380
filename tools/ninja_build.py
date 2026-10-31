@@ -207,6 +207,8 @@ def copy_common_assets(root: Path) -> None:
     cp(ROOT / "LICENSE", ext4_notices / "LICENSE")
     cp(ROOT / "driver/fs/ext4/PROVENANCE.md", ext4_notices)
     cp(ROOT / "driver/fs/ext4/SOURCE.json", ext4_notices)
+    cp(ROOT / "driver/fs/ext4/REFERENCES.json", ext4_notices)
+    cp(ROOT / "driver/fs/ext4/LWEXT4_BSD_NOTICE.txt", ext4_notices)
 
 
 def copy_modules(root: Path) -> None:

@@ -8,7 +8,8 @@ kernel platform interfaces retain their own existing licensing boundary.
 
 Implementation inputs were the public on-disk format facts, independently
 formatted Linux fixtures, and existing first-party VFS/block-device interfaces.
-No Linux or lwext4 implementation code is used. This is a provenance statement
+No Linux or lwext4 implementation code is copied or translated. The later
+cache/I/O work also consults the BSD design references detailed below. This is a provenance statement
 for these additions, not a formal clean-room certification or a legal clearance
 of the whole project. SPDX identifiers and hashes do not themselves establish
 originality; review the source diff and provenance when changing the inventory.
@@ -93,7 +94,7 @@ independent Linux checks informed that layout, including small final groups and
 backup descriptors. Serialized block counts remain 32-bit (at most 0xffffffff
 4 KiB blocks). The separate host-image profile permits a root up to 1 TiB /
 8192 groups and invokes host tools only as independent processes. The existing
-source inventory remains 18 driver files; no external dependency is added.
+source inventory at that stage contained 18 driver files; no external dependency was added.
 
 The actual native formatter produced a 32 GiB plus 4 KiB / 257-group image that
 passed Linux primary and group-243 backup fsck. Its sparse zero-write test model
@@ -149,6 +150,32 @@ changing their published callback layouts. These are first-party additions,
 not an imported interval-tree, storage or filesystem implementation. The scoped
 ext4 directory inventory does not hash all platform glue; review those source
 diffs and final compile/link inputs separately.
+
+The 2026-10-31 cache/I/O changes consult the file-level BSD notices and design
+views recorded in `REFERENCES.json`. The cache and block-device views were
+available only on moving master; the journal view was rendered at the recorded
+candidate revision. Verified HTTPS full-file downloads were unavailable. No
+upstream file-byte hash, full pinned source audit, include/helper closure review
+or implementation import is claimed. `LWEXT4_BSD_NOTICE.txt` retains the
+observed upstream copyright, conditions and disclaimer and is staged with this
+record in both distributions. The source inventory now contains 19 Apache-2.0
+files, including the newly written `io_cache.h`; no external implementation or
+link archive is added. Future copied/adapted source still requires pinned bytes,
+hashes, complete dependency review, accurate licensing and a policy update.
+
+The design review informed LBA-keyed clean caching, LRU replacement, targeted
+invalidation and direct block-count I/O. The native implementation uses 32
+caller-owned fixed cache slots with bounded recency ranks, instead of upstream
+allocation/trees/reference-counted dirty buffers. Transactions and recovery
+overlays retain priority over cached home blocks. Every attempted write
+invalidates the affected blocks first; read/write/flush failures quarantine the
+session, including warm cache reads after a cold I/O failure. The journal's
+new 16-block gather buffer combines only physically consecutive images within
+one existing phase, preserves escaping/checksums and all six commit barriers,
+and does not import asynchronous checkpoints or dirty writeback. Existing
+original native extent/xattr parsing and mutation algorithms are retained;
+the GPL `ext4_extent.c`, `ext4_extents.c` spelling and `ext4_xattr.c` are explicitly
+excluded as source inputs, regardless of any replacement SPDX label.
 
 SOURCE.json records the reviewed source bytes. Both Ninja generators run
 `tools/check_ext4_sources.py` to detect missing, changed, extra, or incorrectly
