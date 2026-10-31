@@ -196,6 +196,47 @@ size_t queue_enqueue_ref(lock_queue *q, void *data, lock_node **out_node)
     return index;
 }
 
+// Original allocation-free publication for already prepared kernel workers.
+size_t queue_enqueue_preallocated(lock_queue *q, void *data, lock_node *node, lock_node **out_node,
+                                  size_t *published_index)
+{
+    if (out_node) *out_node = NULL;
+    if (!q || !node) return (size_t)-1;
+    spin_lock(&q->lock);
+    if (q->next_index == (size_t)-1)
+    {
+        spin_unlock(&q->lock);
+        return (size_t)-1;
+    }
+    size_t index = q->next_index++;
+    node->data = data;
+    node->index = index;
+    if (published_index) *published_index = index;
+    queue_append_node(q, node);
+    if (out_node) *out_node = node;
+    spin_unlock(&q->lock);
+    return index;
+}
+
+// Roll back an unpublished worker's group link without freeing under a lock.
+bool queue_detach_preallocated(lock_queue *q, lock_node *node)
+{
+    if (!q || !node) return false;
+    spin_lock(&q->lock);
+    lock_node *found = q->head;
+    while (found && found != node) found = found->next;
+    if (!found) { spin_unlock(&q->lock); return false; }
+    if (node->prev) node->prev->next = node->next;
+    else q->head = node->next;
+    if (node->next) node->next->prev = node->prev;
+    else q->tail = node->prev;
+    if (q->rr_cursor == node) q->rr_cursor = node->next ? node->next : q->head;
+    node->next = node->prev = NULL;
+    --q->size;
+    spin_unlock(&q->lock);
+    return true;
+}
+
 size_t queue_enqueue_id(lock_queue *q, void *data, size_t id)
 {
     if (q == NULL) return (size_t)-1;

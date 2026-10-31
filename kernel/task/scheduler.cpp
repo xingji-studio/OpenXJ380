@@ -38,6 +38,91 @@ static_assert(__builtin_offsetof(PROCESSOR_INFO, scheduler_disable_depth) == 0x4
               "PROCESSOR_INFO.scheduler_disable_depth must follow syscall scratch fields");
 
 /*
+ * Queue removal alone does not prove that a TCB is unused: the timer may have
+ * selected it but not published current_task yet. Likewise, after publication
+ * the interrupt epilogue still uses the previous task's kernel stack until
+ * iretq. Keep both references outside PROCESSOR_INFO's assembly ABI. Each entry
+ * is protected by that CPU's scheduler_queue lock, including current_task
+ * publication. CPU array indices are deliberately independent of ACPI IDs.
+ */
+struct SchedulerReferences
+{
+    tcb_t selected;
+    tcb_t previous;
+};
+
+static SchedulerReferences scheduler_references[MAX_CPU_NUM];
+
+static SchedulerReferences *references_for_cpu(PROCESSOR_INFO *cpu)
+{
+    size_t count = get_cpu_num();
+    if (count > MAX_CPU_NUM) count = MAX_CPU_NUM;
+    for (size_t i = 0; i < count; i++)
+    {
+        if (get_cpu(i) == cpu) return &scheduler_references[i];
+    }
+    return NULL;
+}
+
+static bool scheduler_referenced(tcb_t task, pcb_t process)
+{
+    size_t count = get_cpu_num();
+    if (count > MAX_CPU_NUM) count = MAX_CPU_NUM;
+    for (size_t i = 0; i < count; i++)
+    {
+        PROCESSOR_INFO *cpu = get_cpu(i);
+        if (cpu == NULL) continue;
+        lock_queue *queue = cpu->scheduler_queue;
+        if (queue != NULL) spin_lock(&queue->lock);
+        tcb_t references[] = {__atomic_load_n(&cpu->current_task, __ATOMIC_ACQUIRE),
+                              scheduler_references[i].selected, scheduler_references[i].previous};
+        bool found = false;
+        for (tcb_t reference : references)
+        {
+            if (reference != NULL && (task != NULL ? reference == task : reference->parent_group == process))
+                found = true;
+        }
+        if (queue != NULL) spin_unlock(&queue->lock);
+        if (found) return true;
+    }
+    return false;
+}
+
+bool scheduler_task_referenced(tcb_t task)
+{
+    return task != NULL && scheduler_referenced(task, NULL);
+}
+
+bool scheduler_process_referenced(pcb_t process)
+{
+    return process != NULL && scheduler_referenced(NULL, process);
+}
+
+static void scheduler_interrupt_enter(PROCESSOR_INFO *cpu)
+{
+    if (cpu == NULL || cpu->scheduler_queue == NULL) return;
+    SchedulerReferences *references = references_for_cpu(cpu);
+    if (references == NULL) return;
+    spin_lock(&cpu->scheduler_queue->lock);
+    // A subsequent interrupt proves the previous iretq and stack handoff ran.
+    references->previous = NULL;
+    spin_unlock(&cpu->scheduler_queue->lock);
+}
+
+static void scheduler_publish_task(PROCESSOR_INFO *cpu, tcb_t previous, tcb_t next)
+{
+    SchedulerReferences *references = references_for_cpu(cpu);
+    spin_lock(&cpu->scheduler_queue->lock);
+    if (references != NULL)
+    {
+        if (previous != next) references->previous = previous;
+        references->selected = NULL;
+    }
+    __atomic_store_n(&cpu->current_task, next, __ATOMIC_RELEASE);
+    spin_unlock(&cpu->scheduler_queue->lock);
+}
+
+/*
  * Keep boot/fatal state separate from runtime preemption state. A shared
  * boolean let one CPU's critical section disable scheduling on every CPU, and
  * a stray enable from an unrelated path could then make it globally runnable.
@@ -243,7 +328,8 @@ static inline bool is_task_schedulable(tcb_t task, tcb_t current)
     if (task->task_level == TASK_IDLE_LEVEL) return false;
     if (task->parent_group == NULL) return false;
     if (task->parent_group->status == DEATH || task->parent_group->status == FUTEX ||
-        task->parent_group->status == OUT || task->parent_group->status == WAIT) {
+        task->parent_group->status == OUT || task->parent_group->status == WAIT ||
+        task->parent_group->status == ZOMBIE) {
         return false;
     }
     return true;
@@ -255,7 +341,8 @@ static inline bool is_current_task_runnable(tcb_t task)
     if (task->status != RUNNING && task->status != START && task->status != CREATE) return false;
     if (task->parent_group == NULL) return false;
     if (task->parent_group->status == DEATH || task->parent_group->status == FUTEX ||
-        task->parent_group->status == OUT || task->parent_group->status == WAIT) {
+        task->parent_group->status == OUT || task->parent_group->status == WAIT ||
+        task->parent_group->status == ZOMBIE) {
         return false;
     }
     return true;
@@ -330,7 +417,8 @@ static uint64_t queue_average_vruntime(lock_queue *queue, tcb_t current, uint64_
         tcb_t candidate = (tcb_t)node->data;
         uint64_t wake_base = current != NULL ? current->eevdf_vruntime : candidate->eevdf_vruntime;
         wake_sleeping_task(candidate, now, wake_base);
-        if (candidate != current && candidate != NULL && candidate->task_level == TASK_IDLE_LEVEL && idle != NULL) {
+        if (candidate != current && candidate != NULL && candidate->task_level == TASK_IDLE_LEVEL && idle != NULL &&
+            is_current_task_runnable(candidate)) {
             *idle = candidate;
         }
         if (candidate == current) {
@@ -384,11 +472,14 @@ tcb_t select_next_task_safe()
     if (cpu == NULL) return NULL;
     lock_queue *queue = cpu->scheduler_queue;
     if (queue == NULL) return NULL;
+    SchedulerReferences *references = references_for_cpu(cpu);
+    if (references == NULL) return NULL;
 
     spin_lock(&queue->lock);
 
     if (queue->size == 0 || queue->head == NULL)
     {
+        references->selected = NULL;
         spin_unlock(&queue->lock);
         return NULL;
     }
@@ -422,6 +513,7 @@ tcb_t select_next_task_safe()
 
     tcb_t result = best != NULL ? best : (is_current_task_runnable(current) ? current : idle);
     if (result != NULL) mark_task_dispatched(result, now);
+    references->selected = result;
     spin_unlock(&queue->lock);
     return result;
 }
@@ -447,6 +539,7 @@ extern "C" registers_t *timer_handle(registers_t *reg)
 {
     // send_eoi();
     PROCESSOR_INFO *cpu = get_current_cpu();
+    scheduler_interrupt_enter(cpu);
     const bool boot_ready = __atomic_load_n(&scheduler_boot_ready, __ATOMIC_ACQUIRE);
     const uint64_t disable_depth =
         cpu != NULL ? __atomic_load_n(&cpu->scheduler_disable_depth, __ATOMIC_ACQUIRE) : 0;
@@ -527,6 +620,15 @@ extern "C" registers_t *timer_handle(registers_t *reg)
     }
 #endif
     if (best == NULL || best == current) {
+        if (cpu->scheduler_queue != NULL) scheduler_publish_task(cpu, current, current);
+        cpu->scheduler_ticks = 0;
+        send_eoi();
+        return reg;
+    }
+
+    if (!is_current_task_runnable(best))
+    {
+        scheduler_publish_task(cpu, current, current);
         cpu->scheduler_ticks = 0;
         send_eoi();
         return reg;
@@ -535,33 +637,36 @@ extern "C" registers_t *timer_handle(registers_t *reg)
     // 记录当前线程运行时最新的 FSBASE，避免调度后丢失用户态 TLS 环境。
     current->fs_base = read_fsbase();
 
-    // 任务寻父处理
-    if (best->parent_group && 
-        (best->parent_group->parent_task == NULL || 
-         best->parent_group->parent_task->status == DEATH || 
-         best->parent_group->parent_task->status == OUT)) {
-        best->parent_group->parent_task = kernel_group;
-    }
+    // Process collection reparents children under the process/child-list
+    // locks. The timer must not dereference an unpinned parent PCB or change
+    // parent_task independently of those lists.
 
     // 正式切换
     if (cpu->current_task != best) {
         // 更新任务状态
-        if (current->status == RUNNING) { 
-            current->status = START; 
-        }
-        if (best->status == START || best->status == CREATE) { 
-            best->status = RUNNING; 
+        TaskStatus old_status = RUNNING;
+        __atomic_compare_exchange_n(&current->status, &old_status, START, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+        old_status = START;
+        if (!__atomic_compare_exchange_n(&best->status, &old_status, RUNNING, false, __ATOMIC_ACQ_REL,
+                                         __ATOMIC_ACQUIRE))
+        {
+            old_status = CREATE;
+            __atomic_compare_exchange_n(&best->status, &old_status, RUNNING, false, __ATOMIC_ACQ_REL,
+                                         __ATOMIC_ACQUIRE);
         }
         
         // 只有上下文有效的任务才切换
         if (best->context0.rip != 0) {
             cpu->scheduler_ticks = 0;
             change_proccess(reg, current, best);
-            cpu->current_task = best;
+            scheduler_publish_task(cpu, current, best);
         } else {
             // 如果上下文无效，不切换并恢复状态
-            current->status = RUNNING;
+            old_status = START;
+            __atomic_compare_exchange_n(&current->status, &old_status, RUNNING, false, __ATOMIC_ACQ_REL,
+                                         __ATOMIC_ACQUIRE);
             cpu->scheduler_ticks = 0;
+            scheduler_publish_task(cpu, current, current);
         }
     }
     send_eoi();
@@ -658,7 +763,7 @@ static size_t scheduler_cpu_index(PROCESSOR_INFO *cpu)
     return (size_t)-1;
 }
 
-size_t add_task(tcb_t new_task)
+static size_t add_task_impl(tcb_t new_task, lock_node *prepared)
 {
     if (new_task == NULL) return -1;
 	    
@@ -726,8 +831,16 @@ size_t add_task(tcb_t new_task)
     spin_unlock(&min_cpu->scheduler_queue->lock);
     init_task_eevdf_entity(new_task, base_vruntime, now);
     new_task->cpu_id      = min_cpu_index;
-    new_task->queue_index = queue_enqueue_ref(min_cpu->scheduler_queue, new_task, &new_task->sched_node);
-    if (strcmp(new_task->name, "fmanager") == 0)
+    size_t queue_index;
+    if (prepared)
+        queue_index = queue_enqueue_preallocated(min_cpu->scheduler_queue, new_task, prepared,
+                                                 &new_task->sched_node, &new_task->queue_index);
+    else
+        new_task->queue_index = queue_index =
+            queue_enqueue_ref(min_cpu->scheduler_queue, new_task, &new_task->sched_node);
+    // A prepared worker can finish immediately after queue publication.
+    // Never inspect its TCB again once another CPU can execute it.
+    if (!prepared && strcmp(new_task->name, "fmanager") == 0)
     {
         write_serial_fmt("[sched-debug] enqueue fmanager task=%p tid=%llu cpu=%llu lapic=%llu queue=%llu "
                          "status=%u rip=%llx rsp=%llx depth=%llu\n",
@@ -745,7 +858,18 @@ size_t add_task(tcb_t new_task)
     // debug_sched_queue(min_cpu->scheduler_queue);
     
     spin_unlock(&scheduler_lock);
-    return new_task->queue_index;
+    return queue_index;
+}
+
+size_t add_task(tcb_t new_task)
+{
+    return add_task_impl(new_task, NULL);
+}
+
+size_t add_task_preallocated(tcb_t new_task, lock_node *prepared)
+{
+    if (!prepared) return (size_t)-1;
+    return add_task_impl(new_task, prepared);
 }
 
 void remove_task(tcb_t task)

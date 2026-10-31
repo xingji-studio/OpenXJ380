@@ -15,6 +15,7 @@ mkdir -p \
     "$root/apps/thirdparty" \
     "$root/bin" \
     "$root/boot" \
+    "$root/config" \
     "$root/dev" \
     "$root/etc/fastfetch" \
     "$root/etc/gsman/services" \
@@ -25,7 +26,7 @@ mkdir -p \
     "$root/lib64" \
     "$root/media" \
     "$root/mnt" \
-    "$root/mod" \
+    "$root/system/mod" \
     "$root/opt" \
     "$root/proc" \
     "$root/root" \
@@ -69,6 +70,7 @@ mkdir -p \
     "$root/var/tmp"
 
 chmod 1777 "$root/tmp" "$root/var/tmp"
+cp docs/CONFIG.md "$root/config/README.md"
 printf "nameserver 223.5.5.5\n" > "$root/etc/resolv.conf"
 
 cat > "$root/etc/os-release" <<'EOF'

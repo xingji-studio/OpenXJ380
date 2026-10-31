@@ -40,6 +40,7 @@
 #define HBA_PxINTR_NIF (1 << 26)
 #define HBA_PxINTR_OF  (1 << 24)
 #define HBA_PxTFD_ERR  (1)
+#define HBA_PxTFD_DF   (1 << 5)
 #define HBA_PxTFD_BSY  (1 << 7)
 #define HBA_PxTFD_DRQ  (1 << 3)
 
@@ -97,6 +98,8 @@
 #define ATA_READ_DMA               0xc8
 #define ATA_WRITE_DMA_EXT          0x35
 #define ATA_WRITE_DMA              0xca
+#define ATA_FLUSH_CACHE            0xe7
+#define ATA_FLUSH_CACHE_EXT        0xea
 
 // ATA 状态寄存器 (STS) 位定�?
 #define ATA_STS_ERR (1 << 0) // Error
@@ -115,7 +118,7 @@
 #define AHCI_CMD_CR (1 << 15) // Command Running
 
 #define IDDEV_OFFMAXLBA       60
-#define IDDEV_OFFMAXLBA_EXT   230
+#define IDDEV_OFFMAXLBA_EXT   100
 #define IDDEV_OFFLSECSIZE     117
 #define IDDEV_OFFWWN          108
 #define IDDEV_OFFSERIALNUM    10
@@ -229,6 +232,8 @@ struct hba_cmdt {
 
 #define HBA_DEV_FEXTLBA 1
 #define HBA_DEV_FATAPI  (1 << 1)
+#define HBA_DEV_FFLUSH  (1 << 2)
+#define HBA_DEV_FFLUSH_EXT (1 << 3)
 
 struct hba_port;
 struct ahci_hba;
@@ -278,6 +283,7 @@ struct hba_port {
     void                  *fis;
     struct hba_device     *device;
     struct ahci_hba       *hba;
+    int                    io_error; // Latched until complete port reinitialization.
 };
 
 struct ahci_hba {
@@ -287,6 +293,8 @@ struct ahci_hba {
     uint32_t            cmd_slots;
     uint32_t            version;
     struct hba_port    *ports[32];
+    void              *pci_device;
+    bool               quarantined;
 };
 
 struct scsi_cdb12 {
@@ -339,6 +347,9 @@ void sata_submit(struct hba_device *dev, struct blkio_req *io_req);
 void sata_read_error(struct hba_port *port);
 void ahci_post(struct hba_port *port, struct hba_cmd_state *state, int slot);
 int  ahci_try_send(struct hba_port *port, int slot);
+int  ahci_send_command(struct hba_port *port, int slot, uint64_t timeout_ns);
+int  ahci_fail_port(struct hba_port *port, int error);
+int  sata_flush(struct hba_device *dev);
 void achi_register_ops(struct hba_port *port);
 void ahci_parsestr(char *str, uint16_t *reg_start, int size_word);
 void ahci_parse_dev_info(struct hba_device *dev_info, uint16_t *data);

@@ -1,5 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
 #include "ahci/ahci.h"
 #include "proto.hpp"
+#include <errno.h>
 
 extern bool ahci_get_accel();
 
@@ -10,6 +12,7 @@ static size_t ahci_max_sectors_per_cmd(const struct hba_device *dev)
     size_t limit = kAhciMaxBytesPerCmd / dev->block_size;
     if (limit == 0) { limit = 1; }
     if (limit > 0xffff) { limit = 0xffff; }
+    if (!(dev->flags & HBA_DEV_FEXTLBA) && limit > 0xff) limit = 0xff;
     return limit;
 }
 
@@ -69,13 +72,15 @@ static void sata_submit_safe(struct hba_device *dev, struct blkio_req *io_req)
         sata_create_fis(fis, write ? ATA_WRITE_DMA_EXT : ATA_READ_DMA_EXT, io_req->lba, count);
     }
     else { sata_create_fis(fis, write ? ATA_WRITE_DMA : ATA_READ_DMA, io_req->lba, count); }
-    fis->dev = (1 << 6);
+    fis->dev = (1 << 6) | ((dev->flags & HBA_DEV_FEXTLBA) ? 0 : ((io_req->lba >> 24) & 0xf));
     if (!write && io_req->lba < 8) {
         // write_serial_fmt("AHCI TRACE: FIS=%02x %02x %02x %02x %02x %02x %02x %02x count=0x%x\n",
                         //  fis->head.type, fis->head.options, fis->head.status_cmd, fis->head.feat_err, fis->lba0,
                         //  fis->lba8, fis->lba16, fis->dev, fis->count);
     }
-    if (!ahci_try_send(port, slot)) {
+    int error = ahci_send_command(port, slot, 5000000000ULL);
+    if (error) {
+        io_req->status = error;
         sata_log_io_context("command-failed", port, header, table, slot, write, io_req->lba, count, io_req->buf,
                             io_req->len);
         return;
@@ -84,6 +89,8 @@ static void sata_submit_safe(struct hba_device *dev, struct blkio_req *io_req)
     if (header->transferred_size != io_req->len) {
         sata_log_io_context("transfer-size-mismatch", port, header, table, slot, write, io_req->lba, count,
                             io_req->buf, io_req->len);
+        io_req->status = ahci_fail_port(port, -EIO);
+        return;
     }
     delay_us_hp(50);
     io_req->status = 0;
@@ -134,13 +141,15 @@ static void sata_submit_fast(struct hba_device *dev, struct blkio_req *io_req)
             sata_create_fis(fis, write ? ATA_WRITE_DMA_EXT : ATA_READ_DMA_EXT, lba, count);
         }
         else { sata_create_fis(fis, write ? ATA_WRITE_DMA : ATA_READ_DMA, lba, count); }
-        fis->dev = (1 << 6);
+        fis->dev = (1 << 6) | ((dev->flags & HBA_DEV_FEXTLBA) ? 0 : ((lba >> 24) & 0xf));
         if (!write && lba < 8) {
             // write_serial_fmt("AHCI TRACE: FIS=%02x %02x %02x %02x %02x %02x %02x %02x count=0x%x\n",
                             //  fis->head.type, fis->head.options, fis->head.status_cmd, fis->head.feat_err, fis->lba0,
                             //  fis->lba8, fis->lba16, fis->dev, fis->count);
         }
-        if (!ahci_try_send(port, slot)) {
+        int error = ahci_send_command(port, slot, 5000000000ULL);
+        if (error) {
+            io_req->status = error;
             sata_log_io_context("command-failed", port, header, table, slot, write, lba, count,
                                 io_req->buf + offset, chunk);
             return;
@@ -149,6 +158,8 @@ static void sata_submit_fast(struct hba_device *dev, struct blkio_req *io_req)
         if (header->transferred_size != chunk) {
             sata_log_io_context("transfer-size-mismatch", port, header, table, slot, write, lba, count,
                                 io_req->buf + offset, chunk);
+            io_req->status = ahci_fail_port(port, -EIO);
+            return;
         }
         remaining -= chunk;
         offset    += chunk;
@@ -160,10 +171,44 @@ static void sata_submit_fast(struct hba_device *dev, struct blkio_req *io_req)
 
 void sata_submit(struct hba_device *dev, struct blkio_req *io_req)
 {
-    io_req->status = -1;
-    if (ahci_get_accel()) {
+    if (!io_req) return;
+    io_req->status = -EINVAL;
+    if (!dev || !dev->port || !dev->hba || !dev->block_size ||
+        io_req->len % dev->block_size || io_req->lba > dev->max_lba ||
+        io_req->len / dev->block_size > dev->max_lba - io_req->lba) return;
+    if (dev->port->io_error || dev->hba->quarantined)
+    {
+        io_req->status = dev->port->io_error ? dev->port->io_error : -EIO;
+        return;
+    }
+    if (!io_req->len) { io_req->status = 0; return; }
+    if (ahci_get_accel() || io_req->len > ahci_max_sectors_per_cmd(dev) * dev->block_size) {
         sata_submit_fast(dev, io_req);
     } else {
         sata_submit_safe(dev, io_req);
     }
+}
+
+int sata_flush(struct hba_device *dev)
+{
+    if (!dev || !dev->port || !dev->hba) return -ENODEV;
+    if (dev->port->io_error) return dev->port->io_error;
+    if (dev->hba->quarantined) return -EIO;
+    if (dev->flags & HBA_DEV_FATAPI) return -EOPNOTSUPP;
+    uint8_t command = dev->flags & HBA_DEV_FFLUSH_EXT ? ATA_FLUSH_CACHE_EXT :
+                      dev->flags & HBA_DEV_FFLUSH ? ATA_FLUSH_CACHE : 0;
+    if (!command) return -EOPNOTSUPP;
+    struct hba_cmdh *header;
+    struct hba_cmdt *table;
+    int slot = hba_prepare_cmd(dev->port, &table, &header);
+    if (slot < 0) return dev->port->io_error ? dev->port->io_error : -EBUSY;
+    // ATA FLUSH CACHE (E7h) / FLUSH CACHE EXT (EAh) use a non-data command.
+    // Do not bind a buffer or encode a zero-sector READ/WRITE DMA operation.
+    header->prdt_len = 0;
+    header->transferred_size = 0;
+    header->options &= ~(HBA_CMDH_WRITE | HBA_CMDH_ATAPI | HBA_CMDH_PREFETCH);
+    sata_create_fis((struct sata_reg_fis *)table->command_fis, command, 0, 0);
+    int error = ahci_send_command(dev->port, slot, 30000000000ULL);
+    if (!error && header->transferred_size != 0) return ahci_fail_port(dev->port, -EIO);
+    return error;
 }

@@ -1,8 +1,13 @@
+// SPDX-License-Identifier: Apache-2.0
 #include <ahci/ahci.h>
 #include <pci/pci.h>
 #include <proto.hpp>
 #include <device.h>
+#include <block_source.h>
 #include <ioctl.h>
+#include <errno.h>
+#include <mutex.h>
+#include "deadline.h"
 
 void              *op_buffer;
 static uint32_t    cdb_size[] = {SCSI_CDB12, SCSI_CDB16, 0, 0};
@@ -18,9 +23,9 @@ static constexpr uint64_t AHCI_PORT_STOP_TIMEOUT_NS  = 2000000000ULL;
 static constexpr uint64_t AHCI_PORT_READY_TIMEOUT_NS = 5000000000ULL;
 
 static bool ahci_wait_port_cmd_clear(volatile hba_reg_t *port_reg, uint32_t mask, uint64_t timeout_ns) {
-    uint64_t start = nanoTime();
+    AhciDeadline deadline(nanoTime());
     while ((port_reg[HBA_RPxCMD] & mask) != 0) {
-        if (nanoTime() - start >= timeout_ns) return false;
+        if (deadline.expired(nanoTime(), timeout_ns)) return false;
         asm volatile("pause");
     }
     return true;
@@ -32,6 +37,64 @@ static bool ahci_stop_port_engine(volatile hba_reg_t *port_reg) {
 
     port_reg[HBA_RPxCMD] &= ~HBA_PxCMD_FRE;
     return ahci_wait_port_cmd_clear(port_reg, HBA_PxCMD_FR, AHCI_PORT_STOP_TIMEOUT_NS);
+}
+
+int ahci_fail_port(struct hba_port *port, int error)
+{
+    if (!port) return error;
+    port->io_error = error < 0 ? error : -EIO;
+    // CI is hardware-owned once submitted. Clearing it in software or blindly
+    // retrying can reuse a command table while DMA still references it. First
+    // stop both engines and retain all command/FIS storage for the failed port.
+    if (ahci_stop_port_engine(port->regs)) return port->io_error;
+
+    struct ahci_hba *hba = port->hba;
+    if (hba)
+    {
+        hba->quarantined = true;
+        for (unsigned i = 0; i < 32; ++i)
+            if (hba->ports[i] && hba->ports[i] != port) hba->ports[i]->io_error = -EIO;
+        pci_device_t *device = (pci_device_t *)hba->pci_device;
+        if (device)
+        {
+            uint32_t command = pci_read_command(device, PCI_CONF_COMMAND) & 0xffff;
+            pci_write_command(device, PCI_CONF_COMMAND, command & ~PCI_COMMAND_MASTER);
+            io_mfence();
+            if (!(pci_read_command(device, PCI_CONF_COMMAND) & PCI_COMMAND_MASTER))
+            {
+                write_serial_string("AHCI: controller bus mastering disabled; in-flight DMA drain unconfirmed\n");
+            }
+        }
+    }
+    // Bus-master disable prevents new transactions but does not establish that
+    // already-issued DMA has drained. With CR/FR still active, never return the
+    // caller's buffer, even if PCI command readback confirms bus mastering off.
+    write_serial_string("AHCI: cannot confirm DMA quiescence; halting to preserve buffer ownership\n");
+    for (;;) asm volatile("cli; hlt");
+}
+
+static bool ahci_allocate_command_tables(struct hba_port *port)
+{
+    for (uint32_t slot = 0; slot < port->hba->cmd_slots; ++slot)
+    {
+        uint64_t physical = alloc_frames(1);
+        if (!physical)
+        {
+            for (uint32_t previous = 0; previous < slot; ++previous)
+            {
+                free_frame(port->cmd_table_phys[previous]);
+                port->cmd_tables[previous] = NULL;
+                port->cmd_table_phys[previous] = 0;
+            }
+            return false;
+        }
+        struct hba_cmdt *table = (struct hba_cmdt *)driver_phys_to_virt(physical);
+        page_map_to(get_current_directory(), (uint64_t)table, physical, KERNEL_PTE_FLAGS);
+        memset(table, 0, PAGE_SIZE);
+        port->cmd_tables[slot] = table;
+        port->cmd_table_phys[slot] = physical;
+    }
+    return true;
 }
 
 static bool ahci_wait_port_ready(volatile hba_reg_t *port_reg, uint64_t timeout_ns) {
@@ -122,20 +185,44 @@ void ahci_parsestr(char *str, uint16_t *reg_start, int size_word) {
 }
 
 void ahci_parse_dev_info(struct hba_device *dev_info, uint16_t *data) {
-    dev_info->max_lba          = *((uint32_t *)(data + IDDEV_OFFMAXLBA));
-    dev_info->block_size       = *((uint32_t *)(data + IDDEV_OFFLSECSIZE));
+    dev_info->flags &= HBA_DEV_FATAPI;
+    dev_info->max_lba          = (uint32_t)data[IDDEV_OFFMAXLBA] |
+                                ((uint32_t)data[IDDEV_OFFMAXLBA + 1] << 16);
+    dev_info->block_size       = 512;
     dev_info->cbd_size         = cdb_size[(*data & 0x3)];
-    dev_info->wwn              = *(uint64_t *)(data + IDDEV_OFFWWN);
-    dev_info->block_per_sec    = 1 << (*(data + IDDEV_OFFLPP) & 0xf);
+    dev_info->wwn              = (uint64_t)data[IDDEV_OFFWWN] | ((uint64_t)data[IDDEV_OFFWWN + 1] << 16) |
+                                ((uint64_t)data[IDDEV_OFFWWN + 2] << 32) |
+                                ((uint64_t)data[IDDEV_OFFWWN + 3] << 48);
+    dev_info->block_per_sec    = 1;
     dev_info->alignment_offset = *(data + IDDEV_OFFALIGN) & 0x3fff;
-    dev_info->capabilities     = *((uint32_t *)(data + IDDEV_OFFCAPABILITIES));
+    dev_info->capabilities     = (uint32_t)data[IDDEV_OFFCAPABILITIES] |
+                                ((uint32_t)data[IDDEV_OFFCAPABILITIES + 1] << 16);
 
-    if (!dev_info->block_size) { dev_info->block_size = 512; }
-
-    if ((*(data + IDDEV_OFFADDSUPPORT) & 0x8) && (*(data + IDDEV_OFFA48SUPPORT) & 0x400)) {
-        dev_info->max_lba  = *((uint64_t *)(data + IDDEV_OFFMAXLBA_EXT));
+    // IDENTIFY words 83 and 106 have explicit validity signatures. Words
+    // 117/118 count 16-bit words, not bytes. Refuse invalid advertised geometry
+    // instead of guessing 512-byte sectors and issuing writes at wrong offsets.
+    uint16_t command_sets = data[83];
+    bool valid_commands = (command_sets & 0xc000) == 0x4000;
+    if (valid_commands && (command_sets & (1u << 10))) {
+        dev_info->max_lba  = (uint64_t)data[100] | ((uint64_t)data[101] << 16) |
+                            ((uint64_t)data[102] << 32) | ((uint64_t)data[103] << 48);
         dev_info->flags   |= HBA_DEV_FEXTLBA;
     }
+    if (valid_commands && (command_sets & (1u << 12))) dev_info->flags |= HBA_DEV_FFLUSH;
+    if (valid_commands && (command_sets & (1u << 13))) dev_info->flags |= HBA_DEV_FFLUSH_EXT;
+    uint16_t sector_information = data[106];
+    if ((sector_information & 0xc000) == 0x4000)
+    {
+        if (sector_information & (1u << 12))
+        {
+            uint32_t words = (uint32_t)data[117] | ((uint32_t)data[118] << 16);
+            dev_info->block_size = words >= 256 && words <= 32768 && !(words & (words - 1)) ? words * 2 : 0;
+        }
+        if (sector_information & (1u << 13)) dev_info->block_per_sec = 1u << (sector_information & 0xf);
+    }
+    if (!(dev_info->flags & HBA_DEV_FATAPI) &&
+        (dev_info->max_lba > ((dev_info->flags & HBA_DEV_FEXTLBA) ? (1ULL << 48) : (1ULL << 28))))
+        dev_info->max_lba = 0;
 
     ahci_parsestr(dev_info->serial_num, data + IDDEV_OFFSERIALNUM, 10);
     ahci_parsestr(dev_info->model, data + IDDEV_OFFMODELNUM, 20);
@@ -152,27 +239,23 @@ int __get_free_slot(struct hba_port *port) {
 }
 
 int hba_prepare_cmd(struct hba_port *port, struct hba_cmdt **cmdt, struct hba_cmdh **cmdh) {
+    if (!port || !port->hba || !port->regs || !port->cmdlst || !cmdt || !cmdh ||
+        !port->hba->cmd_slots || port->hba->cmd_slots > 32 || port->io_error || port->hba->quarantined) return -1;
     int slot = __get_free_slot(port);
     if (slot < 0) return -1;
     struct hba_cmdh *cmd_header = (struct hba_cmdh*)phys_to_virt((uint64_t)&port->cmdlst[slot]);
     memset(cmd_header, 0, sizeof(struct hba_cmdh));
 
-    if (port->cmd_tables[slot] == NULL) {
-        uint64_t phys = alloc_frames(1);
-        if (phys == 0) return -1;
-        struct hba_cmdt *cmd_table = (struct hba_cmdt *)driver_phys_to_virt(phys);
-        page_map_to(get_current_directory(), (uint64_t)cmd_table, phys, KERNEL_PTE_FLAGS);
-        memset(cmd_table, 0, PAGE_SIZE);
-        port->cmd_tables[slot]    = cmd_table;
-        port->cmd_table_phys[slot] = phys;
-    }
+    // Runtime requests may only reuse command storage prepared at discovery.
+    // No allocation or page-table work is allowed beneath the I/O mutex.
+    if (!port->cmd_tables[slot]) return -1;
 
     struct hba_cmdt *cmd_table = port->cmd_tables[slot];
     uint64_t         phys      = port->cmd_table_phys[slot];
     memset(cmd_table, 0, PAGE_SIZE);
     cmd_header->cmd_table_base       = (uint32_t)(phys & 0xFFFFFFFF);
     cmd_header->cmd_table_base_upper = (uint32_t)(phys >> 32);
-    cmd_header->options = HBA_CMDH_FIS_LEN(sizeof(struct sata_reg_fis)) | HBA_CMDH_CLR_BUSY;
+    cmd_header->options = HBA_CMDH_FIS_LEN(sizeof(struct sata_reg_fis));
     *cmdh = cmd_header;
     *cmdt = cmd_table;
     return slot;
@@ -214,7 +297,7 @@ int hba_bind_vbuf(struct hba_cmdh *cmdh, struct hba_cmdt *cmdt, struct vecbuf *v
 }
 
 int hba_bind_sbuf(struct hba_cmdh *cmdh, struct hba_cmdt *cmdt, void *buf, uint32_t len) {
-    if (len > 0x400000UL) {
+    if (!buf || len == 0 || len > 0x400000UL) {
         write_serial_fmt("AHCI buffer too large\n");
         return -1;
     }
@@ -334,6 +417,12 @@ int ahci_init_device(struct hba_port *port) {
 
     // 解析IDENTIFY数据
     ahci_parse_dev_info(port->device, data);
+    if (!(port->device->flags & HBA_DEV_FATAPI) &&
+        (!port->device->max_lba || !port->device->block_size))
+    {
+        write_serial_string("AHCI: invalid IDENTIFY capacity or sector geometry\n");
+        goto fail_cleanup;
+    }
 
     // 如果是ATAPI设备，需要获取容量信�?
     if (port->device->flags & HBA_DEV_FATAPI) {
@@ -341,7 +430,10 @@ int ahci_init_device(struct hba_port *port) {
         
         // 准备READ CAPACITY命令
         memset(cmd_table, 0, sizeof(struct hba_cmdt)); // 清空命令�?
-        sata_create_fis(cmd_fis, ATA_PACKET, 0, 0); // 设置PACKET FIS
+        sata_create_fis(cmd_fis, ATA_PACKET, 512ULL << 8, 0); // LBA mid/high carry the byte-count limit.
+        // PACKET DMA and device-to-host direction belong to FeaturesLow
+        // (FIS byte 3), not the FeaturesExp field at byte 11.
+        cmd_fis->head.feat_err = 1U | (1U << 2);
         
         // 根据CDB大小创建SCSI命令
         if (port->device->cbd_size == SCSI_CDB12) {
@@ -349,7 +441,7 @@ int ahci_init_device(struct hba_port *port) {
             scsi_create_packet12(cdb12, SCSI_READ_CAPACITY_10, 0, 0);
         } else {
             struct scsi_cdb16 *cdb16 = (struct scsi_cdb16 *)cmd_table->atapi_cmd;
-            scsi_create_packet16(cdb16, SCSI_READ_CAPACITY_16, 0, 0);
+            scsi_create_packet16(cdb16, SCSI_READ_CAPACITY_16, 0, 512);
             cdb16->misc1 = 0x10; // service action for READ CAPACITY(16)
         }
 
@@ -371,6 +463,11 @@ int ahci_init_device(struct hba_port *port) {
 
         // 解析容量信息
         scsi_parse_capacity(port->device, (uint32_t *)data);
+        if (!port->device->max_lba || !port->device->block_size)
+        {
+            write_serial_string("AHCI: invalid ATAPI READ CAPACITY response\n");
+            goto fail_cleanup;
+        }
     }
 
     // 注册设备操作
@@ -392,20 +489,43 @@ fail_cleanup:
     return 0;
 }
 
-spin_t ahci_operate_lock = SPIN_INIT;
+static mutex_t ahci_operate_lock;
+
+class AhciOperationGuard
+{
+    bool locked;
+
+public:
+    AhciOperationGuard() : locked(false)
+    {
+        // Before process_setup/SMP this is a single-CPU synchronous discovery
+        // path. mutex_lock cannot represent a NULL TCB owner in that phase.
+        // Runtime callers serialize data and flush in the same sleeping mutex.
+        if (get_current_task()) locked = mutex_lock(&ahci_operate_lock) == 0;
+    }
+
+    ~AhciOperationGuard()
+    {
+        if (locked) mutex_unlock(&ahci_operate_lock);
+    }
+
+    bool ready() const { return locked || get_current_task() == NULL; }
+};
 
 size_t ahci_read(int drive, uint8_t *buffer, size_t size, size_t lba) {
-    spin_lock(&ahci_operate_lock);
+    if (drive < 0 || drive >= AHCI_MAX_DEVICES) return 0;
+    AhciOperationGuard guard;
+    if (!guard.ready()) return 0;
     struct hba_device *dev = (struct hba_device *)hbaDevice[drive];
     if (dev == NULL) {
         write_serial_fmt("AHCI: read on missing device drive=%d lba=%llu sectors=%llu\n", drive, lba, size);
-        spin_unlock(&ahci_operate_lock);
         return 0;
     }
+    if (!dev->block_size || lba > dev->max_lba || size > dev->max_lba - lba ||
+        size > (uint64_t)-1 / dev->block_size || dev->port->io_error || dev->hba->quarantined) return 0;
     struct blkio_req   req = {
           .buf = (uint64_t)buffer, .lba = lba, .len = size * dev->block_size, .flags = 0, .status = -1};
     dev->ops.submit(dev, &req);
-    spin_unlock(&ahci_operate_lock);
     if (req.status != 0) {
         write_serial_fmt("AHCI: read failed drive=%d lba=%llu sectors=%llu bytes=%llu\n", drive, lba, size, req.len);
         return 0;
@@ -414,17 +534,19 @@ size_t ahci_read(int drive, uint8_t *buffer, size_t size, size_t lba) {
 }
 
 size_t ahci_write(int drive, uint8_t *buffer, size_t size, size_t lba) {
-    spin_lock(&ahci_operate_lock);
+    if (drive < 0 || drive >= AHCI_MAX_DEVICES) return 0;
+    AhciOperationGuard guard;
+    if (!guard.ready()) return 0;
     struct hba_device *dev = (struct hba_device *)hbaDevice[drive];
     if (dev == NULL) {
         write_serial_fmt("AHCI: write on missing device drive=%d lba=%llu sectors=%llu\n", drive, lba, size);
-        spin_unlock(&ahci_operate_lock);
         return 0;
     }
+    if (!dev->block_size || lba > dev->max_lba || size > dev->max_lba - lba ||
+        size > (uint64_t)-1 / dev->block_size || dev->port->io_error || dev->hba->quarantined) return 0;
     struct blkio_req   req = {
           .buf = (uint64_t)buffer, .lba = lba, .len = size * dev->block_size, .flags = BLKIO_WRITE, .status = -1};
     dev->ops.submit(dev, &req);
-    spin_unlock(&ahci_operate_lock);
     if (req.status != 0) {
         write_serial_fmt("AHCI: write failed drive=%d lba=%llu sectors=%llu bytes=%llu\n", drive, lba, size, req.len);
         return 0;
@@ -434,13 +556,18 @@ size_t ahci_write(int drive, uint8_t *buffer, size_t size, size_t lba) {
 
 static int ahci_ioctl(device_t *device, size_t req, void *arg)
 {
-    (void)device;
     (void)arg;
-    return req == IOBLKSYNC ? 0 : -1;
+    if (req != IOBLKSYNC) return -EOPNOTSUPP;
+    if (!device || device->vdiskid >= AHCI_MAX_DEVICES) return -ENODEV;
+    AhciOperationGuard guard;
+    if (!guard.ready()) return -EDEADLK;
+    struct hba_device *disk = hbaDevice[device->vdiskid];
+    return disk ? sata_flush(disk) : -ENODEV;
 }
 
 // �?utils.cpp 中添�?
 void ahci_setup() {
+    mutex_create(&ahci_operate_lock, false);
     write_serial_string("AHCI: port init fix trace v3\n");
     pci_device_t *device = pci_find_class(0x010601);
     if (device == NULL) {
@@ -459,6 +586,7 @@ void ahci_setup() {
     op_buffer = (void *)alloc_frames(0x400000UL / PAGE_SIZE);
     struct ahci_hba *hba = (struct ahci_hba*)malloc(sizeof(struct ahci_hba));
     memset(hba, 0, sizeof(struct ahci_hba));
+    hba->pci_device = device;
     hba->base = (hba_reg_t *)phys_to_virt(bar5.address);
     hba->version = hba->base[HBA_RVER];
     uint32_t major = (hba->version >> 16) & 0xFF;
@@ -534,6 +662,11 @@ void ahci_setup() {
         port_regs[HBA_RPxFB + 1]  = (uint32_t)(fis_pa >> 32);
         port->cmdlst = (struct hba_cmdh *)(uintptr_t)clb_pa;
         port->fis    = (void *)(uintptr_t)fis_pa;
+        if (!ahci_allocate_command_tables(port))
+        {
+            write_serial_fmt("AHCI[%d] failed to allocate command tables\n", i);
+            continue;
+        }
         port_regs[HBA_RPxCI] = 0;
         port_regs[HBA_RPxSACT] = 0;
         hba_clear_reg(port_regs[HBA_RPxIS]);
@@ -570,8 +703,26 @@ void ahci_setup() {
         sata.write_vbuf = NULL;
         sata.max_size = __UINT64_MAX__;
         strcpy(sata.drive_name, name_buf);
-        int id = regist_device(NULL, sata);
+        int id = sata.write ? regist_durable_block_device(NULL, sata) : regist_device(NULL, sata);
+        if (id < 0 || id >= AHCI_MAX_DEVICES)
+        {
+            device_t *unusable = id >= 0 ? get_device((size_t)id) : NULL;
+            if (unusable) unusable->flag = 0;
+            write_serial_fmt("AHCI[%d] device registration exceeds AHCI drive map id=%d\n", i, id);
+            continue;
+        }
         hbaDevice[id] = hbadev;
+        BlockSourceHardware provenance = {};
+        provenance.controller = device;
+        provenance.transport = XJ_INSTALLER_SOURCE_AHCI;
+        provenance.block_size = hbadev->block_size;
+        provenance.bytes = sata.size;
+        provenance.read_only = (hbadev->flags & HBA_DEV_FATAPI) != 0;
+        provenance.sata_port = (uint16_t)i;
+        provenance.sata_multiplier = 0xffff; // This driver addresses direct HBA ports only.
+        int source_status = block_source_register((uint32_t)id, provenance);
+        if (source_status)
+            write_serial_fmt("AHCI[%d] source provenance unavailable: %d\n", i, source_status);
         write_serial_fmt("sata%d: blk_size=%d, blk=0..%d, %s%s\n", i, hbadev->block_size, hbadev->max_lba,
                          hbadev->model, (hbadev->flags & HBA_DEV_FATAPI) ? " [ATAPI read-only]" : "");
     }

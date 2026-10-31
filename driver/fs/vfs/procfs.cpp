@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 #define ALL_IMPLEMENTATION
 #include <procfs.h>
 #include <efi/boot.h>
@@ -10,21 +11,221 @@
 #include <proto.hpp>
 #include <user/user.h>
 #include <smp/smp.h>
+#include <cpu/regio.h>
+#include <syscall/fd_lifetime.h>
+#include <user/permissions.h>
 
 static int procfs_id     = 0;
 static int proc_self_id  = 0;
+static tcb_t procfs_bootstrap_owner;
+static uint64_t procfs_bootstrap_tid;
 vfs_node_t procfs_root   = NULL;
 spin_t     procfs_oplock = SPIN_INIT;
 extern lock_queue   *pcb_group_queue;
 extern XSK_SMP_INFO *xsi;
 
+// A process file can outlive both its name and its PCB. Context references keep
+// that identity alive, while operation tickets alone retain access to the PCB.
+// Collection withdraws the process first, retires its context, and waits for
+// these bounded task-context operations before freeing process-owned storage.
+struct ProcfsProcessContext
+{
+    pcb_t identity;
+    pcb_t task;
+    uint64_t pid;
+    uint64_t references;
+    uint64_t active;
+    vfs_node_t node;
+    vfs_node_t mount_pin;
+    ProcfsProcessContext *next;
+    bool retired;
+    bool collecting;
+};
+
+struct ProcfsOperationRecord
+{
+    ProcfsProcessContext *process;
+    pcb_t task;
+    tcb_t owner;
+    ProcfsOperationRecord *next;
+};
+
+static spin_t process_context_lock = SPIN_INIT;
+static ProcfsProcessContext *process_contexts;
+static ProcfsProcessContext *retired_contexts;
+static ProcfsOperationRecord *process_operations;
+
+static void procfs_destroy_context(ProcfsProcessContext *process)
+{
+    vfs_node_t mount = process->mount_pin;
+    free(process);
+    if (mount) vfs_close(mount);
+}
+
+class ProcfsSpinGuard
+{
+    spin_t *lock;
+    uint64_t flags;
+public:
+    explicit ProcfsSpinGuard(spin_t *value) : lock(value), flags(get_rflags())
+    {
+        __asm__ volatile("cli" ::: "memory");
+        spin_lock(lock);
+    }
+    ~ProcfsSpinGuard()
+    {
+        spin_unlock(lock);
+        if (flags & (1ULL << 9)) __asm__ volatile("sti" ::: "memory");
+    }
+};
+
+static void procfs_context_release(ProcfsProcessContext *process)
+{
+    if (!process) return;
+    bool release = false;
+    {
+        ProcfsSpinGuard guard(&process_context_lock);
+        if (process->references) release = --process->references == 0;
+    }
+    if (release) procfs_destroy_context(process);
+}
+
+static bool procfs_context_retain(ProcfsProcessContext *process)
+{
+    ProcfsSpinGuard guard(&process_context_lock);
+    if (!process || process->references == uint64_t(-1)) return false;
+    ++process->references;
+    return true;
+}
+
+static ProcfsOperationRecord *procfs_operation_acquire(ProcfsProcessContext *process)
+{
+    if (!get_current_task() || !scheduler_is_enabled()) return NULL;
+    auto *record = static_cast<ProcfsOperationRecord *>(malloc(sizeof(ProcfsOperationRecord)));
+    if (!record) return NULL;
+    bool captured = false;
+    {
+        ProcfsSpinGuard guard(&process_context_lock);
+        if (process && !process->retired && process->task && process->references != uint64_t(-1) &&
+            process->active != uint64_t(-1))
+        {
+            record->process = process;
+            record->task = process->task;
+            record->owner = get_current_task();
+            record->next = process_operations;
+            process_operations = record;
+            ++process->references;
+            ++process->active;
+            captured = true;
+        }
+    }
+    if (!captured) { free(record); return NULL; }
+    return record;
+}
+
+static ProcfsOperationRecord *procfs_operation_for_pid(uint64_t pid)
+{
+    if (!pcb_group_queue || !get_current_task() || !scheduler_is_enabled()) return NULL;
+    auto *candidate = static_cast<ProcfsProcessContext *>(calloc(1, sizeof(ProcfsProcessContext)));
+    auto *record = static_cast<ProcfsOperationRecord *>(malloc(sizeof(ProcfsOperationRecord)));
+    if (!candidate || !record) { free(candidate); free(record); return NULL; }
+    bool captured = false, published = false;
+    {
+        // This lock proves the PCB has not been withdrawn by collection. No
+        // allocator, filesystem callback or wait occurs in either locked scope.
+        ProcfsSpinGuard list_guard(&pcb_group_queue->lock);
+        pcb_t task = NULL;
+        for (lock_node *entry = pcb_group_queue->head; entry; entry = entry->next)
+        {
+            auto *process = static_cast<pcb_t>(entry->data);
+            if (process && process->pid == pid && process->status != DEATH && process->status != OUT &&
+                __atomic_load_n(&process->fd_cleanup_state, __ATOMIC_ACQUIRE) < 3)
+            {
+                task = process;
+                break;
+            }
+        }
+        if (task)
+        {
+            ProcfsSpinGuard guard(&process_context_lock);
+            ProcfsProcessContext *process = process_contexts;
+            while (process && (process->identity != task || process->pid != pid)) process = process->next;
+            if (!process)
+            {
+                process = candidate;
+                process->identity = process->task = task;
+                process->pid = pid;
+                process->references = 1; // Published-context registry hold.
+                process->next = process_contexts;
+                process_contexts = process;
+                published = true;
+            }
+            if (!process->retired && process->references != uint64_t(-1) && process->active != uint64_t(-1))
+            {
+                record->process = process;
+                record->task = task;
+                record->owner = get_current_task();
+                record->next = process_operations;
+                process_operations = record;
+                ++process->references;
+                ++process->active;
+                captured = true;
+            }
+        }
+    }
+    if (!published) free(candidate);
+    if (!captured) { free(record); return NULL; }
+    return record;
+}
+
+static void procfs_operation_release(ProcfsOperationRecord *record)
+{
+    if (!record) return;
+    ProcfsProcessContext *release = NULL;
+    bool found = false;
+    {
+        ProcfsSpinGuard guard(&process_context_lock);
+        ProcfsOperationRecord **link = &process_operations;
+        while (*link && *link != record) link = &(*link)->next;
+        if (*link)
+        {
+            *link = record->next;
+            ProcfsProcessContext *process = record->process;
+            --process->active;
+            if (!--process->references) release = process;
+            found = true;
+        }
+    }
+    if (found) free(record);
+    if (release) procfs_destroy_context(release);
+}
+
+class ProcfsOperation
+{
+    ProcfsOperationRecord *record = NULL;
+public:
+    ProcfsOperation() = default;
+    explicit ProcfsOperation(ProcfsProcessContext *process) { if (process) record = procfs_operation_acquire(process); }
+    ~ProcfsOperation() { procfs_operation_release(record); }
+    bool acquire(uint64_t pid) { record = procfs_operation_for_pid(pid); return record != NULL; }
+    pcb_t get() const { return record ? record->task : NULL; }
+    ProcfsProcessContext *context() const { return record ? record->process : NULL; }
+    ProcfsOperation(const ProcfsOperation &) = delete;
+    ProcfsOperation &operator=(const ProcfsOperation &) = delete;
+};
+
+static vfs_node_t procfs_ensure_process(ProcfsOperation &operation);
+
 static size_t procfs_copy_content(void *addr, size_t offset, size_t size, const char *content, size_t content_len);
-static void procfs_refresh_fd_dir(vfs_node_t fd_dir, pcb_t task);
+static void procfs_refresh_fd_dir(vfs_node_t fd_dir, ProcfsOperation &operation);
+static bool procfs_fd_number(const char *name, size_t &number);
 static vfs_node_t procfs_current_self_target()
 {
     tcb_t task = get_current_task();
     if (task == NULL || task->parent_group == NULL) return NULL;
-    return task->parent_group->procfs_node;
+    ProcfsOperation operation;
+    if (!operation.acquire(task->parent_group->pid)) return NULL;
+    return procfs_ensure_process(operation);
 }
 
 const char filesystems_content[] = //"nodev\tsysfs\n"
@@ -41,17 +242,6 @@ static int dummy() {
 
 static int udummy() {
     return VFS_STATUS_FAILED;
-}
-
-static bool procfs_node_is_task_dir(vfs_node_t node)
-{
-    if (node == NULL || node->parent != procfs_root || !(node->type & file_dir)) return false;
-    if (node->name == NULL || node->name[0] == '\0') return false;
-    for (const char *p = node->name; *p != '\0'; p++)
-    {
-        if (*p < '0' || *p > '9') return false;
-    }
-    return true;
 }
 
 static const char *procfs_kernel_cmdline()
@@ -173,9 +363,11 @@ static char *proc_gen_uptime(size_t *content_len)
 static char *proc_gen_loadavg(size_t *content_len)
 {
     uint64_t runnable = 0;
-    uint64_t total = pcb_group_queue ? pcb_group_queue->size : 0;
+    uint64_t total = 0;
     if (pcb_group_queue != NULL)
     {
+        ProcfsSpinGuard guard(&pcb_group_queue->lock);
+        total = pcb_group_queue->size;
         queue_foreach(pcb_group_queue, node)
         {
             pcb_t task = (pcb_t)node->data;
@@ -219,13 +411,14 @@ static uint32_t proc_task_uid(pcb_t task)
     if (task == NULL) return 0;
     if (task->thread_queue != NULL)
     {
+        ProcfsSpinGuard guard(&task->thread_queue->lock);
         queue_foreach(task->thread_queue, node)
         {
             tcb_t thread = (tcb_t)node->data;
             if (thread != NULL && thread->user_info != NULL) return user_uid(thread->user_info);
         }
     }
-    return user_uid(task_effective_user());
+    return user_uid(&task->permission_user);
 }
 
 static uint32_t proc_task_gid(pcb_t task)
@@ -233,20 +426,14 @@ static uint32_t proc_task_gid(pcb_t task)
     if (task == NULL) return 0;
     if (task->thread_queue != NULL)
     {
+        ProcfsSpinGuard guard(&task->thread_queue->lock);
         queue_foreach(task->thread_queue, node)
         {
             tcb_t thread = (tcb_t)node->data;
             if (thread != NULL && thread->user_info != NULL) return user_gid(thread->user_info);
         }
     }
-    return user_gid(task_effective_user());
-}
-
-static void procfs_set_owner(vfs_node_t node, pcb_t task)
-{
-    if (node == NULL) return;
-    node->owner = proc_task_uid(task);
-    node->group = proc_task_gid(task);
+    return user_gid(&task->permission_user);
 }
 
 static size_t procfs_copy_content(void *addr, size_t offset, size_t size, const char *content, size_t content_len)
@@ -301,6 +488,7 @@ static uint64_t proc_thread_signal(pcb_t task)
 {
     uint64_t signals = 0;
     if (task == NULL || task->thread_queue == NULL) return 0;
+    ProcfsSpinGuard guard(&task->thread_queue->lock);
     queue_foreach(task->thread_queue, node)
     {
         tcb_t thread = (tcb_t)node->data;
@@ -313,12 +501,20 @@ static uint64_t proc_thread_blocked(pcb_t task)
 {
     uint64_t blocked = 0;
     if (task == NULL || task->thread_queue == NULL) return 0;
+    ProcfsSpinGuard guard(&task->thread_queue->lock);
     queue_foreach(task->thread_queue, node)
     {
         tcb_t thread = (tcb_t)node->data;
         if (thread != NULL) blocked |= thread->blocked;
     }
     return blocked;
+}
+
+static uint64_t proc_task_parent_pid(pcb_t task)
+{
+    if (!task || !pcb_group_queue) return 0;
+    ProcfsSpinGuard guard(&pcb_group_queue->lock);
+    return task->parent_task ? task->parent_task->pid : 0;
 }
 
 static void proc_task_vma_bounds(pcb_t task, uint64_t *start_code, uint64_t *end_code,
@@ -373,54 +569,63 @@ const char *get_vma_permissions(vma_t *vma) {
     return perms;
 }
 
-char *proc_gen_maps_file(pcb_t task, size_t *content_len) {
-    vma_t *vma = task->vma_manager.vma_list;
-
-    size_t offset  = 0;
-    size_t ctn_len = PAGE_SIZE;
-    char  *buf     = (char*)malloc(ctn_len);
-
-    while (vma) {
-        vfs_node_t node = NULL;
-        if (vma->vm_fd != -1) {
-            fd_file_handle *fd_handle =
-                (fd_file_handle*)queue_get(task->file_open, vma->vm_fd);
-            if (fd_handle != NULL) node = fd_handle->node;
-        }
-
-        int len = sprintf(buf + offset, "%012lx-%012lx %s %08lx %02x:%02x %lu", vma->vm_start,
-                          vma->vm_end, get_vma_permissions(vma), (unsigned long)vma->vm_offset, 0,
-                          0, node ? node->inode : 0);
-
-        if (offset + len > ctn_len) {
-            ctn_len = (offset + len + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
-            buf     = (char*)realloc(buf, ctn_len);
-        }
-        offset += len;
-
-        const char *pathname = vma->vm_name;
-        if (pathname && strlen(pathname) > 0) {
-            len = sprintf(buf + offset, "%*s%s", 15, "", pathname);
-            if (offset + len > ctn_len) {
-                ctn_len = (offset + len + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
-                buf     = (char*)realloc(buf, ctn_len);
-            }
-            offset += len;
-        }
-
-        len = sprintf(buf + offset, "\n");
-        if (offset + len > ctn_len) {
-            ctn_len = (offset + len + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
-            buf     = (char*)realloc(buf, ctn_len);
-        }
-        offset += len;
-
-        vma = vma->vm_next;
+static bool procfs_append_map(char *&buffer, size_t &capacity, size_t &offset, const char *text, size_t size)
+{
+    if (size > size_t(-1) - offset - 1) return false;
+    size_t required = offset + size + 1;
+    if (required > capacity)
+    {
+        if (required > size_t(-1) - PAGE_SIZE + 1) return false;
+        size_t next_capacity = (required + PAGE_SIZE - 1) & ~(size_t(PAGE_SIZE) - 1);
+        char *next = static_cast<char *>(realloc(buffer, next_capacity));
+        if (!next) return false;
+        buffer = next;
+        capacity = next_capacity;
     }
+    memcpy(buffer + offset, text, size);
+    offset += size;
+    buffer[offset] = 0;
+    return true;
+}
 
+char *proc_gen_maps_file(pcb_t task, size_t *content_len)
+{
+    *content_len = 0;
+    size_t offset = 0, capacity = PAGE_SIZE;
+    char *buffer = static_cast<char *>(malloc(capacity));
+    if (!buffer) return NULL;
+    buffer[0] = 0;
+    // The process observation retains collection-owned storage. Concurrent
+    // live exec/munmap still requires the separate VMA snapshot protocol.
+    for (vma_t *vma = task->vma_manager.vma_list; vma; vma = vma->vm_next)
+    {
+        FdOperation descriptor;
+        uint64_t inode = 0;
+        if (vma->vm_fd >= 0 && !descriptor.acquire_process(task, vma->vm_fd))
+        {
+            vfs_child_lock();
+            inode = descriptor.get()->node->inode;
+            vfs_child_unlock();
+        }
+        char permissions[5] = {
+            vma->vm_flags & VMA_READ ? 'r' : '-', vma->vm_flags & VMA_WRITE ? 'w' : '-',
+            vma->vm_flags & VMA_EXEC ? 'x' : '-', vma->vm_flags & VMA_SHARED ? 's' : 'p', 0
+        };
+        char line[192];
+        int length = snprintf(line, sizeof(line), "%012lx-%012lx %s %08lx %02x:%02x %lu",
+                              vma->vm_start, vma->vm_end, permissions, (unsigned long)vma->vm_offset,
+                              0, 0, (unsigned long)inode);
+        bool valid = length >= 0 && size_t(length) < sizeof(line) &&
+                     procfs_append_map(buffer, capacity, offset, line, size_t(length));
+        const char *pathname = vma->vm_name;
+        if (valid && pathname && *pathname)
+            valid = procfs_append_map(buffer, capacity, offset, "               ", 15) &&
+                    procfs_append_map(buffer, capacity, offset, pathname, strlen(pathname));
+        if (valid) valid = procfs_append_map(buffer, capacity, offset, "\n", 1);
+        if (!valid) { free(buffer); return NULL; }
+    }
     *content_len = offset;
-
-    return buf;
+    return buffer;
 }
 
 char *proc_gen_status_file(pcb_t task, size_t *content_len) {
@@ -445,7 +650,7 @@ char *proc_gen_status_file(pcb_t task, size_t *content_len) {
                       "VmSize:\t%llu kB\n",
                       task->name,
                       (unsigned long long)task->pid,
-                      (unsigned long long)(task->parent_task ? task->parent_task->pid : 0),
+                      (unsigned long long)proc_task_parent_pid(task),
                       proc_task_state_text(task),
                       (unsigned long long)task->pid,
                       uid, uid, uid, uid,
@@ -519,9 +724,9 @@ char *proc_gen_stat_file(pcb_t task, size_t *content_len) {
                            (int)task->pid,  // pid
                            task->name, // name
                            proc_task_state(task),                        // state
-                           task->parent_task ? (int)task->parent_task->pid : 0, // ppid
+                           (int)proc_task_parent_pid(task), // ppid
                            (int)task->pid,                              // pgrp
-                           task->parent_task ? (int)task->parent_task->pid : (int)task->pid, // session
+                           (int)(proc_task_parent_pid(task) ? proc_task_parent_pid(task) : task->pid), // session
                            0,                                            // tty_nr
                            (int)task->pid,                              // tpgid
                            flags,                                        // flags
@@ -578,7 +783,7 @@ char *proc_gen_stat_file(pcb_t task, size_t *content_len) {
 char *proc_gen_mounts(size_t *context_len) {
     char *mount_info =
         "dev /dev devfs rw,nosuid,relatime,mode=755,inode64 0 0\n"
-        "proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0\n"
+        "proc /proc proc ro,nosuid,nodev,noexec,relatime 0 0\n"
         "tmpfs /tmp tmpfs rw,nosuid,size=8040232k,nr_inodes=1048576,nodev,inode64,usrquota 0 0";
     *context_len = strlen(mount_info);
     return strdup(mount_info);
@@ -767,160 +972,202 @@ char *proc_gen_cpuinfo(size_t *content_len)
     return buf;
 }
 
-errno_t procfs_mount(const char *src, vfs_node_t node) {
-    if (src != (void *)PROC_REGISTER_ID) return VFS_STATUS_FAILED;
-    procfs_root = node;
+static void procfs_discard_private(vfs_node_t node);
 
-    procfs_root->fsid = procfs_id;
-    procfs_root->owner = 0;
-    procfs_root->group = 0;
-
-    vfs_node_t procfs_self = vfs_node_alloc(procfs_root, "self");
-    procfs_self->type      = file_symlink;
-    procfs_self->mode      = 0644;
-    procfs_self->linkto    = NULL;
-    procfs_self->fsid      = proc_self_id;
-    procfs_self->owner     = 0;
-    procfs_self->group     = 0;
-
-    struct RootProcFile { const char *name; const char *handle; } root_files[] = {
-        {"cmdline", "cmdline"},
-        {"cpuinfo", "cpuinfo"},
-        {"mounts", "mounts"},
-        {"filesystems", "filesystems"},
-        {"meminfo", "meminfo"},
-        {"uptime", "uptime"},
-        {"loadavg", "loadavg"},
-        {"stat", "stat"},
-        {"version", "version"},
-    };
-
-    for (size_t i = 0; i < sizeof(root_files) / sizeof(root_files[0]); i++)
+static vfs_node_t procfs_prepare_global(vfs_node_t parent, const char *name, uint16_t type,
+                                       uint16_t mode, const char *kind)
+{
+    auto *handle = kind ? static_cast<proc_handle_t *>(calloc(1, sizeof(proc_handle_t))) : NULL;
+    if (kind && !handle) return NULL;
+    vfs_node_t node = vfs_node_alloc(parent, name);
+    if (!node) { free(handle); return NULL; }
+    node->type = type;
+    node->mode = mode;
+    node->owner = node->group = 0;
+    node->fsid = procfs_id;
+    if (kind)
     {
-        vfs_node_t file = vfs_node_alloc(procfs_root, root_files[i].name);
-        file->type = file_none;
-        file->mode = 0444;
-        file->owner = 0;
-        file->group = 0;
-        file->fsid = procfs_id;
-        proc_handle_t *file_handle = (proc_handle_t *)malloc(sizeof(proc_handle_t));
-        file->handle = file_handle;
-        file_handle->task = NULL;
-        sprintf(file_handle->name, "%s", root_files[i].handle);
+        handle->node = node;
+        strcpy(handle->name, kind);
+        node->handle = handle;
     }
-
-    vfs_node_t sys_dir = vfs_node_alloc(procfs_root, "sys");
-    sys_dir->type = file_dir;
-    sys_dir->mode = 0555;
-    sys_dir->owner = 0;
-    sys_dir->group = 0;
-    sys_dir->fsid = procfs_id;
-
-    vfs_node_t kernel_dir = vfs_node_alloc(sys_dir, "kernel");
-    kernel_dir->type = file_dir;
-    kernel_dir->mode = 0555;
-    kernel_dir->owner = 0;
-    kernel_dir->group = 0;
-    kernel_dir->fsid = procfs_id;
-
-    struct SysKernelProcFile { const char *name; const char *handle; } sys_kernel_files[] = {
-        {"ostype", "sys_kernel_ostype"},
-        {"osrelease", "sys_kernel_osrelease"},
-        {"version", "sys_kernel_version"},
-        {"hostname", "sys_kernel_hostname"},
-    };
-
-    for (size_t i = 0; i < sizeof(sys_kernel_files) / sizeof(sys_kernel_files[0]); i++)
-    {
-        vfs_node_t file = vfs_node_alloc(kernel_dir, sys_kernel_files[i].name);
-        file->type = file_none;
-        file->mode = 0444;
-        file->owner = 0;
-        file->group = 0;
-        file->fsid = procfs_id;
-        proc_handle_t *file_handle = (proc_handle_t *)malloc(sizeof(proc_handle_t));
-        file->handle = file_handle;
-        file_handle->task = NULL;
-        sprintf(file_handle->name, "%s", sys_kernel_files[i].handle);
-    }
-
-    procfs_update_task_list();
-
-    return VFS_STATUS_SUCCESS;
+    return node;
 }
 
-void procfs_open(void *parent, const char *name, vfs_node_t node) {
+static void procfs_rebind_private(vfs_node_t node, vfs_node_t mount)
+{
+    node->root = mount;
+    node->dev = mount->dev;
+    for (list_t entry = node->child; entry; entry = entry->next)
+        procfs_rebind_private(static_cast<vfs_node_t>(entry->data), mount);
+}
+
+errno_t procfs_mount(const char *src, vfs_node_t node)
+{
+    // This global singleton is initialized only by procfs_setup while the boot
+    // scheduler gate is closed. sys_mount can translate strings to this token,
+    // so the token alone is not authorization or an exclusivity guarantee.
+    tcb_t owner = get_current_task();
+    if (src != (void *)PROC_REGISTER_ID || !owner || owner != procfs_bootstrap_owner ||
+        owner->tid != procfs_bootstrap_tid || scheduler_is_enabled()) return -EOPNOTSUPP;
+    if (procfs_root) return -EBUSY;
+    if (!node) return -EINVAL;
+    vfs_node_t prepared = procfs_prepare_global(NULL, node->name, file_dir, 0555, "proc_root");
+    if (!prepared) return -ENOMEM;
+    bool ready = true;
+    vfs_node_t self = procfs_prepare_global(prepared, "self", file_symlink, 0644, NULL);
+    if (!self) ready = false;
+    else
+    {
+        auto *handle = static_cast<procfs_self_handle_t *>(calloc(1, sizeof(procfs_self_handle_t)));
+        if (!handle) ready = false;
+        else
+        {
+            handle->self = self;
+            self->handle = handle;
+            self->fsid = proc_self_id;
+        }
+    }
+    struct GlobalFile { const char *name; const char *kind; } root_files[] = {
+        {"filesystems", "filesystems"}, {"cpuinfo", "cpuinfo"}, {"cmdline", "cmdline"},
+        {"meminfo", "meminfo"}, {"uptime", "uptime"}, {"loadavg", "loadavg"},
+        {"stat", "stat"}, {"mounts", "mounts"}, {"version", "version"},
+    };
+    for (const GlobalFile &file : root_files)
+        if (ready && !procfs_prepare_global(prepared, file.name, file_none, 0444, file.kind)) ready = false;
+    vfs_node_t sys = ready ? procfs_prepare_global(prepared, "sys", file_dir, 0555, NULL) : NULL;
+    vfs_node_t kernel = sys ? procfs_prepare_global(sys, "kernel", file_dir, 0555, NULL) : NULL;
+    if (!kernel) ready = false;
+    GlobalFile kernel_files[] = {
+        {"ostype", "sys_kernel_ostype"}, {"osrelease", "sys_kernel_osrelease"},
+        {"version", "sys_kernel_version"}, {"hostname", "sys_kernel_hostname"},
+    };
+    for (const GlobalFile &file : kernel_files)
+        if (ready && !procfs_prepare_global(kernel, file.name, file_none, 0444, file.kind)) ready = false;
+    if (!ready) { procfs_discard_private(prepared); return -ENOMEM; }
+    procfs_rebind_private(prepared, node);
+    for (list_t entry = prepared->child; entry; entry = entry->next)
+        static_cast<vfs_node_t>(entry->data)->parent = node;
+    static_cast<proc_handle_t *>(prepared->handle)->node = node;
+    // Before changing fsid, finalize the old mountpoint using its own backend.
+    // The internal bootstrap-owner scope remains exclusive through publication.
+    int error = vfs_close_cached_backend(node);
+    if (error) { procfs_discard_private(prepared); return error; }
+    vfs_child_lock();
+    node->handle = prepared->handle;
+    node->child = prepared->child;
+    node->fsid = procfs_id;
+    node->root = node;
+    node->is_mount = true;
+    node->type = file_dir;
+    node->size = 0;
+    node->owner = node->group = 0;
+    node->mode = 0555;
+    prepared->handle = NULL;
+    prepared->child = NULL;
+    procfs_root = node;
+    vfs_child_unlock();
+    vfs_free(prepared);
+    return 0;
+}
+
+void procfs_open(void *parent, const char *name, vfs_node_t node)
+{
     UNUSED(parent, name);
     if (node == procfs_root) procfs_update_task_list();
-    if (procfs_node_is_task_dir(node))
+    auto *handle = static_cast<proc_handle_t *>(node->handle);
+    if (handle && handle->process && !strcmp(handle->name, "proc_fd_dir"))
     {
-        int pid = atoi(node->name);
-        pcb_t task = found_pcb(pid);
-        if (task != NULL) procfs_on_new_task(task);
+        ProcfsOperation operation(handle->process);
+        if (operation.get()) procfs_refresh_fd_dir(node, operation);
+        else permissions_set_file_error(ENOENT);
     }
-    proc_handle_t *handle = (proc_handle_t *)node->handle;
-    if (handle != NULL && !strcmp(handle->name, "proc_fd_dir") && handle->task != NULL)
-        procfs_refresh_fd_dir(node, handle->task);
 }
 
-void procfs_close(void *current) {
-    UNUSED(current);
+void procfs_close(void *current)
+{
+    auto *handle = static_cast<proc_handle_t *>(current);
+    if (!handle) return;
+    ProcfsProcessContext *process = handle->process;
+    free(handle);
+    procfs_context_release(process);
 }
 
-size_t procfs_readlink(vfs_node_t node, void *addr, size_t offset, size_t size) {
-    if (node == NULL || addr == NULL) return VFS_STATUS_FAILED;
-
-    if (node->handle != NULL)
+size_t procfs_readlink(vfs_node_t node, void *addr, size_t offset, size_t size)
+{
+    if (!node || !addr || !node->handle) return VFS_STATUS_FAILED;
+    auto *handle = static_cast<proc_handle_t *>(node->handle);
+    ProcfsOperation operation(handle->process);
+    pcb_t task = operation.get();
+    if (handle->process && !task)
     {
-        proc_handle_t *handle = (proc_handle_t *)node->handle;
-        if (!strcmp(handle->name, "proc_exe"))
-        {
-            const char *target = handle->task && handle->task->exe_path ? handle->task->exe_path : "";
-            return procfs_copy_content(addr, offset, size, target, strlen(target));
-        }
-        if (!strcmp(handle->name, "proc_fd"))
-        {
-            if (handle->task == NULL || handle->task->file_open == NULL || node->name == NULL)
-                return VFS_STATUS_FAILED;
-            int fdnum = atoi(node->name);
-            fd_file_handle *fh = (fd_file_handle *)queue_get(handle->task->file_open, fdnum);
-            if (fh == NULL || fh->node == NULL) return VFS_STATUS_FAILED;
-            char target[256];
-            if (fh->node->type & file_pipe)
-                sprintf(target, "pipe:[%llu]", (unsigned long long)fh->node->inode);
-            else if (fh->node->type & file_socket)
-                sprintf(target, "socket:[%llu]", (unsigned long long)fh->node->inode);
-            else if (fh->node->name && fh->node->name[0])
-                sprintf(target, "/%s", fh->node->name);
-            else
-                sprintf(target, "anon_inode:[%llu]", (unsigned long long)fh->node->inode);
-            return procfs_copy_content(addr, offset, size, target, strlen(target));
-        }
+        permissions_set_file_error(ENOENT);
+        return VFS_STATUS_FAILED;
     }
-
-    if (node->linkto != NULL)
+    if (!strcmp(handle->name, "proc_exe"))
     {
-        char target[MAX_PID_NAME_LEN + 8];
-        sprintf(target, "/proc/%s", node->linkto->name);
+        const char *target = task && task->exe_path ? task->exe_path : "";
         return procfs_copy_content(addr, offset, size, target, strlen(target));
+    }
+    if (!strcmp(handle->name, "proc_fd"))
+    {
+        size_t number;
+        if (!task || !procfs_fd_number(node->name, number)) return VFS_STATUS_FAILED;
+        // Declare the FD ticket after the process ticket: release the
+        // descriptor before dropping the PCB operation pin on every return.
+        FdOperation descriptor;
+        int error = descriptor.acquire_process(task, int(number));
+        if (error) { permissions_set_file_error(-error); return VFS_STATUS_FAILED; }
+        vfs_node_t target_node = descriptor.get()->node;
+        char special[64];
+        const char *target = NULL;
+        vfs_child_lock();
+        if (target_node->type & file_pipe)
+        {
+            snprintf(special, sizeof(special), "pipe:[%llu]", (unsigned long long)target_node->inode);
+            target = special;
+        }
+        else if (target_node->type & file_socket)
+        {
+            snprintf(special, sizeof(special), "socket:[%llu]", (unsigned long long)target_node->inode);
+            target = special;
+        }
+        vfs_child_unlock();
+        char *path = target ? NULL : vfs_get_fullpath(target_node);
+        if (!target) target = path;
+        size_t result = target ? procfs_copy_content(addr, offset, size, target, strlen(target)) : VFS_STATUS_FAILED;
+        free(path);
+        return result;
     }
     return VFS_STATUS_FAILED;
 }
 
-size_t procfs_write(void *file, const void *addr, size_t offset, size_t size) {
-    UNUSED(file, addr, offset, size);
-    return size;
+size_t procfs_write(void *file, const void *addr, size_t offset, size_t size)
+{
+    UNUSED(addr, offset, size);
+    auto *handle = static_cast<proc_handle_t *>(file);
+    if (!handle) return VFS_STATUS_FAILED;
+    ProcfsOperation operation(handle->process);
+    if (handle->process && !operation.get())
+    {
+        permissions_set_file_error(ENOENT);
+        return VFS_STATUS_FAILED;
+    }
+    permissions_set_file_error(EROFS);
+    return VFS_STATUS_FAILED;
 }
 
 size_t procfs_read(void *file, void *addr, size_t offset, size_t size) {
     proc_handle_t *handle = (proc_handle_t *)file;
     if (!handle) { return VFS_STATUS_FAILED; }
-    pcb_t task;
-    if (handle->task == NULL) {
-        task = get_current_task()->parent_group;
-    } else {
-        task = handle->task;
+    ProcfsOperation operation(handle->process);
+    pcb_t task = operation.get();
+    if (handle->process && !task)
+    {
+        permissions_set_file_error(ENOENT);
+        return VFS_STATUS_FAILED;
     }
+    if (!handle->process && get_current_task()) task = get_current_task()->parent_group;
 
     if (!strcmp(handle->name, "filesystems")) {
         size_t fs_size = strlen(filesystems_content);
@@ -994,7 +1241,7 @@ size_t procfs_read(void *file, void *addr, size_t offset, size_t size) {
         return to_copy;
     } else if (!strcmp(handle->name, "proc_maps")) {
         size_t content_len = 0;
-        char  *content     = proc_gen_maps_file(handle->task, &content_len);
+        char  *content     = proc_gen_maps_file(task, &content_len);
         size_t to_copy = procfs_copy_content(addr, offset, size, content, content_len);
         free(content);
         return to_copy;
@@ -1028,6 +1275,19 @@ vfs_node_t procfs_dup(vfs_node_t src) {
 errno_t procfs_stat(void *file, vfs_node_t node) {
     if (file == NULL) return EOK;
     proc_handle_t *handle = (proc_handle_t *)file;
+    if (node == procfs_root)
+    {
+        procfs_update_task_list();
+        node->size = 0;
+        return EOK;
+    }
+    ProcfsOperation operation(handle->process);
+    pcb_t task = operation.get();
+    if (handle->process && !task)
+    {
+        permissions_set_file_error(ENOENT);
+        return -ENOENT;
+    }
     if (!strcmp(handle->name, "filesystems"))
         node->size = strlen(filesystems_content);
     else if (!strcmp(handle->name, "cpuinfo")) {
@@ -1069,36 +1329,39 @@ errno_t procfs_stat(void *file, vfs_node_t node) {
         node->size = strlen(procfs_kernel_hostname());
     }
     else if (!strcmp(handle->name, "proc_cmdline"))
-        node->size = procfs_task_cmdline_len(handle->task);
+        node->size = procfs_task_cmdline_len(task);
     else if (!strcmp(handle->name, "proc_comm"))
-        node->size = strlen(handle->task->name) + 1;
+        node->size = strlen(task->name) + 1;
     else if (!strcmp(handle->name, "proc_exe"))
-        node->size = handle->task && handle->task->exe_path ? strlen(handle->task->exe_path) : 0;
+        node->size = task && task->exe_path ? strlen(task->exe_path) : 0;
     else if (!strcmp(handle->name, "proc_statm")) {
         size_t content_len = 0;
-        char *content = proc_gen_statm_file(handle->task, &content_len);
+        char *content = proc_gen_statm_file(task, &content_len);
         free(content);
         node->size = content_len;
     }
     else if (!strcmp(handle->name, "proc_maps")) {
         size_t content_len = 0;
-        char  *content     = proc_gen_maps_file(handle->task, &content_len);
+        char  *content     = proc_gen_maps_file(task, &content_len);
         free(content);
         node->size = content_len;
     } else if (!strcmp(handle->name, "dri_name"))
         node->size = strlen("cpkernel_drm");
     else if (!strcmp(handle->name, "proc_fd_dir"))
+    {
+        procfs_refresh_fd_dir(node, operation);
         node->size = 0;
+    }
     else if (!strcmp(handle->name, "proc_fd"))
         node->size = 64;
     else if (!strcmp(handle->name, "proc_stat")) {
         size_t content_len = 0;
-        char  *content     = proc_gen_stat_file(handle->task, &content_len);
+        char  *content     = proc_gen_stat_file(task, &content_len);
         node->size         = content_len;
         free(content);
     } else if (!strcmp(handle->name, "proc_status")) {
         size_t content_len = 0;
-        char  *content     = proc_gen_status_file(handle->task, &content_len);
+        char  *content     = proc_gen_status_file(task, &content_len);
         node->size         = content_len;
         free(content);
     } else if (!strcmp(handle->name, "mounts")) {
@@ -1113,6 +1376,7 @@ errno_t procfs_stat(void *file, vfs_node_t node) {
 void procfs_self_open(void *parent, const char *name, vfs_node_t node) {
     UNUSED(parent, name);
     procfs_self_handle_t *handle = (procfs_self_handle_t *)malloc(sizeof(procfs_self_handle_t));
+    if (!handle) { permissions_set_file_error(ENOMEM); return; }
     handle->self                 = node;
     node->handle                 = handle;
 }
@@ -1210,85 +1474,120 @@ static struct vfs_callback procfs_callbacks = {
     .rename   = (vfs_rename_t)dummy,
 };
 
-void procfs_setup() {
-    procfs_id    = vfs_regist("proc", &procfs_callbacks, PROC_REGISTER_ID, 0x9fa0);
-    proc_self_id = vfs_regist("proc_self", &procfs_self_callbacks, PROC_REGISTER_ID, 0x0);
-    vfs_node_t proot;
-    vfs_mkdir("/proc");
-    proot=vfs_open("/proc");
-    procfs_mount((const char*)PROC_REGISTER_ID,proot);
-    if (procfs_id == VFS_STATUS_FAILED || proc_self_id == VFS_STATUS_FAILED) {
-        write_serial_fmt("procfs register error\n");
-    }
-}
-
-void procfs_update_task_list() {
-    if (procfs_root == NULL || pcb_group_queue == NULL) return;
-    queue_foreach(pcb_group_queue, node)
-    {
-        procfs_on_new_task((pcb_t)node->data);
-    }
-}
-
-static void procfs_refresh_fd_dir(vfs_node_t fd_dir, pcb_t task)
+void procfs_setup()
 {
-    if (fd_dir == NULL || task == NULL) return;
-    list_t child = fd_dir->child;
-    while (child != NULL) {
-        list_t next = child->next;
-        vfs_node_t child_node = (vfs_node_t)child->data;
-        if (child_node != NULL) {
-            if (child_node->handle) {
-                free(child_node->handle);
-                child_node->handle = NULL;
-            }
-            free(child_node);
-        }
-        fd_dir->child = list_delete_node(fd_dir->child, child);
-        child = next;
+    if (procfs_root || !get_current_task() || scheduler_is_enabled()) return;
+    procfs_id = vfs_regist("procfs", &procfs_callbacks, PROC_REGISTER_ID, 0x9fa0);
+    proc_self_id = vfs_regist("proc_self", &procfs_self_callbacks, PROC_REGISTER_ID, 0x0);
+    if (procfs_id == VFS_STATUS_FAILED || proc_self_id == VFS_STATUS_FAILED)
+    {
+        write_serial_fmt("procfs register error\n");
+        return;
     }
-
-    if (task->file_open == NULL) return;
-    spin_lock(&task->file_open->lock);
-    lock_node *ln = task->file_open->head;
-    while (ln != NULL) {
-        fd_file_handle *fh = (fd_file_handle *)ln->data;
-        if (fh != NULL && fh->node != NULL) {
-            char fdname[16];
-            sprintf(fdname, "%zu", fh->fd);
-            vfs_node_t fd_entry = vfs_child_append(fd_dir, fdname, NULL);
-            fd_entry->type = file_symlink;
-            fd_entry->mode = 0400;
-            fd_entry->fsid = procfs_id;
-            fd_entry->owner = task->procfs_node ? task->procfs_node->owner : 0;
-            fd_entry->group = task->procfs_node ? task->procfs_node->group : 0;
-            proc_handle_t *handle = (proc_handle_t *)malloc(sizeof(proc_handle_t));
-            handle->task = task;
-            sprintf(handle->name, "proc_fd");
-            fd_entry->handle = handle;
-        }
-        ln = ln->next;
-    }
-    spin_unlock(&task->file_open->lock);
+    vfs_set_unmount_quiescence(procfs_id, true);
+    // All current proc entries are observation interfaces. Dummy mutation
+    // callbacks must not let a privileged caller unlink/rename context nodes.
+    vfs_set_readonly(procfs_id, true);
+    vfs_set_readonly(proc_self_id, true);
+    vfs_mkdir("/proc");
+    vfs_node_t node = vfs_open("/proc");
+    if (!node) { write_serial_fmt("procfs mountpoint unavailable\n"); return; }
+    procfs_bootstrap_owner = get_current_task();
+    procfs_bootstrap_tid = procfs_bootstrap_owner->tid;
+    int error = procfs_mount((const char *)PROC_REGISTER_ID, node);
+    procfs_bootstrap_owner = NULL;
+    procfs_bootstrap_tid = 0;
+    vfs_close(node);
+    if (error) write_serial_fmt("procfs bootstrap mount failed (%d)\n", error);
 }
 
-void procfs_on_new_task(pcb_t task) {
-    if (procfs_root == NULL || task == NULL) return;
+// All process-cache publication happens in ordinary task context. The legacy
+// creation hook intentionally does no VFS work while the creator spin lock and
+// per-CPU scheduler gate are held; the published process list is authoritative.
+void procfs_on_new_task(pcb_t task)
+{
+    UNUSED(task);
+}
 
-    char name[MAX_PID_NAME_LEN];
-    sprintf(name, "%llu", (unsigned long long)task->pid);
-
-    vfs_node_t node = vfs_do_search(procfs_root, name);
-    if (node == NULL) {
-        node       = vfs_child_append(procfs_root, name, NULL);
-        node->type = file_dir;
-        node->mode = 0555;
-        node->fsid = procfs_id;
+static vfs_node_t procfs_private_process_node(vfs_node_t parent, const char *name, uint16_t type,
+                                             uint16_t mode, ProcfsProcessContext *process,
+                                             uint32_t uid, uint32_t gid, const char *kind)
+{
+    auto *handle = static_cast<proc_handle_t *>(calloc(1, sizeof(proc_handle_t)));
+    if (!handle || !procfs_context_retain(process)) { free(handle); return NULL; }
+    vfs_node_t node = vfs_node_alloc(parent, name);
+    if (!node)
+    {
+        procfs_context_release(process);
+        free(handle);
+        return NULL;
     }
-    procfs_set_owner(node, task);
-    task->procfs_node = node;
+    node->type = type;
+    node->mode = mode;
+    node->owner = uid;
+    node->group = gid;
+    node->fsid = procfs_id;
+    node->root = procfs_root->root;
+    node->dev = procfs_root->dev;
+    handle->node = node;
+    handle->process = process;
+    strcpy(handle->name, kind);
+    node->handle = handle;
+    return node;
+}
 
-    struct TaskProcFile { const char *name; const char *handle; uint16_t type; uint16_t mode; } task_files[] = {
+static void procfs_discard_private(vfs_node_t node)
+{
+    if (!node) return;
+    // Unlike a generic directory reference close, the checked disposer closes
+    // directory backend handles too. All nodes here are unpublished/refquiet
+    // and procfs close cannot fail or issue storage I/O.
+    int error = vfs_try_free_detached(node);
+    if (error) write_serial_fmt("procfs: retaining failed private cache disposal (%d)\n", error);
+}
+
+static vfs_node_t procfs_ensure_process(ProcfsOperation &operation)
+{
+    ProcfsProcessContext *process = operation.context();
+    pcb_t task = operation.get();
+    if (!process || !task || !procfs_root) return NULL;
+    uint32_t uid = proc_task_uid(task), gid = proc_task_gid(task);
+    {
+        ProcfsSpinGuard guard(&process_context_lock);
+        if (process->retired) return NULL;
+        if (process->node)
+        {
+            // The immutable PID namespace has eight fixed direct children.
+            // FD entries refresh their ownership separately, one name at a
+            // time, so an unbounded FD list is never walked under this lock.
+            vfs_child_lock();
+            process->node->owner = uid;
+            process->node->group = gid;
+            for (list_t entry = process->node->child; entry; entry = entry->next)
+            {
+                auto *node = static_cast<vfs_node_t>(entry->data);
+                if (!vfs_node_retiring_locked(node))
+                {
+                    node->owner = uid;
+                    node->group = gid;
+                }
+            }
+            vfs_child_unlock();
+            return process->node;
+        }
+        vfs_child_lock();
+        vfs_node_t mount = procfs_root->root;
+        bool needs_pin = mount && mount != rootdir && mount->is_mount && !process->mount_pin;
+        bool busy = vfs_node_retiring_locked(procfs_root) || (needs_pin && mount->refcount == uint32_t(-1));
+        if (!busy && needs_pin) { ++mount->refcount; process->mount_pin = mount; }
+        vfs_child_unlock();
+        if (busy) return NULL;
+    }
+    char name[MAX_PID_NAME_LEN];
+    snprintf(name, sizeof(name), "%llu", (unsigned long long)process->pid);
+    vfs_node_t root = procfs_private_process_node(NULL, name, file_dir, 0555, process, uid, gid, "proc_pid_dir");
+    if (!root) return NULL;
+    struct TaskFile { const char *name; const char *kind; uint16_t type; uint16_t mode; } files[] = {
         {"cmdline", "proc_cmdline", file_none, 0444},
         {"comm", "proc_comm", file_none, 0444},
         {"exe", "proc_exe", file_symlink, 0777},
@@ -1296,54 +1595,353 @@ void procfs_on_new_task(pcb_t task) {
         {"stat", "proc_stat", file_none, 0444},
         {"statm", "proc_statm", file_none, 0444},
         {"status", "proc_status", file_none, 0444},
+        {"fd", "proc_fd_dir", file_dir, 0555},
     };
-
-    for (size_t i = 0; i < sizeof(task_files) / sizeof(task_files[0]); i++)
-    {
-        vfs_node_t file = vfs_do_search(node, task_files[i].name);
-        if (file == NULL) file = vfs_child_append(node, task_files[i].name, NULL);
-        file->type = task_files[i].type;
-        file->mode = task_files[i].mode;
-        file->fsid = procfs_id;
-        procfs_set_owner(file, task);
-        proc_handle_t *handle = (proc_handle_t *)file->handle;
-        if (handle == NULL)
+    for (const TaskFile &file : files)
+        if (!procfs_private_process_node(root, file.name, file.type, file.mode, process, uid, gid, file.kind))
         {
-            handle = (proc_handle_t *)malloc(sizeof(proc_handle_t));
-            file->handle = handle;
+            procfs_discard_private(root);
+            return NULL;
         }
-        handle->task = task;
-        sprintf(handle->name, "%s", task_files[i].handle);
+    list_t entry = list_alloc(root);
+    if (!entry) { procfs_discard_private(root); return NULL; }
+    vfs_node_t result = NULL;
+    bool published = false;
+    {
+        ProcfsSpinGuard guard(&process_context_lock);
+        vfs_child_lock();
+        if (!process->retired && !vfs_node_retiring_locked(procfs_root))
+        {
+            result = process->node;
+            bool duplicate = false;
+            for (list_t child = procfs_root->child; child; child = child->next)
+            {
+                auto *node = static_cast<vfs_node_t>(child->data);
+                if (node && node->name && !strcmp(node->name, name)) { duplicate = true; break; }
+            }
+            if (!result && !duplicate)
+            {
+                root->parent = procfs_root;
+                entry->next = procfs_root->child;
+                if (entry->next) entry->next->prev = entry;
+                procfs_root->child = entry;
+                process->node = root;
+                __atomic_store_n(&task->procfs_node, root, __ATOMIC_RELEASE);
+                result = root;
+                published = true;
+            }
+        }
+        vfs_child_unlock();
     }
-
-    vfs_node_t fd_dir = vfs_do_search(node, "fd");
-    if (fd_dir == NULL) {
-        fd_dir       = vfs_child_append(node, "fd", NULL);
-        fd_dir->type = file_dir;
-        fd_dir->mode = 0555;
-        fd_dir->fsid = procfs_id;
-        procfs_set_owner(fd_dir, task);
-        proc_handle_t *fd_handle = (proc_handle_t *)malloc(sizeof(proc_handle_t));
-        fd_handle->task = task;
-        sprintf(fd_handle->name, "proc_fd_dir");
-        fd_dir->handle = fd_handle;
-    }
-    procfs_refresh_fd_dir(fd_dir, task);
+    if (!published) { free(entry); procfs_discard_private(root); }
+    return result;
 }
 
-void procfs_on_exit_task(pcb_t task) {
-    if (procfs_root == NULL) return;
-    spin_lock(&procfs_oplock);
-
-    char name[MAX_PID_NAME_LEN];
-    sprintf(name, "%llu", (unsigned long long)task->pid);
-
-    vfs_node_t node = vfs_do_search(procfs_root, name);
-    if (node && node->parent) {
-        node->parent->child = list_delete(node->parent->child, node);
-        vfs_free(node);
-        task->procfs_node = NULL;
+void procfs_update_task_list()
+{
+    if (!procfs_root || !pcb_group_queue || !get_current_task() || !scheduler_is_enabled()) return;
+    size_t capacity = 0;
+    {
+        ProcfsSpinGuard guard(&pcb_group_queue->lock);
+        for (lock_node *entry = pcb_group_queue->head; entry; entry = entry->next) ++capacity;
     }
+    if (capacity > size_t(-1) / sizeof(uint64_t)) return;
+    auto *pids = static_cast<uint64_t *>(malloc(capacity * sizeof(uint64_t)));
+    if (capacity && !pids) return;
+    size_t count = 0;
+    {
+        ProcfsSpinGuard guard(&pcb_group_queue->lock);
+        for (lock_node *entry = pcb_group_queue->head; entry && count < capacity; entry = entry->next)
+        {
+            auto *task = static_cast<pcb_t>(entry->data);
+            if (task && task->status != DEATH && task->status != OUT) pids[count++] = task->pid;
+        }
+    }
+    for (size_t i = 0; i < count; ++i)
+    {
+        ProcfsOperation operation;
+        if (operation.acquire(pids[i])) procfs_ensure_process(operation);
+    }
+    free(pids);
+}
 
-    spin_unlock(&procfs_oplock);
+static void procfs_sort_numbers(size_t *numbers, size_t count)
+{
+    auto sift = [&](size_t root, size_t end)
+    {
+        while (root < end / 2)
+        {
+            size_t child = root * 2 + 1;
+            if (child + 1 < end && numbers[child] < numbers[child + 1]) ++child;
+            if (numbers[root] >= numbers[child]) break;
+            size_t value = numbers[root]; numbers[root] = numbers[child]; numbers[child] = value;
+            root = child;
+        }
+    };
+    for (size_t i = count / 2; i; --i) sift(i - 1, count);
+    for (size_t end = count; end > 1; --end)
+    {
+        size_t value = numbers[0]; numbers[0] = numbers[end - 1]; numbers[end - 1] = value;
+        sift(0, end - 1);
+    }
+}
+
+static bool procfs_fd_number(const char *name, size_t &number)
+{
+    if (!name || !*name) return false;
+    number = 0;
+    for (const char *p = name; *p; ++p)
+    {
+        if (*p < '0' || *p > '9' || number > (0x7fffffffU - size_t(*p - '0')) / 10) return false;
+        number = number * 10 + size_t(*p - '0');
+    }
+    return true;
+}
+
+static bool procfs_has_number(const size_t *numbers, size_t count, size_t number)
+{
+    size_t first = 0;
+    while (first < count)
+    {
+        size_t middle = first + (count - first) / 2;
+        if (numbers[middle] == number) return true;
+        if (numbers[middle] < number) first = middle + 1;
+        else count = middle;
+    }
+    return false;
+}
+
+static void procfs_refresh_fd_dir(vfs_node_t directory, ProcfsOperation &operation)
+{
+    pcb_t task = operation.get();
+    ProcfsProcessContext *process = operation.context();
+    if (!directory || !task || !process) return;
+    size_t capacity = 0, count = 0;
+    if (fd_snapshot_numbers(task, NULL, 0, capacity)) return;
+    if (capacity > size_t(-1) / sizeof(size_t)) return;
+    auto *numbers = static_cast<size_t *>(malloc(capacity * sizeof(size_t)));
+    if (capacity && !numbers) return;
+    int error = fd_snapshot_numbers(task, numbers, capacity, count);
+    if (error || count > capacity) { free(numbers); return; }
+    procfs_sort_numbers(numbers, count);
+    uint32_t uid = directory->owner, gid = directory->group;
+    for (size_t i = 0; i < count; ++i)
+    {
+        char name[24];
+        snprintf(name, sizeof(name), "%zu", numbers[i]);
+        bool found = false;
+        vfs_child_lock();
+        for (list_t entry = directory->child; entry; entry = entry->next)
+        {
+            auto *node = static_cast<vfs_node_t>(entry->data);
+            if (node && node->name && !strcmp(node->name, name))
+            {
+                if (!vfs_node_retiring_locked(node))
+                {
+                    node->owner = uid;
+                    node->group = gid;
+                }
+                found = true;
+                break;
+            }
+        }
+        vfs_child_unlock();
+        if (found) continue;
+        vfs_node_t node = procfs_private_process_node(NULL, name, file_symlink, 0400, process, uid, gid, "proc_fd");
+        if (!node) break;
+        list_t link = list_alloc(node);
+        if (!link) { procfs_discard_private(node); break; }
+        bool published = false;
+        {
+            ProcfsSpinGuard guard(&process_context_lock);
+            vfs_child_lock();
+            bool duplicate = false;
+            for (list_t entry = directory->child; entry; entry = entry->next)
+            {
+                auto *child = static_cast<vfs_node_t>(entry->data);
+                if (child && child->name && !strcmp(child->name, name)) { duplicate = true; break; }
+            }
+            if (!process->retired && !duplicate && !vfs_node_retiring_locked(directory))
+            {
+                node->parent = directory;
+                link->next = directory->child;
+                if (link->next) link->next->prev = link;
+                directory->child = link;
+                published = true;
+            }
+            vfs_child_unlock();
+        }
+        if (!published) { free(link); procfs_discard_private(node); }
+    }
+    size_t child_count = 0;
+    vfs_child_lock();
+    for (list_t entry = directory->child; entry; entry = entry->next) ++child_count;
+    vfs_child_unlock();
+    if (child_count > size_t(-1) / sizeof(vfs_node_t)) { free(numbers); return; }
+    auto *obsolete = static_cast<vfs_node_t *>(malloc(child_count * sizeof(vfs_node_t)));
+    if (child_count && !obsolete) { free(numbers); return; }
+    size_t obsolete_count = 0;
+    vfs_child_lock();
+    for (list_t entry = directory->child; entry && obsolete_count < child_count; entry = entry->next)
+    {
+        auto *node = static_cast<vfs_node_t>(entry->data);
+        size_t number;
+        if (node && procfs_fd_number(node->name, number) && !procfs_has_number(numbers, count, number) &&
+            !vfs_node_retiring_locked(node) && node->refcount != uint32_t(-1))
+        {
+            ++node->refcount;
+            obsolete[obsolete_count++] = node;
+        }
+    }
+    vfs_child_unlock();
+    for (size_t i = 0; i < obsolete_count; ++i)
+        if (vfs_prune_child(directory, obsolete[i], 1)) vfs_close(obsolete[i]);
+    free(obsolete);
+    free(numbers);
+}
+
+static bool procfs_owner_quiescent(tcb_t task)
+{
+    return task && (task->status == DEATH || task->status == OUT) && !scheduler_task_referenced(task);
+}
+
+static bool procfs_reap_operation(tcb_t owner, bool all)
+{
+    ProcfsOperationRecord *record = NULL;
+    ProcfsProcessContext *release = NULL;
+    {
+        ProcfsSpinGuard guard(&process_context_lock);
+        ProcfsOperationRecord **entry = &process_operations;
+        while (*entry)
+        {
+            if ((all || (*entry)->owner == owner) && procfs_owner_quiescent((*entry)->owner))
+            {
+                record = *entry;
+                *entry = record->next;
+                ProcfsProcessContext *process = record->process;
+                --process->active;
+                if (!--process->references) release = process;
+                break;
+            }
+            entry = &(*entry)->next;
+        }
+    }
+    if (record) free(record);
+    if (release) procfs_destroy_context(release);
+    return record != NULL;
+}
+
+bool procfs_operation_thread_exit(tcb_t task)
+{
+    // The caller still owns the TCB; acquire/reap scans retain their owner
+    // pointers under this same lock until every record has been unlinked.
+    {
+        ProcfsSpinGuard guard(&process_context_lock);
+        if (!procfs_owner_quiescent(task)) return false;
+    }
+    while (procfs_reap_operation(task, false)) {}
+    return true;
+}
+
+void procfs_reap_retired()
+{
+    if (!get_current_task() || !scheduler_is_enabled()) return;
+    // FD removal finishes its owner/PCB-dependent registry work first. Once
+    // extracted, finish_handle only closes its retained vnode and frees memory.
+    fd_reap_abandoned_operations();
+    while (procfs_reap_operation(NULL, true)) {}
+    ProcfsProcessContext *process = NULL;
+    {
+        ProcfsSpinGuard guard(&process_context_lock);
+        for (ProcfsProcessContext *entry = retired_contexts; entry; entry = entry->next)
+            if (!entry->collecting && !entry->active)
+            {
+                entry->collecting = true;
+                process = entry;
+                break;
+            }
+    }
+    if (!process) return;
+    int error = process->node ? vfs_try_free_detached(process->node) : 0;
+    {
+        ProcfsSpinGuard guard(&process_context_lock);
+        ProcfsProcessContext **link = &retired_contexts;
+        while (*link && *link != process) link = &(*link)->next;
+        if (*link)
+        {
+            *link = process->next;
+            if (error)
+            {
+                // Rotate a busy tree so one held descriptor cannot starve
+                // reclamation of every subsequently retired process cache.
+                ProcfsProcessContext **tail = &retired_contexts;
+                while (*tail) tail = &(*tail)->next;
+                *tail = process;
+                process->next = NULL;
+                process->collecting = false;
+            }
+        }
+    }
+    if (!error) procfs_context_release(process); // Retired-queue hold.
+}
+
+void procfs_on_exit_task(pcb_t task)
+{
+    if (!task) return;
+    ProcfsProcessContext *process = NULL;
+    list_t detached = NULL;
+    {
+        ProcfsSpinGuard guard(&process_context_lock);
+        ProcfsProcessContext **link = &process_contexts;
+        while (*link && (*link)->identity != task) link = &(*link)->next;
+        if (*link)
+        {
+            process = *link;
+            *link = process->next;
+            process->retired = true;
+            process->task = NULL;
+            // The transferred registry/queue hold remains exclusive to this
+            // exit waiter until all live operations finish. No extra counter
+            // increment (and therefore no overflow) is needed for the waiter.
+            process->collecting = true;
+            vfs_child_lock();
+            if (process->node && procfs_root)
+            {
+                list_t entry = procfs_root->child;
+                while (entry && entry->data != process->node) entry = entry->next;
+                if (entry)
+                {
+                    if (entry->prev) entry->prev->next = entry->next;
+                    else procfs_root->child = entry->next;
+                    if (entry->next) entry->next->prev = entry->prev;
+                    detached = entry;
+                }
+            }
+            vfs_child_unlock();
+            process->next = retired_contexts;
+            retired_contexts = process; // Transfer published-registry hold.
+        }
+        __atomic_store_n(&task->procfs_node, static_cast<vfs_node_t>(NULL), __ATOMIC_RELEASE);
+    }
+    free(detached);
+    if (!process) return;
+    for (;;)
+    {
+        // A killed callback runs no C++ destructor. Reap its heap ticket only
+        // after current/selected/previous-stack references prove quiescence.
+        fd_reap_abandoned_operations();
+        while (procfs_reap_operation(NULL, true)) {}
+        bool active;
+        {
+            ProcfsSpinGuard guard(&process_context_lock);
+            active = process->active != 0;
+        }
+        if (!active) break;
+        scheduler_yield();
+    }
+    {
+        ProcfsSpinGuard guard(&process_context_lock);
+        process->collecting = false;
+    }
+    procfs_reap_retired();
 }

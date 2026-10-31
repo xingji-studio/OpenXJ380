@@ -5,6 +5,8 @@
 #include <mm/page.h>
 #include <power.h>
 #include <proto.hpp>
+#include <fs/ext4/ext4.h>
+#include <task/scheduler.h>
 
 #define ACPI_GAS_SYSTEM_MEMORY 0
 #define ACPI_GAS_SYSTEM_IO     1
@@ -225,8 +227,25 @@ static bool acpi_reboot(BOOT_CONFIG *boot_config)
     return true;
 }
 
+static void finish_filesystems_before_poweroff()
+{
+    // Normal power actions run in task context. Fatal/early-boot paths cannot
+    // wait for storage or acquire filesystem mutexes; leave recovery enabled.
+    if (!scheduler_is_enabled() || !get_current_task())
+    {
+        write_serial_string("EXT4: power cleanup unavailable; recovery required on next boot.\n");
+        return;
+    }
+    uint64_t flags = get_rflags();
+    __asm__ volatile("sti" ::: "memory");
+    int error = ext4fs_finish_all();
+    if (!(flags & (1ULL << 9))) __asm__ volatile("cli" ::: "memory");
+    write_serial_fmt("EXT4: power cleanup %s (%d)\n", error ? "failed" : "complete", error);
+}
+
 [[noreturn]] void power_shutdown(EFI_SYSTEM_TABLE *system_table, BOOT_CONFIG *boot_config)
 {
+    finish_filesystems_before_poweroff();
     uint64_t saved_entry     = 0;
     bool     identity_mapped = with_efi_identity_map(&saved_entry);
 
@@ -285,6 +304,7 @@ static void reboot_fallback(BOOT_CONFIG *boot_config)
 
 [[noreturn]] void power_reboot(EFI_SYSTEM_TABLE *system_table, BOOT_CONFIG *boot_config)
 {
+    finish_filesystems_before_poweroff();
     (void)boot_config;
 
     uint64_t saved_entry     = 0;

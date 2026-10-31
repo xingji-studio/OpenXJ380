@@ -86,6 +86,9 @@ typedef struct vfs_node *vfs_node_t;
 
 typedef errno_t (*vfs_mount_t)(const char *src, vfs_node_t node);
 typedef void (*vfs_unmount_t)(void *root);
+// Optional fallible durability step, before any mount nodes are destroyed.
+typedef int (*vfs_prepare_unmount_t)(void *root);
+typedef int (*vfs_checked_unmount_t)(void *handle);
 
 typedef void (*vfs_open_t)(void *parent, const char *name, vfs_node_t node);
 typedef void (*vfs_close_t)(void *current);
@@ -126,6 +129,7 @@ enum {
     file_pts      = 0x1000UL, // pts 设备
     file_proxy    = 0x2000UL, // 代理节点
     file_delete   = 0x4000UL, // 删除标记 (仅在删除时使用)
+    file_unlinked = 0x8000UL, // Detached managed name; parent reference remains owned until final close.
 };
 
 typedef struct vfs_callback { // VFS回调函数
@@ -189,6 +193,32 @@ struct vfs_node {
     uint64_t   rdev;        // 真实设备号
 };
 
+// Optional filesystem extensions stay outside the loadable-module callback ABI.
+typedef int (*vfs_link_node_t)(void *parent, vfs_node_t source, vfs_node_t created);
+void vfs_set_link_node(int fsid, vfs_link_node_t callback);
+typedef int (*vfs_finalize_node_t)(void *handle, vfs_node_t node);
+void vfs_set_finalize_node(int fsid, vfs_finalize_node_t callback);
+// Bootstrap mount handoff only: caller exclusively owns this empty, unmounted
+// directory through backend close AND replacement/publication. No spin/backend
+// lock may be held. This is not a concurrent runtime mount reservation API.
+// Existing backend errors propagate; never publish another fsid on failure.
+int vfs_close_cached_backend(vfs_node_t node);
+void vfs_set_unlinked_lifetime(int fsid, bool enabled);
+bool vfs_uses_unlinked_lifetime(vfs_node_t node);
+struct vfs_xattr_ops
+{
+    int (*get)(vfs_node_t, const char *, void *, size_t, size_t *);
+    int (*list)(vfs_node_t, char *, size_t, size_t *);
+    int (*set)(vfs_node_t, const char *, const void *, size_t, unsigned);
+    int (*remove)(vfs_node_t, const char *);
+};
+
+void vfs_set_xattr_ops(int fsid, const vfs_xattr_ops *ops);
+int vfs_getxattr(vfs_node_t node, const char *name, void *value, size_t capacity, size_t *required);
+int vfs_listxattr(vfs_node_t node, char *names, size_t capacity, size_t *required);
+int vfs_setxattr(vfs_node_t node, const char *name, const void *value, size_t length, unsigned flags);
+int vfs_removexattr(vfs_node_t node, const char *name);
+
 struct fd {
     void  *file;
     size_t offset;
@@ -221,6 +251,7 @@ void vfs_child_unlock();
  * @return 非0代表创建失败
  */
 errno_t vfs_mkdir(const char *name);
+errno_t vfs_mkdir_mode(const char *name, uint16_t mode, uint32_t uid, uint32_t gid);
 
 /**
  * 创建文件节点
@@ -228,6 +259,7 @@ errno_t vfs_mkdir(const char *name);
  * @return 非0代表创建失败
  */
 errno_t vfs_mkfile(const char *name);
+errno_t vfs_mkfile_mode(const char *name, uint16_t mode, uint32_t uid, uint32_t gid);
 
 /**
  * 注册文件系统回调指针
@@ -240,6 +272,34 @@ errno_t vfs_mkfile(const char *name);
  * @return 文件系统id
  */
 int vfs_regist(const char *name, vfs_callback_t callback, int register_id, uint64_t magic);
+// Fallible boot registration; leaves the registry unchanged on failure.
+int vfs_regist_checked(const char *name, vfs_callback_t callback, int register_id, uint64_t magic, int *fsid);
+// Filesystem properties are registered separately to preserve the callback ABI.
+void vfs_set_readonly(int fsid, bool readonly);
+bool vfs_is_readonly(vfs_node_t node);
+void vfs_set_managed_lifetime(int fsid, bool enabled);
+// Opt-in namespace ownership: generic mounts cannot overwrite this backend.
+void vfs_set_reject_overmount(int fsid, bool enabled);
+bool vfs_uses_managed_lifetime(vfs_node_t node);
+void vfs_set_prepare_unmount(int fsid, vfs_prepare_unmount_t callback);
+// Opt into lookup/creation retirement and busy-subtree checks without changing
+// a legacy filesystem's file lifetime or virtual symlink behavior.
+void vfs_set_unmount_quiescence(int fsid, bool enabled);
+// On error the adapter must retain its context/device lifetime. This extension
+// lets VFS report final teardown errors without changing vfs_callback's ABI.
+void vfs_set_checked_unmount(int fsid, vfs_checked_unmount_t callback);
+// Historical name retained for ABI compatibility; managed RW mounts may use it.
+int vfs_publish_readonly_mount(vfs_node_t node, const struct vfs_node *prepared);
+// Boot-only publication retaining the original root and mounted /dev tree.
+// Caller releases covered private directory placeholders after unlocking.
+int vfs_publish_system_root(struct vfs_node *prepared, list_t *covered);
+// Boot-only deep RAM tree publication. The caller exclusively owns the fresh
+// tree (root ref=1, each nonroot ref=2: cache plus backend pin). Descendant
+// root pointers already name the stable rootdir. Bindings point to backend
+// root-owner fields initially equal to prepared; commit changes them together
+// with rootdir. No callback/allocator runs in the publication lock.
+int vfs_publish_system_tree(struct vfs_node *prepared, uint64_t expected_nodes,
+                            vfs_node_t **bindings, size_t binding_count, list_t *covered);
 
 /**
  * 创建 link 文件
@@ -279,6 +339,18 @@ errno_t vfs_close(vfs_node_t node);
  * @param vfs 节点
  */
 void vfs_free(vfs_node_t vfs);
+// Caller holds vfs_child_lock; this bounded query never allocates or performs I/O.
+bool vfs_node_retiring_locked(vfs_node_t node);
+// Retire a still-linked cached child outside all spin/backend locks. `parent`
+// must remain retained. On success consume its tree ownership and exactly
+// held_references caller-owned pins; on failure preserve both tree and pins.
+// Cache eviction and checked backend close precede any object destruction.
+int vfs_prune_child(vfs_node_t parent, vfs_node_t child, unsigned held_references = 0,
+                    bool require_unvisited = false);
+// Caller serializes a private retired queue and owns an already detached tree.
+// EBUSY preserves the tree and mount lifetime; success consumes/frees it. Never
+// call under a spin/backend lock or mark these nodes file_delete/unlinked.
+int vfs_try_free_detached(vfs_node_t node);
 
 /**
  * 更新 vfs 节点的状态
@@ -293,6 +365,9 @@ void vfs_update(vfs_node_t node);
  */
 vfs_node_t vfs_open(const char *str);
 vfs_node_t vfs_open_no_follow(const char *str);
+// Retained metadata lookup. Rejects pipe/PTY endpoints with EOPNOTSUPP before
+// opening or retaining them; release ordinary returned nodes with vfs_close.
+vfs_node_t vfs_open_metadata(const char *str, bool follow_final_symlink);
 
 errno_t vfs_register_alias(const char *alias_path, const char *target_path);
 
@@ -333,6 +408,8 @@ bool is_virtual_fs(const char *src);
 vfs_node_t vfs_do_search(vfs_node_t dir, const char *name);
 void       vfs_free_child(vfs_node_t vfs);
 errno_t    vfs_delete(vfs_node_t node);
+// Consumes the caller's retained node reference on every success/failure path.
+errno_t    vfs_delete_owned(vfs_node_t node);
 errno_t    vfs_rename(vfs_node_t node, const char *nw);
 errno_t    vfs_resize(vfs_node_t node, uint64_t size);
 errno_t    vfs_resize_fast(vfs_node_t node, uint64_t size);
@@ -375,3 +452,9 @@ char *vfs_get_fullpath(vfs_node_t node);
 char *at_resolve_pathname(int dirfd, char *pathname);
 char *vfs_cwd_path_build(char *src); // 构建当前工作目录的路径
 bool  vfs_init();
+
+// Authorization is separate from internal name lookup.
+bool vfs_check_access(vfs_node_t node, const char *path, int operation);
+// Checks the canonical destination child, without mutating its existing parent.
+bool vfs_check_child_creation(vfs_node_t parent, const char *name);
+int vfs_last_error();

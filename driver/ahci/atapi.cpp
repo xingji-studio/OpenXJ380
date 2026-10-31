@@ -18,19 +18,30 @@ void scsi_create_packet16(struct scsi_cdb16 *cdb, uint8_t opcode, uint64_t lba, 
     cdb->length    = SCSI_FLIP(alloc_size);
 }
 
+// READ CAPACITY returns an inclusive last LBA. Everywhere else in this driver
+// max_lba is a block count: range checks permit [0, max_lba), and registration
+// reports max_lba * block_size bytes. Invalid responses leave no usable device.
 void scsi_parse_capacity(struct hba_device *device, uint32_t *parameter)
 {
-    if (device->cbd_size == SCSI_CDB16)
-    {
-        device->max_lba    = (uint64_t)SCSI_FLIP(*(parameter + 1)) | ((uint64_t)SCSI_FLIP(*parameter) << 32);
-        device->block_size = SCSI_FLIP(*(parameter + 2));
-    }
-    else
-    {
-        // for READ_CAPACITY(10)
-        device->max_lba    = SCSI_FLIP(*(parameter));
-        device->block_size = SCSI_FLIP(*(parameter + 1));
-    }
+    if (!device) return;
+    device->max_lba = 0;
+    device->block_size = 0;
+    if (!parameter || (device->cbd_size != SCSI_CDB12 && device->cbd_size != SCSI_CDB16)) return;
+    const uint8_t *p = (const uint8_t *)parameter;
+    uint64_t last_lba = 0;
+    unsigned lba_bytes = device->cbd_size == SCSI_CDB16 ? 8 : 4;
+    for (unsigned i = 0; i < lba_bytes; ++i) last_lba = (last_lba << 8) | p[i];
+    uint32_t block_size = 0;
+    for (unsigned i = 0; i < 4; ++i) block_size = (block_size << 8) | p[lba_bytes + i];
+    // 0xffffffff in READ CAPACITY(10) requests READ CAPACITY(16); it is not
+    // an exact capacity. This ATAPI path cannot silently invent that capacity.
+    if ((device->cbd_size == SCSI_CDB12 && last_lba == 0xffffffffULL) ||
+        last_lba == ~(uint64_t)0 || block_size < 512 || block_size > 65536 ||
+        (block_size & (block_size - 1))) return;
+    uint64_t blocks = last_lba + 1;
+    if (blocks > ~(uint64_t)0 / block_size) return;
+    device->max_lba = blocks;
+    device->block_size = block_size;
 }
 
 void scsi_submit(struct hba_device *dev, struct blkio_req *io_req)
@@ -61,7 +72,7 @@ void scsi_submit(struct hba_device *dev, struct blkio_req *io_req)
     struct sata_reg_fis *fis = (struct sata_reg_fis *)(&table->command_fis);
     void                *cdb = table->atapi_cmd;
     sata_create_fis(fis, ATA_PACKET, (size << 8), 0);
-    fis->feature = 1 | ((!write) << 2);
+    fis->head.feat_err = 1 | ((!write) << 2); // PACKET FeaturesLow, FIS byte 3.
 
     if (port->device->cbd_size == SCSI_CDB16)
     {

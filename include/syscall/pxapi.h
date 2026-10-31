@@ -1,6 +1,7 @@
 #pragma once
 
 #include <proto.hpp>
+#include <installer/native_protocol.h>
 
 typedef void (*MsgPrcor)(uint64_t type, uint64_t hdata, uint64_t ldata);
 
@@ -57,6 +58,7 @@ typedef struct {
 #define SXAH_INSTALLER_LOG              128956723895689226
 #define SXAH_INSTALLER_START_OPTIONS    128956723895689227
 #define SXAH_INSTALLER_PRECHECK_OPTIONS 128956723895689228
+#define SXAH_INSTALLER_NATIVE XJ_INST_NATIVE_SYSCALL
 
 #define SXAH_CHECK_TERMINAL_INIT_STATUS  3801    // 查询终端初始化状态
 
@@ -330,6 +332,9 @@ void do_xapi_GetTimeX(uint64_t tt);
 uint64_t do_xapi_GetMemorySize();
 void do_xapi_Run(char *path);
 uint64_t do_xapi_RunArgs(char *path, char **argv);
+uint64_t do_xapi_SpawnInherited(char *path, char **argv);
+uint64_t do_xapi_QueryFileAccess(uint64_t path, uint64_t access);
+uint64_t do_xapi_RequestFileAccess(uint64_t path, uint64_t access, uint64_t offered);
 uint64_t do_xapi_MapMemory(uint64_t ptr, uint64_t size, uint32_t flags);
 void do_xapi_FlushTime();
 uint64_t do_xapi_GetTaskList(uint64_t buffer, uint64_t max_count);
@@ -352,6 +357,8 @@ uint64_t do_xapi_InstallerPrecheckOptions(uint64_t options, uint64_t out);
 uint64_t do_xapi_InstallerProgress(uint64_t progress);
 uint64_t do_xapi_InstallerRescue(uint64_t action, uint64_t disk_id, uint64_t out);
 uint64_t do_xapi_InstallerLog(uint64_t out);
+uint64_t do_xapi_InstallerNative(uint64_t operation, uint64_t request, uint64_t request_bytes,
+                                uint64_t response, uint64_t response_bytes);
 
 
 
@@ -380,3 +387,10 @@ uint64_t message_ask(uint64_t msg_type_p, uint64_t hdatap, uint64_t ldatap, uint
 
 // Process-lifetime global screen capture protection.
 #define XAPI_SET_SECRET           7486
+
+#define XAPI_LIFT_PERMISSIONS 7496
+#define XAPI_GET_CURRENT_PERMISSIONS 7497
+#define XAPI_REQUEST_PERMISSIONS 7498
+#define XAPI_SPAWN_INHERITED 7499
+#define XAPI_QUERY_FILE_ACCESS 7500
+#define XAPI_REQUEST_FILE_ACCESS 7501

@@ -140,9 +140,17 @@ struct process_control_block
     bool     notify_pcor_registered;
     uint64_t ime_launch_generation;
     uint32_t ime_role; // 0: application, 1: selected engine, 2: registry manager, 3: own IME settings
+    UserInfo permission_user; // Process-owned identity; never aliases the login account.
+    uint64_t permission_revision;
+    char permission_directory[4096]; // Canonical executable parent; independent of cwd.
+    bool permission_file_dialog; // Kernel-issued metadata browsing capability; never inherited by fork/exec.
     bool screen_secret; // Process-lifetime global capture prohibition.
     bool screen_raw_mapped; // Live framebuffer mappings cannot be revoked by a syscall check.
     pcb_t screen_capture_next; // Intrusive policy list, protected by the capture state lock.
+    // Core-owned tail: 0 pending, 1 draining, 2 drained, 3 collecting,
+    // 4 exclusive collection preparation, 5 drain with collection requested.
+    uint32_t fd_cleanup_state;
+    tcb_t wait_owner; // Exclusive waitpid claim; cleared before this TCB is freed.
 };
 #ifndef CONFIG_USER_ELF_HEADER_START
 #define CONFIG_USER_ELF_HEADER_START 0x0000300000000000UL
@@ -186,7 +194,7 @@ struct thread_control_block
 
     uint64_t syscall_stack;
     uint64_t syscall_user_rsp;
-    
+
     uint64_t load_start;
     uint64_t load_end;
 
@@ -222,6 +230,11 @@ struct thread_control_block
 
     bool owns_user_stack;
     uint32_t ime_storage_depth; // Trusted filesystem I/O, not a user raw-device grant.
+    int file_access_error; // Per-thread VFS error; no global errno race.
+    const char *permission_profile_owner; // Scoped authenticated profile service; kernel-owned storage.
+    uint32_t permission_dialog_launch_depth; // Read-only load scope for the fixed file picker executable.
+    vfs_node_t permission_dialog_reader; // Private picker result, released if its calling thread exits.
+    bool permission_terminal_launch; // Read-only exec loading of the fixed native console host.
     uint32_t ime_config_depth; // Kernel-only settings transaction scope.
     uint64_t ime_launch_generation;
     uint32_t ime_launch_role; // Consumed by a controlled loader invocation.

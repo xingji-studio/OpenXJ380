@@ -8,6 +8,7 @@
 #include <dlinker.h>
 #include <mm/uaccess.h>
 #include <task/pcb.h>
+#include <block_access.h>
 
 device_t        device_ctl[256];
 id_allocator_t *dev_allocator;
@@ -16,6 +17,14 @@ static const size_t BLK_DIRECT_MIN_BYTES = 0x10000UL;
 static uint8_t *blk_cached_bounce[256];
 static size_t   blk_cached_bounce_bytes[256];
 static mutex_t  blk_cached_bounce_lock[256];
+class DeviceManagementGuard
+{
+    BlockAccessToken token = 0;
+public:
+    DeviceManagementGuard() { block_access_management_begin(&token); }
+    ~DeviceManagementGuard() { if (token) block_access_management_end(token); }
+    bool ready() const { return token != 0; }
+};
 typedef struct {
     uint8_t *buffer;
     size_t   mapped_bytes;
@@ -160,11 +169,21 @@ static bool blk_user_buffer_valid(const void *buffer, size_t length) {
     return user_range_mapped(current->parent_group->pagedir, buffer, length);
 }
 
-int regist_device(const char *path, device_t vd) {
+static int register_device(const char *path, device_t vd, bool slice, uint32_t parent, uint64_t offset,
+                           bool flush_supported = false) {
+    DeviceManagementGuard publication;
+    if (!publication.ready()) return -EBUSY;
     int i = id_alloc(dev_allocator);
-    if (i == -1) return -1;
+    if (i < 0 || i >= 256) return -1;
+    if (vd.type == DEVICE_BLOCK)
+    {
+        int error = slice ? block_access_register_slice(i, parent, offset, vd.size) :
+                            block_access_register_whole(i, vd.size, flush_supported);
+        if (error) { id_free(dev_allocator, i); return error; }
+    }
     device_ctl[i]         = vd;
     device_ctl[i].vdiskid = i;
+    if (vd.type == DEVICE_BLOCK) block_access_publish_device(i, block_access_generation(i));
     // write_serial_fmt("path: %s id %d\n",path,i);
     errno_t ret;
     if ((ret = devfs_register(path, i)) != EOK) {
@@ -178,10 +197,34 @@ int regist_device(const char *path, device_t vd) {
     return i;
 }
 
+int regist_device(const char *path, device_t vd) {
+    return register_device(path, vd, false, 0, 0);
+}
+
+int regist_durable_block_device(const char *path, device_t vd) {
+    if (vd.type != DEVICE_BLOCK || !vd.read || !vd.write || !vd.ioctl) return -EINVAL;
+    return register_device(path, vd, false, 0, 0, true);
+}
+
+int regist_partition_device(const char *path, device_t vd, uint32_t parent, uint64_t offset) {
+    if (vd.type != DEVICE_BLOCK) return -EINVAL;
+    return register_device(path, vd, true, parent, offset);
+}
+
 EXPORT_SYMBOL(regist_device);
+EXPORT_SYMBOL(regist_durable_block_device);
 
 void delete_device(int vdiskid) {
-    if (vdiskid >= 256) return;
+    DeviceManagementGuard publication;
+    if (!publication.ready()) return;
+    if (vdiskid < 0 || vdiskid >= 256) return;
+    if (device_ctl[vdiskid].type == DEVICE_BLOCK)
+    {
+        int error = block_access_unregister(vdiskid);
+        // A busy vnode may outlive the first registry withdrawal. It stays
+        // offline, but closing that reference must permit final deletion.
+        if (error && error != -ENODEV) return;
+    }
     if (mutex_trylock(&blk_cached_bounce_lock[vdiskid]) == 0) {
         if (blk_cached_bounce[vdiskid] != NULL) {
             blk_free_bounce(blk_cached_bounce[vdiskid], blk_cached_bounce_bytes[vdiskid]);
@@ -193,23 +236,22 @@ void delete_device(int vdiskid) {
     device_t dev = device_ctl[vdiskid];
     if (dev.path != NULL)
     {
-        devfs_delete(dev.path);
+        if (devfs_delete(dev.path) != EOK) return;
         free(dev.path);
     }
     else if (dev.drive_name[0] != '\0')
     {
-        devfs_delete(dev.drive_name);
+        if (devfs_delete(dev.drive_name) != EOK) return;
     }
-    id_free(dev_allocator, dev.vdiskid);
-    dev.path    = NULL;
-    dev.flag    = 0;
-    dev.vdiskid = 0;
+    device_ctl[vdiskid].path = NULL;
+    device_ctl[vdiskid].flag = 0;
+    id_free(dev_allocator, dev.vdiskid); // Last access: the ID may be reused immediately afterward.
 }
 EXPORT_SYMBOL(delete_device);
 
 bool have_vdisk(int drive) {
     int indx = drive;
-    if (indx >= 256) { return false; }
+    if (indx < 0 || indx >= 256) { return false; }
     return device_ctl[indx].flag > 0;
 }
 
@@ -232,6 +274,7 @@ void *device_mmap(int drive, void *addr, size_t len) {
 }
 
 device_t *get_device(size_t id) {
+    if (id >= 256) return NULL;
     if (device_ctl[id].flag == 0) return NULL;
     return &device_ctl[id];
 }
@@ -273,10 +316,16 @@ size_t device_read(size_t lba, size_t number, void *buffer, int drive) {
         if (device_ctl[drive].type == DEVICE_STREAM) {
             return device_ctl[drive].read(drive, (uint8_t*)buffer, number, lba);
         }
-        if (device_ctl[drive].sector_size == 0 ||
+        BlockExtent extent;
+        if (device_ctl[drive].type == DEVICE_BLOCK && block_access_resolve(drive, 0, &extent)) return 0;
+        if (device_ctl[drive].sector_size == 0 || lba > (size_t)-1 / device_ctl[drive].sector_size ||
             (number != 0 && device_ctl[drive].sector_size > (size_t)-1 / number)) {
             return 0;
         }
+        BlockAccessIo access(drive, device_ctl[drive].type == DEVICE_BLOCK ? extent.generation : 0,
+                              lba * device_ctl[drive].sector_size, number * device_ctl[drive].sector_size,
+                              device_ctl[drive].type == DEVICE_BLOCK);
+        if (!access.ready()) return 0;
         size_t ret_size = 0;
         for (size_t i = 0; i < number; i += SECTORS_ONCE) {
             int sectors  = ((number - i) >= SECTORS_ONCE) ? SECTORS_ONCE : (number - i);
@@ -290,12 +339,18 @@ size_t device_read(size_t lba, size_t number, void *buffer, int drive) {
 }
 size_t device_write(size_t lba, size_t number, const void *buffer, int drive) {
     if (have_vdisk(drive)) {
-        if (device_ctl[drive].sector_size == 0 ||
+        BlockExtent extent;
+        if (device_ctl[drive].type == DEVICE_BLOCK && block_access_resolve(drive, 0, &extent)) return 0;
+        if (device_ctl[drive].sector_size == 0 || lba > (size_t)-1 / device_ctl[drive].sector_size ||
             (number != 0 && device_ctl[drive].sector_size > (size_t)-1 / number)) {
             write_serial_fmt("device_write: reject drive=%d name=%s lba=%zu sectors=%zu sector_size=%zu\n",
                              drive, device_ctl[drive].drive_name, lba, number, device_ctl[drive].sector_size);
             return 0;
         }
+        BlockAccessIo access(drive, device_ctl[drive].type == DEVICE_BLOCK ? extent.generation : 0,
+                              lba * device_ctl[drive].sector_size, number * device_ctl[drive].sector_size,
+                              device_ctl[drive].type == DEVICE_BLOCK);
+        if (!access.ready()) return 0;
         size_t ret_size = 0;
         for (size_t i = 0; i < number; i += SECTORS_ONCE) {
             int sectors  = ((number - i) >= SECTORS_ONCE) ? SECTORS_ONCE : (number - i);
@@ -320,6 +375,11 @@ size_t blk_device_read(int drive, void *buffer, size_t offset, size_t length) {
         return 0;
     }
 
+    BlockExtent extent;
+    if (device_ctl[drive].type == DEVICE_BLOCK && block_access_resolve(drive, 0, &extent)) return (size_t)-1;
+    BlockAccessIo access(drive, device_ctl[drive].type == DEVICE_BLOCK ? extent.generation : 0, offset, length,
+                          device_ctl[drive].type == DEVICE_BLOCK);
+    if (!access.ready()) return (size_t)-1;
     device_t device = device_ctl[drive];
     if (device.type == DEVICE_STREAM) {
         return device.read(drive, (uint8_t *)buffer, length, offset);
@@ -416,6 +476,12 @@ size_t blk_device_write(device_t device, const void *buffer, size_t offset, size
     if (length == 0) {
         return 0;
     }
+    BlockExtent extent;
+    if (device.type == DEVICE_BLOCK && block_access_resolve(device.vdiskid, 0, &extent)) return (size_t)-1;
+    BlockAccessIo access(device.vdiskid, device.type == DEVICE_BLOCK ? extent.generation : 0, offset, length,
+                          device.type == DEVICE_BLOCK);
+    if (!access.ready()) return (size_t)-1;
+    if (device.type == DEVICE_BLOCK) device = device_ctl[device.vdiskid];
     if (!blk_user_buffer_valid(buffer, length)) {
         write_serial_fmt("blk_device_write: reject unmapped buffer=%#llx len=%#llx thread=%s\n",
                          (unsigned long long)(uint64_t)buffer, (unsigned long long)length,
