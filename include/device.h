@@ -48,6 +48,10 @@ int    device_manager_init();
  * @return 注册编号
  */
 int regist_device(const char *path, device_t vd);
+// Trusted drivers only: this declaration requires a real durable flush ioctl.
+int regist_durable_block_device(const char *path, device_t vd);
+// Register the physical interval before publishing a partition's devfs node.
+int regist_partition_device(const char *path, device_t vd, uint32_t parent, uint64_t offset);
 
 /**
  * 卸载一个设备 (devfs也会删除设备节点)

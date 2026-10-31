@@ -1,7 +1,11 @@
+// SPDX-License-Identifier: Apache-2.0
 #include <device.h>
+#include <block_source.h>
 #include <proto.hpp>
 #include <nvme/nvme.h>
 #include <ioctl.h>
+#include <errno.h>
+#include <mutex.h>
 
 #define NVME_CSTS_FATAL (1U << 1)
 #define NVME_CSTS_RDY (1U << 0)
@@ -10,6 +14,7 @@
 #define NVME_SQE_OPC_ADMIN_CREATE_IO_CQ 5U
 #define NVME_SQE_OPC_ADMIN_IDENTIFY 6U
 
+#define NVME_SQE_OPC_IO_FLUSH 0U
 #define NVME_SQE_OPC_IO_WRITE 1U
 #define NVME_SQE_OPC_IO_READ 2U
 
@@ -30,9 +35,33 @@
 //     return beg;
 // }
 
+static mutex_t nvme_operate_lock;
+static bool nvme_lock_ready;
+
+// Boot probing is single-threaded before a current task exists. Runtime I/O
+// uses a sleeping lock; no DMA/PRP allocation occurs under a driver spin lock.
+class NVMEOperation
+{
+    bool locked;
+    bool valid;
+public:
+    NVMEOperation() : locked(nvme_lock_ready && get_current_task()), valid(true)
+    {
+        if (locked && mutex_lock(&nvme_operate_lock) != 0)
+        {
+            locked = false;
+            valid = false;
+        }
+    }
+    ~NVMEOperation() { if (locked) mutex_unlock(&nvme_operate_lock); }
+    bool acquired() const { return valid; }
+};
+
 void NVMEConfigureQ(NVME_CONTROLLER *ctrl, NVME_QUEUE_COMMON *q, uint32_t idx, uint32_t len)
 {
     memset(q, 0, sizeof(NVME_QUEUE_COMMON));
+    q->CTR = ctrl;
+    q->ID = idx >> 1;
     q->DBL = (uint32_t *)(((uint8_t *)ctrl->CAP) + 0x1000 + idx * ctrl->DST);
     q->MSK = len - 1;
 }
@@ -42,6 +71,7 @@ int NVMEConfigureCQ(NVME_CONTROLLER *ctrl, NVME_COMPLETION_QUEUE *cq, uint32_t i
     cq->CQE = 0;
     uint64_t phyAddr = 0;
     phyAddr = (uint64_t)alloc_frames(1);
+    if (!phyAddr) return -ENOMEM;
     cq->CQE = (NVME_COMPLETION_QUEUE_ENTRY *)phys_to_virt(phyAddr);
     memset(cq->CQE, 0, 0x1000);
     cq->COM.HAD = 0;
@@ -54,6 +84,7 @@ int NVMEConfigureSQ(NVME_CONTROLLER *ctrl, NVME_SUBMISSION_QUEUE *sq, uint32_t i
     NVMEConfigureQ(ctrl, &sq->COM, idx, len);
     uint64_t phyAddr = 0;
     phyAddr = (uint64_t)alloc_frames(1);
+    if (!phyAddr) return -ENOMEM;
     sq->SQE = (NVME_SUBMISSION_QUEUE_ENTRY *)phys_to_virt(phyAddr);
     memset(sq->SQE, 0, 0x1000);
     sq->COM.HAD = 0;
@@ -61,69 +92,104 @@ int NVMEConfigureSQ(NVME_CONTROLLER *ctrl, NVME_SUBMISSION_QUEUE *sq, uint32_t i
     sq->COM.PHA = 0;
     return 0;
 }
-int NVMEWaitingRDY(NVME_CONTROLLER *ctrl, uint32_t rdy)
+// Controller enable/disable uses CAP.TO; ordinary I/O gets a bounded 30s
+// deadline. These waits use the monotonic HPET clock, including during boot.
+static constexpr uint64_t kCommandTimeoutNs = 30000000000ULL;
+
+static bool nvme_status_success(uint16_t status)
 {
-    uint32_t csts;
-    while (rdy != ((csts = ctrl->CAP->CST) & NVME_CSTS_RDY))
-    {
-        cpu_relax();
-    }
-    return 0;
+    // Completion STS includes the phase bit in bit 0. Both SC and SCT must be
+    // zero: checking SC alone can incorrectly accept a non-generic error.
+    return (status & 0x0ffeU) == 0;
 }
-NVME_COMPLETION_QUEUE_ENTRY NVMEWaitingCMD(NVME_SUBMISSION_QUEUE *sq, NVME_SUBMISSION_QUEUE_ENTRY *e)
+
+int NVMEWaitingRDY(NVME_CONTROLLER *ctrl, uint32_t ready)
 {
-    NVME_COMPLETION_QUEUE_ENTRY errcqe;
-    memset(&errcqe, 0xFF, sizeof(NVME_COMPLETION_QUEUE_ENTRY));
-
-    if (((sq->COM.TAL + 1) % (sq->COM.MSK + 1ULL)) == sq->COM.HAD)
+    uint64_t start = nanoTime();
+    uint64_t timeout = uint64_t(ctrl->WTO ? ctrl->WTO : 500) * 1000000ULL;
+    for (;;)
     {
-        write_serial_fmt("SUBMISSION QUEUE IS FULL\n");
-        return errcqe;
-    }
-
-    // Commit
-    NVME_SUBMISSION_QUEUE_ENTRY *sqe = sq->SQE + sq->COM.TAL;
-    memcpy(sqe, e, sizeof(NVME_SUBMISSION_QUEUE_ENTRY));
-    sqe->CDW0 |= (uint32_t)sq->COM.TAL << 16;
-
-    // Doorbell
-    sq->COM.TAL++;
-    sq->COM.TAL %= (sq->COM.MSK + 1ULL);
-    sq->COM.DBL[0] = (uint32_t)sq->COM.TAL;
-
-    // Check completion
-    NVME_COMPLETION_QUEUE *cq = sq->ICQ;
-    while ((cq->CQE[cq->COM.HAD].STS & 0x1) != cq->COM.PHA)
-    {
+        uint32_t status = ctrl->CAP->CST;
+        if (ready && (status & NVME_CSTS_FATAL)) return -EIO;
+        if ((status & NVME_CSTS_RDY) == ready) return 0;
+        if (nanoTime() - start >= timeout) return -ETIMEDOUT;
         cpu_relax();
     }
+}
 
-    // Consume CQE
-    NVME_COMPLETION_QUEUE_ENTRY *cqe = cq->CQE + cq->COM.HAD;
-    uint16_t cqNextHAD = (cq->COM.HAD + 1) % (cq->COM.MSK + 1ULL);
-    if (cqNextHAD < cq->COM.HAD)
-    {
-        cq->COM.PHA ^= 1;
-    }
-    cq->COM.HAD = cqNextHAD;
+static bool nvme_quiesce(NVME_CONTROLLER *ctrl)
+{
+    ctrl->CAP->CC = 0;
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    ctrl->DMA_STOPPED = NVMEWaitingRDY(ctrl, 0) == 0;
+    return ctrl->DMA_STOPPED;
+}
 
-    if (cqe->QHD != sq->COM.HAD)
+static NVME_COMPLETION_QUEUE_ENTRY nvme_transport_error(NVME_CONTROLLER *ctrl)
+{
+    NVME_COMPLETION_QUEUE_ENTRY error = {};
+    error.STS = 0xffff;
+    ctrl->FAILED = true;
+    if (!nvme_quiesce(ctrl))
+        write_serial_string("NVME: controller could not quiesce; DMA allocations remain pinned\n");
+    return error;
+}
+
+NVME_COMPLETION_QUEUE_ENTRY NVMEWaitingCMD(NVME_SUBMISSION_QUEUE *sq, NVME_SUBMISSION_QUEUE_ENTRY *command)
+{
+    NVME_CONTROLLER *ctrl = sq->COM.CTR;
+    NVME_COMPLETION_QUEUE_ENTRY error = {};
+    error.STS = 0xffff;
+    if (!ctrl || ctrl->FAILED || !sq->ICQ || !sq->SQE || !sq->ICQ->CQE) return error;
+    if ((ctrl->CAP->CST & NVME_CSTS_FATAL) ||
+        ((sq->COM.TAL + 1) % (sq->COM.MSK + 1ULL)) == sq->COM.HAD)
+        return nvme_transport_error(ctrl);
+
+    uint16_t id = sq->COM.TAL;
+    NVME_SUBMISSION_QUEUE_ENTRY *submitted = sq->SQE + id;
+    memcpy(submitted, command, sizeof(*submitted));
+    submitted->CDW0 = (submitted->CDW0 & 0xffffU) | (uint32_t(id) << 16);
+    sq->COM.TAL = (sq->COM.TAL + 1) % (sq->COM.MSK + 1ULL);
+    // Publish the complete SQE before ringing its MMIO doorbell.
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    *(volatile uint32_t *)sq->COM.DBL = sq->COM.TAL;
+
+    NVME_COMPLETION_QUEUE *cq = sq->ICQ;
+    uint64_t start = nanoTime();
+    while ((__atomic_load_n(&cq->CQE[cq->COM.HAD].STS, __ATOMIC_ACQUIRE) & 1U) != cq->COM.PHA)
     {
-        sq->COM.HAD = cqe->QHD;
+        if ((ctrl->CAP->CST & NVME_CSTS_FATAL) || nanoTime() - start >= kCommandTimeoutNs)
+        {
+            write_serial_string("NVME: command failed or timed out; controller taken offline\n");
+            return nvme_transport_error(ctrl);
+        }
+        cpu_relax();
     }
-    // Doorbell
-    cq->COM.DBL[0] = (uint32_t)cq->COM.HAD;
-    return *cqe;
+    if (ctrl->CAP->CST & NVME_CSTS_FATAL) return nvme_transport_error(ctrl);
+    // Snapshot before releasing the CQ slot to the controller. It may reuse
+    // that memory as soon as the completion-head doorbell advances.
+    NVME_COMPLETION_QUEUE_ENTRY completed;
+    memcpy(&completed, cq->CQE + cq->COM.HAD, sizeof(completed));
+    if (completed.CID != id || completed.QID != sq->COM.ID || completed.QHD > sq->COM.MSK)
+        return nvme_transport_error(ctrl);
+    sq->COM.HAD = completed.QHD;
+    uint16_t next = (cq->COM.HAD + 1) % (cq->COM.MSK + 1ULL);
+    if (next < cq->COM.HAD) cq->COM.PHA ^= 1;
+    cq->COM.HAD = next;
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    *(volatile uint32_t *)cq->COM.DBL = cq->COM.HAD;
+    return completed;
 }
 
 void nvme_rwfail(uint16_t status)
 {
-    write_serial_fmt("Status: %#010lx, status code: %#010lx, status code type: %#010lx\n", status, status & 0xFF, (status >> 8) & 0x7);
+    write_serial_fmt("NVME: completion status=%x SC=%x SCT=%x\n", status,
+                     (status >> 1) & 0xffU, (status >> 9) & 7U);
 }
+
 static inline void *alloc_frames_bytes(uint64_t bytes) {
-    uint64_t addr = (uint64_t)phys_to_virt(
-        alloc_frames((bytes + PAGE_SIZE - 1) / PAGE_SIZE));
-    return (void *)addr;
+    uint64_t physical = alloc_frames((bytes + PAGE_SIZE - 1) / PAGE_SIZE);
+    return physical ? (void *)phys_to_virt(physical) : NULL;
 }
 
 static inline void free_frames_bytes(void *ptr, uint64_t bytes) {
@@ -133,7 +199,10 @@ static inline void free_frames_bytes(void *ptr, uint64_t bytes) {
 
 bool BuildPRPList(void *vaddr, uint64_t size, NVME_PRP_LIST *prpList)
 {
+    if (!vaddr || !prpList || !size || size > 128 * 1024) return false;
+    memset(prpList, 0, sizeof(*prpList));
     uint64_t vaddrStart = (uint64_t)vaddr;
+    if (size > ~(uint64_t)0 - vaddrStart) return false;
     uint64_t vaddrEnd = vaddrStart + size;
     uint64_t pageMask = PAGE_SIZE - 1;
 
@@ -188,71 +257,70 @@ void FreePRPList(NVME_PRP_LIST *prpList)
 
 uint32_t NVMETransfer(NVME_NAMESPACE *ns, void *buf, uint64_t lba, uint32_t count, uint32_t write)
 {
-    if (!count || !ns || !buf)
-        return 0;
-
-    if (lba + count > ns->NLBA)
-    {
-        write_serial_fmt("NVME: LBA out of range (lba=%llu, count=%u, max=%llu)\n", lba, count, ns->NLBA);
-        return 0;
-    }
+    NVMEOperation operation;
+    if (!operation.acquired()) return 0;
+    if (!count || !ns || !buf || !ns->CTRL || ns->CTRL->FAILED ||
+        (write && ns->CTRL->WRITE_FAILED) || !ns->BSZ ||
+        lba > ns->NLBA || count > ns->NLBA - lba) return 0;
 
     uint32_t transferred = 0;
-    uint8_t *currentBuf = (uint8_t *)buf;
-    uint64_t currentLBA = lba;
-
-    while (count > 0)
+    while (count)
     {
-        uint32_t chunk = count;
-        if (ns->MXRS != (uint32_t)-1 && chunk > ns->MXRS)
+        // The existing PRP-list builder supports one list page. A small,
+        // page-aligned owned buffer also prevents late DMA into caller memory
+        // if a controller cannot be stopped after a command timeout.
+        uint32_t chunk = 128 * 1024 / ns->BSZ;
+        if (!chunk) return transferred;
+        if (chunk > count) chunk = count;
+        if (ns->MXRS != (uint32_t)-1 && chunk > ns->MXRS) chunk = ns->MXRS;
+        if (!chunk) return transferred;
+        uint64_t size = uint64_t(chunk) * ns->BSZ;
+        void *bounce = alloc_frames_bytes(size);
+        if (!bounce) return transferred;
+        if (write) memcpy(bounce, (uint8_t *)buf + uint64_t(transferred) * ns->BSZ, size);
+        NVME_PRP_LIST prp = {};
+        if (!BuildPRPList(bounce, size, &prp))
         {
-            chunk = ns->MXRS;
-        }
-
-        uint64_t size = chunk * ns->BSZ;
-        NVME_PRP_LIST prpList;
-        if (!BuildPRPList(currentBuf, size, &prpList))
-        {
-            write_serial_fmt("NVME: Failed to build PRP list\n");
+            free_frames_bytes(bounce, size);
             return transferred;
         }
-
-        NVME_SUBMISSION_QUEUE_ENTRY sqe;
-        memset(&sqe, 0, sizeof(NVME_SUBMISSION_QUEUE_ENTRY));
-        sqe.CDW0 = write ? NVME_SQE_OPC_IO_WRITE : NVME_SQE_OPC_IO_READ;
-        sqe.NSID = ns->NSID;
-        sqe.CDWA = (uint32_t)(currentLBA & 0xFFFFFFFF);
-        sqe.CDWB = (uint32_t)(currentLBA >> 32);
-        sqe.CDWC = (1UL << 31) | ((chunk - 1) & 0xFFFF);
-
-        sqe.DATA[0] = prpList.prp1;
-        sqe.DATA[1] = prpList.prp2;
-        if (prpList.UPRP)
+        NVME_SUBMISSION_QUEUE_ENTRY command = {};
+        command.CDW0 = write ? NVME_SQE_OPC_IO_WRITE : NVME_SQE_OPC_IO_READ;
+        command.NSID = ns->NSID;
+        command.CDWA = uint32_t(lba);
+        command.CDWB = uint32_t(lba >> 32);
+        // NLB is zero-based. Bit 31 would request Limited Retry, not FUA;
+        // write durability is requested with the explicit Flush command below.
+        command.CDWC = chunk - 1;
+        command.DATA[0] = prp.prp1;
+        command.DATA[1] = prp.prp2;
+        NVME_COMPLETION_QUEUE_ENTRY completed = NVMEWaitingCMD(&ns->CTRL->ISQ, &command);
+        bool success = nvme_status_success(completed.STS);
+        if (success && !write)
+            memcpy((uint8_t *)buf + uint64_t(transferred) * ns->BSZ, bounce, size);
+        // A completion ends DMA for this command. On transport failure only
+        // RDY=0 proves that it is safe to release controller-owned memory.
+        if (!ns->CTRL->FAILED || ns->CTRL->DMA_STOPPED)
         {
-            sqe.CDW0 |= NVME_SQE_PRP_PTR;
+            FreePRPList(&prp);
+            free_frames_bytes(bounce, size);
         }
-
-        NVME_COMPLETION_QUEUE_ENTRY cqe = NVMEWaitingCMD(&ns->CTRL->ISQ, &sqe);
-        if ((cqe.STS >> 1) & 0xFF)
+        if (!success)
         {
-            nvme_rwfail(cqe.STS);
-            FreePRPList(&prpList);
+            if (write) ns->CTRL->WRITE_FAILED = true;
+            nvme_rwfail(completed.STS);
             return transferred;
         }
-
-        currentBuf += size;
-        currentLBA += chunk;
         transferred += chunk;
+        lba += chunk;
         count -= chunk;
-
-        FreePRPList(&prpList);
     }
-
     return transferred;
 }
 
 void failed_nvme(NVME_CONTROLLER *ctrl)
 {
+    if (!ctrl || !nvme_quiesce(ctrl)) return;
     if (ctrl->ICQ.CQE)
     {
         free_frames((uint64_t)virt_to_phys((uint64_t)ctrl->ICQ.CQE), 1);
@@ -271,47 +339,84 @@ void failed_nvme(NVME_CONTROLLER *ctrl)
     }
 }
 
-void failed_namespace(NVME_IDENTIFY_NAMESPACE *identifyNS)
+void failed_namespace(NVME_IDENTIFY_NAMESPACE *identifyNS, NVME_CONTROLLER *ctrl)
 {
-    free_frames((uint64_t)virt_to_phys((uint64_t)identifyNS), 1);
+    if (!ctrl->FAILED || ctrl->DMA_STOPPED)
+        free_frames((uint64_t)virt_to_phys((uint64_t)identifyNS), 1);
 }
-NVME_NAMESPACE * NV_MAP[256];
-spin_t nvme_operate_lock = SPIN_INIT;
-size_t nvme_read(int data, void *buffer, uint64_t bytes,uint64_t lba)
+NVME_NAMESPACE *NV_MAP[256];
+
+size_t nvme_read(int data, void *buffer, uint64_t count, uint64_t lba)
 {
-    spin_lock(&nvme_operate_lock);
-    size_t ret = NVMETransfer((NVME_NAMESPACE *)NV_MAP[data], buffer, lba, bytes, false);
-    spin_unlock(&nvme_operate_lock);
-    return ret;
+    return data >= 0 && data < 256 && count <= 0xffffffffULL
+               ? NVMETransfer(NV_MAP[data], buffer, lba, uint32_t(count), false) : 0;
 }
 
-size_t nvme_write(int data, void *buffer, uint64_t bytes,uint64_t lba)
+size_t nvme_write(int data, void *buffer, uint64_t count, uint64_t lba)
 {
-    spin_lock(&nvme_operate_lock);
-    size_t ret = NVMETransfer((NVME_NAMESPACE *)NV_MAP[data], buffer, lba, bytes, true);
-    spin_unlock(&nvme_operate_lock);
-    return ret;
+    return data >= 0 && data < 256 && count <= 0xffffffffULL
+               ? NVMETransfer(NV_MAP[data], buffer, lba, uint32_t(count), true) : 0;
 }
 
-static int nvme_ioctl(device_t *device, size_t req, void *arg)
+static int nvme_ioctl(device_t *device, size_t request, void *)
 {
-    (void)device;
-    (void)arg;
-    return req == IOBLKSYNC ? 0 : -1;
+    if (request != IOBLKSYNC) return -EOPNOTSUPP;
+    NVMEOperation operation;
+    if (!operation.acquired()) return -EIO;
+    if (!device || device->vdiskid >= 256 || !NV_MAP[device->vdiskid]) return -ENODEV;
+    NVME_NAMESPACE *ns = NV_MAP[device->vdiskid];
+    if (ns->CTRL->FAILED || ns->CTRL->WRITE_FAILED) return -EIO;
+    // NVM Flush has no data transfer, PRPs, or command-specific dwords. NSID
+    // targets this namespace; this is not an invalid zero-length read/write.
+    NVME_SUBMISSION_QUEUE_ENTRY command = {};
+    command.CDW0 = NVME_SQE_OPC_IO_FLUSH;
+    command.NSID = ns->NSID;
+    NVME_COMPLETION_QUEUE_ENTRY completed = NVMEWaitingCMD(&ns->CTRL->ISQ, &command);
+    if (!nvme_status_success(completed.STS))
+    {
+        ns->CTRL->WRITE_FAILED = true;
+        nvme_rwfail(completed.STS);
+        return -EIO;
+    }
+    return 0;
 }
 
 NVME_CONTROLLER *nvme_driver_init(uint64_t bar0, uint64_t bar_size)
 {
-    NVME_CAPABILITY *cap = (NVME_CAPABILITY *)phys_to_virt(bar0);
-    page_map_range(get_current_directory(), (uint64_t)cap, bar0, bar_size, PTE_PRESENT | PTE_WRITEABLE);
+    if (!nvme_lock_ready)
+    {
+        mutex_create(&nvme_operate_lock, false);
+        nvme_lock_ready = true;
+    }
+    if (!bar0 || (bar0 & (PAGE_SIZE - 1)) || bar_size < 0x1008) return NULL;
+    // Firmware may back the HHDM with huge pages. page_map_range creates 4 KiB
+    // mappings and cannot split those leaves: remapping an HHDM BAR there can
+    // mistake a huge physical frame for a page table. Use the dedicated driver
+    // alias, also giving device registers an explicitly uncached mapping.
+    NVME_CAPABILITY *cap = (NVME_CAPABILITY *)driver_phys_to_virt(bar0);
+    constexpr uint64_t mmio_flags = PTE_PRESENT | PTE_WRITEABLE | (1ULL << 3) | (1ULL << 4);
+    page_map_range(get_current_directory(), (uint64_t)cap, bar0, PAGE_SIZE, mmio_flags);
 
+    if (((cap->CAP >> 48) & 0xf) != 0)
+    {
+        write_serial_string("NVME: controller requires pages larger than 4 KiB\n");
+        return NULL;
+    }
     if (!((cap->CAP >> 37) & 1))
     {
         write_serial_fmt("NVME CONTROLLER DOES NOT SUPPORT NVME COMMAND SET\n");
         return NULL;
     }
+    uint64_t stride = 4ULL << ((cap->CAP >> 32) & 0xf);
+    uint64_t doorbell_bytes = 3 * stride + sizeof(uint32_t);
+    if (bar_size - 0x1000 < doorbell_bytes) return NULL;
+    // Only queues 0 and 1 are used. A BAR may also expose a large controller
+    // memory buffer, which does not need mapping for these register accesses.
+    page_map_range(get_current_directory(), (uint64_t)cap + 0x1000, bar0 + 0x1000,
+                   doorbell_bytes, mmio_flags);
 
     NVME_CONTROLLER *ctrl = (NVME_CONTROLLER *)malloc(sizeof(NVME_CONTROLLER));
+    if (!ctrl) return NULL;
     memset(ctrl, 0, sizeof(NVME_CONTROLLER));
     ctrl->CAP = cap;
     ctrl->WTO = 500 * ((cap->CAP >> 24) & 0xFF);
@@ -324,7 +429,7 @@ NVME_CONTROLLER *nvme_driver_init(uint64_t bar0, uint64_t bar_size)
         failed_nvme(ctrl);
         return NULL;
     }
-    ctrl->DST = 4ULL << ((cap->CAP >> 32) & 0xF);
+    ctrl->DST = stride;
 
     int rc = NVMEConfigureCQ(ctrl, &ctrl->ACQ, 1, 0x1000 / sizeof(NVME_COMPLETION_QUEUE_ENTRY));
     if (rc)
@@ -358,6 +463,7 @@ NVME_CONTROLLER *nvme_driver_init(uint64_t bar0, uint64_t bar_size)
     // Identify Controller
     NVME_IDENTIFY_CONTROLLER *identify = 0;
     identify = (NVME_IDENTIFY_CONTROLLER *)alloc_frames(1);
+    if (!identify) { failed_nvme(ctrl); return NULL; }
     identify = (NVME_IDENTIFY_CONTROLLER *)phys_to_virt((uint64_t)identify);
     memset(identify, 0, 0x1000);
 
@@ -370,7 +476,7 @@ NVME_CONTROLLER *nvme_driver_init(uint64_t bar0, uint64_t bar_size)
     sqe.NSID = 0;
     sqe.CDWA = NVME_ADMIN_IDENTIFY_CNS_ID_CTRL;
     NVME_COMPLETION_QUEUE_ENTRY cqe = NVMEWaitingCMD(&ctrl->ASQ, &sqe);
-    if ((cqe.STS >> 1) & 0xFF)
+    if (!nvme_status_success(cqe.STS))
     {
         write_serial_fmt("CANNOT IDENTIFY NVME CONTROLLER\n");
         failed_nvme(ctrl);
@@ -425,7 +531,7 @@ NVME_CONTROLLER *nvme_driver_init(uint64_t bar0, uint64_t bar_size)
         ccq.CDWB = 1;
 
         cqe = NVMEWaitingCMD(&ctrl->ASQ, &ccq);
-        if ((cqe.STS >> 1) & 0xFF)
+        if (!nvme_status_success(cqe.STS))
         {
             write_serial_fmt("CANNOT CREATE I/O CQ\n");
             failed_nvme(ctrl);
@@ -455,7 +561,7 @@ NVME_CONTROLLER *nvme_driver_init(uint64_t bar0, uint64_t bar_size)
         csq.CDWB = ((qidx >> 1) << 16) | 1;
 
         cqe = NVMEWaitingCMD(&ctrl->ASQ, &csq);
-        if ((cqe.STS >> 1) & 0xFF)
+        if (!nvme_status_success(cqe.STS))
         {
             write_serial_fmt("CANNOT CREATE I/O SQ");
             failed_nvme(ctrl);
@@ -474,6 +580,7 @@ NVME_CONTROLLER *nvme_driver_init(uint64_t bar0, uint64_t bar_size)
     uint32_t nsid = nsidx + 1;
 
     NVME_IDENTIFY_NAMESPACE *identifyNS = (NVME_IDENTIFY_NAMESPACE *)alloc_frames_bytes(PAGE_SIZE);
+    if (!identifyNS) { failed_nvme(ctrl); return NULL; }
     memset(identifyNS, 0, 0x1000);
 
     memset(&sqe, 0, sizeof(NVME_SUBMISSION_QUEUE_ENTRY));
@@ -484,10 +591,10 @@ NVME_CONTROLLER *nvme_driver_init(uint64_t bar0, uint64_t bar_size)
     sqe.NSID = nsid;
     sqe.CDWA = NVME_ADMIN_IDENTIFY_CNS_ID_NS;
     cqe = NVMEWaitingCMD(&ctrl->ASQ, &sqe);
-    if ((cqe.STS >> 1) & 0xFF)
+    if (!nvme_status_success(cqe.STS))
     {
         write_serial_fmt("CANNOT IDENTIFY NAMESPACE\n");
-        failed_namespace(identifyNS);
+        failed_namespace(identifyNS, ctrl);
         return NULL;
     }
 
@@ -495,18 +602,19 @@ NVME_CONTROLLER *nvme_driver_init(uint64_t bar0, uint64_t bar_size)
     if (currentLBAFormat > identifyNS->NLBA)
     {
         write_serial_fmt("Current LBA Format error\n");
-        failed_namespace(identifyNS);
+        failed_namespace(identifyNS, ctrl);
         return NULL;
     }
 
     if (!identifyNS->SIZE)
     {
         write_serial_fmt("Invalid namespace size\n");
-        failed_namespace(identifyNS);
+        failed_namespace(identifyNS, ctrl);
         return NULL;
     }
 
     NVME_NAMESPACE *ns = (NVME_NAMESPACE *)malloc(sizeof(NVME_NAMESPACE));
+    if (!ns) { failed_namespace(identifyNS, ctrl); failed_nvme(ctrl); return NULL; }
     memset(ns, 0, sizeof(NVME_NAMESPACE));
     ns->CTRL = ctrl;
     ns->NSID = nsid;
@@ -514,29 +622,38 @@ NVME_CONTROLLER *nvme_driver_init(uint64_t bar0, uint64_t bar_size)
 
     NVME_LOGICAL_BLOCK_ADDRESS *fmt = identifyNS->LBAF + currentLBAFormat;
 
-    ns->BSZ = 1ULL << fmt->DS;
+    if (fmt->DS < 9 || fmt->DS > 12 || fmt->MS)
+    {
+        failed_namespace(identifyNS, ctrl);
+        failed_nvme(ctrl);
+        free(ns);
+        return NULL;
+    }
+    ns->BSZ = 1U << fmt->DS;
     ns->META = fmt->MS;
-    if (ns->BSZ > 0x1000)
+    if (ns->BSZ > 0x1000 || ns->NLBA > (~(uint64_t)0) / ns->BSZ)
     {
         write_serial_fmt("BLOCK SIZE > 0x1000 !!!\n");
-        failed_namespace(identifyNS);
+        failed_namespace(identifyNS, ctrl);
         free(ns);
         return NULL;
     }
 
-    if (mdts)
+    ns->MXRS = 128 * 1024 / ns->BSZ;
+    if (mdts && mdts < 16)
     {
-        ns->MXRS = ((1ULL << mdts) * 0x1000) / ns->BSZ;
+        uint64_t limit = ((1ULL << mdts) * PAGE_SIZE) / ns->BSZ;
+        if (limit < ns->MXRS) ns->MXRS = uint32_t(limit);
     }
-    else
-    {
-        ns->MXRS = -1;
-    }
+    uint8_t source_eui64[8];
+    memcpy(source_eui64, &identifyNS->XUID, sizeof(source_eui64));
+    bool source_shared_namespace = (identifyNS->NMIC & 1) != 0;
+    failed_namespace(identifyNS, ctrl);
 
     // regist_blkdev((char *)"nvme", ns, ns->BSZ, ns->NLBA * ns->BSZ, ns->MXRS * ns->BSZ, nvme_read, nvme_write);
     char name_buf[20];
     sprintf(name_buf, "nvme%d", 1);
-    device_t sata;
+    device_t sata = {};
     sata.size = ns->NLBA*ns->BSZ;
     sata.sector_size = ns->BSZ;
     sata.type = DEVICE_BLOCK;
@@ -550,7 +667,37 @@ NVME_CONTROLLER *nvme_driver_init(uint64_t bar0, uint64_t bar_size)
     sata.write_vbuf = NULL;
     sata.max_size   = ns->MXRS * ns->BSZ;
     strcpy(sata.drive_name, name_buf);
-    int id = regist_device(NULL, sata);
+    int id = regist_durable_block_device(NULL, sata);
+    if (id < 0 || id >= 256)
+    {
+        failed_nvme(ctrl);
+        free(ns);
+        return NULL;
+    }
     NV_MAP[id] = ns;
+    // Authenticate the controller that actually owns this initialized BAR.
+    // Duplicate BAR aliases and shared/multipath namespaces remain unsupported.
+    pci_device_t *source_controller = NULL;
+    bool source_ambiguous = false;
+    for (uint32_t i = 0; i < get_pci_num() && i < PCI_DEVICE_MAX; ++i)
+    {
+        pci_device_t *candidate = pci_devices[i];
+        if (!candidate || (candidate->class_code >> 8) != 0x0108 ||
+            candidate->bars[0].address != bar0 || candidate->bars[0].size != bar_size) continue;
+        if (source_controller) { source_ambiguous = true; break; }
+        source_controller = candidate;
+    }
+    if (source_controller && !source_ambiguous && !source_shared_namespace)
+    {
+        BlockSourceHardware provenance = {};
+        provenance.controller = source_controller;
+        provenance.transport = XJ_INSTALLER_SOURCE_NVME;
+        provenance.block_size = ns->BSZ;
+        provenance.bytes = sata.size;
+        provenance.nvme_namespace = ns->NSID;
+        memcpy(provenance.nvme_eui64, source_eui64, sizeof(source_eui64));
+        int source_status = block_source_register((uint32_t)id, provenance);
+        if (source_status) write_serial_fmt("NVMe source provenance unavailable: %d\n", source_status);
+    }
     return ctrl;
 }

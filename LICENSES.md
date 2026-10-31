@@ -9,6 +9,7 @@ binary distribution. The command-line image installs the repository notices at
 | Component | License | Source location | Image location |
 | --- | --- | --- | --- |
 | XJ380 project | Apache-2.0 | `LICENSE` | `LICENSE` |
+| Native first-party ext4 driver, journaled mutation core, offline formatter and fresh-volume factory build/readback | Apache-2.0 | `driver/fs/ext4/PROVENANCE.md`; `driver/fs/ext4/SOURCE.json`; `kernel/installer/` | `/system/licenses/native-ext4/` |
 | FatFs | ChaN permissive license | `driver/fs/fatfs/ff.cpp` | `fatfs.txt` |
 | lwIP | BSD-style | compiled files under `kmod/netserver/lwip/` | `lwip-notice-full.txt` |
 | musl ELF definitions | MIT | `include/elf.h`; `third_party/musl-elf` | `musl-elf.txt`; `third-party compliance bundle` |

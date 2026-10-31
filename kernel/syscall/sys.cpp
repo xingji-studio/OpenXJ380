@@ -1,9 +1,11 @@
 #include <user/permissions.h>
 #include <input_method.h>
 #include <syscall/syscall.h>
+#include <syscall/fd_lifetime.h>
 #include <proto.hpp>
 #include <fs/vfs/vfs.h>
 #include <fs/fatfs/fatfs.h>
+#include <fs/ext4/ext4.h>
 #include <ioctl.h>
 #include <cpu/fsgsbase.h>
 #include <task/poll.h>
@@ -172,6 +174,11 @@ static uint64_t fill_stat_from_node(vfs_node_t node, struct stat *out)
 {
     if (!vfs_check_access(node, NULL, IME_FILE_STAT)) return SYSCALL_FAULT_(vfs_last_error());
     if (node == NULL || out == NULL) return SYSCALL_FAULT_(EINVAL);
+    if (ext4fs_owns_node(node))
+    {
+        int error = ext4fs_stat(node, out);
+        return error < 0 ? SYSCALL_FAULT_(-error) : 0;
+    }
     memset(out, 0, sizeof(*out));
     uint64_t ctime_ns = node->createtime;
     uint64_t mtime_ns = node->writetime;
@@ -287,6 +294,12 @@ static uint64_t statfs_kernel_node(vfs_node_t node, struct statfs *buf)
     {
         struct statfs fatfs_buf;
         if (fatfs_statfs(node, &fatfs_buf) == EOK) kbuf = fatfs_buf;
+    }
+
+    if (ext4fs_owns_node(node))
+    {
+        int error = ext4fs_statfs(node, &kbuf);
+        if (error < 0) return SYSCALL_FAULT_(-error);
     }
 
     if (!copy_to_user_pagedir(current_user_pagedir(), buf, &kbuf, sizeof(kbuf))) return SYSCALL_FAULT_(EFAULT);
@@ -560,18 +573,18 @@ static bool wait4_pid_matches(pcb_t child, long pid)
     return pid == -1 ? true : (long)child->pid == pid;
 }
 
-static pcb_t wait4_find_child(pcb_t parent, long pid)
+static bool wait4_has_child(pcb_t parent, long pid)
 {
-    if (parent == NULL || parent->child_pcb == NULL) return NULL;
+    if (parent == NULL || parent->child_pcb == NULL) return false;
 
-    pcb_t found = NULL;
+    bool found = false;
     spin_lock(&parent->child_pcb->lock);
     queue_foreach(parent->child_pcb, node)
     {
         pcb_t child = (pcb_t)node->data;
         if (wait4_pid_matches(child, pid))
         {
-            found = child;
+            found = true;
             break;
         }
     }
@@ -589,8 +602,13 @@ static pcb_t wait4_find_zombie_child(pcb_t parent, long pid)
     queue_foreach(parent->child_pcb, node)
     {
         pcb_t child = (pcb_t)node->data;
-        if (child != NULL && child->status == ZOMBIE && wait4_pid_matches(child, pid))
+        if (child != NULL && child->status == ZOMBIE && !__atomic_load_n(&child->wait_owner, __ATOMIC_ACQUIRE) &&
+            wait4_pid_matches(child, pid))
         {
+            // The parent child-list lock publishes one exclusive waiter.
+            // WAIT is unschedulable and cannot be mistaken for another zombie.
+            __atomic_store_n(&child->wait_owner, get_current_task(), __ATOMIC_RELEASE);
+            __atomic_store_n(&child->status, WAIT, __ATOMIC_RELEASE);
             found = child;
             break;
         }
@@ -639,6 +657,10 @@ static uint64_t wait4_reap_child(pcb_t parent, pcb_t child, int *status)
         int wait_status = (child->exit_code & 0xff) << 8;
         if (!copy_to_user_pagedir(parent->pagedir, status, &wait_status, sizeof(wait_status)))
         {
+            spin_lock(&parent->child_pcb->lock);
+            __atomic_store_n(&child->wait_owner, (tcb_t)NULL, __ATOMIC_RELEASE);
+            if (child->status == WAIT) __atomic_store_n(&child->status, ZOMBIE, __ATOMIC_RELEASE);
+            spin_unlock(&parent->child_pcb->lock);
             return SYSCALL_FAULT_(EFAULT);
         }
     }
@@ -654,7 +676,7 @@ static uint64_t wait4_reap_child(pcb_t parent, pcb_t child, int *status)
                          child->exit_code,
                          child->status);
     }
-    kill_proc(child, child->exit_code, false);
+    process_complete_wait(child);
     return child_pid;
 }
 
@@ -696,21 +718,31 @@ static uint64_t open_kernel_path(char *path0, uint64_t flags, uint64_t mode)
         free(normalized_path);
         return SYSCALL_FAULT_(vfs_last_error());
     }
+    if (node && (flags & O_CREAT) && (flags & O_EXCL))
+    {
+        vfs_close(node);
+        free(normalized_path);
+        return SYSCALL_FAULT_(EEXIST);
+    }
     if (node == NULL)
     {
         if (flags & O_CREAT)
         {
-            if (mode & O_DIRECTORY) { vfs_mkdir(normalized_path); }
-            else
-                vfs_mkfile(normalized_path);
+            pcb_t process = get_current_task()->parent_group;
+            uint16_t create_mode = (uint16_t)(mode & 07777 & ~(process ? process->umask : 0));
+            int created = (mode & O_DIRECTORY) ?
+                vfs_mkdir_mode(normalized_path, create_mode, current_uid(), current_gid()) :
+                vfs_mkfile_mode(normalized_path, create_mode, current_uid(), current_gid());
+            if (created != 0) goto err;
             node = vfs_open(normalized_path);
             if (node == NULL)
                 goto err;
             else {
-                stamp_node_owner(node);
-                pcb_t process = get_current_task()->parent_group;
-                uint64_t create_mode = mode & ~(process != NULL ? process->umask : 0);
-                if ((create_mode & 07777) != 0) node->mode = (uint16_t)(create_mode & 07777);
+                if (!ext4fs_owns_node(node))
+                {
+                    stamp_node_owner(node);
+                    if (create_mode) node->mode = create_mode;
+                }
                 goto next;
             }
         }
@@ -749,20 +781,18 @@ next:
     }
 
     fd_file_handle *fd_handle = (fd_file_handle *)calloc(1, sizeof(fd_file_handle));
-    // not_null_assets(fd_handle, "sys_open: null alloc fd");
+    if (!fd_handle) { vfs_close(node); free(normalized_path); return SYSCALL_FAULT_(ENOMEM); }
     fd_handle->offset = flags & O_APPEND ? node->size : 0;
     fd_handle->node   = node;
     fd_handle->flags  = flags;
     fd_handle->node->flags = flags;
-    int index         = (int)queue_enqueue_lowest(get_current_task()->parent_group->file_open, fd_handle);
-    fd_handle->fd     = index;
-    if (index == -1)
+    int index = fd_install_handle(get_current_task()->parent_group, fd_handle, 0, false);
+    if (index < 0)
     {
         write_serial_fmt("sys_open: open %s failed.\n", normalized_path);
-        vfs_close(node);
-        free(fd_handle);
+        fd_retire_handle(fd_handle);
         free(normalized_path);
-        return SYSCALL_FAULT_(ENOENT);
+        return SYSCALL_FAULT_(-index);
     }
     free(normalized_path);
     return index;
@@ -788,70 +818,25 @@ sys_(open, char *path0, uint64_t flags, uint64_t mode)
 sys_(close, int fd)
 {
     if (unlikely(fd < 0)) return SYSCALL_FAULT_(EINVAL);
-    fd_file_handle *handle = (fd_file_handle *)queue_remove_at(get_current_task()->parent_group->file_open, fd);
+    fd_file_handle *handle = fd_detach_descriptor(get_current_task()->parent_group, size_t(fd));
     if (handle == NULL) return SYSCALL_FAULT_(EBADF);
-    vfs_close(handle->node);
-    free(handle);
-    return 0;
+    int error = fd_retire_handle(handle);
+    return error < 0 ? SYSCALL_FAULT_(-error) : 0;
 }
 
 sys_(close_range, uint32_t first, uint32_t last, uint32_t flags)
 {
     if ((flags & ~(CLOSE_RANGE_UNSHARE | CLOSE_RANGE_CLOEXEC)) != 0) return SYSCALL_FAULT_(EINVAL);
-    if ((flags & CLOSE_RANGE_UNSHARE) != 0) return SYSCALL_FAULT_(ENOSYS);
+    if (flags & CLOSE_RANGE_UNSHARE) return SYSCALL_FAULT_(ENOSYS);
     if (first > last) return SYSCALL_FAULT_(EINVAL);
-
     pcb_t process = get_current_task()->parent_group;
-    if (process == NULL || process->file_open == NULL) return SYSCALL_FAULT_(EBADF);
-
-    const bool cloexec = (flags & CLOSE_RANGE_CLOEXEC) != 0;
-    lock_queue *queue = process->file_open;
-    size_t count = 0;
-
-    spin_lock(&queue->lock);
-    for (lock_node *node = queue->head; node != NULL; node = node->next)
+    if (!process) return SYSCALL_FAULT_(EBADF);
+    if (flags & CLOSE_RANGE_CLOEXEC)
     {
-        if (node->index >= first && node->index <= last) count++;
+        fd_mark_cloexec(process, first, last);
+        return 0;
     }
-
-    size_t *fds = NULL;
-    if (count != 0)
-    {
-        fds = (size_t *)malloc(sizeof(size_t) * count);
-        if (fds == NULL)
-        {
-            spin_unlock(&queue->lock);
-            return SYSCALL_FAULT_(ENOMEM);
-        }
-
-        size_t i = 0;
-        for (lock_node *node = queue->head; node != NULL; node = node->next)
-        {
-            if (node->index >= first && node->index <= last) fds[i++] = node->index;
-        }
-    }
-    spin_unlock(&queue->lock);
-
-    for (size_t i = 0; i < count; i++)
-    {
-        fd_file_handle *handle = (fd_file_handle *)queue_get(queue, fds[i]);
-        if (handle == NULL) continue;
-
-        if (cloexec)
-        {
-            handle->flags |= O_CLOEXEC;
-            continue;
-        }
-
-        handle = (fd_file_handle *)queue_remove_at(queue, fds[i]);
-        if (handle != NULL)
-        {
-            vfs_close(handle->node);
-            free(handle);
-        }
-    }
-
-    free(fds);
+    while (fd_file_handle *handle = fd_detach_matching(process, first, last, false)) fd_retire_handle(handle);
     return 0;
 }
 
@@ -866,7 +851,10 @@ sys_(write, int fd, uint8_t *buffer, size_t size)
     if (unlikely(size == 0)) return 0;
     if (fd == 2) mirror_linux_output_to_serial("stderr", buffer, size);
     else if (fd == 1 && trace_xbps_task()) mirror_linux_output_to_serial("stdout", buffer, size);
-    fd_file_handle *handle = (fd_file_handle *)queue_get(get_current_task()->parent_group->file_open, fd);
+    FdOperation operation;
+    int operation_error = operation.acquire(fd);
+    if (operation_error) return SYSCALL_FAULT_(-operation_error);
+    fd_file_handle *handle = operation.get();
     if (!handle) return SYSCALL_FAULT_(EBADF);
     if (handle->node->type & file_socket)
     {
@@ -879,17 +867,8 @@ sys_(write, int fd, uint8_t *buffer, size_t size)
     return (uint64_t)ret;
 }
 
-sys_(read, int fd, uint8_t *buffer, size_t size)
+static uint64_t read_from_handle(fd_file_handle *handle, uint8_t *buffer, size_t size)
 {
-    pcb_t process = get_current_task()->parent_group;
-    if (process != NULL && process->linux_abi)
-    {
-        // write_serial_fmt("[busybox-debug] sys_read fd=%d size=%llu\n", fd, (unsigned long long)size);
-    }
-    if (unlikely(fd < 0 || buffer == NULL)) return SYSCALL_FAULT_(EINVAL);
-    if (unlikely(size == 0)) return 0;
-    fd_file_handle *handle = (fd_file_handle *)queue_get(get_current_task()->parent_group->file_open, fd);
-    if (!handle) return SYSCALL_FAULT_(EBADF);
     if (handle->node->type & file_socket)
     {
         int64_t ret = read_to_user_buffer(handle, buffer, size, true, 0, false);
@@ -931,6 +910,23 @@ pipe:;
         scheduler_yield();
     }
     goto read;
+}
+
+sys_(read, int fd, uint8_t *buffer, size_t size)
+{
+    pcb_t process = get_current_task()->parent_group;
+    if (process != NULL && process->linux_abi)
+    {
+        // write_serial_fmt("[busybox-debug] sys_read fd=%d size=%llu\n", fd, (unsigned long long)size);
+    }
+    if (unlikely(fd < 0 || buffer == NULL)) return SYSCALL_FAULT_(EINVAL);
+    if (unlikely(size == 0)) return 0;
+    FdOperation operation;
+    int operation_error = operation.acquire(fd);
+    if (operation_error) return SYSCALL_FAULT_(-operation_error);
+    fd_file_handle *handle = operation.get();
+    if (!handle) return SYSCALL_FAULT_(EBADF);
+    return read_from_handle(handle, buffer, size);
 }
 
 sys_(sendto, int fd, const void *buffer, size_t size, uint64_t flags, const struct sockaddr *addr, socklen_t addrlen)
@@ -1249,7 +1245,10 @@ recv_out:
 sys_(setsockopt, int fd, int level, int optname, const void *optval, socklen_t optlen)
 {
     if (fd < 0) return SYSCALL_FAULT_(EBADF);
-    fd_file_handle *handle = (fd_file_handle *)queue_get(get_current_task()->parent_group->file_open, fd);
+    FdOperation descriptor_pin;
+    int descriptor_error = descriptor_pin.acquire(fd);
+    if (descriptor_error) return SYSCALL_FAULT_(-descriptor_error);
+    fd_file_handle *handle = descriptor_pin.get();
     if (handle == NULL) return SYSCALL_FAULT_(EBADF);
     if (!(handle->node->type & file_socket)) return SYSCALL_FAULT_(ENOTSOCK);
     if (optlen != 0 && optval == NULL) return SYSCALL_FAULT_(EFAULT);
@@ -1266,7 +1265,10 @@ sys_(getsockopt, int fd, int level, int optname, void *optval, socklen_t *optlen
     if (fd < 0) return SYSCALL_FAULT_(EBADF);
     if (optval == NULL || optlen == NULL) return SYSCALL_FAULT_(EFAULT);
 
-    fd_file_handle *handle = (fd_file_handle *)queue_get(get_current_task()->parent_group->file_open, fd);
+    FdOperation descriptor_pin;
+    int descriptor_error = descriptor_pin.acquire(fd);
+    if (descriptor_error) return SYSCALL_FAULT_(-descriptor_error);
+    fd_file_handle *handle = descriptor_pin.get();
     if (handle == NULL) return SYSCALL_FAULT_(EBADF);
     if (!(handle->node->type & file_socket)) return SYSCALL_FAULT_(ENOTSOCK);
 
@@ -1350,7 +1352,7 @@ sys_(wait4, unsigned long pid_value, int *status, int options, void *rusage)
     if (parent == NULL || parent->child_pcb == NULL) return SYSCALL_FAULT_(ECHILD);
     if ((options & ~(LINUX_WNOHANG | LINUX_WUNTRACED | LINUX_WCONTINUED)) != 0) return SYSCALL_FAULT_(EINVAL);
     if (pid < -1 || pid == 0) return SYSCALL_FAULT_(EINVAL);
-    if (wait4_find_child(parent, pid) == NULL) return SYSCALL_FAULT_(ECHILD);
+    if (!wait4_has_child(parent, pid)) return SYSCALL_FAULT_(ECHILD);
 
     if (trace)
     {
@@ -1373,7 +1375,7 @@ sys_(wait4, unsigned long pid_value, int *status, int options, void *rusage)
         zombie = wait4_find_zombie_child(parent, pid);
         if (zombie != NULL) return wait4_reap_child(parent, zombie, status);
 
-        if (wait4_find_child(parent, pid) == NULL) return SYSCALL_FAULT_(ECHILD);
+        if (!wait4_has_child(parent, pid)) return SYSCALL_FAULT_(ECHILD);
 
         ipc_message_t message = wait4_pop_exit_message(parent, pid, false);
         if (message == NULL)
@@ -1406,15 +1408,13 @@ sys_(wait4, unsigned long pid_value, int *status, int options, void *rusage)
         }
         free(message);
 
-        pcb_t child = wait4_find_child(parent, child_pid);
+        pcb_t child = wait4_find_zombie_child(parent, child_pid);
         if (child == NULL)
         {
-            if (wait4_find_child(parent, pid) == NULL) return SYSCALL_FAULT_(ECHILD);
+            if (!wait4_has_child(parent, pid)) return SYSCALL_FAULT_(ECHILD);
             continue;
         }
 
-        child->exit_code = exit_code;
-        child->status    = ZOMBIE;
         return wait4_reap_child(parent, child, status);
     }
 }
@@ -1686,7 +1686,10 @@ sys_(ioctl, int fd, int options, void *arg2)
         //                  (unsigned long long)(uintptr_t)arg2);
     }
     if (unlikely(fd < 0)) return SYSCALL_FAULT_(EINVAL);
-    fd_file_handle *handle =  (fd_file_handle*)queue_get(get_current_task()->parent_group->file_open, fd);
+    FdOperation descriptor_pin;
+    int descriptor_error = descriptor_pin.acquire(fd);
+    if (descriptor_error) return SYSCALL_FAULT_(-descriptor_error);
+    fd_file_handle *handle = descriptor_pin.get();
     if (handle == NULL) return SYSCALL_FAULT_(EBADF);
 
     size_t arg_size = ioctl_arg_size(options);
@@ -1762,7 +1765,10 @@ sys_(writev, int fd, struct iovec *iov, int iovcnt)
         return SYSCALL_FAULT_(EFAULT);
     }
     page_directory_t *pagedir = get_current_task()->parent_group->pagedir;
-    fd_file_handle *handle =  (fd_file_handle*)queue_get(get_current_task()->parent_group->file_open, fd);
+    FdOperation operation;
+    int operation_error = operation.acquire(fd);
+    if (operation_error) return SYSCALL_FAULT_(-operation_error);
+    fd_file_handle *handle = operation.get();
     if (handle == NULL) return SYSCALL_FAULT_(EBADF);
     if (handle->node->type & file_socket)
     {
@@ -1807,7 +1813,10 @@ sys_(readv, int fd, struct iovec *iov, int iovcnt0)
     if (unlikely(iovcnt0 < 0 || (size_t)iovcnt0 > USER_IOV_MAX)) return SYSCALL_FAULT_(EINVAL);
     if (iovcnt0 == 0) return 0;
     size_t          iovcnt = (size_t)iovcnt0;
-    fd_file_handle *handle =  (fd_file_handle*)queue_get(get_current_task()->parent_group->file_open, fd);
+    FdOperation operation;
+    int operation_error = operation.acquire(fd);
+    if (operation_error) return SYSCALL_FAULT_(-operation_error);
+    fd_file_handle *handle = operation.get();
     if (handle == NULL) return SYSCALL_FAULT_(EBADF);
 
     size_t iov_bytes = 0;
@@ -1824,7 +1833,7 @@ sys_(readv, int fd, struct iovec *iov, int iovcnt0)
     for (size_t i = 0; i < iovcnt; i++)
     {
         if (kiov[i].iov_len == 0) continue;
-        uint64_t ret = sys_read(fd, (uint8_t *)kiov[i].iov_base, kiov[i].iov_len, 0, 0, 0, regs);
+        uint64_t ret = read_from_handle(handle, (uint8_t *)kiov[i].iov_base, kiov[i].iov_len);
         if ((int64_t)ret < 0)
         {
             free(kiov);
@@ -2155,9 +2164,12 @@ sys_(mmap, uint64_t addr, size_t length, uint64_t prot, uint64_t flags, int fd,
         }
     }
 
+    FdOperation mapping_descriptor;
     fd_file_handle *file_handle = NULL;
     if (!(flags & MAP_ANONYMOUS)) {
-        file_handle = (fd_file_handle *)queue_get(process->file_open, fd);
+        int descriptor_error = mapping_descriptor.acquire(fd);
+        if (descriptor_error) return SYSCALL_FAULT_(-descriptor_error);
+        file_handle = mapping_descriptor.get();
         if (file_handle == NULL || file_handle->node == NULL) return SYSCALL_FAULT_(EBADF);
         if (file_handle->node->type == file_dir) return SYSCALL_FAULT_(EACCES);
     }
@@ -2205,13 +2217,14 @@ sys_(mmap, uint64_t addr, size_t length, uint64_t prot, uint64_t flags, int fd,
 
     if (!(flags & MAP_ANONYMOUS)) {
         uint64_t ret = (uint64_t)vfs_map(file_handle->node, start_addr, aligned_len, prot, flags, offset);
-        if (ret == 0)
+        if (ret == 0 || ret >= (uint64_t)-4095)
         {
-            // A denied device mapping must not look like a successful mapping at
-            // address zero, nor leave an unmapped reservation in the VMA list.
+            // Failed file/device mappings must not leave a VMA reservation,
+            // nor make an address-zero denial look like a successful mapping.
             vma_remove(mgr, vma);
             vma_free(vma);
             mm_op_lock_release();
+            if (ret) return ret;
             return SYSCALL_FAULT_((file_handle->node->type & file_fbdev) ? EACCES : ENOMEM);
         }
         mm_op_lock_release();
@@ -2548,14 +2561,24 @@ sys_(fchdir, int fd)
     pcb_t process = get_current_task()->parent_group;
     if (process == NULL || process->file_open == NULL) return SYSCALL_FAULT_(EBADF);
 
-    fd_file_handle *handle = (fd_file_handle *)queue_get(process->file_open, fd);
+    FdOperation descriptor_pin;
+    int descriptor_error = descriptor_pin.acquire(fd);
+    if (descriptor_error) return SYSCALL_FAULT_(-descriptor_error);
+    fd_file_handle *handle = descriptor_pin.get();
     if (handle == NULL || handle->node == NULL) return SYSCALL_FAULT_(EBADF);
     if (!(handle->node->type & file_dir)) return SYSCALL_FAULT_(ENOTDIR);
 
     char *normalized_path = vfs_get_fullpath(handle->node);
     if (unlikely(normalized_path == NULL)) return SYSCALL_FAULT_(ENOENT);
 
-    handle->node->refcount++;
+    if (handle->node != rootdir)
+    {
+        vfs_child_lock();
+        bool overflow = handle->node->refcount == uint32_t(-1);
+        if (!overflow) ++handle->node->refcount;
+        vfs_child_unlock();
+        if (overflow) { free(normalized_path); return SYSCALL_FAULT_(EOVERFLOW); }
+    }
     uint64_t ret = set_current_cwd(handle->node, normalized_path);
     if ((int64_t)ret < 0)
     {
@@ -2593,8 +2616,10 @@ static uint64_t poll_kernel_fds(struct pollfd *fds_user, size_t nfds, size_t tim
         {
             fds_user[i].revents = 0;
             if (fds_user[i].fd < 0) continue;
-            fd_file_handle *handle =
-                (fd_file_handle *)queue_get(get_current_task()->parent_group->file_open, fds_user[i].fd);
+            FdOperation descriptor_pin;
+            int descriptor_error = descriptor_pin.acquire(fds_user[i].fd);
+            if (descriptor_error == -ENOMEM) return SYSCALL_FAULT_(ENOMEM);
+            fd_file_handle *handle = descriptor_pin.get();
             if (handle == NULL)
             {
                 fds_user[i].revents = POLLNVAL;
@@ -2754,7 +2779,7 @@ static uint64_t epoll_create_common(int flags)
     fd_handle->flags = flags & EPOLL_CLOEXEC ? O_CLOEXEC : 0;
     node->flags = fd_handle->flags;
 
-    int fd = (int)queue_enqueue_lowest(get_current_task()->parent_group->file_open, fd_handle);
+    int fd = fd_install_handle(get_current_task()->parent_group, fd_handle, 0, false);
     if (fd < 0)
     {
         epoll_close_node(node);
@@ -2764,7 +2789,6 @@ static uint64_t epoll_create_common(int flags)
         return SYSCALL_FAULT_(EMFILE);
     }
 
-    fd_handle->fd = fd;
     return fd;
 }
 
@@ -2971,90 +2995,58 @@ sys_(tgkill, int tgid, int tid, int sig)
 
 extern fd_file_handle *fd_dup(fd_file_handle *src);
 
+static int duplicate_descriptor(int fd, int newfd, bool exact, bool cloexec)
+{
+    if (fd < 0 || newfd < 0) return -EBADF;
+    FdOperation operation;
+    int error = operation.acquire(fd);
+    if (error) return error;
+    if (exact && fd == newfd) return newfd;
+    fd_file_handle *copy = fd_dup(operation.get());
+    if (!copy) return -ENOMEM;
+    if (cloexec) copy->flags |= O_CLOEXEC;
+    else copy->flags &= ~O_CLOEXEC;
+    int result = fd_install_handle(get_current_task()->parent_group, copy, newfd, exact);
+    if (result < 0) fd_retire_handle(copy);
+    return result;
+}
+
 sys_(dup2, int fd, int newfd)
 {
-    if (unlikely(fd < 0 || newfd < 0)) return SYSCALL_FAULT_(EBADF);
-    if (fd == newfd) return newfd;
-
-    fd_file_handle *handle =  (fd_file_handle*)queue_get(get_current_task()->parent_group->file_open, fd);
-    if (unlikely(handle == NULL)) return SYSCALL_FAULT_(EBADF);
-
-    fd_file_handle *old_handle =  (fd_file_handle*)queue_get(get_current_task()->parent_group->file_open, newfd);
-    if (old_handle != NULL)
-    {
-        queue_remove_at(get_current_task()->parent_group->file_open, newfd);
-        vfs_close(old_handle->node);
-        free(old_handle);
-    }
-
-    fd_file_handle *new_handle = fd_dup(handle);
-    if (new_handle == NULL) return SYSCALL_FAULT_(ENOMEM);
-    new_handle->flags &= ~O_CLOEXEC;
-    new_handle->fd = newfd;
-    if (queue_enqueue_id(get_current_task()->parent_group->file_open, new_handle, newfd) == (size_t)-1)
-    {
-        vfs_close(new_handle->node);
-        free(new_handle);
-        return SYSCALL_FAULT_(EBADF);
-    }
-    return newfd;
+    return duplicate_descriptor(fd, newfd, true, false);
 }
 
 sys_(dup3, int fd, int newfd, int flags)
 {
     if (fd == newfd) return SYSCALL_FAULT_(EINVAL);
-    if ((flags & ~O_CLOEXEC) != 0) return SYSCALL_FAULT_(EINVAL);
-
-    int ret = (int)sys_dup2(fd, newfd, 0, 0, 0, 0, regs);
-    if (ret < 0) return ret;
-
-    fd_file_handle *handle = (fd_file_handle *)queue_get(get_current_task()->parent_group->file_open, newfd);
-    if (handle != NULL)
-    {
-        if (flags & O_CLOEXEC) handle->flags |= O_CLOEXEC;
-        else handle->flags &= ~O_CLOEXEC;
-    }
-    return ret;
+    if (flags & ~O_CLOEXEC) return SYSCALL_FAULT_(EINVAL);
+    return duplicate_descriptor(fd, newfd, true, (flags & O_CLOEXEC) != 0);
 }
 
 sys_(dup, int fd)
 {
-    if (unlikely(fd < 0)) return SYSCALL_FAULT_(EINVAL);
-    fd_file_handle *handle =  (fd_file_handle*)queue_get(get_current_task()->parent_group->file_open, fd);
-    if (handle == NULL) return SYSCALL_FAULT_(EBADF);
-    fd_file_handle *new_handle = fd_dup(handle);
-    if (new_handle == NULL) return SYSCALL_FAULT_(ENOMEM);
-    new_handle->flags &= ~O_CLOEXEC;
-    return new_handle->fd      = queue_enqueue_lowest(get_current_task()->parent_group->file_open, new_handle);
+    return duplicate_descriptor(fd, 0, false, false);
 }
 
 static int fd_dup_from(fd_file_handle *handle, int minfd, bool cloexec)
 {
-    if (handle == NULL || minfd < 0) return -EINVAL;
-
-    fd_file_handle *new_handle = fd_dup(handle);
-    if (new_handle == NULL) return -ENOMEM;
-    if (cloexec) new_handle->flags |= O_CLOEXEC;
-    else new_handle->flags &= ~O_CLOEXEC;
-
-    lock_queue *queue = get_current_task()->parent_group->file_open;
-    int newfd = minfd;
-    while (queue_get(queue, (size_t)newfd) != NULL) newfd++;
-
-    new_handle->fd = queue_enqueue_id(queue, new_handle, (size_t)newfd);
-    if (new_handle->fd == (size_t)-1)
-    {
-        vfs_close(new_handle->node);
-        free(new_handle);
-        return -EBADF;
-    }
-    return newfd;
+    if (!handle || minfd < 0) return -EINVAL;
+    fd_file_handle *copy = fd_dup(handle);
+    if (!copy) return -ENOMEM;
+    if (cloexec) copy->flags |= O_CLOEXEC;
+    else copy->flags &= ~O_CLOEXEC;
+    int result = fd_install_handle(get_current_task()->parent_group, copy, minfd, false);
+    if (result < 0) fd_retire_handle(copy);
+    return result;
 }
 
 sys_(fcntl, int fd, int cmd, uint64_t arg)
 {
     if (fd < 0 || cmd < 0) return SYSCALL_FAULT_(EINVAL);
-    fd_file_handle *handle =  (fd_file_handle*)queue_get(get_current_task()->parent_group->file_open, fd);
+    FdOperation operation;
+    int operation_error = operation.acquire(fd);
+    if (operation_error) return SYSCALL_FAULT_(-operation_error);
+    fd_file_handle *handle = operation.get();
     if (handle == NULL) return SYSCALL_FAULT_(EBADF);
 
     switch (cmd)
@@ -3181,7 +3173,10 @@ sys_(fstat, int fd, struct stat *buf)
 {
     if (unlikely(buf == NULL)) return SYSCALL_FAULT_(EINVAL);
 
-    fd_file_handle *handle =  (fd_file_handle*)queue_get(get_current_task()->parent_group->file_open, fd);
+    FdOperation operation;
+    int operation_error = operation.acquire(fd);
+    if (operation_error) return SYSCALL_FAULT_(-operation_error);
+    fd_file_handle *handle = operation.get();
     if (unlikely(handle == NULL)) return SYSCALL_FAULT_(EBADF);
     struct stat kstat;
     uint64_t ret = fill_stat_from_node(handle->node, &kstat);
@@ -3276,14 +3271,20 @@ sys_(mkdir, char *name, uint64_t mode)
     char  *npath = vfs_cwd_path_build(user_path);
     free(user_path);
     if (npath == NULL) return SYSCALL_FAULT_(ENOMEM);
-    size_t ret   = vfs_mkdir(npath) == VFS_STATUS_FAILED ? SYSCALL_FAULT_(vfs_last_error()) : 0;
+    pcb_t process = get_current_task()->parent_group;
+    uint16_t create_mode = (uint16_t)(mode & 07777 & ~(process ? process->umask : 0));
+    size_t ret = vfs_mkdir_mode(npath, create_mode, current_uid(), current_gid()) != 0 ?
+                 SYSCALL_FAULT_(vfs_last_error()) : 0;
     if (ret == 0)
     {
         vfs_node_t node = vfs_open(npath);
         if (node != NULL)
         {
-            stamp_node_owner(node);
-            if ((mode & 07777) != 0) node->mode = (uint16_t)(mode & 07777);
+            if (!ext4fs_owns_node(node))
+            {
+                stamp_node_owner(node);
+                if (create_mode) node->mode = create_mode;
+            }
             vfs_close(node);
         }
     }
@@ -3312,7 +3313,10 @@ sys_(listen, int fd, int backlog)
 
 sys_(lseek, int fd, int64_t offset, size_t whence)
 {
-    fd_file_handle *handle =  (fd_file_handle*)queue_get(get_current_task()->parent_group->file_open, fd);
+    FdOperation descriptor_pin;
+    int descriptor_error = descriptor_pin.acquire(fd);
+    if (descriptor_error) return SYSCALL_FAULT_(-descriptor_error);
+    fd_file_handle *handle = descriptor_pin.get();
     if (unlikely(handle == NULL)) return SYSCALL_FAULT_(EBADF);
     if (handle->node->type & (file_socket | file_pipe)) return SYSCALL_FAULT_(ESPIPE);
 
@@ -3331,12 +3335,12 @@ sys_(lseek, int fd, int64_t offset, size_t whence)
         break;
     case SEEK_DATA:
         if (offset < 0) return SYSCALL_FAULT_(EINVAL);
-        if (offset >= handle->node->size) return SYSCALL_FAULT_(ENXIO);
+        if (uint64_t(offset) >= handle->node->size) return SYSCALL_FAULT_(ENXIO);
         new_offset = (uint64_t)offset;
         break;
     case SEEK_HOLE:
         if (offset < 0) return SYSCALL_FAULT_(EINVAL);
-        if (offset >= handle->node->size) return SYSCALL_FAULT_(ENXIO);
+        if (uint64_t(offset) >= handle->node->size) return SYSCALL_FAULT_(ENXIO);
         return handle->node->size;
     default: return SYSCALL_FAULT_(EINVAL);
     }
@@ -3572,7 +3576,10 @@ sys_(getdents, int fd, struct dirent *dents, size_t size)
     page_directory_t *pagedir = current_user_pagedir();
     if (!user_range_mapped(pagedir, dents, size)) return SYSCALL_FAULT_(EFAULT);
 
-    fd_file_handle *handle =  (fd_file_handle*)queue_get(get_current_task()->parent_group->file_open, fd);
+    FdOperation descriptor_pin;
+    int descriptor_error = descriptor_pin.acquire(fd);
+    if (descriptor_error) return SYSCALL_FAULT_(-descriptor_error);
+    fd_file_handle *handle = descriptor_pin.get();
     if (unlikely(handle == NULL)) { return SYSCALL_FAULT_(EBADF); }
     if (handle->node->type != file_dir) { return SYSCALL_FAULT_(ENOTDIR); }
     if (!vfs_check_access(handle->node, NULL, IME_FILE_LIST)) return SYSCALL_FAULT_(vfs_last_error());
@@ -3624,7 +3631,10 @@ sys_(getdents64, int fd, void *dents, size_t size)
     page_directory_t *pagedir = current_user_pagedir();
     if (!user_range_mapped(pagedir, dents, size)) return SYSCALL_FAULT_(EFAULT);
 
-    fd_file_handle *handle = (fd_file_handle *)queue_get(get_current_task()->parent_group->file_open, fd);
+    FdOperation descriptor_pin;
+    int descriptor_error = descriptor_pin.acquire(fd);
+    if (descriptor_error) return SYSCALL_FAULT_(-descriptor_error);
+    fd_file_handle *handle = descriptor_pin.get();
     if (unlikely(handle == NULL)) { return SYSCALL_FAULT_(EBADF); }
     if (handle->node->type != file_dir) { return SYSCALL_FAULT_(ENOTDIR); }
     if (!vfs_check_access(handle->node, NULL, IME_FILE_LIST)) return SYSCALL_FAULT_(vfs_last_error());
@@ -3751,59 +3761,44 @@ sys_(pipe2, int *pipefd, uint64_t flags)
     int ret = pipefs_create_pair(&node_input, &node_output);
     if (ret < 0) return SYSCALL_FAULT_(-ret);
 
-    lock_queue     *queue     = get_current_task()->parent_group->file_open;
+    pcb_t process = get_current_task()->parent_group;
     fd_file_handle *handle_in = (fd_file_handle *)calloc(1, sizeof(fd_file_handle));
     fd_file_handle *handle_out = (fd_file_handle *)calloc(1, sizeof(fd_file_handle));
     if (!handle_in || !handle_out)
     {
-        free(handle_in);
-        free(handle_out);
-        vfs_close(node_input);
-        vfs_close(node_output);
+        free(handle_in); free(handle_out);
+        vfs_close(node_input); vfs_close(node_output);
         return SYSCALL_FAULT_(ENOMEM);
     }
-    handle_in->node           = node_input;
-    handle_in->offset         = 0;
-    handle_in->flags          = (flags & ~O_ACCMODE) | O_RDONLY;
-    handle_in->node->flags    = handle_in->flags;
-    handle_in->fd             = queue_enqueue_lowest(queue, handle_in);
-    if (handle_in->fd == (size_t)-1)
+    handle_in->node = node_input;
+    handle_in->flags = (flags & ~O_ACCMODE) | O_RDONLY;
+    node_input->flags = handle_in->flags;
+    handle_out->node = node_output;
+    handle_out->flags = (flags & ~O_ACCMODE) | O_WRONLY;
+    node_output->flags = handle_out->flags;
+    FdOperation input, output;
+    int input_fd = input.install(process, handle_in, 0, false);
+    if (input_fd < 0)
     {
-        free(handle_in);
-        free(handle_out);
-        vfs_close(node_input);
-        vfs_close(node_output);
-        return SYSCALL_FAULT_(ENOMEM);
+        fd_retire_handle(handle_in); fd_retire_handle(handle_out);
+        return SYSCALL_FAULT_(-input_fd);
     }
-
-    handle_out->node           = node_output;
-    handle_out->offset         = 0;
-    handle_out->flags          = (flags & ~O_ACCMODE) | O_WRONLY;
-    handle_out->node->flags    = handle_out->flags;
-    handle_out->fd             = queue_enqueue_lowest(queue, handle_out);
-    if (handle_out->fd == (size_t)-1)
+    int output_fd = output.install(process, handle_out, 0, false);
+    if (output_fd < 0)
     {
-        queue_remove_at(queue, handle_in->fd);
-        free(handle_in);
-        free(handle_out);
-        vfs_close(node_input);
-        vfs_close(node_output);
-        return SYSCALL_FAULT_(ENOMEM);
+        if (fd_file_handle *removed = fd_detach_descriptor_if(process, size_t(input_fd), handle_in))
+            fd_retire_handle(removed);
+        fd_retire_handle(handle_out);
+        return SYSCALL_FAULT_(-output_fd);
     }
-
-    int kpipefd[2] = {(int)handle_in->fd, (int)handle_out->fd};
-    if (kernel_pipefd)
-    {
-        memcpy(pipefd, kpipefd, sizeof(kpipefd));
-    }
+    int kpipefd[2] = {input_fd, output_fd};
+    if (kernel_pipefd) memcpy(pipefd, kpipefd, sizeof(kpipefd));
     else if (!copy_to_user_pagedir(current_user_pagedir(), pipefd, kpipefd, sizeof(kpipefd)))
     {
-        queue_remove_at(queue, handle_in->fd);
-        queue_remove_at(queue, handle_out->fd);
-        free(handle_in);
-        free(handle_out);
-        vfs_close(node_input);
-        vfs_close(node_output);
+        if (fd_file_handle *removed = fd_detach_descriptor_if(process, size_t(input_fd), handle_in))
+            fd_retire_handle(removed);
+        if (fd_file_handle *removed = fd_detach_descriptor_if(process, size_t(output_fd), handle_out))
+            fd_retire_handle(removed);
         return SYSCALL_FAULT_(EFAULT);
     }
 
@@ -3834,7 +3829,7 @@ sys_(unlink)
         free(npath);
         return SYSCALL_FAULT_(ENOTDIR);
     }
-    size_t ret = vfs_delete(node) == VFS_STATUS_SUCCESS ? 0 : SYSCALL_FAULT_(vfs_last_error());
+    size_t ret = vfs_delete_owned(node) == VFS_STATUS_SUCCESS ? 0 : SYSCALL_FAULT_(vfs_last_error());
     free(npath);
     return ret;
 }
@@ -3858,7 +3853,7 @@ sys_(rmdir)
         free(n_name);
         return SYSCALL_FAULT_(ENOTDIR);
     }
-    size_t ret = vfs_delete(node) == VFS_STATUS_SUCCESS ? 0 : SYSCALL_FAULT_(vfs_last_error());
+    size_t ret = vfs_delete_owned(node) == VFS_STATUS_SUCCESS ? 0 : SYSCALL_FAULT_(vfs_last_error());
     free(n_name);
     return ret;
 }
@@ -3886,7 +3881,7 @@ sys_(unlinkat)
         return SYSCALL_FAULT_(ENOTDIR);
     }
 
-    uint64_t ret = vfs_delete(node) == VFS_STATUS_SUCCESS ? 0 : SYSCALL_FAULT_(vfs_last_error());
+    uint64_t ret = vfs_delete_owned(node) == VFS_STATUS_SUCCESS ? 0 : SYSCALL_FAULT_(vfs_last_error());
     free(path);
     return ret;
 }
@@ -4011,17 +4006,6 @@ sys_(mkdirat, int dirfd, char *pathname, uint64_t mode)
     return ret == VFS_STATUS_SUCCESS ? 0 : SYSCALL_FAULT_(vfs_last_error());
 }
 
-sys_(flistxattr, int fd, char *list, size_t size)
-{
-    fd_file_handle *handle = (fd_file_handle *)queue_get(get_current_task()->parent_group->file_open, fd);
-    if (handle == NULL || handle->node == NULL) return SYSCALL_FAULT_(EBADF);
-    if (size != 0 && list == NULL) return SYSCALL_FAULT_(EFAULT);
-    if (size != 0 && !user_range_mapped(current_user_pagedir(), list, size)) return SYSCALL_FAULT_(EFAULT);
-    return 0;
-}
-
-
-
 sys_(copy_file_range, int fd_in, uint64_t *off_in, int fd_out, uint64_t *off_out, size_t len, uint64_t flags)
 {
     if (flags != 0) { return SYSCALL_FAULT_(EINVAL); }
@@ -4029,8 +4013,12 @@ sys_(copy_file_range, int fd_in, uint64_t *off_in, int fd_out, uint64_t *off_out
 
     pcb_t process = get_current_task()->parent_group;
     page_directory_t *pagedir = process->pagedir;
-    fd_file_handle *src_handle =  (fd_file_handle*)queue_get(process->file_open, fd_in);
-    fd_file_handle *dst_handle =  (fd_file_handle*)queue_get(process->file_open, fd_out);
+    FdOperation source_pin, destination_pin;
+    int descriptor_error = source_pin.acquire(fd_in);
+    if (!descriptor_error) descriptor_error = destination_pin.acquire(fd_out);
+    if (descriptor_error) return SYSCALL_FAULT_(-descriptor_error);
+    fd_file_handle *src_handle = source_pin.get();
+    fd_file_handle *dst_handle = destination_pin.get();
     if (src_handle == NULL || dst_handle == NULL) { return SYSCALL_FAULT_(EBADF); }
     if (src_handle->node == NULL || dst_handle->node == NULL) return SYSCALL_FAULT_(EBADF);
     if (src_handle->node->type & (file_socket | file_pipe) || dst_handle->node->type & (file_socket | file_pipe))
@@ -4111,7 +4099,10 @@ sys_(pread, int fd, uint8_t *buffer, size_t size, uint64_t offset)
     if (unlikely(fd < 0 || buffer == NULL)) return SYSCALL_FAULT_(EINVAL);
     if (unlikely(size == 0)) return 0;
 
-    fd_file_handle *handle = (fd_file_handle *)queue_get(get_current_task()->parent_group->file_open, fd);
+    FdOperation operation;
+    int operation_error = operation.acquire(fd);
+    if (operation_error) return SYSCALL_FAULT_(-operation_error);
+    fd_file_handle *handle = operation.get();
     if (handle == NULL || handle->node == NULL) return SYSCALL_FAULT_(EBADF);
     if (handle->node->type & file_socket) return SYSCALL_FAULT_(ESPIPE);
     if (handle->node->type & file_pipe) return SYSCALL_FAULT_(ESPIPE);
@@ -4128,7 +4119,10 @@ sys_(pwrite, int fd, uint8_t *buffer, size_t size, int64_t offset)
     if (unlikely(size == 0)) return 0;
     if (unlikely(offset < 0)) return SYSCALL_FAULT_(EINVAL);
 
-    fd_file_handle *handle = (fd_file_handle *)queue_get(get_current_task()->parent_group->file_open, fd);
+    FdOperation operation;
+    int operation_error = operation.acquire(fd);
+    if (operation_error) return SYSCALL_FAULT_(-operation_error);
+    fd_file_handle *handle = operation.get();
     if (handle == NULL || handle->node == NULL) return SYSCALL_FAULT_(EBADF);
     if (handle->node->type & file_socket) return SYSCALL_FAULT_(ESPIPE);
     if (handle->node->type & file_pipe) return SYSCALL_FAULT_(ESPIPE);
@@ -4243,7 +4237,10 @@ sys_(setpgid, int pid, int pgid)
     {
         for (int fd = 0; fd <= 2; fd++)
         {
-            fd_file_handle *handle = (fd_file_handle *)queue_get(process->file_open, fd);
+            FdOperation descriptor_pin;
+            int descriptor_error = descriptor_pin.acquire(fd);
+            if (descriptor_error == -ENOMEM) return SYSCALL_FAULT_(ENOMEM);
+            fd_file_handle *handle = descriptor_pin.get();
             if (handle == NULL || handle->node == NULL) continue;
             vfs_ioctl(handle->node, TIOCSPGRP, &pgid);
         }
@@ -4301,7 +4298,10 @@ sys_(setgroups, int count, const int *gid_list)
 sys_(flock, int fd, int operation)
 {
     if ((operation & ~(1 | 2 | 4 | 8)) != 0) return SYSCALL_FAULT_(EINVAL);
-    fd_file_handle *handle = (fd_file_handle *)queue_get(get_current_task()->parent_group->file_open, fd);
+    FdOperation descriptor_pin;
+    int descriptor_error = descriptor_pin.acquire(fd);
+    if (descriptor_error) return SYSCALL_FAULT_(-descriptor_error);
+    fd_file_handle *handle = descriptor_pin.get();
     if (handle == NULL || handle->node == NULL) return SYSCALL_FAULT_(EBADF);
     return 0;
 }
@@ -4348,6 +4348,36 @@ char *get_parent_path(const char *path) {
     return copy;
 }
 
+
+// Native ext4 owns replacement as one journal transaction. Legacy adapters keep
+// their established path below; never unlink an ext4 target in preparation.
+static int rename_ext4_path(vfs_node_t oldnode, vfs_node_t &newnode, const char *destination, bool &handled)
+{
+    bool source_ext4 = ext4fs_owns_node(oldnode);
+    bool target_ext4 = newnode && ext4fs_owns_node(newnode);
+    char *parent_path = get_parent_path(destination);
+    vfs_node_t parent = parent_path ? vfs_open(parent_path) : NULL;
+    int error = parent ? 0 : !parent_path ? ENOMEM : permissions_file_error() ? vfs_last_error() : ENOENT;
+    free(parent_path);
+    handled = source_ext4 || target_ext4 || (parent && ext4fs_owns_node(parent)) ||
+              (!parent && permissions_file_error());
+    if (!handled)
+    {
+        if (parent) vfs_close(parent);
+        return 0;
+    }
+    if (!error && parent->type != file_dir) error = ENOTDIR;
+    if (!error && (!source_ext4 || !ext4fs_owns_node(parent) || oldnode->root != parent->root)) error = EXDEV;
+    const char *leaf = strrchr(destination, '/');
+    if (!error && !vfs_check_child_creation(parent, leaf ? leaf + 1 : destination)) error = vfs_last_error();
+    // Drop this lookup reference before replacement. The ext4 callback retains
+    // an overwritten inode as an orphan while any existing FD still owns it.
+    if (newnode) { vfs_close(newnode); newnode = NULL; }
+    if (!error && vfs_rename(oldnode, destination) != VFS_STATUS_SUCCESS) error = vfs_last_error();
+    if (parent) vfs_close(parent);
+    if (error) permissions_set_file_error(error);
+    return error ? -error : 0;
+}
 
 sys_(rename, char *oldpath, char *newpath)
 {
@@ -4396,6 +4426,15 @@ sys_(rename, char *oldpath, char *newpath)
         free(noldpath);
         free(nnewpath);
         return SYSCALL_FAULT_(vfs_last_error());
+    }
+    bool handled;
+    int native_result = rename_ext4_path(oldnode, newnode, nnewpath, handled);
+    if (handled)
+    {
+        vfs_close(oldnode);
+        free(noldpath);
+        free(nnewpath);
+        return native_result ? SYSCALL_FAULT_(-native_result) : 0;
     }
     if (newnode && vfs_delete(newnode) != VFS_STATUS_SUCCESS)
     {
@@ -4471,6 +4510,15 @@ sys_(renameat, int olddirfd, char *oldpath, int newdirfd, char *newpath)
         free(resolved_old);
         free(resolved_new);
         return SYSCALL_FAULT_(vfs_last_error());
+    }
+    bool handled;
+    int native_result = rename_ext4_path(oldnode, newnode, resolved_new, handled);
+    if (handled)
+    {
+        vfs_close(oldnode);
+        free(resolved_old);
+        free(resolved_new);
+        return native_result ? SYSCALL_FAULT_(-native_result) : 0;
     }
     if (newnode && vfs_delete(newnode) != VFS_STATUS_SUCCESS)
     {
@@ -4577,11 +4625,11 @@ sys_(umount2)
     char *path = normalize_path(user_path);
     free(user_path);
     int flags = arg1;
-    (void)flags;
+    if (flags) { free(path); return SYSCALL_FAULT_(EOPNOTSUPP); }
     if (path == NULL) return SYSCALL_FAULT_(ENOMEM);
 
     uint64_t status = vfs_unmount(path);
-    if (status == VFS_STATUS_FAILED) status = SYSCALL_FAULT_(EBUSY);
+    if (status == (uint64_t)VFS_STATUS_FAILED) status = SYSCALL_FAULT_(vfs_last_error());
     free(path);
     return status;
 }
@@ -4707,19 +4755,31 @@ sys_(prlimit64, int pid, uint64_t resource, struct rlimit *new_limit, struct rli
 sys_(ftruncate, int fd, uint64_t length)
 {
     if (fd < 0) return SYSCALL_FAULT_(EBADF);
-    fd_file_handle *handle = (fd_file_handle *)queue_get(get_current_task()->parent_group->file_open, fd);
+    FdOperation operation;
+    int operation_error = operation.acquire(fd);
+    if (operation_error) return SYSCALL_FAULT_(-operation_error);
+    fd_file_handle *handle = operation.get();
     if (handle == NULL || handle->node == NULL) return SYSCALL_FAULT_(EBADF);
+    if ((handle->flags & O_PATH) || (handle->flags & O_ACCMODE) == O_RDONLY) return SYSCALL_FAULT_(EBADF);
     if (handle->node->type == file_dir) return SYSCALL_FAULT_(EISDIR);
     if (vfs_resize(handle->node, length) != VFS_STATUS_SUCCESS) return SYSCALL_FAULT_(vfs_last_error());
-    if (handle->offset > length) handle->offset = length;
     return 0;
 }
 
 sys_(fsync, int fd)
 {
     if (fd < 0) return SYSCALL_FAULT_(EBADF);
-    fd_file_handle *handle = (fd_file_handle *)queue_get(get_current_task()->parent_group->file_open, fd);
+    FdOperation operation;
+    int operation_error = operation.acquire(fd);
+    if (operation_error) return SYSCALL_FAULT_(-operation_error);
+    fd_file_handle *handle = operation.get();
     if (handle == NULL || handle->node == NULL) return SYSCALL_FAULT_(EBADF);
+    if (handle->flags & O_PATH) return SYSCALL_FAULT_(EBADF);
+    if (ext4fs_owns_node(handle->node))
+    {
+        int error = ext4fs_sync(handle->node);
+        return error ? SYSCALL_FAULT_(-error) : 0;
+    }
     vfs_update(handle->node);
     return 0;
 }
@@ -4737,7 +4797,10 @@ sys_(fadvise64, int fd, uint64_t offset, uint64_t len, int advice)
     if (fd < 0) return SYSCALL_FAULT_(EBADF);
     if (advice < 0 || advice > 5) return SYSCALL_FAULT_(EINVAL);
 
-    fd_file_handle *handle = (fd_file_handle *)queue_get(get_current_task()->parent_group->file_open, fd);
+    FdOperation descriptor_pin;
+    int descriptor_error = descriptor_pin.acquire(fd);
+    if (descriptor_error) return SYSCALL_FAULT_(-descriptor_error);
+    fd_file_handle *handle = descriptor_pin.get();
     if (handle == NULL || handle->node == NULL) return SYSCALL_FAULT_(EBADF);
     return 0;
 }
@@ -4752,6 +4815,8 @@ sys_(sync_file_range, int fd, int64_t offset, int64_t nbytes, uint64_t flags)
 
 sys_(sync)
 {
+    int error = ext4fs_sync_all();
+    if (error) return SYSCALL_FAULT_(-error);
     if (rootdir != NULL) vfs_update(rootdir);
     return 0;
 }
@@ -4991,18 +5056,47 @@ sys_(chmod, char *path, uint64_t mode)
         return SYSCALL_FAULT_(error);
     }
 
+    if (ext4fs_owns_node(node))
+    {
+        int result = ext4fs_chmod(node, (uint16_t)mode);
+        vfs_close(node);
+        return result;
+    }
     node->mode = (uint16_t)((node->mode & ~07777) | (mode & 07777));
     vfs_close(node);
     return 0;
 }
 
+// These metadata handlers may outlive a concurrent descriptor close. Retain
+// the node while the descriptor table still owns it, then perform allocation,
+// permission checks and filesystem callbacks after releasing both spin locks.
+class MetadataFdNode
+{
+    FdOperation operation_;
+
+public:
+    vfs_node_t node = NULL;
+    int acquire(int fd, bool allow_path = false)
+    {
+        int error = operation_.acquire(fd);
+        if (error) return error;
+        fd_file_handle *handle = operation_.get();
+        if (!allow_path && (handle->flags & O_PATH)) return -EBADF;
+        if (handle->node->type & (file_pipe | file_ptmx | file_pts)) return -EOPNOTSUPP;
+        node = handle->node;
+        if (node != rootdir && node->refcount == uint32_t(-1)) return -EOVERFLOW;
+        return 0;
+    }
+};
+
 sys_(fchmod, int fd, uint64_t mode)
 {
-    if (fd < 0) return SYSCALL_FAULT_(EBADF);
-    fd_file_handle *handle = (fd_file_handle *)queue_get(get_current_task()->parent_group->file_open, fd);
-    if (handle == NULL || handle->node == NULL) return SYSCALL_FAULT_(EBADF);
-    if (!vfs_check_access(handle->node, NULL, IME_FILE_WRITE)) return SYSCALL_FAULT_(vfs_last_error());
-    handle->node->mode = (uint16_t)((handle->node->mode & ~07777) | (mode & 07777));
+    MetadataFdNode target;
+    int error = target.acquire(fd);
+    if (error) return SYSCALL_FAULT_(-error);
+    if (!vfs_check_access(target.node, NULL, IME_FILE_WRITE)) return SYSCALL_FAULT_(vfs_last_error());
+    if (ext4fs_owns_node(target.node)) return ext4fs_chmod(target.node, (uint16_t)mode);
+    target.node->mode = (uint16_t)((target.node->mode & ~07777) | (mode & 07777));
     return 0;
 }
 
@@ -5020,11 +5114,12 @@ sys_(chown, char *path, uint32_t owner, uint32_t group)
 
 sys_(fchown, int fd, uint32_t owner, uint32_t group)
 {
-    if (fd < 0) return SYSCALL_FAULT_(EBADF);
-    fd_file_handle *handle = (fd_file_handle *)queue_get(get_current_task()->parent_group->file_open, fd);
-    if (handle == NULL || handle->node == NULL) return SYSCALL_FAULT_(EBADF);
-    if (!vfs_check_access(handle->node, NULL, IME_FILE_WRITE)) return SYSCALL_FAULT_(vfs_last_error());
-    apply_node_owner(handle->node, owner, group);
+    MetadataFdNode target;
+    int error = target.acquire(fd);
+    if (error) return SYSCALL_FAULT_(-error);
+    if (!vfs_check_access(target.node, NULL, IME_FILE_WRITE)) return SYSCALL_FAULT_(vfs_last_error());
+    if (ext4fs_owns_node(target.node)) return ext4fs_chown(target.node, owner, group);
+    apply_node_owner(target.node, owner, group);
     return 0;
 }
 
@@ -5046,6 +5141,12 @@ sys_(fchownat, int dirfd, char *pathname, uint32_t owner, uint32_t group, int fl
         return SYSCALL_FAULT_(error);
     }
 
+    if (ext4fs_owns_node(node))
+    {
+        int result = ext4fs_chown(node, owner, group);
+        vfs_close(node);
+        return result;
+    }
     apply_node_owner(node, owner, group);
     vfs_close(node);
     return 0;
@@ -5078,6 +5179,12 @@ sys_(fchmodat, int dirfd, char *pathname, uint64_t mode, int flags)
         return SYSCALL_FAULT_(error);
     }
 
+    if (ext4fs_owns_node(node))
+    {
+        int result = ext4fs_chmod(node, (uint16_t)mode);
+        vfs_close(node);
+        return result;
+    }
     node->mode = (uint16_t)((node->mode & ~07777) | (mode & 07777));
     vfs_close(node);
     return 0;
@@ -5101,6 +5208,7 @@ sys_(utimensat, int dirfd, char *pathname, const struct timespec *times, int fla
     char *resolved = NULL;
     vfs_node_t node = NULL;
     bool close_node = true;
+    MetadataFdNode retained_fd;
     if (target_fd)
     {
         if (dirfd == AT_FDCWD)
@@ -5108,13 +5216,11 @@ sys_(utimensat, int dirfd, char *pathname, const struct timespec *times, int fla
             free(kpath);
             return SYSCALL_FAULT_(EINVAL);
         }
-        fd_file_handle *handle = (fd_file_handle *)queue_get(get_current_task()->parent_group->file_open, dirfd);
-        if (handle == NULL || handle->node == NULL)
-        {
-            free(kpath);
-            return SYSCALL_FAULT_(EBADF);
-        }
-        node = handle->node;
+        int error = retained_fd.acquire(dirfd, pathname != NULL);
+        free(kpath);
+        kpath = NULL;
+        if (error) return SYSCALL_FAULT_(-error);
+        node = retained_fd.node;
         close_node = false;
     }
     else
@@ -5132,6 +5238,19 @@ sys_(utimensat, int dirfd, char *pathname, const struct timespec *times, int fla
         int error = vfs_last_error();
         if (close_node) vfs_close(node);
         return SYSCALL_FAULT_(error);
+    }
+
+    if (ext4fs_owns_node(node))
+    {
+        struct timespec ktimes[2];
+        if (times && !copy_from_user_pagedir(current_user_pagedir(), ktimes, times, sizeof(ktimes)))
+        {
+            if (close_node) vfs_close(node);
+            return SYSCALL_FAULT_(EFAULT);
+        }
+        int result = ext4fs_utimens(node, times ? ktimes : NULL);
+        if (close_node) vfs_close(node);
+        return result;
     }
 
     uint64_t now = realtime_ns();
@@ -5207,6 +5326,33 @@ sys_(utimes, char *filename, const struct timeval *times)
         return SYSCALL_FAULT_(error);
     }
 
+    if (ext4fs_owns_node(node))
+    {
+        struct timespec ktimes[2];
+        if (times)
+        {
+            struct timeval ktv[2];
+            if (!copy_from_user_pagedir(current_user_pagedir(), ktv, times, sizeof(ktv)))
+            {
+                vfs_close(node);
+                return SYSCALL_FAULT_(EFAULT);
+            }
+            for (int i = 0; i < 2; ++i)
+            {
+                if (ktv[i].tv_usec < 0 || ktv[i].tv_usec >= 1000000L)
+                {
+                    vfs_close(node);
+                    return SYSCALL_FAULT_(EINVAL);
+                }
+                ktimes[i].tv_sec = ktv[i].tv_sec;
+                ktimes[i].tv_nsec = ktv[i].tv_usec * 1000L;
+            }
+        }
+        int result = ext4fs_utimens(node, times ? ktimes : NULL);
+        vfs_close(node);
+        return result;
+    }
+
     if (times != NULL)
     {
         struct timeval ktv[2];
@@ -5254,15 +5400,18 @@ sys_(fsopen, char *fsname, uint32_t flags)
     if (filesystem == NULL) return SYSCALL_FAULT_(ENOENT);
 
     vfs_node_t node = vfs_node_alloc(NULL, NULL);
+    if (!node) return SYSCALL_FAULT_(ENOMEM);
     node->type      = file_none;
     node->handle    = filesystem;
     node->size = 0;
 
     fd_file_handle *handle =  (fd_file_handle*)calloc(1, sizeof(fd_file_handle));
-    handle->node           = node;
-    handle->fd             = queue_enqueue_lowest(get_current_task()->parent_group->file_open, handle);
-    handle->flags          = flags;
-    return handle->fd;
+    if (!handle) { free(node); return SYSCALL_FAULT_(ENOMEM); }
+    handle->node = node;
+    handle->flags = flags;
+    int fd = fd_install_handle(get_current_task()->parent_group, handle, 0, false);
+    if (fd < 0) { free(handle); free(node); return SYSCALL_FAULT_(-fd); }
+    return fd;
 }
 
 sys_(getppid)
@@ -5361,7 +5510,10 @@ sys_(statfs, char *path, struct statfs *buf)
 sys_(fstatfs, int fd, struct statfs *buf)
 {
     if (fd < 0 || buf == NULL) return SYSCALL_FAULT_(EINVAL);
-    fd_file_handle *handle = (fd_file_handle *)queue_get(get_current_task()->parent_group->file_open, fd);
+    FdOperation descriptor_pin;
+    int descriptor_error = descriptor_pin.acquire(fd);
+    if (descriptor_error) return SYSCALL_FAULT_(-descriptor_error);
+    fd_file_handle *handle = descriptor_pin.get();
     if (handle == NULL || handle->node == NULL) return SYSCALL_FAULT_(EBADF);
     return statfs_kernel_node(handle->node, buf);
 }
@@ -5369,12 +5521,17 @@ sys_(fstatfs, int fd, struct statfs *buf)
 
 sys_(sendfile, int out_fd, int in_fd, uint64_t *offset_ptr, size_t count)
 {
-    pcb_t           process    = get_current_task()->parent_group;
-    fd_file_handle *out_handle =  (fd_file_handle*)queue_get(process->file_open, out_fd);
-    fd_file_handle *in_handle  =  (fd_file_handle*)queue_get(process->file_open, in_fd);
+    FdOperation source_pin, destination_pin;
+    int descriptor_error = source_pin.acquire(in_fd);
+    if (!descriptor_error) descriptor_error = destination_pin.acquire(out_fd);
+    if (descriptor_error) return SYSCALL_FAULT_(-descriptor_error);
+    fd_file_handle *out_handle = destination_pin.get();
+    fd_file_handle *in_handle = source_pin.get();
     if (out_handle == NULL || in_handle == NULL) return SYSCALL_FAULT_(EBADF);
 
-    uint64_t current_offset = offset_ptr == NULL ? in_handle->offset : *offset_ptr;
+    uint64_t current_offset = in_handle->offset;
+    if (offset_ptr && !copy_from_user_pagedir(current_user_pagedir(), &current_offset, offset_ptr,
+                                            sizeof(current_offset))) return SYSCALL_FAULT_(EFAULT);
     size_t   total_sent     = 0;
 
     size_t remaining = count;
@@ -5414,7 +5571,11 @@ sys_(sendfile, int out_fd, int in_fd, uint64_t *offset_ptr, size_t count)
         remaining          -= bytes_read;
     }
     free(buffer);
-    if (offset_ptr != NULL) { *offset_ptr = current_offset; }
+    if (offset_ptr != NULL)
+    {
+        if (!copy_to_user_pagedir(current_user_pagedir(), offset_ptr, &current_offset, sizeof(current_offset)))
+            return total_sent ? total_sent : SYSCALL_FAULT_(EFAULT);
+    }
     else
     {
         in_handle->offset = current_offset;

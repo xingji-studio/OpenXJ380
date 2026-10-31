@@ -644,43 +644,8 @@ static EFI_STATUS boot_file_exists(struct EFI_FILE_PROTOCOL *root, CHAR16 *path)
 
 static int boot_volume_has_system_markers(struct EFI_FILE_PROTOCOL *root)
 {
-    return !EFI_ERROR(boot_file_exists(root, L"\\EFI\\BOOT\\BOOTX64.EFI")) &&
+    return !EFI_ERROR(boot_file_exists(root, L"\\system\\activept.cfk")) &&
            !EFI_ERROR(boot_file_exists(root, L"\\system\\kernel.krl"));
-}
-
-static EFI_STATUS open_system_volume(struct EFI_FILE_PROTOCOL **out_root)
-{
-    if (out_root == NULL) return EFI_INVALID_PARAMETER;
-    *out_root = NULL;
-
-    EFI_HANDLE *handles = NULL;
-    UINTN       handle_count = 0;
-    EFI_STATUS  status = BS->LocateHandleBuffer(ByProtocol, &sfsp_guid, NULL, &handle_count, &handles);
-    if (EFI_ERROR(status)) return status;
-
-    for (UINTN i = 0; i < handle_count; i++)
-    {
-        struct EFI_SIMPLE_FILE_SYSTEM_PROTOCOL *fs = NULL;
-        status = BS->OpenProtocol(handles[i], &sfsp_guid, (void **)&fs, IM, NULL,
-                                  EFI_OPEN_PROTOCOL_BY_HANDLE_PROTOCOL);
-        if (EFI_ERROR(status) || fs == NULL) continue;
-
-        struct EFI_FILE_PROTOCOL *candidate = NULL;
-        status = fs->OpenVolume(fs, &candidate);
-        if (EFI_ERROR(status) || candidate == NULL) continue;
-
-        if (boot_volume_has_system_markers(candidate))
-        {
-            *out_root = candidate;
-            BS->FreePool(handles);
-            return EFI_SUCCESS;
-        }
-
-        candidate->Close(candidate);
-    }
-
-    BS->FreePool(handles);
-    return EFI_NOT_FOUND;
 }
 
 static EFI_STATUS boot_file_size(struct EFI_FILE_PROTOCOL *file, UINTN *out_size)
@@ -745,6 +710,302 @@ static EFI_STATUS read_boot_file(struct EFI_FILE_PROTOCOL *root, CHAR16 *path, v
     *out_buffer = buffer;
     *out_size = size;
     return EFI_SUCCESS;
+}
+
+// Original installer RAM/source handoff (Apache-2.0). These declarations describe
+// UEFI protocol ABI fields only; no third-party implementation is incorporated.
+typedef struct BOOT_INSTALLER_BLOCK_MEDIA
+{
+    UINT32 media_id;
+    BOOLEAN removable, present, partition, read_only, write_caching;
+    UINT32 block_size, io_align;
+    UINT64 last_block;
+} BOOT_INSTALLER_BLOCK_MEDIA;
+
+typedef struct BOOT_INSTALLER_BLOCK_IO
+{
+    UINT64 revision;
+    BOOT_INSTALLER_BLOCK_MEDIA *media;
+} BOOT_INSTALLER_BLOCK_IO;
+
+typedef struct BOOT_INSTALLER_PCI_IO
+{
+    UINTN poll[2], memory[2], io[2];
+    EFI_STATUS(EFIAPI *read_config)(void *, UINT32, UINT32, UINTN, void *);
+    UINTN write_config, copy_memory, map, unmap, allocate_buffer, free_buffer, flush;
+    EFI_STATUS(EFIAPI *get_location)(void *, UINTN *, UINTN *, UINTN *, UINTN *);
+} BOOT_INSTALLER_PCI_IO;
+
+static EFI_GUID boot_installer_device_path_guid = {0x09576e91, 0x6d3f, 0x11d2,
+                                                   {0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b}};
+static EFI_GUID boot_installer_pci_io_guid = {0x4cf5b200, 0x68b8, 0x4ca5,
+                                             {0x9e, 0xec, 0xb2, 0x3e, 0x3f, 0x50, 0x02, 0x9a}};
+static EFI_GUID boot_installer_block_io_guid = {0x964e5b21, 0x6459, 0x11d2,
+                                               {0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b}};
+
+// Match complete handle device paths, not a relative LoadedImage FilePath.
+// Ambiguous firmware handles are rejected before any identity is published.
+static EFI_STATUS boot_installer_exact_protocol(EFI_GUID *protocol, const UINT8 *path, UINTN prefix_bytes,
+                                                EFI_HANDLE *out_handle, void **out_protocol)
+{
+    if (!protocol || !path || prefix_bytes > XJ_INSTALLER_PATH_MAX - 4 || !out_handle || !out_protocol)
+        return EFI_INVALID_PARAMETER;
+    *out_handle = NULL;
+    *out_protocol = NULL;
+    EFI_HANDLE *handles = NULL;
+    UINTN count = 0;
+    EFI_STATUS status = BS->LocateHandleBuffer(ByProtocol, protocol, NULL, &count, &handles);
+    if (EFI_ERROR(status)) return status;
+    if (!handles || count > 4096)
+    {
+        if (handles) BS->FreePool(handles);
+        return EFI_COMPROMISED_DATA;
+    }
+    unsigned found = 0;
+    for (UINTN i = 0; i < count; ++i)
+    {
+        const UINT8 *candidate = NULL;
+        if (EFI_ERROR(BS->OpenProtocol(handles[i], &boot_installer_device_path_guid, (void **)&candidate,
+                                       IM, NULL, EFI_OPEN_PROTOCOL_GET_PROTOCOL)) || !candidate) continue;
+        // Compare only complete, length-checked nodes, so a shorter firmware
+        // path is never read past its terminator while comparing a long prefix.
+        UINTN offset = 0;
+        int equal = 1;
+        while (offset < prefix_bytes)
+        {
+            if (prefix_bytes - offset < 4) { equal = 0; break; }
+            UINTN bytes = xj_installer_le16(candidate + offset + 2);
+            if (candidate[offset] == 0x7f || bytes < 4 || bytes > prefix_bytes - offset)
+            { equal = 0; break; }
+            for (UINTN j = 0; j < bytes; ++j)
+                if (candidate[offset + j] != path[offset + j]) { equal = 0; break; }
+            if (!equal) break;
+            offset += bytes;
+        }
+        if (!equal || candidate[prefix_bytes] != 0x7f || candidate[prefix_bytes + 1] != 0xff ||
+            xj_installer_le16(candidate + prefix_bytes + 2) != 4) continue;
+        void *instance = NULL;
+        status = BS->OpenProtocol(handles[i], protocol, &instance, IM, NULL, EFI_OPEN_PROTOCOL_GET_PROTOCOL);
+        if (EFI_ERROR(status) || !instance) continue;
+        if (++found == 1) { *out_handle = handles[i]; *out_protocol = instance; }
+    }
+    BS->FreePool(handles);
+    if (found != 1)
+    {
+        *out_handle = NULL;
+        *out_protocol = NULL;
+        return found ? EFI_COMPROMISED_DATA : EFI_UNSUPPORTED;
+    }
+    return EFI_SUCCESS;
+}
+
+static int boot_installer_media_bytes(const BOOT_INSTALLER_BLOCK_MEDIA *media, UINT64 *bytes)
+{
+    if (!media || !media->present || !media->block_size || media->last_block == ~(UINT64)0 ||
+        media->last_block + 1 > ~(UINT64)0 / media->block_size) return 0;
+    *bytes = (media->last_block + 1) * media->block_size;
+    return *bytes != 0;
+}
+
+static void boot_installer_capture_source(XJ_INSTALLER_SOURCE *output)
+{
+    XJ_INSTALLER_PATH_INFO parsed;
+    XJ_INSTALLER_SOURCE source;
+    UINT32 reason = XJ_INSTALLER_SOURCE_UNSUPPORTED;
+    xmemset(output, 0, sizeof(*output));
+    if (!LIP || !LIP->DeviceHandle) goto failure;
+    const UINT8 *path = NULL;
+    EFI_STATUS status = BS->OpenProtocol(LIP->DeviceHandle, &boot_installer_device_path_guid,
+                                         (void **)&path, IM, NULL, EFI_OPEN_PROTOCOL_GET_PROTOCOL);
+    if (EFI_ERROR(status) || !path) goto failure;
+    reason = xj_installer_parse_device_path(path, XJ_INSTALLER_PATH_MAX, &parsed);
+    if (reason != XJ_INSTALLER_SOURCE_SUPPORTED) goto failure;
+    source = parsed.identity;
+    for (UINT32 i = 0; i < source.pci_count; ++i)
+    {
+        EFI_HANDLE pci_handle = NULL;
+        BOOT_INSTALLER_PCI_IO *pci = NULL;
+        status = boot_installer_exact_protocol(&boot_installer_pci_io_guid, path, parsed.pci_end[i],
+                                               &pci_handle, (void **)&pci);
+        if (EFI_ERROR(status) || !pci || !pci->get_location || !pci->read_config)
+        { reason = status == EFI_COMPROMISED_DATA ? XJ_INSTALLER_SOURCE_AMBIGUOUS :
+                                                    XJ_INSTALLER_SOURCE_UNSUPPORTED; goto failure; }
+        UINTN segment, bus, device, function;
+        status = pci->get_location(pci, &segment, &bus, &device, &function);
+        if (EFI_ERROR(status) || segment > 65535 || bus > 255 || device > 31 || function > 7 ||
+            device != source.pci[i].device || function != source.pci[i].function)
+        { reason = XJ_INSTALLER_SOURCE_MALFORMED; goto failure; }
+        source.pci[i].segment = (UINT16)segment;
+        source.pci[i].bus = (UINT8)bus;
+        UINT32 class_revision = 0;
+        status = pci->read_config(pci, 2, 8, 1, &class_revision); // EfiPciIoWidthUint32.
+        UINT32 class_code = class_revision >> 8;
+        if (EFI_ERROR(status) ||
+            (i + 1 < source.pci_count && (class_code >> 8) != 0x0604) ||
+            (i + 1 == source.pci_count &&
+             ((source.transport == XJ_INSTALLER_SOURCE_AHCI && class_code != 0x010601) ||
+              (source.transport == XJ_INSTALLER_SOURCE_NVME && (class_code >> 8) != 0x0108) ||
+              (source.transport == XJ_INSTALLER_SOURCE_IDE && (class_code >> 8) != 0x0101))))
+        { reason = XJ_INSTALLER_SOURCE_UNSUPPORTED; goto failure; }
+    }
+    EFI_HANDLE physical_handle = NULL, volume_handle = NULL;
+    BOOT_INSTALLER_BLOCK_IO *physical = NULL, *volume = NULL;
+    status = boot_installer_exact_protocol(&boot_installer_block_io_guid, path, parsed.physical_path_bytes,
+                                           &physical_handle, (void **)&physical);
+    if (EFI_ERROR(status) || !physical || !physical->media || physical->media->partition)
+    { reason = status == EFI_COMPROMISED_DATA ? XJ_INSTALLER_SOURCE_AMBIGUOUS :
+                                                XJ_INSTALLER_SOURCE_UNSUPPORTED; goto failure; }
+    status = boot_installer_exact_protocol(&boot_installer_block_io_guid, path, source.path_bytes - 4,
+                                           &volume_handle, (void **)&volume);
+    if (EFI_ERROR(status) || !volume || volume_handle != LIP->DeviceHandle || !volume->media)
+    { reason = status == EFI_COMPROMISED_DATA ? XJ_INSTALLER_SOURCE_AMBIGUOUS :
+                                                XJ_INSTALLER_SOURCE_UNSUPPORTED; goto failure; }
+    if (!boot_installer_media_bytes(physical->media, &source.physical_bytes) ||
+        !boot_installer_media_bytes(volume->media, &source.volume_bytes))
+    { reason = XJ_INSTALLER_SOURCE_MALFORMED; goto failure; }
+    source.physical_block_size = physical->media->block_size;
+    source.volume_block_size = volume->media->block_size;
+    if (physical->media->read_only) source.flags |= XJ_INSTALLER_SOURCE_READ_ONLY;
+    if (parsed.media_start > ~(UINT64)0 / source.physical_block_size)
+    { reason = XJ_INSTALLER_SOURCE_MALFORMED; goto failure; }
+    source.volume_offset = parsed.media_start * source.physical_block_size;
+    if (!xj_installer_source_valid(&source))
+    { reason = XJ_INSTALLER_SOURCE_MALFORMED; goto failure; }
+    *output = source;
+    return;
+failure:
+    output->status = reason;
+}
+
+// Page-exclusive bounded allocations permit later ownership validation and
+// freezing without changing protection on unrelated AllocatePool objects.
+static EFI_STATUS read_boot_package(struct EFI_FILE_PROTOCOL *root, CHAR16 *path, void **out_buffer,
+                                     UINTN *out_size, XJ_INSTALLER_PACKAGE_SPAN *span, UINT64 already_bytes)
+{
+    if (!root || !path || !out_buffer || !out_size || !span) return EFI_INVALID_PARAMETER;
+    *out_buffer = NULL;
+    *out_size = 0;
+    xmemset(span, 0, sizeof(*span));
+    struct EFI_FILE_PROTOCOL *file = NULL;
+    EFI_STATUS status = open_boot_file(root, path, &file);
+    if (EFI_ERROR(status)) return status;
+    UINTN bytes = 0;
+    status = boot_file_size(file, &bytes);
+    if (EFI_ERROR(status) || !bytes || bytes > XJ_INSTALLER_PACKAGE_MAX ||
+        already_bytes > XJ_INSTALLER_PACKAGES_MAX || bytes > XJ_INSTALLER_PACKAGES_MAX - already_bytes)
+    {
+        file->Close(file);
+        return EFI_ERROR(status) ? status : EFI_OUT_OF_RESOURCES;
+    }
+    UINTN pages = (bytes + 4095) / 4096;
+    EFI_PHYSICAL_ADDRESS address = 0xffffffffULL;
+    status = BS->AllocatePages(AllocateMaxAddress, EfiLoaderData, pages, &address);
+    if (EFI_ERROR(status)) { file->Close(file); return status; }
+    if (!address || (address & 4095) || address > 0x100000000ULL - pages * 4096)
+    {
+        BS->FreePages(address, pages);
+        file->Close(file);
+        return EFI_COMPROMISED_DATA;
+    }
+    xmemset((void *)address, 0, pages * 4096);
+    UINTN read_bytes = bytes;
+    status = file->Read(file, &read_bytes, (void *)address);
+    EFI_STATUS closed = file->Close(file);
+    if (EFI_ERROR(status) || read_bytes != bytes || EFI_ERROR(closed))
+    {
+        BS->FreePages(address, pages);
+        return EFI_ERROR(status) ? status : (EFI_ERROR(closed) ? closed : EFI_DEVICE_ERROR);
+    }
+    span->physical = address;
+    span->bytes = bytes;
+    span->pages = pages;
+    *out_buffer = (void *)address;
+    *out_size = bytes;
+    return EFI_SUCCESS;
+}
+
+static int boot_installer_package_magic(const void *buffer, UINTN bytes)
+{
+    static const UINT8 prefix[5] = {'X', 'J', 'P', 'A', 'K'};
+    if (!buffer || bytes < 8) return 0;
+    const UINT8 *p = (const UINT8 *)buffer;
+    for (unsigned i = 0; i < 5; ++i) if (p[i] != prefix[i]) return 0;
+    if (p[6] != '0' || p[7]) return 0;
+    return p[5] == '1' ? XJ_INSTALLER_FORMAT_PAK1 :
+           (p[5] == '2' ? XJ_INSTALLER_FORMAT_PAK2 : 0);
+}
+
+// Read this fixed-size file without allocating from its untrusted length. Only
+// EFI_NOT_FOUND means legacy mode; every error on an existing binding is fatal.
+static EFI_STATUS read_boot_root_binding(struct EFI_FILE_PROTOCOL *root, XJ_ROOT_BINDING *binding, int *present)
+{
+    if (root == NULL || binding == NULL || present == NULL) return EFI_INVALID_PARAMETER;
+    *present = 0;
+    xmemset(binding, 0, sizeof(*binding));
+    struct EFI_FILE_PROTOCOL *file = NULL;
+    EFI_STATUS status = open_boot_file(root, L"\\EFI\\XJ380\\root.bin", &file);
+    if (status == EFI_NOT_FOUND) return EFI_SUCCESS;
+    if (EFI_ERROR(status)) return status;
+    *present = 1;
+
+    UINTN size = 0;
+    status = boot_file_size(file, &size);
+    if (!EFI_ERROR(status) && size != sizeof(*binding)) status = EFI_COMPROMISED_DATA;
+    if (!EFI_ERROR(status))
+    {
+        UINTN read_size = sizeof(*binding);
+        status = file->Read(file, &read_size, binding->bytes);
+        if (!EFI_ERROR(status) && read_size != sizeof(*binding)) status = EFI_DEVICE_ERROR;
+    }
+    EFI_STATUS close_status = file->Close(file);
+    if (EFI_ERROR(status)) return status;
+    if (EFI_ERROR(close_status)) return close_status;
+    return xj_root_binding_valid(binding) ? EFI_SUCCESS : EFI_COMPROMISED_DATA;
+}
+
+// UEFI Device Path section 10: byte-packed nodes, 42-byte Hard Drive nodes,
+// signature at offset 24, GPT format and GUID signature type at offsets 40/41.
+// A single device handle must identify one partition, not a multi-instance path.
+static int boot_device_path_matches_root_binding(const UINT8 *path, UINTN path_limit,
+                                                const XJ_ROOT_BINDING *binding)
+{
+    if (path == NULL || binding == NULL) return 0;
+    int matched = 0;
+    for (UINTN offset = 0; offset <= path_limit && path_limit - offset >= 4;)
+    {
+        const UINT8 *node = path + offset;
+        UINTN length = (UINTN)node[2] | ((UINTN)node[3] << 8);
+        if (length < 4 || length > path_limit - offset) return 0;
+        if (node[0] == 0x7f)
+            return node[1] == 0xff && length == 4 && matched;
+        if (node[0] == 4 && node[1] == 1)
+        {
+            if (matched || length != 42 || node[40] != 2 || node[41] != 2 ||
+                xj_root_binding_le32(node + 4) == 0)
+                return 0;
+            const XJ_ROOT_U8 *expected = xj_root_binding_esp_guid(binding);
+            for (unsigned i = 0; i < 16; ++i)
+                if (node[24 + i] != expected[i]) return 0;
+            matched = 1;
+        }
+        offset += length;
+    }
+    return 0;
+}
+
+static int boot_loaded_esp_matches_root_binding(const XJ_ROOT_BINDING *binding)
+{
+    // The DeviceHandle identifies the volume used by this loaded EFI image.
+    // FilePath alone can contain only a relative file node, so it is not proof.
+    static EFI_GUID device_path_guid = {0x09576e91, 0x6d3f, 0x11d2,
+                                       {0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b}};
+    void *device_path = NULL;
+    if (LIP == NULL || LIP->DeviceHandle == NULL) return 0;
+    EFI_STATUS status = BS->OpenProtocol(LIP->DeviceHandle, &device_path_guid, &device_path, IM, NULL,
+                                         EFI_OPEN_PROTOCOL_GET_PROTOCOL);
+    if (EFI_ERROR(status) || device_path == NULL) return 0;
+    // Firmware supplies the terminated protocol object; cap malformed traversal.
+    return boot_device_path_matches_root_binding((const UINT8 *)device_path, 65536, binding);
 }
 
 EFI_STATUS mallocAt(EFI_PHYSICAL_ADDRESS addr, UINTN size)
@@ -953,6 +1214,10 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, struct EFI_SYSTEM_TABLE *SystemTable
     void                     *installer_root_buffer = NULL;
     void                     *system_payload_buffer = NULL;
     int                       installer_mode = 0;
+    int                       bound_root_mode = 0;
+    XJ_ROOT_BINDING           root_binding;
+    XJ_INSTALLER_HANDOFF      installer_handoff;
+    xmemset(&installer_handoff, 0, sizeof(installer_handoff));
 
     // 引导内核
     status = SFSP->OpenVolume(SFSP, &root);
@@ -968,49 +1233,87 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, struct EFI_SYSTEM_TABLE *SystemTable
     write_serial_string("Root Dir Open Success.\n");
     boot_status("Opening kernel image");
 
-    status = read_boot_file(root, L"\\installer\\installer-kernel.elf", &kernel_buffer, &kernel_size);
-    if (!EFI_ERROR(status))
+    status = read_boot_root_binding(root, &root_binding, &bound_root_mode);
+    if (EFI_ERROR(status) || (bound_root_mode && !boot_loaded_esp_matches_root_binding(&root_binding)))
     {
-        installer_mode = 1;
-        BootMenuFlags |= BOOT_FLAG_INSTALLER | BOOT_FLAG_SHOW_PROGRESS | BOOT_FLAG_DISABLE_KMOD |
-                         BOOT_FLAG_SAFE_STORAGE_IO;
-        write_serial_string("Installer kernel found.\n");
-        boot_status("Loading installer payloads");
+        puts(L"XJ380 boot binding is invalid. Error code: ROOT_BINDING_INVALID");
+        write_serial_string("Root binding invalid or wrong ESP. Stop.\n");
+        while (1)
+            ;
+    }
 
-        status = read_boot_file(root, L"\\installer\\installer-root.pak", &installer_root_buffer,
-                                &installer_root_size);
-        if (EFI_ERROR(status))
-        {
-            puts(L"XJ380 installer payload is missing. Error code: INSTALLER_ROOT_NOT_FOUND");
-            write_serial_string("Installer root payload read failed. Stop.\n");
-            while (1)
-                ;
-        }
-
-        status = read_boot_file(root, L"\\installer\\system-payload.pak", &system_payload_buffer,
-                                &system_payload_size);
-        if (EFI_ERROR(status))
-        {
-            puts(L"XJ380 installer payload is missing. Error code: SYSTEM_PAYLOAD_NOT_FOUND");
-            write_serial_string("System payload read failed. Stop.\n");
-            while (1)
-                ;
-        }
+    if (bound_root_mode)
+    {
+        // A bound kernel must come from the same ESP as this EFI image.
+        status = read_boot_file(root, L"\\system\\kernel.krl", &kernel_buffer, &kernel_size);
     }
     else
     {
-        root->Close(root);
-        root = NULL;
-
-        status = open_system_volume(&root);
-        if (EFI_ERROR(status))
+        status = read_boot_file(root, L"\\installer\\installer-kernel.elf", &kernel_buffer, &kernel_size);
+        if (!EFI_ERROR(status))
         {
-            write_serial_string("system not found\n");
-            while (1)
-                ;
+            installer_mode = 1;
+            BootMenuFlags |= BOOT_FLAG_INSTALLER | BOOT_FLAG_SHOW_PROGRESS | BOOT_FLAG_DISABLE_KMOD |
+                             BOOT_FLAG_SAFE_STORAGE_IO;
+            write_serial_string("Installer kernel found.\n");
+            boot_status("Loading installer payloads");
+
+            status = read_boot_package(root, L"\\installer\\installer-root.pak", &installer_root_buffer,
+                                       &installer_root_size, &installer_handoff.root, 0);
+            if (EFI_ERROR(status))
+            {
+                puts(L"XJ380 installer payload is missing. Error code: INSTALLER_ROOT_NOT_FOUND");
+                write_serial_string("Installer root payload read failed. Stop.\n");
+                while (1)
+                    ;
+            }
+
+            status = read_boot_package(root, L"\\installer\\system-payload.pak", &system_payload_buffer,
+                                       &system_payload_size, &installer_handoff.system, installer_root_size);
+            if (EFI_ERROR(status))
+            {
+                puts(L"XJ380 installer payload is missing. Error code: SYSTEM_PAYLOAD_NOT_FOUND");
+                write_serial_string("System payload read failed. Stop.\n");
+                while (1)
+                    ;
+            }
+            int root_format = boot_installer_package_magic(installer_root_buffer, installer_root_size);
+            int system_format = boot_installer_package_magic(system_payload_buffer, system_payload_size);
+            if (root_format != XJ_INSTALLER_FORMAT_PAK1 || !system_format)
+            {
+                write_serial_string("Unsupported installer package profile. Stop.\n");
+                while (1) ;
+            }
+            installer_handoff.magic = XJ_INSTALLER_HANDOFF_MAGIC;
+            installer_handoff.version = XJ_INSTALLER_HANDOFF_VERSION;
+            installer_handoff.bytes = sizeof(installer_handoff);
+            installer_handoff.root_format = root_format;
+            installer_handoff.loader_image_physical = (UINT64)LIP->ImageBase;
+            installer_handoff.loader_image_bytes = LIP->ImageSize;
+            installer_handoff.system_profile = system_format == XJ_INSTALLER_FORMAT_PAK2 ?
+                XJ_INSTALLER_PROFILE_EXT4_PAK2 : XJ_INSTALLER_PROFILE_FAT32_PAK1;
+            boot_installer_capture_source(&installer_handoff.source);
+            if (!xj_installer_handoff_valid(&installer_handoff))
+            {
+                write_serial_string("Invalid installer handoff. Stop.\n");
+                while (1) ;
+            }
+            BootMenuFlags |= BOOT_FLAG_INSTALLER_HANDOFF;
+        }
+        else
+        {
+            // Without a descriptor, only this loaded volume's legacy markers
+            // authorize legacy boot. Never borrow a marker from another disk.
+            if (!boot_volume_has_system_markers(root))
+            {
+                write_serial_string("Root binding and local legacy system markers missing. Stop.\n");
+                while (1)
+                    ;
+            }
+
+            status = read_boot_file(root, L"\\system\\kernel.krl", &kernel_buffer, &kernel_size);
         }
 
-        status = read_boot_file(root, L"\\system\\kernel.krl", &kernel_buffer, &kernel_size);
     }
 
     if (EFI_ERROR(status))
@@ -1020,6 +1323,19 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, struct EFI_SYSTEM_TABLE *SystemTable
         write_serial_string("Kernel Read Failed. Stop.\n");
         while (1)
             ;
+    }
+
+    if (bound_root_mode)
+    {
+        if (!xj_root_binding_kernel_matches(&root_binding, kernel_buffer, kernel_size))
+        {
+            puts(L"XJ380 boot kernel does not match root binding. Error code: ROOT_KERNEL_MISMATCH");
+            write_serial_string("Root binding kernel length or CRC32C mismatch. Stop.\n");
+            while (1)
+                ;
+        }
+        BootMenuFlags |= BOOT_FLAG_BOUND_ROOT;
+        write_serial_string("Bound root descriptor and ESP kernel verified.\n");
     }
 
     write_serial_string("XSK2.1 Kernel Read Success.\n");
@@ -1078,12 +1394,14 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, struct EFI_SYSTEM_TABLE *SystemTable
 
     BootConfig->is_qemu = 0;
     BootConfig->boot_flags = BootMenuFlags;
+    if (bound_root_mode) xmemcpy(&BootConfig->root_binding, &root_binding, sizeof(root_binding));
     if (installer_mode)
     {
         BootConfig->installer_root_pak = (UINT64)installer_root_buffer;
         BootConfig->installer_root_pak_size = (UINT64)installer_root_size;
         BootConfig->system_payload_pak = (UINT64)system_payload_buffer;
         BootConfig->system_payload_pak_size = (UINT64)system_payload_size;
+        BootConfig->installer_handoff = installer_handoff;
     }
 
     // 获取RSDP

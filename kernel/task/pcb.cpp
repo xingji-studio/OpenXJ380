@@ -15,6 +15,8 @@
 #include <elf.h>
 #include <errno.h>
 #include <fs/vfs/vfs.h>
+#include <fs/ext4/ext4.h>
+#include <fs/fatfs/fatfs.h>
 #if defined(XJ380)
 #include <graphics/window/window.h>
 #endif
@@ -24,7 +26,11 @@
 #include <pctable/gdt.h>
 #include <procfs.h>
 #include <syscall/syscall.h>
+#include <syscall/fd_lifetime.h>
+#include <block_access.h>
+#include <installer/jobs.h>
 #include <task/ipc.h>
+#include <smp/smp.h>
 
 // Product audio resources are revoked at successful image publication.
 extern "C" void OpenXJ380Audio_ReleaseProcess(void *) __attribute__((weak));
@@ -251,6 +257,56 @@ tcb_t found_thread(pcb_t pcb, int tid)
     return ret;
 }
 
+static bool process_list_contains_locked(pcb_t process)
+{
+    for (lock_node *entry = pcb_group_queue->head; entry; entry = entry->next)
+        if (entry->data == process) return true;
+    return false;
+}
+
+static bool notify_parent_exit(pcb_t child, int exit_code)
+{
+    // Parent collection changes parent_task under the process-list lock. Both
+    // allocations precede that lock; publication transfers ownership at unlock.
+    auto *message = static_cast<ipc_message_t>(malloc(sizeof(struct ipc_message)));
+    if (!message) return false;
+    auto *node = static_cast<lock_node *>(malloc(sizeof(lock_node)));
+    if (!node) { free(message); return false; }
+    memset(message, 0, sizeof(*message));
+    message->type = IPC_MSG_TYPE_EPID;
+    for (unsigned i = 0; i < 4; ++i) message->data[i] = uint8_t(uint32_t(exit_code) >> (i * 8));
+    node->data = message;
+    node->next = NULL;
+    bool published = false;
+    spin_lock(&pcb_group_queue->lock);
+    if (process_list_contains_locked(child))
+    {
+        pcb_t parent = child->parent_task;
+        lock_queue *queue = parent ? parent->ipc_queue : NULL;
+        if (queue)
+        {
+            spin_lock(&queue->lock);
+            if (queue->next_index != size_t(-1))
+            {
+                message->pid = int(child->pid);
+                node->index = queue->next_index++;
+                node->prev = queue->tail;
+                if (queue->tail) queue->tail->next = node;
+                else queue->head = node;
+                queue->tail = node;
+                if (!queue->rr_cursor) queue->rr_cursor = queue->head;
+                ++queue->size;
+                published = true;
+            }
+            spin_unlock(&queue->lock);
+        }
+    }
+    spin_unlock(&pcb_group_queue->lock);
+    // A receiver may already have freed both objects after publication.
+    if (!published) { free(node); free(message); }
+    return published;
+}
+
 void kill_proc(pcb_t pcb, int exit_code, bool is_zombie)
 {
     if (pcb == NULL) return;
@@ -264,36 +320,27 @@ void kill_proc(pcb_t pcb, int exit_code, bool is_zombie)
 
     if (is_zombie)
     {
-        close_process_file_table(pcb);
-        pcb->status = ZOMBIE;
+        // Exit may run with interrupts or scheduling disabled. The reaper
+        // drains descriptors only after every exiting thread leaves all CPUs.
+        pcb->status = DEATH;
         if (pcb->thread_queue->size > 0)
         {
             spin_lock(&pcb->thread_queue->lock);
             queue_foreach(pcb->thread_queue, node)
             {
                 tcb_t tcb = (tcb_t)node->data;
-                kill_thread(tcb);
+                if (tcb) tcb->status = DEATH;
             }
             spin_unlock(&pcb->thread_queue->lock);
         }
-        ipc_message_t msg = (ipc_message_t)malloc(sizeof(struct ipc_message));
-        if (msg == NULL)
+        __atomic_store_n(&pcb->status, ZOMBIE, __ATOMIC_RELEASE);
+        if (!notify_parent_exit(pcb, exit_code))
         {
             write_serial_fmt("task: cannot notify parent of process %s exit.\n", pcb->name);
-            return;
         }
-        msg->pid          = pcb->pid;
-        msg->type         = IPC_MSG_TYPE_EPID;
-        msg->data[0]      = exit_code & 0xFF;
-        msg->data[1]      = (exit_code >> 8) & 0xFF;
-        msg->data[2]      = (exit_code >> 16) & 0xFF;
-        msg->data[3]      = (exit_code >> 24) & 0xFF;
-        ipc_send(pcb->parent_task, msg);
     }
     else
     {
-        if (pcb->parent_task != NULL && pcb->parent_task->child_pcb != NULL)
-            queue_remove_data(pcb->parent_task->child_pcb, pcb);
         pcb->status = DEATH;
         kill_proc0(pcb);
     }
@@ -301,35 +348,80 @@ void kill_proc(pcb_t pcb, int exit_code, bool is_zombie)
 
 bool kill_proc_deferred(pcb_t pcb, int exit_code)
 {
-    if (pcb == NULL || kernel_group == NULL || pcb->pid == kernel_group->pid) return false;
-
+    if (!pcb || !kernel_group || !pcb_group_queue) return false;
+    // A raw lookup may race withdrawal. Establish list membership before any
+    // PCB dereference, and retain this lock until every terminal write is done.
+    spin_lock(&pcb_group_queue->lock);
+    if (!process_list_contains_locked(pcb) || pcb == kernel_group)
+    {
+        spin_unlock(&pcb_group_queue->lock);
+        return false;
+    }
     if (pcb->parent_task != kernel_group)
     {
-        size_t reaper_index = queue_enqueue(kernel_group->child_pcb, pcb);
-        if (reaper_index == (size_t)-1) return false;
-
-        if (pcb->parent_task != NULL && pcb->parent_task->child_pcb != NULL)
-            queue_remove_data(pcb->parent_task->child_pcb, pcb);
+        lock_queue *siblings = pcb->parent_task ? pcb->parent_task->child_pcb : NULL;
+        lock_queue *adopted = kernel_group->child_pcb;
+        if (!siblings || !adopted)
+        {
+            spin_unlock(&pcb_group_queue->lock);
+            return false;
+        }
+        spin_lock(&siblings->lock);
+        spin_lock(&adopted->lock);
+        lock_node *entry = siblings->head;
+        while (entry && entry->data != pcb) entry = entry->next;
+        if (!entry)
+        {
+            spin_unlock(&adopted->lock);
+            spin_unlock(&siblings->lock);
+            spin_unlock(&pcb_group_queue->lock);
+            return false;
+        }
+        size_t index = 0;
+        for (;;)
+        {
+            bool used = false;
+            for (lock_node *other = adopted->head; other; other = other->next)
+                if (other->index == index) { used = true; break; }
+            if (!used) break;
+            ++index;
+        }
+        if (entry->prev) entry->prev->next = entry->next;
+        else siblings->head = entry->next;
+        if (entry->next) entry->next->prev = entry->prev;
+        else siblings->tail = entry->prev;
+        if (siblings->rr_cursor == entry) siblings->rr_cursor = entry->next ? entry->next : siblings->head;
+        if (siblings->size) --siblings->size;
+        entry->index = index;
+        entry->prev = adopted->tail;
+        entry->next = NULL;
+        if (adopted->tail) adopted->tail->next = entry;
+        else adopted->head = entry;
+        adopted->tail = entry;
+        if (!adopted->rr_cursor) adopted->rr_cursor = entry;
+        ++adopted->size;
+        if (index >= adopted->next_index) adopted->next_index = index + 1;
         pcb->parent_task = kernel_group;
         pcb->ppid = kernel_group->pid;
-        pcb->child_index = reaper_index;
+        pcb->child_index = index;
+        spin_unlock(&adopted->lock);
+        spin_unlock(&siblings->lock);
     }
 
     pcb->exit_code = exit_code;
-    close_process_file_table(pcb);
-    pcb->status = DEATH;
-
     if (pcb->thread_queue != NULL)
     {
         spin_lock(&pcb->thread_queue->lock);
         queue_foreach(pcb->thread_queue, node)
         {
             tcb_t tcb = (tcb_t)node->data;
-            kill_thread(tcb);
+            if (tcb) tcb->status = DEATH;
         }
         spin_unlock(&pcb->thread_queue->lock);
     }
-
+    __atomic_store_n(&pcb->status, DEATH, __ATOMIC_RELEASE);
+    spin_unlock(&pcb_group_queue->lock);
+    // Reaper collection may free pcb immediately after the unlock.
     return true;
 }
 
@@ -366,11 +458,261 @@ static char **copy_kernel_string_vector_owned(char **argv, size_t argc)
     return copy;
 }
 
+static bool process_current_on_cpu(pcb_t process)
+{
+    return scheduler_process_referenced(process);
+}
+
+static bool wait_owner_quiescent(tcb_t owner)
+{
+    return owner && (owner->status == DEATH || owner->status == OUT) && !scheduler_task_referenced(owner);
+}
+
+static void release_wait_claims(tcb_t owner, bool only_quiescent)
+{
+    spin_lock(&pcb_group_queue->lock);
+    for (lock_node *entry = pcb_group_queue->head; entry; entry = entry->next)
+    {
+        pcb_t child = static_cast<pcb_t>(entry->data);
+        tcb_t waiter = child ? __atomic_load_n(&child->wait_owner, __ATOMIC_ACQUIRE) : NULL;
+        if (!waiter || (owner && waiter != owner) || (only_quiescent && !wait_owner_quiescent(waiter))) continue;
+        lock_queue *children = child->parent_task ? child->parent_task->child_pcb : NULL;
+        if (children) spin_lock(&children->lock);
+        __atomic_store_n(&child->wait_owner, (tcb_t)NULL, __ATOMIC_RELEASE);
+        if (child->status == WAIT) __atomic_store_n(&child->status, ZOMBIE, __ATOMIC_RELEASE);
+        if (children) spin_unlock(&children->lock);
+    }
+    spin_unlock(&pcb_group_queue->lock);
+}
+
+void process_release_wait_claims(tcb_t owner) { release_wait_claims(owner, false); }
+void process_reap_wait_claims() { release_wait_claims(NULL, true); }
+
+static void collect_quiesced_process(pcb_t pcb);
+
+static void abandon_quiesced_block_access(pcb_t process)
+{
+    // The caller's collection/drain pin keeps this withdrawn or terminal
+    // process and its thread queue alive. Do not use the reaper's own TCB as
+    // the dead I/O owner, and never revoke a still selected/current stack.
+    if (!process || !process->thread_queue) return;
+    for (lock_node *entry = process->thread_queue->head; entry; entry = entry->next)
+    {
+        tcb_t task = static_cast<tcb_t>(entry->data);
+        if (task && (task->status == DEATH || task->status == OUT) && !scheduler_task_referenced(task))
+        {
+            block_access_abandon_owner(task, task->tid);
+            installer::jobs_abandon_worker(task, task->tid);
+        }
+    }
+}
+
+// A PCB-tail state pins a quiescent zombie while its descriptors are drained.
+// Collection competes with this claim before unlinking/freeing the PCB. No
+// allocation or filesystem work occurs while the process-list lock is held.
+void reap_quiesced_file_descriptors()
+{
+    pcb_t target = NULL;
+    bool already_drained = false;
+    spin_lock(&pcb_group_queue->lock);
+    for (lock_node *entry = pcb_group_queue->head; entry; entry = entry->next)
+    {
+        pcb_t process = static_cast<pcb_t>(entry->data);
+        if (!process || (process->status != ZOMBIE && process->status != DEATH) || process_current_on_cpu(process))
+            continue;
+        uint32_t expected = 0;
+        if (__atomic_compare_exchange_n(&process->fd_cleanup_state, &expected, 1, false, __ATOMIC_ACQ_REL,
+                                        __ATOMIC_ACQUIRE)) { target = process; break; }
+        if (expected == 2 && process->status == DEATH &&
+            !__atomic_load_n(&process->wait_owner, __ATOMIC_ACQUIRE) &&
+            __atomic_compare_exchange_n(&process->fd_cleanup_state, &expected, 3, false, __ATOMIC_ACQ_REL,
+                                        __ATOMIC_ACQUIRE))
+        {
+            target = process;
+            already_drained = true;
+            break;
+        }
+    }
+    spin_unlock(&pcb_group_queue->lock);
+    if (!target) return;
+    if (already_drained) { collect_quiesced_process(target); return; }
+    abandon_quiesced_block_access(target);
+    ext4fs_quiescent_exit();
+    fatfs_quiescent_exit();
+    close_process_file_table(target);
+    if (target->thread_queue)
+        for (lock_node *entry = target->thread_queue->head; entry; entry = entry->next)
+            fd_operation_thread_exit(static_cast<tcb_t>(entry->data));
+    uint32_t state = __atomic_load_n(&target->fd_cleanup_state, __ATOMIC_ACQUIRE);
+    for (;;)
+    {
+        bool collect = !__atomic_load_n(&target->wait_owner, __ATOMIC_ACQUIRE) &&
+                       (state == 5 || target->status == DEATH);
+        if (__atomic_compare_exchange_n(&target->fd_cleanup_state, &state, collect ? 3U : 2U, false,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+        {
+            // A concurrent waitpid records its request as state 5. Transfer
+            // directly from the drain pin to collection, with no unpinned gap.
+            if (collect) collect_quiesced_process(target);
+            return;
+        }
+    }
+}
+
+// 0: another collector/drain owns the PCB, 1: exclusive collection,
+// 2: exclusive preparation retained while a running process is deferred.
+static int claim_process_collection(pcb_t pcb, bool transfer_waiter = false)
+{
+    if (__atomic_load_n(&pcb->wait_owner, __ATOMIC_ACQUIRE) && !transfer_waiter) return 0;
+    if (transfer_waiter) __atomic_store_n(&pcb->status, DEATH, __ATOMIC_RELEASE);
+    uint32_t state = __atomic_load_n(&pcb->fd_cleanup_state, __ATOMIC_ACQUIRE);
+    for (;;)
+    {
+        if (state == 1)
+        {
+            if (__atomic_compare_exchange_n(&pcb->fd_cleanup_state, &state, 5, false, __ATOMIC_ACQ_REL,
+                                            __ATOMIC_ACQUIRE))
+            {
+                if (transfer_waiter) __atomic_store_n(&pcb->wait_owner, (tcb_t)NULL, __ATOMIC_RELEASE);
+                return 0;
+            }
+            continue;
+        }
+        if (state == 3 || state == 4 || state == 5)
+        {
+            if (transfer_waiter) __atomic_store_n(&pcb->wait_owner, (tcb_t)NULL, __ATOMIC_RELEASE);
+            return 0;
+        }
+        if (__atomic_compare_exchange_n(&pcb->fd_cleanup_state, &state, 4, false, __ATOMIC_ACQ_REL,
+                                        __ATOMIC_ACQUIRE)) break;
+    }
+    if (transfer_waiter) __atomic_store_n(&pcb->wait_owner, (tcb_t)NULL, __ATOMIC_RELEASE);
+    if (process_current_on_cpu(pcb)) return 2;
+    __atomic_store_n(&pcb->fd_cleanup_state, 3, __ATOMIC_RELEASE);
+    return 1;
+}
+
 void kill_proc0(pcb_t pcb)
 {
+    int claim = claim_process_collection(pcb);
+    if (!claim) return;
+    if (claim == 2)
+    {
+        kill_proc_deferred(pcb, pcb->exit_code);
+        // The preparation pin covers reparenting; no PCB access follows its
+        // release, since the existing reaper may immediately collect it.
+        __atomic_store_n(&pcb->fd_cleanup_state, 0, __ATOMIC_RELEASE);
+        return;
+    }
+    collect_quiesced_process(pcb);
+}
+
+// Couple list withdrawal to the waiter claim. A lookup either publishes
+// wait_owner first, or finds no list entry after collection has withdrawn it.
+static lock_node *detach_process_entry(lock_queue *queue, void *data)
+{
+    if (!queue) return NULL;
+    for (lock_node *entry = queue->head; entry; entry = entry->next)
+    {
+        if (entry->data != data) continue;
+        if (entry->prev) entry->prev->next = entry->next;
+        else queue->head = entry->next;
+        if (entry->next) entry->next->prev = entry->prev;
+        else queue->tail = entry->prev;
+        if (queue->rr_cursor == entry) queue->rr_cursor = entry->next ? entry->next : queue->head;
+        if (queue->size) --queue->size;
+        return entry;
+    }
+    return NULL;
+}
+
+static bool detach_process_child(pcb_t pcb)
+{
+    spin_lock(&pcb_group_queue->lock);
+    pcb_t parent = pcb->parent_task;
+    lock_queue *siblings = parent ? parent->child_pcb : NULL;
+    if (siblings) spin_lock(&siblings->lock);
+    if (__atomic_load_n(&pcb->wait_owner, __ATOMIC_ACQUIRE))
+    {
+        if (siblings) spin_unlock(&siblings->lock);
+        spin_unlock(&pcb_group_queue->lock);
+        return false;
+    }
+    lock_node *family_entry = detach_process_entry(siblings, pcb);
+    if (siblings) spin_unlock(&siblings->lock);
+    // Move existing child queue nodes rather than allocating while locked.
+    // Every parent pointer changes before this PCB leaves the protected list.
+    lock_queue *children = pcb->child_pcb;
+    lock_queue *adopted = kernel_group->child_pcb;
+    if (children)
+    {
+        spin_lock(&children->lock);
+        spin_lock(&adopted->lock);
+        while (children->head)
+        {
+            lock_node *entry = children->head;
+            auto *child = static_cast<pcb_t>(entry->data);
+            detach_process_entry(children, child);
+            size_t index = adopted->next_index;
+            for (;;)
+            {
+                bool used = false;
+                for (lock_node *other = adopted->head; other; other = other->next)
+                    if (other->index == index) { used = true; break; }
+                if (!used) break;
+                ++index;
+            }
+            adopted->next_index = index + 1;
+            entry->index = index;
+            entry->prev = adopted->tail;
+            entry->next = NULL;
+            if (adopted->tail) adopted->tail->next = entry;
+            else adopted->head = entry;
+            adopted->tail = entry;
+            if (!adopted->rr_cursor) adopted->rr_cursor = entry;
+            ++adopted->size;
+            child->parent_task = kernel_group;
+            child->ppid = kernel_group->pid;
+            child->child_index = index;
+            if (child->status == ZOMBIE || child->status == WAIT)
+            {
+                __atomic_store_n(&child->wait_owner, (tcb_t)NULL, __ATOMIC_RELEASE);
+                __atomic_store_n(&child->status, DEATH, __ATOMIC_RELEASE);
+            }
+        }
+        spin_unlock(&adopted->lock);
+        spin_unlock(&children->lock);
+    }
+    lock_node *global_entry = detach_process_entry(pcb_group_queue, pcb);
+    spin_unlock(&pcb_group_queue->lock);
+    free(family_entry);
+    free(global_entry);
+    return true;
+}
+
+void process_complete_wait(pcb_t child)
+{
+    int claim = claim_process_collection(child, true);
+    if (!claim) return;
+    if (claim == 2)
+    {
+        kill_proc_deferred(child, child->exit_code);
+        __atomic_store_n(&child->fd_cleanup_state, 0, __ATOMIC_RELEASE);
+        return;
+    }
+    collect_quiesced_process(child);
+}
+
+static void collect_quiesced_process(pcb_t pcb)
+{
+    if (!detach_process_child(pcb))
+    {
+        __atomic_store_n(&pcb->fd_cleanup_state, 2, __ATOMIC_RELEASE);
+        return;
+    }
+    pcb->status = DEATH;
     // Withdraw before destroying thread_queue: terminal group-signal delivery
     // holds the process-list lock while visiting that queue.
-    queue_remove_data(pcb_group_queue, pcb);
     /*
      * Mark every thread dead before notifying product subsystems. Exit hooks
      * use the status to reclaim process-owned locks while TCB pointers are
@@ -390,6 +732,9 @@ void kill_proc0(pcb_t pcb)
      * and PCB. Generic OpenXJ380 builds do not include the product window
      * implementation and use the socket hook as a no-op.
      */
+    abandon_quiesced_block_access(pcb);
+    ext4fs_quiescent_exit();
+    fatfs_quiescent_exit();
     ime_process_exit(pcb);
 #if defined(XJ380)
     OpenXJ380Socket_NotifyProcessExit(pcb);
@@ -409,6 +754,10 @@ void kill_proc0(pcb_t pcb)
     } while (true);
 
     queue_destroy(pcb->thread_queue);
+    // Withdrawal already transferred every child node to the reaper. Release
+    // the empty queue as well, so repeated application exits do not leak it.
+    if (pcb->child_pcb) queue_destroy(pcb->child_pcb);
+    pcb->child_pcb = NULL;
 
     // 保存需要在free之后访问的字段
     char *cmdline = pcb->cmdline;
@@ -491,6 +840,16 @@ extern void remove_task(tcb_t task);
 
 void kill_thread0(tcb_t task)
 {
+    if ((task->status == DEATH || task->status == OUT) && !scheduler_task_referenced(task))
+    {
+        block_access_abandon_owner(task, task->tid);
+        installer::jobs_abandon_worker(task, task->tid);
+    }
+    ext4fs_quiescent_exit();
+    fatfs_quiescent_exit();
+    process_release_wait_claims(task);
+    fd_operation_thread_exit(task);
+    procfs_operation_thread_exit(task);
     permissions_thread_exit(task);
     task->status = OUT;
     clear_child_tid_if_requested(task);
@@ -1788,35 +2147,7 @@ static void *file_copy(void *ptr)
 
 static void close_exec_file_descriptors(pcb_t process)
 {
-    if (process == NULL || process->file_open == NULL) return;
-
-    while (true)
-    {
-        size_t fd_to_close = (size_t)-1;
-
-        spin_lock(&process->file_open->lock);
-        lock_node *node = process->file_open->head;
-        while (node != NULL)
-        {
-            fd_file_handle *handle = (fd_file_handle *)node->data;
-            if (handle != NULL && (handle->flags & O_CLOEXEC))
-            {
-                fd_to_close = node->index;
-                break;
-            }
-            node = node->next;
-        }
-        spin_unlock(&process->file_open->lock);
-
-        if (fd_to_close == (size_t)-1) break;
-
-        fd_file_handle *handle = (fd_file_handle *)queue_remove_at(process->file_open, fd_to_close);
-        if (handle != NULL)
-        {
-            vfs_close(handle->node);
-            free(handle);
-        }
-    }
+    while (fd_file_handle *handle = fd_detach_matching(process, 0, size_t(-1), true)) fd_retire_handle(handle);
 }
 
 static void free_fd_handle_queue(lock_queue *queue)
@@ -1824,10 +2155,9 @@ static void free_fd_handle_queue(lock_queue *queue)
     if (queue == NULL) return;
     while (true)
     {
-        fd_file_handle *handle = (fd_file_handle *)queue_dequeue(queue);
+        fd_file_handle *handle = fd_detach_first(queue);
         if (handle == NULL) break;
-        vfs_close(handle->node);
-        free(handle);
+        fd_retire_handle(handle);
     }
     queue_destroy(queue);
 }
@@ -1861,20 +2191,18 @@ static bool fd_table_unref(pcb_t pcb)
 
 static void close_process_file_table(pcb_t pcb)
 {
-    if (pcb == NULL || pcb->file_open == NULL) return;
-
-    lock_queue *file_open = pcb->file_open;
+    if (pcb == NULL) return;
+    lock_queue *file_open = fd_detach_process_table(pcb);
+    if (!file_open) return;
     bool close_fd_table = fd_table_unref(pcb);
-    pcb->file_open = NULL;
 
     if (!close_fd_table) return;
 
     while (true)
     {
-        fd_file_handle *handle = (fd_file_handle *)queue_dequeue(file_open);
+        fd_file_handle *handle = fd_detach_first(file_open);
         if (handle == NULL) break;
-        vfs_close(handle->node);
-        free(handle);
+        fd_retire_handle(handle);
     }
     queue_destroy(file_open);
 }
@@ -1900,6 +2228,10 @@ static void free_partial_process(pcb_t pcb, bool owns_pagedir)
         queue_remove_data(pcb->parent_task->child_pcb, pcb);
     if (pcb_group_queue != NULL && pcb->queue_index != (size_t)-1)
         queue_remove_data(pcb_group_queue, pcb);
+
+    // A failed fork may already have appeared in a lazy /proc snapshot.
+    // Withdraw it before retiring observers, then wait outside creator locks.
+    procfs_on_exit_task(pcb);
 
     if (pcb->thread_queue) queue_destroy(pcb->thread_queue);
     if (pcb->child_pcb) queue_destroy(pcb->child_pcb);
@@ -2053,9 +2385,9 @@ uint64_t process_fork(struct X64_REGS *reg, bool is_vfork, uint64_t user_stack, 
     if (!vma_manager_clone(&current_pcb->vma_manager, &new_pcb->vma_manager))//calloc灏辨垜鐙楀懡
     {
         write_serial_fmt("task: cannot clone process vma information.\n");
-        free_partial_process(new_pcb, !is_vfork);
         spin_unlock(&create_thread_lock);
         restore_runtime_state(scheduler_depth, is_sti);
+        free_partial_process(new_pcb, !is_vfork);
         return -ENOMEM;
     }
     new_pcb->brk_start   = current_pcb->brk_start;
@@ -2092,9 +2424,9 @@ uint64_t process_fork(struct X64_REGS *reg, bool is_vfork, uint64_t user_stack, 
         new_pcb->ipc_queue == NULL ||
         new_pcb->tty == NULL || new_pcb->xtttp_stc == NULL)
     {
-        free_partial_process(new_pcb, !is_vfork);
         spin_unlock(&create_thread_lock);
         restore_runtime_state(scheduler_depth, is_sti);
+        free_partial_process(new_pcb, !is_vfork);
         return (uint64_t)-ENOMEM;
     }
     memset(new_pcb->xtttp_stc, 0, sizeof(xtttp_dtt));
@@ -2102,27 +2434,27 @@ uint64_t process_fork(struct X64_REGS *reg, bool is_vfork, uint64_t user_stack, 
     new_pcb->queue_index = queue_enqueue(pcb_group_queue, new_pcb);
     if (new_pcb->queue_index == (size_t)-1)
     {
-        free_partial_process(new_pcb, !is_vfork);
         spin_unlock(&create_thread_lock);
         restore_runtime_state(scheduler_depth, is_sti);
+        free_partial_process(new_pcb, !is_vfork);
         return (uint64_t)-ENOMEM;
     }
 
     new_pcb->child_index = queue_enqueue(current_pcb->child_pcb, new_pcb);
     if (new_pcb->child_index == (size_t)-1)
     {
-        free_partial_process(new_pcb, !is_vfork);
         spin_unlock(&create_thread_lock);
         restore_runtime_state(scheduler_depth, is_sti);
+        free_partial_process(new_pcb, !is_vfork);
         return (uint64_t)-ENOMEM;
     }
 
     tcb_t new_task = alloc_zeroed_tcb();
     if (new_task == NULL)
     {
-        free_partial_process(new_pcb, !is_vfork);
         spin_unlock(&create_thread_lock);
         restore_runtime_state(scheduler_depth, is_sti);
+        free_partial_process(new_pcb, !is_vfork);
         return (uint64_t)-(ENOMEM);
     }
     new_task->task_level     = TASK_APPLICATION_LEVEL;
@@ -2132,20 +2464,20 @@ uint64_t process_fork(struct X64_REGS *reg, bool is_vfork, uint64_t user_stack, 
     uint64_t kernel_stack_phys = alloc_frames(KERNEL_STACK_SIZE / PAGE_SIZE);
     if (kernel_stack_phys == 0)
     {
-        free_partial_process(new_pcb, !is_vfork);
-        free_fork_task(new_task);
         spin_unlock(&create_thread_lock);
         restore_runtime_state(scheduler_depth, is_sti);
+        free_partial_process(new_pcb, !is_vfork);
+        free_fork_task(new_task);
         return (uint64_t)-ENOMEM;
     }
     uint64_t syscall_stack_phys = alloc_frames(KERNEL_STACK_SIZE / PAGE_SIZE);
     if (syscall_stack_phys == 0)
     {
+        spin_unlock(&create_thread_lock);
+        restore_runtime_state(scheduler_depth, is_sti);
         free_partial_process(new_pcb, !is_vfork);
         free_frames(kernel_stack_phys, KERNEL_STACK_SIZE / PAGE_SIZE);
         free_fork_task(new_task);
-        spin_unlock(&create_thread_lock);
-        restore_runtime_state(scheduler_depth, is_sti);
         return (uint64_t)-ENOMEM;
     }
     new_task->kernel_stack  = ((uint64_t)phys_to_virt(kernel_stack_phys)) + KERNEL_STACK_SIZE;
@@ -2176,19 +2508,19 @@ uint64_t process_fork(struct X64_REGS *reg, bool is_vfork, uint64_t user_stack, 
     if ((clone_flags & CLONE_PARENT_SETTID_FLAG) &&
         !copy_to_user_pagedir(current_pcb->pagedir, parent_tid, &child_tid_value, sizeof(child_tid_value)))
     {
-        free_partial_process(new_pcb, !is_vfork);
-        free_fork_task(new_task);
         spin_unlock(&create_thread_lock);
         restore_runtime_state(scheduler_depth, is_sti);
+        free_partial_process(new_pcb, !is_vfork);
+        free_fork_task(new_task);
         return (uint64_t)-EFAULT;
     }
     if ((clone_flags & CLONE_CHILD_SETTID_FLAG) &&
         !copy_to_user_pagedir(new_pcb->pagedir, child_tid, &child_tid_value, sizeof(child_tid_value)))
     {
-        free_partial_process(new_pcb, !is_vfork);
-        free_fork_task(new_task);
         spin_unlock(&create_thread_lock);
         restore_runtime_state(scheduler_depth, is_sti);
+        free_partial_process(new_pcb, !is_vfork);
+        free_fork_task(new_task);
         return (uint64_t)-EFAULT;
     }
     if (clone_flags & CLONE_CHILD_CLEARTID_FLAG)
@@ -2199,10 +2531,10 @@ uint64_t process_fork(struct X64_REGS *reg, bool is_vfork, uint64_t user_stack, 
     new_task->group_index  = queue_enqueue(new_pcb->thread_queue, new_task);
     if (new_task->group_index == (size_t)-1)
     {
-        free_partial_process(new_pcb, !is_vfork);
-        free_fork_task(new_task);
         spin_unlock(&create_thread_lock);
         restore_runtime_state(scheduler_depth, is_sti);
+        free_partial_process(new_pcb, !is_vfork);
+        free_fork_task(new_task);
         return (uint64_t)-ENOMEM;
     }
 
@@ -2213,10 +2545,10 @@ uint64_t process_fork(struct X64_REGS *reg, bool is_vfork, uint64_t user_stack, 
     if (add_task(new_task) == (size_t)-1)
     {
         queue_remove_at(new_pcb->thread_queue, new_task->group_index);
-        free_partial_process(new_pcb, !is_vfork);
-        free_fork_task(new_task);
         spin_unlock(&create_thread_lock);
         restore_runtime_state(scheduler_depth, is_sti);
+        free_partial_process(new_pcb, !is_vfork);
+        free_fork_task(new_task);
         return (uint64_t)-ENOMEM;
     }
     spin_unlock(&create_thread_lock);

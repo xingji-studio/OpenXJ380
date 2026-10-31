@@ -11,6 +11,8 @@
 #include "fs/fatfs/ff.h"     /* Obtains integer types */
 #include "krlibc.h"
 #include "proto.hpp"
+#include <ioctl.h>
+#include <fs/fatfs/private.h>
 
 vfs_node_t fatfs_get_node_by_number(int number);
 extern bool ahci_is_qemu_environment();
@@ -43,6 +45,13 @@ static void fatfs_cache_invalidate(byte pdrv)
     if (pdrv < 10) {
         fatfs_read_cache[pdrv].valid = false;
     }
+}
+
+// Original Apache-2.0 port hook. A reused private drive must never observe
+// a prior normal drive's cached sectors, or publish them to a later normal use.
+void fatfs_disk_cache_reset(unsigned drive)
+{
+    if (drive < 10) fatfs_cache_invalidate(byte(drive));
 }
 
 static bool fatfs_cache_ensure(byte pdrv)
@@ -97,6 +106,7 @@ static DRESULT fatfs_cache_fill(byte pdrv, LBA_t sector, uint min_count)
 DSTATUS disk_status(byte pdrv /* Physical drive nmuber to identify the drive */
 )
 {
+    if (fatfs_esp_private_drive(pdrv)) return fatfs_esp_disk_status(pdrv) ? STA_NOINIT : 0;
     DSTATUS stat = STA_NOINIT;
     // int result;
     if (fatfs_get_node_by_number(pdrv)) stat &= ~STA_NOINIT;
@@ -110,6 +120,7 @@ DSTATUS disk_status(byte pdrv /* Physical drive nmuber to identify the drive */
 DSTATUS disk_initialize(byte pdrv /* Physical drive nmuber to identify the drive */
 )
 {
+    if (fatfs_esp_private_drive(pdrv)) return fatfs_esp_disk_status(pdrv) ? STA_NOINIT : 0;
     DSTATUS stat = STA_NOINIT;
     // int result;
     if (fatfs_get_node_by_number(pdrv)) stat &= ~STA_NOINIT;
@@ -126,6 +137,13 @@ DRESULT disk_read(byte  pdrv,   /* Physical drive nmuber to identify the drive *
                   uint  count   /* Number of sectors to read */
 )
 {
+    // Private factory I/O always goes to the authenticated raw window. It
+    // bypasses read-ahead completely, including cache hits from prior slots.
+    if (fatfs_esp_private_drive(pdrv))
+    {
+        fatfs_cache_invalidate(pdrv);
+        return fatfs_esp_disk_read(pdrv, buff, sector, count) ? RES_ERROR : RES_OK;
+    }
     DRESULT res = RES_PARERR;
     vfs_node_t node = fatfs_get_node_by_number(pdrv);
     if (!node || buff == NULL || count == 0) return RES_PARERR;
@@ -164,6 +182,11 @@ DRESULT disk_write(byte        pdrv,   /* Physical drive nmuber to identify the 
                    uint        count   /* Number of sectors to write */
 )
 {
+    if (fatfs_esp_private_drive(pdrv))
+    {
+        fatfs_cache_invalidate(pdrv);
+        return fatfs_esp_disk_write(pdrv, buff, sector, count) ? RES_ERROR : RES_OK;
+    }
     DRESULT res = RES_PARERR;
     if (!fatfs_get_node_by_number(pdrv)) return RES_PARERR;
     fatfs_cache_invalidate(pdrv);
@@ -180,6 +203,7 @@ extern vfs_node_t drive_number_mapping[10];
 
 u32 disk_size(byte drive)
 {
+    if (fatfs_esp_private_drive(drive)) return fatfs_esp_disk_sectors(drive);
     if (drive >= 10 || drive_number_mapping[drive] == NULL) return 0;
     return (u32)(drive_number_mapping[drive]->size / 512);
 }
@@ -193,6 +217,18 @@ DRESULT disk_ioctl(byte  pdrv, /* Physical drive nmuber (0..) */
                    void *buff  /* Buffer to send/receive control data */
 )
 {
+    if (fatfs_esp_private_drive(pdrv))
+    {
+        if (fatfs_esp_disk_status(pdrv)) return RES_ERROR;
+        switch (cmd)
+        {
+        case GET_SECTOR_SIZE: if (!buff) return RES_PARERR; *(u16 *)buff = 512; return RES_OK;
+        case GET_SECTOR_COUNT: if (!buff) return RES_PARERR; *(LBA_t *)buff = fatfs_esp_disk_sectors(pdrv); return RES_OK;
+        case GET_BLOCK_SIZE: if (!buff) return RES_PARERR; *(u32 *)buff = 1; return RES_OK;
+        case CTRL_SYNC: return fatfs_esp_disk_sync(pdrv) ? RES_ERROR : RES_OK;
+        default: return RES_PARERR;
+        }
+    }
     // DRESULT res;
     // int result;
 
@@ -201,7 +237,12 @@ DRESULT disk_ioctl(byte  pdrv, /* Physical drive nmuber (0..) */
     case GET_SECTOR_SIZE: *(u16 *)buff = 512; return RES_OK;
     case GET_SECTOR_COUNT: *(u32 *)buff = disk_size(pdrv); return RES_OK;
     case GET_BLOCK_SIZE: *(u16 *)buff = 0; return RES_OK;
-    case CTRL_SYNC: return fatfs_get_node_by_number(pdrv) != NULL ? RES_OK : RES_PARERR;
+    case CTRL_SYNC:
+    {
+        vfs_node_t node = fatfs_get_node_by_number(pdrv);
+        if (!node) return RES_PARERR;
+        return vfs_ioctl(node, IOBLKSYNC, NULL) == 0 ? RES_OK : RES_ERROR;
+    }
     default: break;
     }
 

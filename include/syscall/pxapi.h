@@ -1,6 +1,7 @@
 #pragma once
 
 #include <proto.hpp>
+#include <installer/native_protocol.h>
 
 typedef void (*MsgPrcor)(uint64_t type, uint64_t hdata, uint64_t ldata);
 
@@ -57,6 +58,7 @@ typedef struct {
 #define SXAH_INSTALLER_LOG              128956723895689226
 #define SXAH_INSTALLER_START_OPTIONS    128956723895689227
 #define SXAH_INSTALLER_PRECHECK_OPTIONS 128956723895689228
+#define SXAH_INSTALLER_NATIVE XJ_INST_NATIVE_SYSCALL
 
 #define SXAH_CHECK_TERMINAL_INIT_STATUS  3801    // 查询终端初始化状态
 
@@ -353,6 +355,8 @@ uint64_t do_xapi_InstallerPrecheckOptions(uint64_t options, uint64_t out);
 uint64_t do_xapi_InstallerProgress(uint64_t progress);
 uint64_t do_xapi_InstallerRescue(uint64_t action, uint64_t disk_id, uint64_t out);
 uint64_t do_xapi_InstallerLog(uint64_t out);
+uint64_t do_xapi_InstallerNative(uint64_t operation, uint64_t request, uint64_t request_bytes,
+                                uint64_t response, uint64_t response_bytes);
 
 
 

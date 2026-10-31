@@ -2,6 +2,7 @@
 #include <stdint.h>
 
 typedef struct thread_control_block *tcb_t;
+typedef struct process_control_block *pcb_t;
 
 extern const uint64_t TIME_SLICE;
 extern const uint64_t MIN_SLICE;
@@ -34,5 +35,11 @@ void scheduler_sleep_ns(uint64_t nano);
 void scheduler_wake_task(tcb_t task);
 void scheduler_tick();
 void scheduler_init_task(tcb_t task);
+
+// Terminal status plus absence from these references permits reclamation.
+// Includes a selected task and the previous interrupt's kernel-stack owner.
+// Never call while holding any CPU scheduler_queue lock.
+bool scheduler_task_referenced(tcb_t task);
+bool scheduler_process_referenced(pcb_t process);
 
 // tcb_t select_next_task_safe();

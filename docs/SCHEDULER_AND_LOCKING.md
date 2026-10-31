@@ -28,6 +28,17 @@ in `kernel/task/scheduler.cpp` are intentional ABI checks. New per-CPU state
 belongs after those assembly fields unless every assembly offset is reviewed
 and updated together.
 
+Terminal status alone does not make a task or process reclaimable. The timer
+publishes its selected task under the CPU queue lock before releasing that
+lock. When it publishes a new `current_task`, it retains the previous stack
+owner until the next interrupt entry proves that `iretq` completed. Private
+reference arrays preserve the fixed `PROCESSOR_INFO` layout and use CPU array
+indices rather than ACPI IDs. `scheduler_task_referenced()` and
+`scheduler_process_referenced()` include all three references. Mark a task
+terminal before checking, and remove it from its scheduler queue before free.
+Never call these queries while holding any CPU scheduler queue lock. Queries
+perform bounded scans without allocation, yielding or I/O.
+
 ## Lock and allocator rules
 
 liballoc's internal lock does not mask interrupts. If an interrupt arrives
@@ -55,11 +66,36 @@ validate the generation/lifetime before publishing the result.
 image decoding, task-dock painting, and the input-method service. Ordinary
 `mutex_lock()` retains its original semantics. A terminal thread may still be
 executing a kernel call on another CPU, so recovery checks both DEATH/OUT status
-and absence from every CPU's `current_task`. The mutex metadata spin lock pins
+and absence from the scheduler's current, selected and previous-stack
+references. The mutex metadata spin lock pins
 the owner pointer during this check: each participating subsystem must retain
 its process-exit hook, clearing the lock before its owner's TCB is freed.
 Never retain `mutex_get_owner()` outside that lifetime boundary for recovery.
 The CPU scan is bounded; yielding and rebuilding happen after unlocking.
+Recovery transfers the mutex directly to the recovering waiter while its
+metadata lock is held. Publishing an unlocked mutex first would allow another
+waiter to enter without learning that protected state needs recovery.
+
+Ext4 uses this mechanism to fail closed, rather than rebuild an interrupted
+in-memory transaction. An abandoned operation permanently rejects ext4 I/O
+and new mounts until reboot, marks existing mounts failed and quarantines the
+writer/device buffers. It never clean-closes or checkpoints that session.
+`ext4fs_quiescent_exit()` must run before descriptor cleanup and before a
+terminal owner's TCB is freed, so no mutex retains a dangling owner pointer.
+
+Ordinary file syscalls hold kernel-private heap operation tickets while using
+an FD. Close removes the descriptor immediately; its handle and VFS reference
+survive until the final ticket is released. Ticket owners are reclaimed only
+after the scheduler reference scan proves quiescence. Process exit drains FDs
+from task context in the reaper, outside spin locks and scheduler-disabled
+sections. PCB collection and waitpid claims must retain their private lifetime
+pins while any cleanup or user-memory copy is in progress.
+
+Known limit: forced termination of a waiter after it claims exclusive PCB
+collection can retain that partially collected child until reboot. Collection
+is not a resumable transaction, so another task must not blindly take over its
+pin and repeat frees. This conservative retention is distinct from normal
+waitpid/exit cleanup and from journal replay after reboot.
 The input-method service reloads its verified settings journal and revokes the
 old engine session when a caller dies while holding its service mutex.
 Learning storage uses its own recoverable mutex with the same process-exit hook.
@@ -136,9 +172,19 @@ interaction.
 
 ## Current runtime regression evidence
 
-The latest recorded QEMU run completed GUI login and desktop startup, launched 15
+An earlier QEMU run completed GUI login and desktop startup, launched 15
 fmanager instances with 15/15 user-stack builds, then started the control center.
 GDB observed the scheduler boot gate open and all four CPU disable depths at zero;
 QEMU exited normally. Artifacts were kept outside the source tree under
 `/tmp/xj380-fixed-20261002-03/`. The project does not yet have an automated QEMU
 regression target, so repeat these steps after changes to the invariants above.
+
+The native ext4 integration regression also passed with the final scheduler,
+FD and process-lifetime changes: real first-account creation, a second boot and
+password login, desktop/dock startup, 15/15 ordinary file-manager launches and
+control-center System/Appearance/App Showcase navigation. Both QEMU sessions
+exited normally through QMP with code zero. The four-CPU TCG run reported no
+page fault, panic, assertion or recovery tripwire. Evidence is in
+`/tmp/xj380-ext4-gui-regression-1k4_872v/result.json`, with serial logs, screenshots
+and staged artifact hashes beside it. This is GUI liveness evidence, not a
+claim that arbitrary interrupted kernel cleanup is resumable.

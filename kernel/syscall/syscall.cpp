@@ -84,6 +84,7 @@ static const char *debug_syscall_name(uint64_t nr)
     case SYS_UNAME: return "uname";
     case SYS_FCNTL: return "fcntl";
     case SYS_FLOCK: return "flock";
+    case SYS_UMOUNT2: return "umount2";
     case SYS_SYNC: return "sync";
     case SYS_FSYNC: return "fsync";
     case SYS_FDATASYNC: return "fdatasync";
@@ -150,7 +151,18 @@ static const char *debug_syscall_name(uint64_t nr)
     case SYS_PRCTL: return "prctl";
     case SYS_ARCH_PRCTL: return "arch_prctl";
     case SYS_CHROOT: return "chroot";
+    case SYS_SETXATTR: return "setxattr";
+    case SYS_LSETXATTR: return "lsetxattr";
+    case SYS_FSETXATTR: return "fsetxattr";
+    case SYS_GETXATTR: return "getxattr";
+    case SYS_LGETXATTR: return "lgetxattr";
+    case SYS_FGETXATTR: return "fgetxattr";
+    case SYS_LISTXATTR: return "listxattr";
+    case SYS_LLISTXATTR: return "llistxattr";
     case SYS_FLISTXATTR: return "flistxattr";
+    case SYS_REMOVEXATTR: return "removexattr";
+    case SYS_LREMOVEXATTR: return "lremovexattr";
+    case SYS_FREMOVEXATTR: return "fremovexattr";
     case SYS_SET_TID_ADDRESS: return "set_tid_address";
     case SYS_FADVISE64: return "fadvise64";
     case SYS_COPY_FILE_RANGE: return "copy_file_range";
@@ -351,6 +363,7 @@ extern "C" uint64_t c_syscall_handler(struct X64_REGS *regs, uint64_t user_rsp)
         break;
     case SYS_FCNTL: regs->rax = (uint64_t)sys_fcntl(regs->rdi, regs->rsi, regs->rdx, 0, 0, 0, regs); break;
     case SYS_FLOCK: regs->rax = (uint64_t)sys_flock(regs->rdi, regs->rsi, 0, 0, 0, 0, regs); break;
+    case SYS_UMOUNT2: regs->rax = (uint64_t)sys_umount2(regs->rdi, regs->rsi, 0, 0, 0, 0, regs); break;
     case SYS_SYNC: regs->rax = (uint64_t)sys_sync(0, 0, 0, 0, 0, 0, regs); break;
     case SYS_FSYNC: regs->rax = (uint64_t)sys_fsync(regs->rdi, 0, 0, 0, 0, 0, regs); break;
     case SYS_FDATASYNC: regs->rax = (uint64_t)sys_fdatasync(regs->rdi, 0, 0, 0, 0, 0, regs); break;
@@ -427,8 +440,41 @@ extern "C" uint64_t c_syscall_handler(struct X64_REGS *regs, uint64_t user_rsp)
     case SYS_GETPID: regs->rax = get_current_task()->parent_group->pid; break;
     case SYS_GETTID: regs->rax = get_current_task()->tid; break;
     case SYS_TIME: regs->rax = (uint64_t)sys_time((int64_t *)regs->rdi, 0, 0, 0, 0, 0, regs); break;
+    case SYS_SETXATTR:
+        regs->rax = sys_setxattr((const char *)regs->rdi, (const char *)regs->rsi, (const void *)regs->rdx, regs->r10, (int)regs->r8, 0, regs);
+        break;
+    case SYS_LSETXATTR:
+        regs->rax = sys_lsetxattr((const char *)regs->rdi, (const char *)regs->rsi, (const void *)regs->rdx, regs->r10, (int)regs->r8, 0, regs);
+        break;
+    case SYS_FSETXATTR:
+        regs->rax = sys_fsetxattr((int)regs->rdi, (const char *)regs->rsi, (const void *)regs->rdx, regs->r10, (int)regs->r8, 0, regs);
+        break;
+    case SYS_GETXATTR:
+        regs->rax = sys_getxattr((const char *)regs->rdi, (const char *)regs->rsi, (void *)regs->rdx, regs->r10, 0, 0, regs);
+        break;
+    case SYS_LGETXATTR:
+        regs->rax = sys_lgetxattr((const char *)regs->rdi, (const char *)regs->rsi, (void *)regs->rdx, regs->r10, 0, 0, regs);
+        break;
+    case SYS_FGETXATTR:
+        regs->rax = sys_fgetxattr((int)regs->rdi, (const char *)regs->rsi, (void *)regs->rdx, regs->r10, 0, 0, regs);
+        break;
+    case SYS_LISTXATTR:
+        regs->rax = sys_listxattr((const char *)regs->rdi, (char *)regs->rsi, regs->rdx, 0, 0, 0, regs);
+        break;
+    case SYS_LLISTXATTR:
+        regs->rax = sys_llistxattr((const char *)regs->rdi, (char *)regs->rsi, regs->rdx, 0, 0, 0, regs);
+        break;
     case SYS_FLISTXATTR:
-        regs->rax = (uint64_t)sys_flistxattr(regs->rdi, (char *)regs->rsi, regs->rdx, 0, 0, 0, regs);
+        regs->rax = sys_flistxattr((int)regs->rdi, (char *)regs->rsi, regs->rdx, 0, 0, 0, regs);
+        break;
+    case SYS_REMOVEXATTR:
+        regs->rax = sys_removexattr((const char *)regs->rdi, (const char *)regs->rsi, 0, 0, 0, 0, regs);
+        break;
+    case SYS_LREMOVEXATTR:
+        regs->rax = sys_lremovexattr((const char *)regs->rdi, (const char *)regs->rsi, 0, 0, 0, 0, regs);
+        break;
+    case SYS_FREMOVEXATTR:
+        regs->rax = sys_fremovexattr((int)regs->rdi, (const char *)regs->rsi, 0, 0, 0, 0, regs);
         break;
     case SYS_GETTIMEOFDAY:
         regs->rax = (uint64_t)sys_gettimeofday((struct timeval *)regs->rdi, (void *)regs->rsi, 0, 0, 0, 0, regs);
@@ -729,6 +775,9 @@ extern "C" uint64_t c_syscall_handler(struct X64_REGS *regs, uint64_t user_rsp)
     case SXAH_INSTALLER_PROGRESS: regs->rax = do_xapi_InstallerProgress(regs->rdi); break;
     case SXAH_INSTALLER_RESCUE: regs->rax = do_xapi_InstallerRescue(regs->rdi, regs->rsi, regs->rdx); break;
     case SXAH_INSTALLER_LOG: regs->rax = do_xapi_InstallerLog(regs->rdi); break;
+    case SXAH_INSTALLER_NATIVE:
+        regs->rax = do_xapi_InstallerNative(regs->rdi, regs->rsi, regs->rdx, regs->r10, regs->r8);
+        break;
     case SXAH_SET_LOG_CONFIG:
         if ((regs->rdi & ~LOG_CONFIG_VALID_MASK) != 0)
         {

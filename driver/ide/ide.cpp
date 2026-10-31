@@ -1,6 +1,7 @@
 #include <ide/ide.h>
 #include <proto.hpp>
 #include <pci/pci.h>
+#include <block_source.h>
 #include <fs/vfs/vfs.h>
 #include <ioctl.h>
 
@@ -208,7 +209,9 @@ static int ide_flush(int drive) {
     outb(base + 6, drive_select);
     for (int i = 0; i < 4; i++) inb(base + 7);
     outb(base + 7, IDE_CMD_CACHE_FLUSH);
-    return ide_wait_not_busy(base, 1000000) ? 0 : -1;
+    if (!ide_wait_not_busy(base, 1000000)) return -1;
+    uint8_t status = inb(base + 7);
+    return status == 0 || status == 0xff || (status & (IDE_STATUS_ERR | IDE_STATUS_DF)) ? -1 : 0;
 }
 
 // IDE 设备读取回调
@@ -289,6 +292,22 @@ void ide_setup(void) {
     }
     
     write_serial_string("IDE: Found IDE controller\n");
+
+    // Fixed 0x1f0/0x170 channels are attributable only to a unique enabled
+    // compatibility-mode PCI controller. ATAPI detection is still unsupported.
+    unsigned source_controllers = 0;
+    for (uint32_t i = 0; i < get_pci_num() && i < PCI_DEVICE_MAX; ++i)
+    {
+        pci_device_t *candidate = pci_devices[i];
+        if (!candidate || (candidate->class_code >> 8) != 0x0101 ||
+            (candidate->class_code & 5) || !candidate->op || !candidate->op->read) continue;
+        if (candidate->op->read(candidate->bus, candidate->slot, candidate->func, candidate->segment, 4) & 1)
+            ++source_controllers;
+    }
+    bool source_known = source_controllers == 1 && !(ide_controller->class_code & 5) &&
+        ide_controller->op && ide_controller->op->read &&
+        (ide_controller->op->read(ide_controller->bus, ide_controller->slot, ide_controller->func,
+                                  ide_controller->segment, 4) & 1);
     
     // 初始化设备数组
     memset(ide_devices, 0, sizeof(ide_devices));
@@ -351,9 +370,21 @@ void ide_setup(void) {
         
         write_serial_fmt("IDE: Registering %s with %d sectors\n", name_buf, ide_devices[i].sectors);
         
-        int id = regist_device(NULL, ide_dev);
+        int id = regist_durable_block_device(NULL, ide_dev);
         if (id >= 0) {
             ide_devices[i].drive_id = id;  // 保存设备 ID
+            if (source_known && ide_devices[i].device_type == IDE_DEVICE_ATA)
+            {
+                BlockSourceHardware provenance = {};
+                provenance.controller = ide_controller;
+                provenance.transport = XJ_INSTALLER_SOURCE_IDE;
+                provenance.block_size = ide_dev.sector_size;
+                provenance.bytes = ide_dev.size;
+                provenance.ide_channel = (uint8_t)(i / 2);
+                provenance.ide_unit = (uint8_t)(i % 2);
+                int source_status = block_source_register((uint32_t)id, provenance);
+                if (source_status) write_serial_fmt("IDE source provenance unavailable: %d\n", source_status);
+            }
             write_serial_fmt("ide%d registered with id %d\n", i, id);
         }
         

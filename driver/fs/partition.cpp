@@ -1,15 +1,43 @@
+// SPDX-License-Identifier: Apache-2.0
 #include "fs/partition.h"
 #include "device.h"
 #include "errno.h"
 #include "fs/vfs/vfs.h"
 #include "krlibc.h"
+#include <efi/boot.h>
+#include <fs/ext4/ext4.h>
 #include <ioctl.h>
 #include <dlinker.h>
+#include <block_access.h>
 extern device_t device_ctl[256];
 partition_t     partitions[MAX_PARTITIONS_NUM];
 size_t          partition_num = 0;
-partition_t    *device_lists[MAX_PARTITIONS_NUM];
 static bool     partition_runtime_ready = false;
+class PartitionScanGuard
+{
+    BlockAccessToken management = 0, scan = 0;
+public:
+    explicit PartitionScanGuard(size_t device)
+    {
+        if (!block_access_management_begin(&management)) block_access_scan_begin(device, &scan);
+    }
+    ~PartitionScanGuard()
+    {
+        finish();
+        if (management) block_access_management_end(management);
+    }
+    bool ready() const { return scan != 0; }
+    void finish() { if (scan) { block_access_release(scan); scan = 0; } }
+};
+struct PartitionGptIdentity
+{
+    bool seen;
+    bool complete;
+    uint8_t disk_guid[16];
+};
+static PartitionGptIdentity partition_gpt_disks[256];
+static bool partition_inventory_complete = true;
+extern BOOT_CONFIG *EFI_BC;
 
 size_t partition_read(int part, uint8_t *buf, size_t number, size_t lba);
 size_t partition_write(int part, uint8_t *buf, size_t number, size_t lba);
@@ -54,8 +82,8 @@ static void partition_register_device_node(size_t partition_index)
     char buf[20];
     sprintf(buf, "%sp%zu", src_dev->drive_name, partition_index);
     strcpy(part.drive_name, buf);
-    int id           = regist_device(NULL, part);
-    if (id >= 0 && id < MAX_PARTITIONS_NUM) device_lists[id] = &partitions[partition_index];
+    // Authenticate the physical interval before exposing its devfs node.
+    regist_partition_device(NULL, part, partition.vdisk_id, partition.starting_lba * partition.sector_size);
 }
 
 static void partition_try_automount(size_t partition_index)
@@ -73,17 +101,25 @@ static void partition_try_automount(size_t partition_index)
     vfs_mkdir(mount_path);
 
     vfs_node_t mount_node = vfs_open(mount_path);
-    if (mount_node == NULL || mount_node->is_mount) return;
+    if (mount_node == NULL) return;
+    if (mount_node->is_mount)
+    {
+        vfs_close(mount_node);
+        return;
+    }
 
     if (vfs_mount(dev_path, mount_node) == EOK)
     {
         pr_info("part: automount %s -> %s success\n", dev_path, mount_path);
     }
+    vfs_close(mount_node);
 }
 
 static void partition_scan_single_device(size_t vdisk_id, bool auto_mount)
 {
     if (vdisk_id >= 256) return;
+    PartitionScanGuard access(vdisk_id);
+    if (!access.ready()) return;
     device_t *disk = get_device(vdisk_id);
     if (disk == NULL || disk->type != DEVICE_BLOCK || disk->flag < 1) return;
     if (partition_name_is_slice(disk->drive_name)) return;
@@ -94,18 +130,27 @@ static void partition_scan_single_device(size_t vdisk_id, bool auto_mount)
     vfs_node_t device = vfs_open(buf);
     if (device == NULL)
     {
+        partition_inventory_complete = false;
         pr_info("part: Partition scan failed, device %s not found.\n", disk->drive_name);
         return;
     }
 
     size_t first_partition = partition_num;
-    if (!parser_block_device(device, *disk, vdisk_id)) return;
+    bool parsed = parser_block_device(device, *disk, vdisk_id);
+    vfs_close(device);
+    if (!parsed)
+    {
+        partition_inventory_complete = false;
+        return;
+    }
 
     for (size_t j = first_partition; j < partition_num; j++)
     {
         partition_register_device_node(j);
-        if (auto_mount) partition_try_automount(j);
     }
+    access.finish(); // A mounted extent must not overlap the discovery lease.
+    if (auto_mount)
+        for (size_t j = first_partition; j < partition_num; j++) partition_try_automount(j);
 }
 
 void partition_rescan_device(size_t vdisk_id, bool auto_mount)
@@ -150,15 +195,26 @@ static bool partition_read_exact(vfs_node_t device, device_t disk, void *buf, si
 
 size_t partition_read(int part, uint8_t *buf, size_t number, size_t lba)
 {
-    partition_t *partition = device_lists[part];
-    // pr_info("Y K %s %d\n",device_ctl[partition->vdisk_id].drive_name,partition->vdisk_id);
-    return device_ctl[partition->vdisk_id].read(partition->vdisk_id, buf, number, partition->starting_lba + lba);
+    BlockExtent extent;
+    if (part < 0 || block_access_resolve(part, 0, &extent)) return 0;
+    device_t *base = get_device(extent.physical_device);
+    if (!base || !base->read || !base->sector_size || extent.start % base->sector_size ||
+        lba > uint64_t(-1) / base->sector_size || number > uint64_t(-1) / base->sector_size) return 0;
+    BlockAccessIo access(part, extent.generation, lba * base->sector_size, number * base->sector_size);
+    if (!access.ready()) return 0;
+    return base->read(extent.physical_device, buf, number, extent.start / base->sector_size + lba);
 }
 
 size_t partition_write(int part, uint8_t *buf, size_t number, size_t lba)
 {
-    partition_t *partition = device_lists[part];
-    return device_ctl[partition->vdisk_id].write(partition->vdisk_id, buf, number, partition->starting_lba + lba);
+    BlockExtent extent;
+    if (part < 0 || block_access_resolve(part, 0, &extent)) return 0;
+    device_t *base = get_device(extent.physical_device);
+    if (!base || !base->write || !base->sector_size || extent.start % base->sector_size ||
+        lba > uint64_t(-1) / base->sector_size || number > uint64_t(-1) / base->sector_size) return 0;
+    BlockAccessIo access(part, extent.generation, lba * base->sector_size, number * base->sector_size);
+    if (!access.ready()) return 0;
+    return base->write(extent.physical_device, buf, number, extent.start / base->sector_size + lba);
 }
 
 static int partition_sync(partition_t *partition)
@@ -207,8 +263,73 @@ static bool partition_lba_range_is_valid(uint64_t starting_lba, uint64_t ending_
     return sector_count <= size_max / sector_size;
 }
 
+static bool partition_guid_present(const uint8_t guid[16])
+{
+    for (unsigned i = 0; i < 16; ++i) if (guid[i]) return true;
+    return false;
+}
+
+static uint32_t partition_crc32(const void *data, size_t bytes, bool header)
+{
+    auto *input = static_cast<const uint8_t *>(data);
+    uint32_t value = 0xffffffffU;
+    for (size_t i = 0; i < bytes; ++i)
+    {
+        value ^= header && i >= 16 && i < 20 ? 0 : input[i];
+        for (unsigned bit = 0; bit < 8; ++bit)
+            value = (value >> 1) ^ (value & 1 ? 0xedb88320U : 0);
+    }
+    return value ^ 0xffffffffU;
+}
+
+static bool partition_gpt_is_strict(const GPT_DPT *header, const uint8_t *entries, size_t bytes,
+                                    const device_t &disk)
+{
+    uint64_t sectors = disk.size / disk.sector_size;
+    if (header->revision != 0x00010000U || header->header_size < sizeof(GPT_DPT) ||
+        header->header_size > disk.sector_size || header->reserved || header->my_lba != 1 ||
+        !sectors || header->alternate_lba != sectors - 1 || header->alternate_lba <= header->last_usable_lba ||
+        !partition_guid_present(header->disk_guid) || header->partition_entry_lba < 2 ||
+        header->size_of_partition_entry % 128 ||
+        partition_crc32(header, header->header_size, true) != header->header_crc32 ||
+        partition_crc32(entries, bytes, false) != header->partition_entry_array_crc32)
+        return false;
+    uint64_t table_sectors = (bytes + disk.sector_size - 1) / disk.sector_size;
+    if (header->partition_entry_lba > header->first_usable_lba ||
+        table_sectors > header->first_usable_lba - header->partition_entry_lba)
+        return false;
+    size_t occupied = 0;
+    for (uint32_t i = 0; i < header->num_partition_entries; ++i)
+    {
+        auto *entry = reinterpret_cast<const GPT_DPTE *>(entries + size_t(i) * header->size_of_partition_entry);
+        if (!partition_guid_present(entry->partition_type_guid)) continue;
+        if (!partition_guid_present(entry->unique_partition_guid) ||
+            entry->starting_lba < header->first_usable_lba || entry->ending_lba > header->last_usable_lba ||
+            !partition_lba_range_is_valid(entry->starting_lba, entry->ending_lba, disk.sector_size, disk.size))
+            return false;
+        if (++occupied > MAX_PARTITIONS_NUM - partition_num) return false;
+        for (uint32_t j = 0; j < i; ++j)
+        {
+            auto *other = reinterpret_cast<const GPT_DPTE *>(entries + size_t(j) * header->size_of_partition_entry);
+            if (!partition_guid_present(other->partition_type_guid)) continue;
+            if (!memcmp(entry->unique_partition_guid, other->unique_partition_guid, 16) ||
+                (entry->starting_lba <= other->ending_lba && other->starting_lba <= entry->ending_lba))
+                return false;
+        }
+    }
+    return true;
+}
+
 static bool parse_gpt_partitions(vfs_node_t device, struct GPT_DPT *gpt, device_t disk, size_t vdisk_id)
 {
+    if (vdisk_id >= 256) return false;
+    PartitionGptIdentity &identity = partition_gpt_disks[vdisk_id];
+    if (!memcmp(gpt->signature, "EFI PART", 8))
+    {
+        identity.seen = true;
+        identity.complete = false;
+        memcpy(identity.disk_guid, gpt->disk_guid, 16);
+    }
     if (memcmp(gpt->signature, "EFI PART", 8) != 0 || gpt->num_partition_entries == 0 ||
         gpt->partition_entry_lba == 0 || gpt->size_of_partition_entry < sizeof(struct GPT_DPTE) ||
         gpt->size_of_partition_entry > 512)
@@ -217,7 +338,7 @@ static bool parse_gpt_partitions(vfs_node_t device, struct GPT_DPT *gpt, device_
     }
 
     if (partition_num >= MAX_PARTITIONS_NUM ||
-        gpt->num_partition_entries > MAX_PARTITIONS_NUM - partition_num ||
+        gpt->num_partition_entries > MAX_PARTITIONS_NUM ||
         gpt->num_partition_entries > (~(size_t)0) / gpt->size_of_partition_entry ||
         disk.sector_size == 0 || gpt->partition_entry_lba > (~(size_t)0) / disk.sector_size)
         return false;
@@ -242,11 +363,18 @@ static bool parse_gpt_partitions(vfs_node_t device, struct GPT_DPT *gpt, device_
         return false;
     }
 
+    // Legacy enumeration retains its tolerant behavior. A bound root requires
+    // strict primary GPT checks and a complete, non-overlapping inventory.
+    identity.complete = partition_gpt_is_strict(gpt, reinterpret_cast<const uint8_t *>(dptes), dptes_size, disk);
+    if (!identity.complete) partition_inventory_complete = false;
+
     for (size_t j = 0; j < gpt->num_partition_entries; j++)
     {
         struct GPT_DPTE *entry = (struct GPT_DPTE *)((uint8_t *)dptes + j * gpt->size_of_partition_entry);
         if (is_partition_used(entry))
         {
+            // Empty GPT slots do not consume the shared occupied-partition limit.
+            if (partition_num >= MAX_PARTITIONS_NUM) break;
             if (entry->starting_lba < gpt->first_usable_lba || entry->ending_lba > gpt->last_usable_lba ||
                 !partition_lba_range_is_valid(entry->starting_lba, entry->ending_lba, disk.sector_size, disk.size))
             {
@@ -339,6 +467,15 @@ bool parser_block_device(vfs_node_t device, device_t disk, size_t vdisk_id)
     // }
     // pr_info("\n");
     pr_info("PART: MBR signature=%02x%02x type0=%02x\n", mbr[0x1FE], mbr[0x1FF], mbr[0x1BE + 4]);
+    // Inventory GPT identities even on hybrid disks whose first MBR slot is
+    // not protective. Otherwise a cloned disk GUID could evade uniqueness.
+    if (!memcmp(mbr + disk.sector_size, "EFI PART", 8))
+    {
+        bool parsed = parse_gpt_partitions(device, reinterpret_cast<GPT_DPT *>(mbr + disk.sector_size),
+                                           disk, vdisk_id);
+        free(mbr);
+        return parsed;
+    }
     if (mbr[0x1FE] != 0x55 || mbr[0x1FF] != 0xAA) {
         partition_dump_prefix(disk.drive_name, mbr, disk.sector_size);
     }
@@ -445,8 +582,13 @@ int extract_partition_index(const char *name)
 
 int partition_ioctl(device_t *device, size_t req, void *arg)
 {
+    if (!device) return -ENODEV;
+    BlockExtent extent;
+    if (block_access_resolve(device->vdiskid, 0, &extent)) return -ENODEV;
+    BlockAccessIo access(device->vdiskid, extent.generation, 0, extent.bytes);
+    if (!access.ready()) return access.error();
     int device_id = extract_partition_index(device->drive_name);
-    if (device_id == -1) return -ENODEV;
+    if (device_id < 0 || size_t(device_id) >= partition_num) return -ENODEV;
     partition_t partition = partitions[device_id];
     switch (req)
     {
@@ -481,6 +623,8 @@ int partition_ioctl(device_t *device, size_t req, void *arg)
 
 void partition_init()
 {
+    memset(partition_gpt_disks, 0, sizeof(partition_gpt_disks));
+    partition_inventory_complete = true;
     for (size_t i = 0; i < 256; i++)
     {
         if (device_ctl[i].flag >= 1 && device_ctl[i].type == DEVICE_BLOCK)
@@ -490,7 +634,6 @@ void partition_init()
     }
 
     pr_info("Loading part device...\n");
-    for (size_t j = 0; j < partition_num; j++) partition_register_device_node(j);
     partition_runtime_ready = true;
 }
 
@@ -594,10 +737,13 @@ static bool root_probe_partition(const char *dev_path)
     if (vfs_mount(dev_path, probe) == VFS_STATUS_SUCCESS)
     {
         found = root_probe_has_system_markers(probe);
-        vfs_unmount("/__root_probe");
+        // The probe's own lookup must not make a read-only mount look busy.
+        vfs_close(probe);
+        if (vfs_unmount("/__root_probe") != VFS_STATUS_SUCCESS) return false;
+        probe = vfs_open("/__root_probe");
     }
 
-    vfs_delete(probe);
+    if (probe) vfs_delete(probe);
     return found;
 }
 
@@ -659,8 +805,86 @@ static bool mount_named_root_fallback()
     return false;
 }
 
+static int partition_select_bound_root(const XJ_ROOT_BINDING &binding, size_t &root_index)
+{
+    if (!xj_root_binding_valid(&binding) || !partition_guid_present(xj_root_binding_disk_guid(&binding)) ||
+        !partition_guid_present(xj_root_binding_root_guid(&binding)) ||
+        !partition_guid_present(xj_root_binding_esp_guid(&binding)) ||
+        !partition_guid_present(xj_root_binding_ext4_uuid(&binding))) return -EINVAL;
+    if (!partition_inventory_complete) return -EUCLEAN;
+    size_t disk_id = 0, disk_matches = 0, root_matches = 0, esp_matches = 0, esp_index = 0;
+    for (size_t i = 0; i < 256; ++i)
+    {
+        const PartitionGptIdentity &identity = partition_gpt_disks[i];
+        if (identity.seen && !identity.complete) return -EUCLEAN;
+        if (!identity.seen || memcmp(identity.disk_guid, xj_root_binding_disk_guid(&binding), 16)) continue;
+        disk_id = i;
+        ++disk_matches;
+    }
+    if (disk_matches != 1) return disk_matches ? -ENOTUNIQ : -ENOENT;
+    for (size_t i = 0; i < partition_num; ++i)
+    {
+        const partition_t &partition = partitions[i];
+        if (!partition.is_used || partition.type != partition.GPT) continue;
+        if (!memcmp(partition.unique_partition_guid, xj_root_binding_root_guid(&binding), 16))
+        {
+            root_index = i;
+            ++root_matches;
+        }
+        if (!memcmp(partition.unique_partition_guid, xj_root_binding_esp_guid(&binding), 16))
+        {
+            esp_index = i;
+            ++esp_matches;
+        }
+    }
+    if (root_matches != 1 || esp_matches != 1)
+        return root_matches > 1 || esp_matches > 1 ? -ENOTUNIQ : -ENOENT;
+    static const uint8_t linux_type[16] = {0xaf, 0x3d, 0xc6, 0x0f, 0x83, 0x84, 0x72, 0x47,
+                                           0x8e, 0x79, 0x3d, 0x69, 0xd8, 0x47, 0x7d, 0xe4};
+    static const uint8_t esp_type[16] = {0x28, 0x73, 0x2a, 0xc1, 0x1f, 0xf8, 0xd2, 0x11,
+                                         0xba, 0x4b, 0x00, 0xa0, 0xc9, 0x3e, 0xc9, 0x3b};
+    const partition_t &root = partitions[root_index], &esp = partitions[esp_index];
+    if (root_index == esp_index || root.vdisk_id != disk_id || esp.vdisk_id != disk_id ||
+        memcmp(root.disk_guid, xj_root_binding_disk_guid(&binding), 16) ||
+        memcmp(esp.disk_guid, xj_root_binding_disk_guid(&binding), 16) ||
+        memcmp(root.partition_type_guid, linux_type, 16) || memcmp(esp.partition_type_guid, esp_type, 16))
+        return -EUCLEAN;
+    return 0;
+}
+
+static int partition_mount_bound_root(const XJ_ROOT_BINDING &binding)
+{
+    size_t index = 0;
+    int error = partition_select_bound_root(binding, index);
+    if (error) return error;
+    device_t *device = get_device(partitions[index].vdisk_id);
+    if (!device || device->flag < 1 || device->type != DEVICE_BLOCK) return -ENODEV;
+    char path[64];
+    int length = snprintf(path, sizeof(path), "/dev/%sp%zu", device->drive_name, index);
+    if (length < 0 || size_t(length) >= sizeof(path)) return -ENAMETOOLONG;
+    // The adapter verifies UUID and kernel contents against the initial clean
+    // or recovered overlay before its first flush/RECOVER/replay home write.
+    return ext4fs_mount_bound_root(path, &binding);
+}
+
+[[noreturn]] static void root_mount_halt()
+{
+    for (;;) __asm__ volatile("pause\n\t");
+}
+
 void mount_root()
 {
+    if (EFI_BC && (EFI_BC->boot_flags & BOOT_FLAG_BOUND_ROOT))
+    {
+        int error = partition_mount_bound_root(EFI_BC->root_binding);
+        if (!error)
+        {
+            pr_info("Mount bound ext4 root OK\n");
+            return;
+        }
+        pr_warn("Bound ext4 root refused: %d (no legacy fallback)\n", error);
+        root_mount_halt();
+    }
     for (uint64_t i = 0; i < partition_num; i++)
     {
         partition_t p         = partitions[i];
@@ -687,8 +911,5 @@ void mount_root()
     if (mount_named_root_fallback()) return;
 
     write_serial_string("system not found\n");
-    while (1)
-    {
-        __asm__ volatile("pause\n\t");
-    }
+    root_mount_halt();
 }

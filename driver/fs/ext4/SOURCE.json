@@ -1,0 +1,99 @@
+{
+  "schema_version": 1,
+  "implementation": "first-party-native-ext4",
+  "license": "Apache-2.0",
+  "new_external_implementations": [],
+  "new_link_archives": [],
+  "sources": [
+    {
+      "path": "attributes.cpp",
+      "sha256": "d27a3d0406b8a4d1d4e9b8312e6ae05678d732504f8b58de7a1e672218e2fd88",
+      "spdx": "Apache-2.0"
+    },
+    {
+      "path": "attributes.h",
+      "sha256": "dae005e659eafe7198a633c8430c21cf8c00fd0b51c9d1f80a6ed62086c77263",
+      "spdx": "Apache-2.0"
+    },
+    {
+      "path": "directory_hash.cpp",
+      "sha256": "7f27cd159c5f37defbb0ab19b17937c34d2ef289fa79a0ca825f3983f7106bc0",
+      "spdx": "Apache-2.0"
+    },
+    {
+      "path": "directory_index.cpp",
+      "sha256": "7fb03722d327d54e451c70a68f38588bc08af7cf845db02e37d4a12ca20e61ad",
+      "spdx": "Apache-2.0"
+    },
+    {
+      "path": "directory_index.h",
+      "sha256": "f8e8dcdd2777350fcfbf840832046fbd255e8a5a8fbcfaf271128399723c77a3",
+      "spdx": "Apache-2.0"
+    },
+    {
+      "path": "ext4.cpp",
+      "sha256": "e09c798a1c180bbed8432ed698ed4b9cfc38e3b6bdf2c09094129cac235ae450",
+      "spdx": "Apache-2.0"
+    },
+    {
+      "path": "format.cpp",
+      "sha256": "1f218fe5bcca58c59cb2cc36f7b6c61ab2306f5d794128b8fda060837c4b29d1",
+      "spdx": "Apache-2.0"
+    },
+    {
+      "path": "format.h",
+      "sha256": "71ce968ae95fbacbcfe3574956a3030090da6b6cab91828e19a0dac228f0b065",
+      "spdx": "Apache-2.0"
+    },
+    {
+      "path": "journal.cpp",
+      "sha256": "332c8eb10004303dd7b5452be792633149863d218ae4bdc023986b2bdd89e3e4",
+      "spdx": "Apache-2.0"
+    },
+    {
+      "path": "journal.h",
+      "sha256": "479b176d14e5c89f10536fd4692d3e224b82bc4ae15c9ed5f72e1f0b53b606cc",
+      "spdx": "Apache-2.0"
+    },
+    {
+      "path": "mapping.cpp",
+      "sha256": "725f584caafcd77971f715ac9069763a49700438abf5db186d1a919e57de272a",
+      "spdx": "Apache-2.0"
+    },
+    {
+      "path": "namespace.cpp",
+      "sha256": "963a0f985c207a96fd7795be73fb17a2f321d04929409c45e3851b2e5716e2f1",
+      "spdx": "Apache-2.0"
+    },
+    {
+      "path": "native.cpp",
+      "sha256": "335d5e36871fa7c544b39baee00a358718215a45d903341b87704b2335701a04",
+      "spdx": "Apache-2.0"
+    },
+    {
+      "path": "native.h",
+      "sha256": "e58304351a25ebdf312a9fa3ca6847e1e9578fdb6695af7fa851a0e908b34d58",
+      "spdx": "Apache-2.0"
+    },
+    {
+      "path": "orphan.cpp",
+      "sha256": "f33fcb63b81656a5b653bdaa2e4711036535b8ae34e9b73632386955ae6f8edd",
+      "spdx": "Apache-2.0"
+    },
+    {
+      "path": "write.cpp",
+      "sha256": "e666fd7c03f0b71327ee300990f89db7b39f09f9df9aa672c08b86465ac242a9",
+      "spdx": "Apache-2.0"
+    },
+    {
+      "path": "write.h",
+      "sha256": "502b13f24b267d8b252f9a55c411a6f5b970e75b591615e5546566e21caea869",
+      "spdx": "Apache-2.0"
+    },
+    {
+      "path": "xattr.cpp",
+      "sha256": "3a9cf8778091604026189903e55e9e9874c1ed30909e6b9ef7df064bafbb7a0f",
+      "spdx": "Apache-2.0"
+    }
+  ]
+}

@@ -147,6 +147,10 @@ struct process_control_block
     bool screen_secret; // Process-lifetime global capture prohibition.
     bool screen_raw_mapped; // Live framebuffer mappings cannot be revoked by a syscall check.
     pcb_t screen_capture_next; // Intrusive policy list, protected by the capture state lock.
+    // Core-owned tail: 0 pending, 1 draining, 2 drained, 3 collecting,
+    // 4 exclusive collection preparation, 5 drain with collection requested.
+    uint32_t fd_cleanup_state;
+    tcb_t wait_owner; // Exclusive waitpid claim; cleared before this TCB is freed.
 };
 #ifndef CONFIG_USER_ELF_HEADER_START
 #define CONFIG_USER_ELF_HEADER_START 0x0000300000000000UL
@@ -190,7 +194,7 @@ struct thread_control_block
 
     uint64_t syscall_stack;
     uint64_t syscall_user_rsp;
-    
+
     uint64_t load_start;
     uint64_t load_end;
 

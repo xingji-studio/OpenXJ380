@@ -47,7 +47,8 @@ typedef struct _NVME_COMPLETION_QUEUE_ENTRY
 typedef struct _NVME_QUEUE_COMMON
 {
     NVME_CONTROLLER *CTR;
-    uint32_t *DBL;
+    volatile uint32_t *DBL;
+    uint16_t ID; // Queue identifier used to validate completions
     uint16_t MSK;
     uint16_t HAD;
     uint16_t TAL;
@@ -69,7 +70,7 @@ typedef struct _NVME_SUBMISSION_QUEUE
 
 typedef struct _NVME_CONTROLLER
 {
-    NVME_CAPABILITY *CAP;
+    volatile NVME_CAPABILITY *CAP;
     NVME_COMPLETION_QUEUE ACQ;
     NVME_SUBMISSION_QUEUE ASQ;
     NVME_COMPLETION_QUEUE ICQ;
@@ -77,6 +78,9 @@ typedef struct _NVME_CONTROLLER
     uint64_t DST; // Doorbell Stride
     uint32_t WTO; // Waiting Timeout (ms)
     uint32_t NSC; // Namespace Count
+    bool WRITE_FAILED; // A failed write/flush is sticky until controller reinitialization
+    bool FAILED; // Transport failure permanently disables submission
+    bool DMA_STOPPED; // RDY=0 observed after controller disable
     uint8_t SER[0x14];
     uint8_t MOD[0x28];
 } NVME_CONTROLLER;

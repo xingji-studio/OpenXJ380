@@ -199,7 +199,14 @@ def copy_system_apps(root: Path) -> None:
 
 def copy_common_assets(root: Path) -> None:
     mkdir(root / "system/docs")
+    (root / "system/activept.cfk").write_text("OpenXJ380 system root\n", encoding="utf-8")
     cp(ROOT / "docs/EXT4.md", root / "system/docs")
+    cp(ROOT / "docs/EXT4_LICENSE_AUDIT.md", root / "system/docs")
+    ext4_notices = root / "system/licenses/native-ext4"
+    mkdir(ext4_notices)
+    cp(ROOT / "LICENSE", ext4_notices / "LICENSE")
+    cp(ROOT / "driver/fs/ext4/PROVENANCE.md", ext4_notices)
+    cp(ROOT / "driver/fs/ext4/SOURCE.json", ext4_notices)
 
 
 def copy_modules(root: Path) -> None:
@@ -251,7 +258,9 @@ def fix_links(root: Path) -> None:
     )
 
 
-def stage_full_system(root: Path, *, include_linux_compat: bool) -> None:
+def stage_full_system(root: Path, *, include_linux_compat: bool, filesystem: str = "fat32") -> None:
+    if filesystem not in ("fat32", "ext4"):
+        raise ValueError("filesystem must be fat32 or ext4")
     stage_base(root)
     cp(ROOT / "out/BOOTX64.efi", root / "EFI/BOOT/BOOTX64.EFI")
     cp(ROOT / "out/kernel.krl", root / "system")
@@ -263,7 +272,8 @@ def stage_full_system(root: Path, *, include_linux_compat: bool) -> None:
     copy_license_material(root, complete=include_linux_compat)
     mkdir(root / "system/licenses")
     cp(ROOT / "out/compliance/third-party", root / "system/licenses/third-party")
-    fix_links(root)
+    if filesystem == "fat32":
+        fix_links(root)
 
 
 def prepare() -> None:
@@ -301,14 +311,12 @@ def vdisk(*, complete: bool, filesystem: str | None = None, image_path: Path | N
     filesystem = filesystem or env("VDISK_FS", "fat32")
     if filesystem not in ("fat32", "ext4"):
         raise SystemExit("VDISK_FS must be fat32 or ext4")
-    if filesystem == "ext4":
-        raise SystemExit("ext4 system images are disabled: a license-compatible kernel driver is not available")
     image = ROOT / (image_path or Path(env("VDISK_IMAGE", "XJ380.img")))
     vdisk_root = Path(env("VDISK_ROOT", f"/tmp/xj380-vdisk-{os.getuid()}/XJ380"))
     if image.resolve().is_relative_to(vdisk_root.resolve()):
         raise SystemExit("VDISK_IMAGE must be outside VDISK_ROOT")
     reset_dir(vdisk_root, explain_fix=True)
-    stage_full_system(vdisk_root, include_linux_compat=complete)
+    stage_full_system(vdisk_root, include_linux_compat=complete, filesystem=filesystem)
     command = [sys.executable, str(ROOT / "tools/make_disk_image.py"),
                "--root", str(vdisk_root), "--image", str(image), "--fs", filesystem,
                "--size-mib", env("VDISK_SIZE_MIB", "3072"), "--esp-mib", env("VDISK_ESP_MIB", "64"),
@@ -319,12 +327,21 @@ def vdisk(*, complete: bool, filesystem: str | None = None, image_path: Path | N
     reset_dir(vdisk_root, explain_fix=True)
 
 
-def installer_system_stage() -> None:
+def installer_system_stage(*, filesystem: str | None = None) -> None:
+    filesystem = env("INSTALLER_FS", "fat32") if filesystem is None else filesystem
+    if filesystem not in ("fat32", "ext4"):
+        raise SystemExit("INSTALLER_FS must be fat32 or ext4")
     installer_prepare()
     root = Path(env("INSTALLER_SYSTEM_ROOT", f"/tmp/xj380-installer-{os.getuid()}/system-root"))
     reset_dir(root)
-    stage_full_system(root, include_linux_compat=True)
-    run(["python3", env("MAKE_PAK", "tools/make_pak.py"), str(root), env("INSTALLER_SYSTEM_PAK", "out/system-payload.pak")])
+    stage_full_system(root, include_linux_compat=True, filesystem=filesystem)
+    command = ["python3", env("MAKE_PAK", "tools/make_pak.py"), str(root),
+               env("INSTALLER_SYSTEM_PAK", "out/system-payload.pak")]
+    # PAK2 retains the links and metadata preserved by the ext4 staging profile.
+    # Keep the legacy two-positional-argument PAK1 invocation for FAT media.
+    if filesystem == "ext4":
+        command += ["--format", "pak2"]
+    run(command)
 
 
 def installer_root_stage() -> None:
@@ -334,9 +351,11 @@ def installer_root_stage() -> None:
         "apps",
         "apps/system",
         "apps/builtin",
+        "config",
         "tmp",
     ):
         mkdir(root / rel)
+    cp(ROOT / "docs/CONFIG.md", root / "config/README.md")
     copy_system_apps(root)
     run(["python3", env("MAKE_PAK", "tools/make_pak.py"), str(root), env("INSTALLER_ROOT_PAK", "out/installer-root.pak")])
 
@@ -589,6 +608,7 @@ def check_tools() -> None:
     if env("VDISK_FS", "fat32") == "ext4":
         check_required_tool(missing, "mke2fs", ["mke2fs"], "创建并填充 ext4 系统分区", "sudo apt install e2fsprogs")
         check_required_tool(missing, "e2fsck", ["e2fsck"], "校验 ext4 系统分区", "sudo apt install e2fsprogs")
+        check_required_tool(missing, "debugfs", ["debugfs"], "核对 ext4 根分区内核与引导绑定", "sudo apt install e2fsprogs")
     check_required_tool(missing, "qemu-system-x86_64", ["qemu-system-x86_64"], "运行 XJ380 / installer",
                         "sudo apt install qemu-system-x86")
     check_required_tool(missing, "qemu-img", ["qemu-img"], "生成 VMDK 镜像", "sudo apt install qemu-utils")
@@ -648,9 +668,13 @@ def main() -> None:
     parser.add_argument("command")
     parser.add_argument("--fs", choices=("fat32", "ext4"), help="filesystem for vdisk/complete (or VDISK_FS)")
     parser.add_argument("--image", type=Path, help="output for vdisk/complete (or VDISK_IMAGE)")
+    parser.add_argument("--installer-fs", choices=("fat32", "ext4"),
+                        help="filesystem for installer-system-stage (or INSTALLER_FS)")
     args = parser.parse_args()
     if (args.fs or args.image) and args.command not in ("vdisk", "complete"):
         parser.error("--fs and --image apply only to vdisk and complete")
+    if args.installer_fs and args.command != "installer-system-stage":
+        parser.error("--installer-fs applies only to installer-system-stage")
 
     commands = {
         "prepare": prepare,
@@ -659,7 +683,7 @@ def main() -> None:
         "stage-linux-compat": lambda: stage_linux_compat(Path(env("VDISK_ROOT", f"/tmp/xj380-vdisk-{os.getuid()}/XJ380"))),
         "vdisk": lambda: vdisk(complete=False, filesystem=args.fs, image_path=args.image),
         "complete": lambda: vdisk(complete=True, filesystem=args.fs, image_path=args.image),
-        "installer-system-stage": installer_system_stage,
+        "installer-system-stage": lambda: installer_system_stage(filesystem=args.installer_fs),
         "installer-root-stage": installer_root_stage,
         "installer-iso": installer_iso,
         "vmdk": vmdk,
