@@ -7,7 +7,7 @@ struct PermissionPrompt
     uint64_t token;
     size_t pid, tid;
     uint64_t ppid;
-    char name[32], path[256], user[64];
+    char name[32], path[256], user[64], resource[256];
     UserType current_type, target_type;
     uint8_t current, requested, asking;
     bool individual;
@@ -31,6 +31,9 @@ void permissions_answer(uint64_t token, bool approved);
 void permissions_set_backend(bool available);
 bool permissions_have(uint8_t required);
 bool permissions_file_access(vfs_node_t node, const char *path, int operation);
+bool permissions_file_requirements(vfs_node_t node, const char *path, int operation, uint8_t *required);
+int permissions_query_file_access(const char *path, uint64_t access, char *resolved = NULL, size_t capacity = 0);
+int permissions_request_file_access(const char *path, uint64_t access, uint8_t offered = XPERM_ALL);
 bool permissions_file_move(vfs_node_t node, const char *destination);
 bool permissions_file_link(vfs_node_t node, const char *destination);
 

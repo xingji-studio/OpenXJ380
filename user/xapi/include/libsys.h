@@ -389,3 +389,5 @@ uint64_t enter_syscall(uint64_t syscall_number, uint64_t arg1, uint64_t arg2, ui
 #define XAPI_GET_CURRENT_PERMISSIONS 7497
 #define XAPI_REQUEST_PERMISSIONS 7498
 #define XAPI_SPAWN_INHERITED 7499
+#define XAPI_QUERY_FILE_ACCESS 7500
+#define XAPI_REQUEST_FILE_ACCESS 7501

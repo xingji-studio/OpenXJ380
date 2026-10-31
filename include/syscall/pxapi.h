@@ -333,6 +333,8 @@ uint64_t do_xapi_GetMemorySize();
 void do_xapi_Run(char *path);
 uint64_t do_xapi_RunArgs(char *path, char **argv);
 uint64_t do_xapi_SpawnInherited(char *path, char **argv);
+uint64_t do_xapi_QueryFileAccess(uint64_t path, uint64_t access);
+uint64_t do_xapi_RequestFileAccess(uint64_t path, uint64_t access, uint64_t offered);
 uint64_t do_xapi_MapMemory(uint64_t ptr, uint64_t size, uint32_t flags);
 void do_xapi_FlushTime();
 uint64_t do_xapi_GetTaskList(uint64_t buffer, uint64_t max_count);
@@ -390,3 +392,5 @@ uint64_t message_ask(uint64_t msg_type_p, uint64_t hdatap, uint64_t ldatap, uint
 #define XAPI_GET_CURRENT_PERMISSIONS 7497
 #define XAPI_REQUEST_PERMISSIONS 7498
 #define XAPI_SPAWN_INHERITED 7499
+#define XAPI_QUERY_FILE_ACCESS 7500
+#define XAPI_REQUEST_FILE_ACCESS 7501

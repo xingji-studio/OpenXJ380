@@ -48,9 +48,11 @@ enum ImeFileOperation
     IME_FILE_LOOKUP,
     IME_FILE_LIST,
     IME_FILE_STAT,
-    IME_FILE_READ_WRITE
+    IME_FILE_READ_WRITE,
+    IME_FILE_EXPORT
 };
 bool ime_vfs_access(vfs_node_t node, const char *path, ImeFileOperation operation);
+bool ime_vfs_requirements(vfs_node_t node, const char *path, ImeFileOperation operation, uint8_t *required);
 // Called by FAT after resolving a long/short filename, before opening data.
 void ime_vfs_resolved_name(vfs_node_t node, const char *name);
 

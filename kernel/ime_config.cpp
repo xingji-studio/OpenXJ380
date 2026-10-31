@@ -200,12 +200,11 @@ static uint64_t node_policy(vfs_node_t node)
     return result;
 }
 
-bool ime_vfs_access(vfs_node_t node, const char *path, ImeFileOperation operation)
+static bool ime_policy_access(vfs_node_t node, const char *path, ImeFileOperation operation)
 {
     tcb_t task = get_current_task();
     if (!task || task->task_level != TASK_APPLICATION_LEVEL) return true;
     if (task->ime_config_depth && !task->permission_profile_owner) return true;
-    if (!permissions_file_access(node, path, operation)) return false;
     if (permissions_dialog_metadata(node, operation)) return true;
     if (task->permission_profile_owner) return true;
     if (operation == IME_FILE_MOUNT || (node && (node->type & file_block) && !task->ime_storage_depth)) return false;
@@ -245,6 +244,16 @@ bool ime_vfs_access(vfs_node_t node, const char *path, ImeFileOperation operatio
     }
     if (protection & PRIVATE_NODE) return false;
     return !mutation || !(protection & (READ_ONLY_NODE | ANCHOR_NODE));
+}
+
+bool ime_vfs_access(vfs_node_t node, const char *path, ImeFileOperation operation)
+{
+    return permissions_file_access(node, path, operation) && ime_policy_access(node, path, operation);
+}
+
+bool ime_vfs_requirements(vfs_node_t node, const char *path, ImeFileOperation operation, uint8_t *required)
+{
+    return permissions_file_requirements(node, path, operation, required) && ime_policy_access(node, path, operation);
 }
 
 bool ime_valid_id(const char *id)

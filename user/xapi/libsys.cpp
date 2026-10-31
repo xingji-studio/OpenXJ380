@@ -32,3 +32,13 @@ extern "C" __attribute__((noreturn)) void __stack_chk_fail(void)
 {
     for (;;) {}
 }
+
+extern "C" INT64 xapi_QueryFileAccess(const char *path, UINT64 access)
+{
+    return (INT64)enter_syscall(XAPI_QUERY_FILE_ACCESS, (UINT64)path, access, 0, 0, 0, 0);
+}
+
+extern "C" INT64 xapi_RequestFileAccess(const char *path, UINT64 access)
+{
+    return (INT64)enter_syscall(XAPI_REQUEST_FILE_ACCESS, (UINT64)path, access, XPERM_ALL, 0, 0, 0);
+}

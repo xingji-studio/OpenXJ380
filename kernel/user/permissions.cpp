@@ -1,5 +1,6 @@
 #include <user/permissions.h>
 #include <user/process_launch.h>
+#include <user/file_access.h>
 #include <cpu/lock.h>
 #include <errno.h>
 #include <fs/vfs/vfs.h>
@@ -246,7 +247,7 @@ void permissions_thread_exit(tcb_t task)
     }
 }
 
-static int request_permissions(uint8_t target, UserType type, bool individual)
+static int request_permissions(uint8_t target, UserType type, bool individual, const char *resource = NULL)
 {
     tcb_t task = get_current_task();
     if (!task || !task->parent_group || task->task_level != TASK_APPLICATION_LEVEL) return -EPERM;
@@ -267,6 +268,7 @@ static int request_permissions(uint8_t target, UserType type, bool individual)
     spin_unlock(&create_thread_lock);
     r->prompt.target_type = type;
     r->prompt.individual = individual;
+    if (resource) strncpy(r->prompt.resource, resource, sizeof(r->prompt.resource) - 1);
 
     spin_lock(&permission_lock);
     if (r->revision != process->permission_revision)
@@ -500,8 +502,16 @@ static bool system_path(const char *path)
 }
 
 static bool path_access(const char *path, bool directory, int operation, uint8_t mask,
-                        const char *user, const char *application, pcb_t process = NULL)
+                        const char *user, const char *application, pcb_t process = NULL, uint8_t *required_out = NULL)
 {
+    if (operation == IME_FILE_EXPORT)
+    {
+        // Cross-category moves expose directory contents. SV only exposes
+        // names; use the same data-read rule as the transfer guard below.
+        operation = IME_FILE_READ;
+        directory = false;
+    }
+
     if (operation == IME_FILE_LOOKUP) return true; // Internal name lookup exposes no contents or listing.
     if (operation == IME_FILE_MOUNT) return false;
     bool write = operation == IME_FILE_WRITE || operation == IME_FILE_REMOVE || operation == IME_FILE_READ_WRITE;
@@ -519,7 +529,9 @@ static bool path_access(const char *path, bool directory, int operation, uint8_t
             {
                 size_t length = (size_t)(slash - owner);
                 // Neither NV nor a broad executable directory may authorize another account's settings.
-                return strlen(user) == length && prefix_fold(owner, user) && (mask & XPERM_CS);
+                if (strlen(user) != length || !prefix_fold(owner, user)) return false;
+                if (required_out) { *required_out |= XPERM_CS; return true; }
+                return (mask & XPERM_CS) != 0;
             }
         }
     }
@@ -544,6 +556,7 @@ static bool path_access(const char *path, bool directory, int operation, uint8_t
         }
         required = XPERM_NV;
     }
+    if (required_out) { *required_out |= required; return true; }
     return (mask & required) == required;
 }
 
@@ -575,7 +588,8 @@ static char *canonical_target(const char *path)
     return normalized;
 }
 
-static bool file_access(vfs_node_t node, const char *path, int operation, unsigned link_depth)
+static bool file_access(vfs_node_t node, const char *path, int operation, unsigned link_depth,
+                         uint8_t *required_out = NULL)
 {
     tcb_t task = get_current_task();
     if (!task || task->task_level != TASK_APPLICATION_LEVEL) return true;
@@ -591,7 +605,7 @@ static bool file_access(vfs_node_t node, const char *path, int operation, unsign
     // Unlinking removes only the directory entry, so it checks that entry alone.
     if (node && node->linkto && !(node->type & file_symlink) && operation != IME_FILE_REMOVE)
     {
-        if (link_depth >= 40 || !file_access(node->linkto, NULL, operation, link_depth + 1))
+        if (link_depth >= 40 || !file_access(node->linkto, NULL, operation, link_depth + 1, required_out))
         {
             permissions_set_file_error(EACCES);
             return false;
@@ -644,7 +658,7 @@ static bool file_access(vfs_node_t node, const char *path, int operation, unsign
          (__atomic_load_n(&process->permission_file_dialog, __ATOMIC_ACQUIRE) &&
           under(resolved, "/system/resources")));
     bool allowed = service_read || path_access(resolved, node && (node->type & file_dir), operation, mask, username,
-                                               application, process);
+                                               application, process, required_out);
     free(resolved);
     if (!allowed && !permissions_file_error()) permissions_set_file_error(EACCES);
     return allowed;
@@ -653,6 +667,147 @@ static bool file_access(vfs_node_t node, const char *path, int operation, unsign
 bool permissions_file_access(vfs_node_t node, const char *path, int operation)
 {
     return file_access(node, path, operation, 0);
+}
+
+bool permissions_file_requirements(vfs_node_t node, const char *path, int operation, uint8_t *required)
+{
+    return required && file_access(node, path, operation, 0, required);
+}
+
+static bool query_operations(vfs_node_t node, const char *path, uint64_t access, uint8_t *required)
+{
+    if ((access & XFA_READ) &&
+        !ime_vfs_requirements(node, path, access & XFA_EXPORT ? IME_FILE_EXPORT : IME_FILE_READ, required)) return false;
+    if ((access & XFA_WRITE) && !ime_vfs_requirements(node, path, IME_FILE_WRITE, required)) return false;
+    if ((access & XFA_LIST) && !ime_vfs_requirements(node, path, IME_FILE_LIST, required)) return false;
+    if ((access & XFA_STAT) && !ime_vfs_requirements(node, path, IME_FILE_STAT, required)) return false;
+    if ((access & XFA_REMOVE) && !ime_vfs_requirements(node, path, IME_FILE_REMOVE, required)) return false;
+    return true;
+}
+
+int permissions_query_file_access(const char *path, uint64_t access, char *resolved, size_t capacity)
+{
+    if (!path || !path[0] || !(access & 63) || (access & ~511ULL) ||
+        ((access & XFA_CREATE) && !(access & XFA_WRITE)) ||
+        ((access & XFA_EXPORT) && !(access & XFA_READ))) return -EINVAL;
+    permissions_clear_file_error();
+    char *absolute = vfs_cwd_path_build((char *)path);
+    if (!absolute) return -ENOMEM;
+    vfs_node_t node = access & (XFA_NOFOLLOW | XFA_REMOVE) ? vfs_open_no_follow(absolute) : vfs_open(absolute);
+    uint8_t required = 0;
+    bool allowed = true;
+    int error = permissions_file_error();
+    char *canonical = node ? vfs_get_fullpath(node) : NULL;
+    if (node)
+    {
+        if ((access & (XFA_CREATE | XFA_EXCLUSIVE)) == (XFA_CREATE | XFA_EXCLUSIVE))
+        {
+            allowed = false;
+            error = EEXIST;
+        }
+        else allowed = canonical && query_operations(node, NULL, access, &required);
+        vfs_close(node);
+        if (!canonical) error = ENOMEM;
+    }
+    else if (!(access & XFA_CREATE) || (error && error != ENOENT))
+    {
+        allowed = false;
+        if (!error) error = ENOENT;
+    }
+    else
+    {
+        error = 0;
+        permissions_clear_file_error();
+        // Discover the nearest existing ancestor first. Resolve its aliases
+        // before classifying every missing component; the query creates nothing.
+        char *ancestor = strdup(absolute);
+        vfs_node_t parent = NULL;
+        size_t prefix = 0;
+        if (!ancestor) { allowed = false; error = ENOMEM; }
+        while (ancestor && !parent)
+        {
+            char *slash = strrchr(ancestor, '/');
+            if (!slash) break;
+            if (slash == ancestor) ancestor[1] = 0;
+            else *slash = 0;
+            parent = vfs_open(ancestor);
+            if (permissions_file_error() && permissions_file_error() != ENOENT) break;
+            if (!parent) permissions_clear_file_error();
+            if (ancestor[1] == 0) break;
+        }
+        if (!parent)
+        {
+            allowed = false;
+            if (!error) error = permissions_file_error() ? permissions_file_error() : ENOENT;
+        }
+        else if (!(parent->type & file_dir)) { allowed = false; error = ENOTDIR; }
+        else
+        {
+            char *base = vfs_get_fullpath(parent);
+            prefix = strlen(ancestor);
+            const char *suffix = absolute + prefix;
+            size_t bytes = base ? strlen(base) + strlen(suffix) + 2 : 0;
+            char *joined = base ? (char *)malloc(bytes) : NULL;
+            if (joined)
+            {
+                snprintf(joined, bytes, "%s/%s", base, suffix);
+                canonical = normalize_path(joined);
+            }
+            free(joined);
+            if (!canonical) { allowed = false; error = ENOMEM; }
+            // Creating a child needs its parent's capability category, but
+            // does not replace the existing parent's protected IME anchor.
+            if (allowed) allowed = permissions_file_requirements(parent, NULL, IME_FILE_WRITE, &required);
+            // Include each directory that mkdir/mkfile would have to create.
+            size_t base_length = base ? strlen(base) : 0;
+            for (char *p = canonical ? canonical + base_length : NULL; allowed && p && *p; ++p)
+            {
+                if (*p != '/' || p == canonical || p == canonical + base_length) continue;
+                char saved = *p;
+                *p = 0;
+                allowed = ime_vfs_requirements(NULL, canonical, IME_FILE_WRITE, &required);
+                *p = saved;
+            }
+            if (allowed) allowed = query_operations(NULL, canonical, access, &required);
+            free(base);
+        }
+        if (parent) vfs_close(parent);
+        free(ancestor);
+    }
+    if (resolved && capacity)
+    {
+        const char *target = canonical ? canonical : absolute;
+        size_t length = strlen(target);
+        if (length >= capacity && capacity >= 8)
+        {
+            size_t head = (capacity - 4) / 2, tail_length = capacity - 4 - head;
+            memcpy(resolved, target, head);
+            memcpy(resolved + head, "...", 3);
+            memcpy(resolved + head + 3, target + length - tail_length, tail_length);
+        }
+        else strncpy(resolved, target, capacity - 1);
+        resolved[capacity - 1] = 0;
+    }
+    free(canonical);
+    free(absolute);
+    if (!allowed) return -(error ? error : permissions_file_error() ? permissions_file_error() : EACCES);
+    return required & ~permissions_current_mask();
+}
+
+int permissions_request_file_access(const char *path, uint64_t access, uint8_t offered)
+{
+    char resolved[256];
+    int missing = permissions_query_file_access(path, access, resolved, sizeof(resolved));
+    if (missing <= 0) return missing;
+    uint8_t asking = (uint8_t)missing & offered;
+    if (asking)
+    {
+        int result = request_permissions(asking, XUT_Custom, true, resolved);
+        if (result < 0) return result;
+    }
+    // A selected path may have been renamed or retargeted while the user was
+    // deciding. Revalidate without widening the set offered by this operation.
+    return permissions_query_file_access(path, access);
 }
 
 static int transfer_category(const char *path, const char *application)
