@@ -68,9 +68,9 @@ jobs:
           sgdisk --verify XJ380.img
           mdir -i XJ380.img@@1048576 ::/EFI/BOOT/BOOTX64.efi
           mdir -i XJ380.img@@1048576 ::/system/kernel.krl
-          mdir -i XJ380.img@@1048576 ::/apps/system/shell.elf
-          mdir -i XJ380.img@@1048576 ::/mod/e1000.sys
-          mdir -i XJ380.img@@1048576 ::/mod/netserver.sys
+          mdir -i XJ380.img@@1048576 ::/apps/system/shell/shell.elf
+          mdir -i XJ380.img@@1048576 ::/system/mod/e1000.sys
+          mdir -i XJ380.img@@1048576 ::/system/mod/netserver.sys
           mdir -i XJ380.img@@1048576 ::/system/licenses/third-party/MANIFEST.json
           sha256sum XJ380.img > XJ380.img.sha256
           ninja -f build.ninja size
