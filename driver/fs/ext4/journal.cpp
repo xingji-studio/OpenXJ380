@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Original implementation from public JBD2 format descriptions. No Linux,
 // e2fsprogs, lwext4, or other filesystem implementation code is incorporated.
+// Later block-I/O design references are recorded in REFERENCES.json.
 #include "journal.h"
 #include <errno.h>
 
@@ -120,11 +121,52 @@ int Journal::fetch(uint64_t block, void *output)
 
 int Journal::store(uint64_t block, const void *input)
 {
+    return store_run(block, input, 1);
+}
+
+unsigned Journal::transfer_limit() const
+{
+    if (!device_.workspace || device_.maximum_transfer_blocks < 2) return 1;
+    return device_.maximum_transfer_blocks < kMaximumUpdates ? device_.maximum_transfer_blocks : kMaximumUpdates;
+}
+
+int Journal::store_run(uint64_t block, const void *input, unsigned count)
+{
     if (failed_) return -EIO;
-    if (block >= device_.filesystem_blocks || !device_.write(device_.context, block, input, device_.block_size))
+    if (!count || count > transfer_limit() || block >= device_.filesystem_blocks ||
+        count > device_.filesystem_blocks - block ||
+        !device_.write(device_.context, block, input, count * device_.block_size))
     {
         failed_ = true;
         return -EIO;
+    }
+    return 0;
+}
+
+int Journal::write_updates(const BlockUpdate *updates, unsigned count, bool log, uint8_t *single)
+{
+    const unsigned limit = transfer_limit();
+    uint8_t *buffer = limit > 1 ? device_.workspace->transfer : single;
+    for (unsigned first = 0; first < count;)
+    {
+        auto target = [&](unsigned index) -> uint64_t
+        {
+            return log ? mapping_[advance(first_, index + 1)] : updates[index].block;
+        };
+        uint64_t physical = target(first);
+        unsigned run = 1;
+        // Logical journal adjacency is insufficient: mappings may be fragmented
+        // or wrap around the ring. Never combine across a physical discontinuity.
+        while (run < limit && run < count - first && target(first + run) == physical + run) ++run;
+        for (unsigned i = 0; i < run; ++i)
+        {
+            uint8_t *image = buffer + i * device_.block_size;
+            copy(image, updates[first + i].bytes, device_.block_size);
+            if (log && big32(image) == kMagic) zero(image, 4);
+        }
+        int error = store_run(physical, buffer, run);
+        if (error) return error;
+        first += run;
     }
     return 0;
 }
@@ -389,12 +431,7 @@ int Journal::commit(const BlockUpdate *updates, unsigned count)
     }
     if (checksum_version_) seal_block(block, device_.block_size - 4);
     if (!result) result = store(mapping_[first_], block);
-    for (unsigned index = 0; !result && index < count; ++index)
-    {
-        copy(block, updates[index].bytes, device_.block_size);
-        if (big32(block) == kMagic) zero(block, 4);
-        result = store(mapping_[advance(first_, index + 1)], block);
-    }
+    if (!result) result = write_updates(updates, count, true, block);
     if (!result) result = barrier();
     if (!result)
     {
@@ -404,8 +441,7 @@ int Journal::commit(const BlockUpdate *updates, unsigned count)
         result = store(mapping_[advance(first_, count + 1)], block);
     }
     if (!result) result = barrier();
-    for (unsigned index = 0; !result && index < count; ++index)
-        result = store(updates[index].block, updates[index].bytes);
+    if (!result) result = write_updates(updates, count, false, block);
     if (!result) result = barrier();
     if (!result) result = clear();
     return result;
@@ -687,11 +723,20 @@ int Journal::recover(bool &replayed, bool validate_empty)
         result = validate_empty_recovery();
         if (result) return result;
     }
-    for (unsigned i = 0; i < count; ++i)
+    const unsigned limit = transfer_limit();
+    uint8_t *transfer = limit > 1 ? device_.workspace->transfer : block;
+    for (unsigned first = 0; first < count;)
     {
-        result = read_image(images[i], block);
-        if (!result) result = store(targets[i], block);
+        unsigned run = 1;
+        while (run < limit && run < count - first && targets[first + run] == targets[first] + run) ++run;
+        for (unsigned i = 0; i < run; ++i)
+        {
+            result = read_image(images[first + i], transfer + i * device_.block_size);
+            if (result) return result;
+        }
+        result = store_run(targets[first], transfer, run);
         if (result) return result;
+        first += run;
     }
     result = barrier();
     if (!result)

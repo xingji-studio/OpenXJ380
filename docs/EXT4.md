@@ -34,6 +34,19 @@ See [the package contract](INSTALLER_PACKAGES.md).
 
 ## Writable feature and durability boundaries
 
+- Writable sessions share a 32-entry clean read cache for home blocks and
+  journal images in caller-owned workspace storage (128 KiB data maximum).
+  Overlay after-images take priority; every attempted write invalidates its
+  affected cache blocks first. A cold read failure also blocks subsequent warm
+  cache reads and mutations. Large/cross-block reads retain direct backend I/O;
+  explicit read-only mounts retain their existing uncached parser behavior.
+- Journal log-data, checkpoint and replay writes combine physically consecutive
+  blocks into requests of at most 16 blocks / 64 KiB, using an explicit backend
+  opt-in and a caller-owned gather buffer. Fragmented mappings split requests.
+  All six commit flush barriers, checksum/escape handling and pre-write recovery
+  validation are retained. No delayed dirty-cache writeback is introduced.
+  A synthetic 16-image contiguous commit drops from 37 write requests to seven;
+  that is a request-count result, not a hardware throughput measurement.
 - Tested filesystem blocks: 1/2/4 KiB. The fixed 128-block-group writer limit is
   removed: larger geometries use explicit caller-owned `WriteStorage`, sized
   from block, inode and group counts. Checked arena admission has a 256 MiB

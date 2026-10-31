@@ -1,14 +1,16 @@
 # ext4 dependency license audit and implementation decision
 
-Review date: 2026-10-30. Scope: the replacement ext4 kernel implementation in
-OpenXJ380 and its integration into the closed-source XJ380 parent.
+Initial review date: 2026-10-30; permissive-reference follow-up: 2026-10-31.
+Scope: the replacement ext4 kernel implementation in OpenXJ380 and its
+integration into the closed-source XJ380 parent.
 
 ## Decision
 
-Use independently authored native C++ code in OpenXJ380 under Apache-2.0.
-**No external ext4 implementation is approved for import or linkage by this
-review.** The reviewed candidates below remain unapproved; a package license
-field or a repository badge is not a completed per-file/provenance audit.
+Keep the current native C++ implementation in OpenXJ380 under Apache-2.0.
+No whole external filesystem library is approved for import or linkage by this
+review. The user has authorized consulting and adapting compatible BSD-3-Clause
+portions of lwext4 after checking the actual files and provenance. That permission
+does not include its GPL portions or turn a package badge into a file-level audit.
 
 This decision preserves the project's licensing boundary by introducing no new
 third-party filesystem implementation. Existing project dependency exceptions
@@ -16,10 +18,12 @@ remain separate. It does not certify the provenance of future code: each change
 still requires review of its actual origin and content. An Apache SPDX header
 cannot make copied or translated copyleft implementation code permissive.
 
-The implementation must use on-disk format facts and independently generated
-fixtures. Do not copy, translate, or adapt Linux/lwext4 implementation code into
-the replacement. Do not describe this review as a formal clean-room process or
-as a whole-project copyright clearance.
+The existing implementation was developed from on-disk format facts and
+independently generated fixtures. Do not copy, translate, or adapt GPL-licensed
+Linux/lwext4 implementation code into the replacement. Verified permissive
+lwext4 portions are eligible references under the policy below; this supersedes
+the earlier blanket exclusion of all lwext4 implementation code. Do not describe
+this review as a formal clean-room process or whole-project copyright clearance.
 
 ## What was actually reviewed
 
@@ -58,11 +62,78 @@ The manifest's explicit FFI constraint is the relevant evidence here.
 
 ## Approved implementation inputs
 
-The approved route has an empty new third-party implementation dependency set.
+The currently incorporated code has no new third-party filesystem implementation dependency.
 New first-party files need Apache-2.0 SPDX identifiers and a provenance record
 that identifies the public format descriptions used. Existing VFS/block I/O,
 allocator, mutex, and ABI support remains part of the existing kernel boundary.
 This review does not expand that boundary's license exceptions.
+
+### lwext4 permissive reference follow-up, 2026-10-31
+
+Upstream distinguishes per-file terms from its combined GPL distribution.
+Its [README](https://github.com/gkostka/lwext4#credits) identifies the extent and
+xattr implementations as GPL and the remaining modules/headers as BSD-3-Clause;
+the [LICENSE](https://github.com/gkostka/lwext4/blob/master/LICENSE) defers to
+individual file notices. The actual [source tree](https://github.com/gkostka/lwext4/tree/master/src)
+names the excluded files `src/ext4_extent.c` and `src/ext4_xattr.c`. The README's
+`ext4_extents.c` spelling must not become an ineffective exclusion pattern.
+
+The inspected notices in
+[`src/ext4_bcache.c`](https://github.com/gkostka/lwext4/blob/master/src/ext4_bcache.c),
+[`src/ext4_blockdev.c`](https://github.com/gkostka/lwext4/blob/master/src/ext4_blockdev.c),
+[`src/ext4_journal.c`](https://github.com/gkostka/lwext4/blob/master/src/ext4_journal.c)
+and [`include/ext4_config.h`](https://github.com/gkostka/lwext4/blob/master/include/ext4_config.h)
+contain three-clause BSD terms. They are reference candidates for cache,
+block-I/O, journal and configuration work, not a completed dependency-closure
+approval. Other files still need their own inspection before use.
+
+`lwext4_no_gpl` is the module name documented by the
+[RIOT integration](https://api.riot-os.org/group__pkg__lwext4.html), where it disables
+extents and extended attributes. The inspected upstream
+[`src/CMakeLists.txt`](https://github.com/gkostka/lwext4/blob/master/src/CMakeLists.txt)
+collects all C sources in that directory. Its
+[`ext4_config.h`](https://github.com/gkostka/lwext4/blob/master/include/ext4_config.h)
+exposes `CONFIG_EXTENTS_ENABLE` and `CONFIG_XATTR_ENABLE`; toggling them alone is
+not evidence of an explicitly filtered compile/archive input list. Check the
+selected integration's actual inputs instead of assuming the RIOT module name
+is an upstream CMake option.
+
+For implementation reuse:
+
+- Pin the selected upstream revision and hash each reused file, then review its
+  complete notices, origin, included headers and any inlined/helper code. The
+  public file observations above use moving `master` URLs; no complete pinned
+  source/dependency audit or approved binary build is asserted here.
+- Exclude the GPL extent/xattr implementation files and GPL-derived fragments.
+  The native extent/xattr implementations remain available; consulting BSD
+  modules does not require replacing them with a feature-reduced library.
+- Preserve the applicable BSD copyright, conditions and disclaimer in source
+  and distribution materials, and record modified/adapted origins. Do not label
+  adapted upstream code as entirely original Apache-2.0 merely to satisfy a gate.
+- Update provenance, notices and the reviewed source inventory/policy together
+  when an actual adaptation is made. The then-current 18-file Apache-2.0 inventory
+  and its empty new-external-input declarations were unchanged by that follow-up:
+  no lwext4 code or archive has been incorporated into the driver here.
+
+### Cache and journal I/O implementation follow-up
+
+`driver/fs/ext4/REFERENCES.json` records the three BSD design references, their
+review scopes and actual retrieval limits. The journal view was available at
+candidate revision `58bcf89a121b72d4fb66334f1693d3b30e4cb9c5`; cache/blockdev views
+were available only on moving master. Verified full-file HTTPS downloads failed
+certificate validation, so no full upstream file bytes, SHA-256 or completed
+pinned dependency audit is claimed. Copying/translation is deferred until those
+requirements are met. This work consults generic cache/block-I/O/checkpoint
+designs and expresses them in new fixed-storage native code under Apache-2.0.
+
+The inventory is now 19 Apache-2.0 files, adding `io_cache.h`, with no new external
+implementation or archive. `LWEXT4_BSD_NOTICE.txt` retains the upstream copyright,
+BSD conditions and disclaimer as reference material. Both image staging paths
+install that notice and the reference record alongside the native provenance
+and source inventory under `/system/licenses/native-ext4`. The source gate
+checks those records and refuses the excluded upstream extent/xattr filenames
+even if they are relabelled Apache-2.0. This reference allowance does not approve
+importing helpers, headers, whole modules or a prebuilt lwext4 library.
 
 Use the [ext4 on-disk format documentation](https://www.kernel.org/doc/html/latest/filesystems/ext4/)
 as a description of storage fields and behavior. Record references to format

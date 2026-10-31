@@ -1,0 +1,41 @@
+lwext4 BSD design references
+https://github.com/gkostka/lwext4
+
+The native cache and journal I/O changes are newly written Apache-2.0 code.
+The three files recorded in REFERENCES.json were consulted for design review;
+no implementation source, headers, helpers or library was copied or translated.
+Their upstream notices are retained here with the reference record. This does
+not attribute the native implementation to the upstream authors or license
+any excluded upstream file under BSD terms.
+
+src/ext4_bcache.c and src/ext4_blockdev.c:
+Copyright (c) 2013 Grzegorz Kostka (kostka.grzegorz@gmail.com)
+
+src/ext4_journal.c:
+Copyright (c) 2015 Grzegorz Kostka (kostka.grzegorz@gmail.com)
+Copyright (c) 2015 Kaho Ng (ngkaho1234@gmail.com)
+
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions
+are met:
+
+- Redistributions of source code must retain the above copyright
+  notice, this list of conditions and the following disclaimer.
+- Redistributions in binary form must reproduce the above copyright
+  notice, this list of conditions and the following disclaimer in the
+  documentation and/or other materials provided with the distribution.
+- The name of the author may not be used to endorse or promote products
+  derived from this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND ANY EXPRESS OR
+IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY DIRECT, INDIRECT,
+INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
+NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
+THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.

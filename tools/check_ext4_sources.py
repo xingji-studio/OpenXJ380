@@ -26,6 +26,7 @@ UNREVIEWED_INPUT_EXTENSIONS = {
 }
 NATIVE_SOURCES = {"native.cpp", "native.h"}
 NATIVE_INCLUDES = {"native.h", "stdint.h", "errno.h"}
+EXCLUDED_UPSTREAM_NAMES = {"ext4_extent.c", "ext4_extents.c", "ext4_xattr.c"}
 MANIFEST_KEYS = {
     "schema_version", "implementation", "license", "sources",
     "new_external_implementations", "new_link_archives",
@@ -75,6 +76,53 @@ def check_native_includes(name: str, source: str) -> None:
         require(header in NATIVE_INCLUDES, f"{name}: unapproved native include {header!r}")
 
 
+def check_references(directory: Path, required: bool) -> None:
+    path = directory / "REFERENCES.json"
+    if not path.exists() and not required:
+        return
+    require(path.is_file() and not path.is_symlink(), "missing or symlinked REFERENCES.json")
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=unique_fields)
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise PolicyError(f"cannot read REFERENCES.json: {error}") from error
+    require(isinstance(record, dict) and set(record) == {
+        "schema_version", "relationship", "review_date", "repository", "candidate_revision",
+        "copied_or_translated_implementation", "retrieval", "sources", "excluded_implementations", "notice",
+    }, "invalid design reference record")
+    require(type(record["schema_version"]) is int and record["schema_version"] == 1,
+            "unsupported reference schema_version")
+    require(record["relationship"] == "design-reference-only" and
+            record["copied_or_translated_implementation"] is False,
+            "implementation reuse requires a separate license/source review")
+    require(record["repository"] == "https://github.com/gkostka/lwext4" and
+            record["candidate_revision"] == "58bcf89a121b72d4fb66334f1693d3b30e4cb9c5",
+            "unreviewed reference repository/revision")
+    require(isinstance(record["retrieval"], str) and record["retrieval"], "missing reference retrieval scope")
+    require(record["excluded_implementations"] == [
+        "src/ext4_extent.c", "src/ext4_extents.c", "src/ext4_xattr.c",
+    ], "excluded upstream implementations must remain explicit")
+    sources = record["sources"]
+    require(isinstance(sources, list) and len(sources) == 3, "unexpected reference source set")
+    for entry, name in zip(sources, ("ext4_bcache.c", "ext4_blockdev.c", "ext4_journal.c")):
+        require(isinstance(entry, dict) and set(entry) == {
+            "path", "url", "view_revision", "sha256", "license", "reviewed_design",
+        }, "invalid reference source fields")
+        revision = record["candidate_revision"] if name == "ext4_journal.c" else "master"
+        require(entry["path"] == f"src/{name}" and entry["view_revision"] == revision and
+                entry["url"] == f"https://raw.githubusercontent.com/gkostka/lwext4/{revision}/src/{name}",
+                "unreviewed or excluded reference source")
+        require(entry["license"] == "BSD-3-Clause" and entry["sha256"] is None,
+                "reference-only views must not assert unverified full-file hashes")
+        require(isinstance(entry["reviewed_design"], str) and entry["reviewed_design"], "missing design scope")
+    notice = record["notice"]
+    require(isinstance(notice, dict) and set(notice) == {"path", "sha256"} and
+            notice["path"] == "LWEXT4_BSD_NOTICE.txt", "invalid BSD reference notice record")
+    notice_path = directory / "LWEXT4_BSD_NOTICE.txt"
+    require(notice_path.is_file() and not notice_path.is_symlink(), "missing BSD reference notice")
+    data = notice_path.read_bytes()
+    require(hashlib.sha256(data).hexdigest() == notice["sha256"], "BSD reference notice hash changed")
+
+
 def audit(root: Path) -> list[str]:
     directory = root / SOURCE_DIRECTORY
     require(directory.is_dir() and not directory.is_symlink(), "missing or symlinked ext4 source directory")
@@ -103,6 +151,7 @@ def audit(root: Path) -> list[str]:
         relative = PurePosixPath(name)
         require(not relative.is_absolute() and ".." not in relative.parts and relative.as_posix() == name,
                 f"unsafe source path: {name!r}")
+        require(relative.name not in EXCLUDED_UPSTREAM_NAMES, f"excluded upstream implementation: {name}")
         require(relative.suffix in SOURCE_EXTENSIONS, f"unsupported inventory source type: {name}")
         require(name not in entries, f"duplicate source entry: {name}")
         require(entry["spdx"] == "Apache-2.0", f"{name}: source SPDX must be Apache-2.0")
@@ -125,6 +174,7 @@ def audit(root: Path) -> list[str]:
             f"source inventory differs: unlisted={sorted(set(actual) - set(entries))}, "
             f"missing={sorted(set(entries) - set(actual))}")
     require(NATIVE_SOURCES.issubset(actual), "native.cpp and native.h must remain explicitly inventoried")
+    check_references(directory, required="io_cache.h" in actual)
 
     for name, path in sorted(actual.items()):
         data = path.read_bytes()
