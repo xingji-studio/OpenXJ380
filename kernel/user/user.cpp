@@ -1,5 +1,6 @@
 #include <input_method.h>
 #include <user/permissions.h>
+#include <user/special_permissions.h>
 #include <user/process_launch.h>
 #include "../build_settings.h"
 #include <ahci/ahci.h>
@@ -362,6 +363,7 @@ int user_session_login(const char *username, const char *password)
         retry_after_ns = 0;
         spin_unlock(&login_lock);
         if (current_user == NULL || !init_user_profile(current_user->name)) return -EIO;
+        (void)special_permissions_load_user(current_user->name);
         return 0;
     }
     spin_lock(&login_lock);
@@ -407,6 +409,7 @@ int user_session_create_first(const char *username, const char *password)
             {
                 set_current_user_from_info(first_user);
                 if (current_user == NULL || !init_user_profile(current_user->name)) return -EIO;
+                (void)special_permissions_load_user(current_user->name);
                 return 0;
             }
         }
@@ -422,6 +425,7 @@ int user_session_create_first(const char *username, const char *password)
     strncpy(info.password, password, sizeof(info.password) - 1);
     info.user_type = XUT_Admin;
     set_current_user_from_info(&info);
+    (void)special_permissions_load_user(info.name);
     return 0;
 }
 

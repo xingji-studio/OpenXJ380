@@ -144,6 +144,8 @@ UINT64  xapi_SpawnInherited(WSTR path, WSTR argv[]);
 // Zero means permitted; positive values are missing permission bits; negatives are errors.
 INT64 xapi_QueryFileAccess(const char *path, UINT64 access);
 INT64 xapi_RequestFileAccess(const char *path, UINT64 access);
+// 0 granted; negative errno for remembered refusal, interruption or storage failure.
+INT64 xapi_RequestSpecialPermission(uint64_t spid);
 UINT64  xapi_PowerAction(UINT64 action);
 void 	xapi_FlushTime(void);
 

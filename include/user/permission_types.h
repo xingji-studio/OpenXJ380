@@ -1,5 +1,7 @@
 #pragma once
 
+#include "stdint.h"
+
 #ifndef __cplusplus
 #include <stdbool.h>
 #endif
@@ -59,3 +61,50 @@ static inline unsigned char user_type_permission_mask(UserType type)
     default: return 0;
     }
 }
+
+// Special permissions override ordinary R/W/CS/NV/SV/SR/SW for the
+// current account's /users/<username>/picture directory and its descendants.
+typedef enum
+{
+    XSPT_Zero = 0,         // Reserved; never a valid request.
+    XSPT_ReadPicture = 1,  // List, inspect and read /users/<username>/picture.
+    XSPT_WritePicture = 2, // Create and write album contents; does not authorize deletion.
+    XSPT_DeletePicture = 3 // Remove album entries; does not authorize reading or writing.
+} SpecialPermissionType;
+
+enum
+{
+    XSP_STORE_MAGIC = 0x31505358, // XSP1, little endian.
+    XSP_STORE_VERSION = 1,
+    XSP_STORE_COMMITTED = 0x58434d54, // Written last; each byte is nonzero.
+    XSP_APP_PATH_BYTES = 4096,
+    XSP_MAX_APPS = 256,
+    XSP_STORE_LIMIT = 1024 * 1024 + 65536
+};
+#define XSP_KNOWN_MASK ((1ULL << XSPT_ReadPicture) | (1ULL << XSPT_WritePicture) | \
+                        (1ULL << XSPT_DeletePicture))
+
+// /system/config/user/<username>/permission.dat, with a verified .backup
+// snapshot for interrupted writes. Fixed-width, little-endian disk ABI.
+// The header is followed by SpAppCount variable-length application records.
+// Checksum is FNV-1a over the whole snapshot with Checksum set to zero.
+// Commit must equal XSP_STORE_COMMITTED; incomplete writes are not decisions.
+typedef struct
+{
+    uint32_t Magic, Version, SpAppCount, RecordsBytes;
+    uint64_t Generation;
+    uint32_t Checksum, Commit;
+    char UserName[64];
+} SpecialPremissionSettingFileFormat;
+typedef SpecialPremissionSettingFileFormat SpecialPermissionSettingFileFormat;
+
+// Each record contains this header followed by PathBytes bytes of a canonical
+// executable pathname, including its NUL. RecordBytes = sizeof(header) + PathBytes.
+// Records have no padding and must be decoded with memcpy (may be unaligned).
+// Decided records both approval and refusal; Granted is a subset of Decided.
+// An existing decision is returned without another consent dialog on later runs.
+typedef struct
+{
+    uint32_t RecordBytes, PathBytes;
+    uint64_t Decided, Granted;
+} SpecialPermissionAppRecord;

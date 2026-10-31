@@ -53,6 +53,8 @@ bool init_user_dirs(const char *username)
     char desktop_path[256];
     if (!make_user_path(desktop_path, sizeof(desktop_path), username, "/desktop")) return false;
     vfs_mkdir(desktop_path);
+    if (!make_user_path(desktop_path, sizeof(desktop_path), username, "/picture")) return false;
+    vfs_mkdir(desktop_path);
     return true;
 }
 
