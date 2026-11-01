@@ -42,3 +42,8 @@ extern "C" INT64 xapi_RequestFileAccess(const char *path, UINT64 access)
 {
     return (INT64)enter_syscall(XAPI_REQUEST_FILE_ACCESS, (UINT64)path, access, XPERM_ALL, 0, 0, 0);
 }
+
+extern "C" INT64 xapi_RequestSpecialPermission(uint64_t spid)
+{
+    return (INT64)enter_syscall(XAPI_REQUEST_SPECIAL_PERMISSION, spid, 0, 0, 0, 0, 0);
+}

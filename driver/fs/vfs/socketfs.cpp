@@ -1,3 +1,4 @@
+#include <user/permissions.h>
 #define ALL_IMPLEMENTATION
 
 #include <dlinker.h>
@@ -561,6 +562,7 @@ int socket_resolve_ipv6(const char *hostname, uint8_t out_addr[16])
 
 int socket_set_dns_server(uint32_t addr)
 {
+    if (!permissions_have(XPERM_CS)) return -EACCES;
     socket_provider_t provider = {};
     int               ret      = socketfs_snapshot_provider(&provider);
     if (ret < 0) {
@@ -584,6 +586,7 @@ int socket_get_dns_server(uint32_t *out_addr)
 
 int socket_set_ipv4_config(const socket_ipv4_config_t *config)
 {
+    if (!permissions_have(XPERM_CS)) return -EACCES;
     socket_provider_t provider = {};
     int               ret      = socketfs_snapshot_provider(&provider);
     if (ret < 0) {

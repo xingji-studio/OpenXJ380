@@ -1,6 +1,7 @@
 #include <user/permissions.h>
 #include <user/process_launch.h>
 #include <user/file_access.h>
+#include <user/special_permissions.h>
 #include <cpu/lock.h>
 #include <errno.h>
 #include <fs/vfs/vfs.h>
@@ -26,6 +27,9 @@ struct PermissionRequest
     uint8_t remaining;
     bool done;
     bool role_confirmation, role_approved;
+    bool special_ready, special_answered;
+    int special_result;
+    char special_path[XSP_APP_PATH_BYTES];
 };
 static PermissionRequest *requests, *tail;
 
@@ -143,6 +147,16 @@ static PermissionRequest *first_locked()
     {
         if (r->done) continue;
         if (!backend_available || !valid_locked(r)) { r->done = true; continue; }
+        if (r->prompt.special_id)
+        {
+            if (!user_session_is_ready() || !current_user || strcmp(current_user->name, r->prompt.user))
+            { r->done = true; continue; }
+            // Keep the head reserved while a prior answer is persisted. A
+            // duplicate cannot display before its remembered decision exists.
+            if (!r->special_ready || r->special_answered) return NULL;
+            if (!r->prompt.token) r->prompt.token = next_token++;
+            return r;
+        }
         uint8_t current = mask_of(&r->process->permission_user);
         r->remaining &= ~current;
         r->remaining &= session_mask_locked();
@@ -185,6 +199,14 @@ void permissions_answer(uint64_t token, bool approved)
     PermissionRequest *r = first_locked();
     if (r && r->prompt.token == token)
     {
+        if (r->prompt.special_id)
+        {
+            r->special_answered = true;
+            r->role_approved = approved;
+            r->prompt.token = 0;
+            spin_unlock(&permission_lock);
+            return;
+        }
         if (approved)
         {
             uint8_t granted = r->prompt.asking & session_mask_locked();
@@ -226,6 +248,7 @@ static void unlink_locked(PermissionRequest *r)
 
 void permissions_thread_exit(tcb_t task)
 {
+    special_permissions_store_exit(task->parent_group);
     vfs_node_t dialog_reader = __atomic_exchange_n(&task->permission_dialog_reader, (vfs_node_t)NULL, __ATOMIC_ACQ_REL);
     if (dialog_reader) vfs_close(dialog_reader);
     PermissionRequest *garbage = NULL;
@@ -366,6 +389,88 @@ int permissions_request(uint8_t requested)
     return request_permissions(requested, XUT_Custom, true);
 }
 
+int permissions_request_special(uint64_t spid)
+{
+    if (spid < XSPT_ReadPicture || spid > XSPT_DeletePicture) return -EINVAL;
+    tcb_t task = get_current_task();
+    if (!task || !task->parent_group || task->task_level != TASK_APPLICATION_LEVEL) return -EPERM;
+    pcb_t process = task->parent_group;
+    PermissionRequest *r = (PermissionRequest *)calloc(1, sizeof(PermissionRequest));
+    if (!r) return -ENOMEM;
+    r->owner = task;
+    r->process = process;
+    r->special_result = -ESTALE;
+    r->prompt.pid = process->pid;
+    r->prompt.ppid = process->ppid;
+    r->prompt.tid = task->tid;
+    r->prompt.special_id = spid;
+    spin_lock(&create_thread_lock);
+    size_t length = process->exe_path ? strlen(process->exe_path) : 0;
+    if (length && length < sizeof(r->special_path)) memcpy(r->special_path, process->exe_path, length + 1);
+    strncpy(r->prompt.name, process->name, sizeof(r->prompt.name) - 1);
+    r->revision = __atomic_load_n(&process->permission_revision, __ATOMIC_ACQUIRE);
+    spin_unlock(&create_thread_lock);
+    if (!length || length >= sizeof(r->special_path)) { free(r); return -ENAMETOOLONG; }
+    strncpy(r->prompt.path, r->special_path, sizeof(r->prompt.path) - 1);
+    spin_lock(&permission_lock);
+    strncpy(r->prompt.user, process->permission_user.name, sizeof(r->prompt.user) - 1);
+    r->prompt.current_type = process->permission_user.user_type;
+    r->prompt.target_type = r->prompt.current_type;
+    r->session = session_generation;
+    spin_unlock(&permission_lock);
+    int saved = special_permissions_get(r->prompt.user, r->special_path, spid);
+    if (saved) { free(r); return saved < 0 ? saved : saved == 2 ? 0 : -EACCES; }
+    snprintf(r->prompt.resource, sizeof(r->prompt.resource), "/users/%s/picture", r->prompt.user);
+    spin_lock(&permission_lock);
+    if (!backend_available || !valid_locked(r) || !user_session_is_ready() ||
+        !current_user || strcmp(current_user->name, r->prompt.user))
+    { spin_unlock(&permission_lock); free(r); return -EACCES; }
+    if (tail) tail->next = r;
+    else requests = r;
+    tail = r;
+    __atomic_add_fetch(&outstanding_requests, 1U, __ATOMIC_RELEASE);
+    spin_unlock(&permission_lock);
+    // Recheck after publication, without nesting cache_lock in permission_lock.
+    // A concurrent leader either sees this waiter or has already saved a result.
+    saved = special_permissions_cached(r->prompt.user, r->special_path, spid);
+    spin_lock(&permission_lock);
+    if (saved) { r->done = true; r->special_result = saved == 2 ? 0 : -EACCES; }
+    r->special_ready = true;
+    spin_unlock(&permission_lock);
+    for (;;)
+    {
+        spin_lock(&permission_lock);
+        first_locked();
+        if (r->done)
+        {
+            int result = r->special_result;
+            unlink_locked(r);
+            spin_unlock(&permission_lock);
+            free(r);
+            return result;
+        }
+        bool answered = r->special_answered, approved = r->role_approved;
+        spin_unlock(&permission_lock);
+        if (answered)
+        {
+            int result = special_permissions_save(r->prompt.user, r->special_path, spid, approved);
+            spin_lock(&permission_lock);
+            for (PermissionRequest *waiter = requests; waiter; waiter = waiter->next)
+            {
+                if (waiter->prompt.special_id == spid && waiter->session == r->session &&
+                    !strcmp(waiter->prompt.user, r->prompt.user) && !strcmp(waiter->special_path, r->special_path))
+                {
+                    waiter->special_result = valid_locked(waiter) ? result : -ESTALE;
+                    waiter->done = true;
+                    waiter->prompt.token = 0;
+                }
+            }
+            spin_unlock(&permission_lock);
+        }
+        else scheduler_sleep_ns(10000000ULL);
+    }
+}
+
 static bool prefix_fold(const char *path, const char *prefix)
 {
     for (size_t i = 0; prefix[i]; ++i)
@@ -501,6 +606,12 @@ static bool system_path(const char *path)
     return !prefix_fold(path, "/system/resources") && (under(path, "/system") || under(path, "/EFI"));
 }
 
+static bool network_store_path(const char *path, bool ancestors)
+{
+    return under(path, "/config/network") ||
+           (ancestors && (equal_fold(path, "/config") || equal_fold(path, "/")));
+}
+
 static bool path_access(const char *path, bool directory, int operation, uint8_t mask,
                         const char *user, const char *application, pcb_t process = NULL, uint8_t *required_out = NULL)
 {
@@ -514,10 +625,20 @@ static bool path_access(const char *path, bool directory, int operation, uint8_t
 
     if (operation == IME_FILE_LOOKUP) return true; // Internal name lookup exposes no contents or listing.
     if (operation == IME_FILE_MOUNT) return false;
+    int special = special_permissions_access(process, user, path, operation);
+    if (special)
+    {
+        if (special < 0) permissions_set_file_error(-special);
+        return special > 0;
+    }
     bool write = operation == IME_FILE_WRITE || operation == IME_FILE_REMOVE || operation == IME_FILE_READ_WRITE;
     bool read = operation == IME_FILE_READ || operation == IME_FILE_READ_WRITE;
     bool metadata = operation == IME_FILE_STAT || operation == IME_FILE_LIST;
     if (!write && !read && !metadata) return false;
+    // The native CS-checked service serializes its two snapshots. Ordinary
+    // writes must not race its commit marker or create writable aliases, even
+    // when the application has broad NV/CS file permissions.
+    if (write && network_store_path(path, directory && operation == IME_FILE_REMOVE)) return false;
 
     if (under(path, "/users"))
     {
@@ -621,6 +742,7 @@ static bool file_access(vfs_node_t node, const char *path, int operation, unsign
         const char *leaf = resolved && under(resolved, base) ? resolved + strlen(base) : NULL;
         bool allowed = resolved && task->permission_profile_owner[0] &&
             (equal_fold(resolved, "/users") || (leaf && (!leaf[0] || equal_fold(leaf, "/desktop") ||
+                equal_fold(leaf, "/picture") ||
                 equal_fold(leaf, "/settings.json") || equal_fold(leaf, "/settings.dat") ||
                 equal_fold(leaf, "/runfile.dat"))) ||
              (equal_fold(resolved, "/system/config/language.dat") &&
@@ -757,7 +879,11 @@ int permissions_query_file_access(const char *path, uint64_t access, char *resol
             if (!canonical) { allowed = false; error = ENOMEM; }
             // Creating a child needs its parent's capability category, but
             // does not replace the existing parent's protected IME anchor.
-            if (allowed) allowed = permissions_file_requirements(parent, NULL, IME_FILE_WRITE, &required);
+            // An album grant authorizes creating the album itself without
+            // requiring ordinary NV on its existing home directory.
+            const char *owner = get_current_task()->parent_group->permission_user.name;
+            bool album = canonical && special_permissions_path_mask(canonical, IME_FILE_WRITE, owner);
+            if (allowed && !album) allowed = permissions_file_requirements(parent, NULL, IME_FILE_WRITE, &required);
             // Include each directory that mkdir/mkfile would have to create.
             size_t base_length = base ? strlen(base) : 0;
             for (char *p = canonical ? canonical + base_length : NULL; allowed && p && *p; ++p)
@@ -798,6 +924,38 @@ int permissions_request_file_access(const char *path, uint64_t access, uint8_t o
 {
     char resolved[256];
     int missing = permissions_query_file_access(path, access, resolved, sizeof(resolved));
+    if (missing == -EACCES)
+    {
+        tcb_t task = get_current_task();
+        char user[64];
+        spin_lock(&permission_lock);
+        memcpy(user, task->parent_group->permission_user.name, sizeof(user));
+        spin_unlock(&permission_lock);
+        user[sizeof(user) - 1] = 0;
+        // Query already resolved aliases and missing parents. Its shortened
+        // display retains at least 126 leading bytes, enough for the complete
+        // /users/<63-byte username>/picture boundary. Never reclassify a raw
+        // pathname that could identify a different symlink destination.
+        uint64_t special = 0;
+        if (resolved[0])
+        {
+            if (access & (XFA_READ | XFA_LIST | XFA_STAT))
+                special |= special_permissions_path_mask(resolved, IME_FILE_READ, user);
+            if (access & (XFA_WRITE | XFA_CREATE))
+                special |= special_permissions_path_mask(resolved, IME_FILE_WRITE, user);
+            if (access & XFA_REMOVE) special |= special_permissions_path_mask(resolved, IME_FILE_REMOVE, user);
+        }
+        if (special && !(special & ~XSP_KNOWN_MASK))
+        {
+            for (uint64_t id = XSPT_ReadPicture; id <= XSPT_DeletePicture; ++id)
+                if (special & (1ULL << id))
+                {
+                    int result = permissions_request_special(id);
+                    if (result) return result;
+                }
+            missing = permissions_query_file_access(path, access, resolved, sizeof(resolved));
+        }
+    }
     if (missing <= 0) return missing;
     uint8_t asking = (uint8_t)missing & offered;
     if (asking)
@@ -812,6 +970,7 @@ int permissions_request_file_access(const char *path, uint64_t access, uint8_t o
 
 static int transfer_category(const char *path, const char *application)
 {
+    if (special_permissions_path_mask(path, IME_FILE_READ, NULL)) return 4;
     if (prefix_fold(path, "/users/"))
     {
         const char *slash = strchr(path + strlen("/users/"), '/');
@@ -839,7 +998,9 @@ static bool file_transfer(vfs_node_t node, const char *destination, bool hard_li
     // must not make another account's settings.json accessible through NV.
     bool account_root = equal_fold(source, "/users") ||
         (prefix_fold(source, "/users/") && !strchr(source + strlen("/users/"), '/'));
-    bool allowed = !((node->type & file_dir) && account_root);
+    bool allowed = !((node->type & file_dir) && account_root) &&
+        !special_permissions_store_path(source, true) && !special_permissions_store_path(target, true) &&
+        !network_store_path(source, true) && !network_store_path(target, true);
     char application[4096], username[64];
     spin_lock(&permission_lock);
     pcb_t process = task->parent_group;
@@ -849,6 +1010,13 @@ static bool file_transfer(vfs_node_t node, const char *destination, bool hard_li
     spin_unlock(&permission_lock);
     application[sizeof(application) - 1] = 0;
     username[sizeof(username) - 1] = 0;
+    if (allowed)
+    {
+        int source_access = special_permissions_access(process, username, source,
+                                                       hard_link ? IME_FILE_READ : IME_FILE_REMOVE);
+        int target_access = special_permissions_access(process, username, target, IME_FILE_WRITE);
+        allowed = source_access >= 0 && target_access >= 0;
+    }
     int from = transfer_category(source, application);
     int to = transfer_category(target, application);
     if (allowed && from != to)

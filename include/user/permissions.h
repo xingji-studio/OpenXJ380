@@ -11,6 +11,7 @@ struct PermissionPrompt
     UserType current_type, target_type;
     uint8_t current, requested, asking;
     bool individual;
+    uint64_t special_id; // Nonzero selects a persistent special-permission prompt.
 };
 
 void permissions_session_publish(const UserInfo *info);
@@ -25,6 +26,7 @@ uint8_t permissions_current_mask();
 UserType permissions_current_type();
 int permissions_lift(UserType type);
 int permissions_request(uint8_t requested);
+int permissions_request_special(uint64_t spid);
 bool permissions_prompt(PermissionPrompt *out);
 bool permissions_modal_active();
 void permissions_answer(uint64_t token, bool approved);

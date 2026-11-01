@@ -1,3 +1,4 @@
+#include <net/xnet_provider.h>
 #include <user/permissions.h>
 #include <mm/uaccess.h>
 #include <screen_capture.h>
@@ -671,6 +672,9 @@ extern "C" uint64_t c_syscall_handler(struct X64_REGS *regs, uint64_t user_rsp)
 
 
     /* XJ380API XAPI Edition */
+    case XAPI_NET:
+        regs->rax = (uint64_t)xnet_syscall(regs->rdi);
+        break;
     case XAPI_OUTPUT: do_xapi_Output((char *)regs->rdi); break;
     case XAPI_INPUT:
         regs->rax = (uint64_t)do_xapi_Input((char *)regs->rdi, (size_t)regs->rsi, regs->rdx);
@@ -742,6 +746,7 @@ extern "C" uint64_t c_syscall_handler(struct X64_REGS *regs, uint64_t user_rsp)
     case XAPI_RUN_ARGS: regs->rax = do_xapi_RunArgs((char *)regs->rdi, (char **)regs->rsi); break;
     case XAPI_SPAWN_INHERITED: regs->rax = do_xapi_SpawnInherited((char *)regs->rdi, (char **)regs->rsi); break;
     case XAPI_QUERY_FILE_ACCESS: regs->rax = do_xapi_QueryFileAccess(regs->rdi, regs->rsi); break;
+    case XAPI_REQUEST_SPECIAL_PERMISSION: regs->rax = do_xapi_RequestSpecialPermission(regs->rdi); break;
     case XAPI_REQUEST_FILE_ACCESS: regs->rax = do_xapi_RequestFileAccess(regs->rdi, regs->rsi, regs->rdx); break;
     case XAPI_MAP_MEMORY: regs->rax = do_xapi_MapMemory(regs->rdi, regs->rsi, regs->rdx); break;
     case XAPI_REMOVEDIR: sys_rmdir(regs->rdi, 0, 0, 0, 0, 0, regs); break;

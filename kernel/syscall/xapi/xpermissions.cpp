@@ -26,3 +26,8 @@ uint64_t do_xapi_RequestFileAccess(uint64_t path, uint64_t access, uint64_t offe
     free(copy);
     return (uint64_t)permissions_request_file_access(stable, access, (uint8_t)offered);
 }
+
+uint64_t do_xapi_RequestSpecialPermission(uint64_t spid)
+{
+    return (uint64_t)permissions_request_special(spid);
+}
