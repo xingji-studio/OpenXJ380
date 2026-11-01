@@ -606,6 +606,12 @@ static bool system_path(const char *path)
     return !prefix_fold(path, "/system/resources") && (under(path, "/system") || under(path, "/EFI"));
 }
 
+static bool network_store_path(const char *path, bool ancestors)
+{
+    return under(path, "/config/network") ||
+           (ancestors && (equal_fold(path, "/config") || equal_fold(path, "/")));
+}
+
 static bool path_access(const char *path, bool directory, int operation, uint8_t mask,
                         const char *user, const char *application, pcb_t process = NULL, uint8_t *required_out = NULL)
 {
@@ -629,6 +635,10 @@ static bool path_access(const char *path, bool directory, int operation, uint8_t
     bool read = operation == IME_FILE_READ || operation == IME_FILE_READ_WRITE;
     bool metadata = operation == IME_FILE_STAT || operation == IME_FILE_LIST;
     if (!write && !read && !metadata) return false;
+    // The native CS-checked service serializes its two snapshots. Ordinary
+    // writes must not race its commit marker or create writable aliases, even
+    // when the application has broad NV/CS file permissions.
+    if (write && network_store_path(path, directory && operation == IME_FILE_REMOVE)) return false;
 
     if (under(path, "/users"))
     {
@@ -989,7 +999,8 @@ static bool file_transfer(vfs_node_t node, const char *destination, bool hard_li
     bool account_root = equal_fold(source, "/users") ||
         (prefix_fold(source, "/users/") && !strchr(source + strlen("/users/"), '/'));
     bool allowed = !((node->type & file_dir) && account_root) &&
-        !special_permissions_store_path(source, true) && !special_permissions_store_path(target, true);
+        !special_permissions_store_path(source, true) && !special_permissions_store_path(target, true) &&
+        !network_store_path(source, true) && !network_store_path(target, true);
     char application[4096], username[64];
     spin_lock(&permission_lock);
     pcb_t process = task->parent_group;

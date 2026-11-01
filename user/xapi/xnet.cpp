@@ -374,6 +374,26 @@ extern "C" XNetResult xapi_NetApplyDnsConfig(const XNetDnsConfig *p)
     return dispatch(XNET_OP_DNS_APPLY, 0, p);
 }
 
+extern "C" XNetResult xapi_NetGetSavedConfig(XNetSavedConfig *p)
+{
+    return dispatch(XNET_OP_CONFIG_READ, 0, 0, p);
+}
+
+extern "C" XNetResult xapi_NetSaveConfig(const XNetSavedConfig *p)
+{
+    return dispatch(XNET_OP_CONFIG_SAVE, 0, p);
+}
+
+extern "C" XNetResult xapi_NetReloadConfig(void)
+{
+    return dispatch(XNET_OP_CONFIG_RELOAD);
+}
+
+extern "C" XNetResult xapi_NetGetConfigStatus(XNetConfigStatus *p)
+{
+    return dispatch(XNET_OP_CONFIG_STATUS, 0, 0, p);
+}
+
 extern "C" XNetResult xapi_NetWatchCreate(XNetInterfaceId id, XNetHandle *out)
 {
     return dispatch(XNET_OP_WATCH_CREATE, 0, 0, out, 0, 0, id);

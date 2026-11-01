@@ -33,6 +33,7 @@ typedef uint32_t XNetInterfaceId;
 #define XNET_CAP_TCP_KEEPALIVE  64ULL
 #define XNET_CAP_UDP_BROADCAST  128ULL
 #define XNET_CAP_RUNTIME_CONFIG 256ULL
+#define XNET_CAP_SAVED_CONFIG   512ULL
 
 #define XNET_CREATED      1U
 #define XNET_BOUND        2U

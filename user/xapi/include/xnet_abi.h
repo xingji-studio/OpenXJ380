@@ -32,6 +32,10 @@
 #define XNET_OP_TCP_GET        27U
 #define XNET_OP_UDP_SET        28U
 #define XNET_OP_UDP_GET        29U
+#define XNET_OP_CONFIG_READ    30U
+#define XNET_OP_CONFIG_SAVE    31U
+#define XNET_OP_CONFIG_RELOAD  32U
+#define XNET_OP_CONFIG_STATUS  33U
 
 // The syscall copies this envelope and each pointed input before publication.
 // input/output/auxiliary are user virtual addresses, never backend pointers.

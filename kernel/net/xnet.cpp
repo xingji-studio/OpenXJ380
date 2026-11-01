@@ -3,6 +3,7 @@
 // kernel-owned worker enters the stack, so terminating an application cannot
 // abandon lwIP's core mutex. Locks protect publication, never backend calls,
 // user copies, allocation, destruction or sleeping.
+#include "xnet_settings.h"
 #include <dlinker.h>
 #include <net/xnet_provider.h>
 #include <syscall/signal.h>
@@ -58,6 +59,8 @@ union Payload
     XNetInterfaceConfig config;
     XNetDnsConfig       dns;
     XNetChange          change;
+    XNetSavedConfig     saved;
+    XNetConfigStatus    config_status;
 };
 struct Job
 {
@@ -93,6 +96,10 @@ XNetInterfaceAddress interface_addresses[3];
 XNetDnsConfig        dns_config;
 uint32_t             address_count;
 uint64_t             generation = 1;
+bool                 boot_config_done;
+XNetConfigStatus     config_status = {
+    sizeof(XNetConfigStatus), 1, 0, 0, 0, -EINPROGRESS, -EINPROGRESS, {0, 0}
+};
 
 bool is_closed(const Object *o)
 {
@@ -233,6 +240,33 @@ void refresh_interface()
     }
 }
 
+int reload_settings()
+{
+    config_status = {
+        sizeof(XNetConfigStatus), 1, XNET_CONFIG_DONE, 0, 0, 0, 0, {0, 0}
+    };
+    XNetSavedConfig saved;
+    config_status.load_result = xnet_settings_read(&saved);
+    if (config_status.load_result)
+    {
+        config_status.apply_result = XNET_CANCELLED; // Invalid/failed read never changes the live network.
+        return int(config_status.load_result);
+    }
+    config_status.revision = saved.revision;
+    if (saved.flags & XNET_SAVED_RECOVERED) config_status.flags |= XNET_CONFIG_RECOVERED;
+    if (!(saved.flags & XNET_SAVED_ENABLED)) return 0;
+    config_status.flags |= XNET_CONFIG_ENABLED;
+    int error            = !__atomic_load_n(&registered, __ATOMIC_ACQUIRE) ? -ENODEV
+                           : !(interface_info.flags & XNET_STACK_READY)    ? -EAGAIN
+                                                                           : 0;
+    if (!error) error = provider.apply_interface(&saved.ipv4);
+    if (!error) error = provider.apply_dns(&saved.dns);
+    config_status.apply_result = error;
+    if (!error) config_status.flags |= XNET_CONFIG_APPLIED;
+    refresh_interface();
+    return error;
+}
+
 void fail_connect(Object *o, int error)
 {
     if (o->impl) provider.close(o->impl);
@@ -350,7 +384,7 @@ bool execute(Job *j)
             XNET_ABI_VERSION,
             __atomic_load_n(&registered, __ATOMIC_ACQUIRE) ? 1U : 0U,
             XNET_MAX_OBJECTS,
-            present ? provider.features : 0,
+            (present ? provider.features : 0) | XNET_CAP_SAVED_CONFIG,
             XNET_MAX_WAIT_ITEMS,
             XNET_MAX_TRANSFER_BYTES,
             present ? 1U : 0U,
@@ -655,6 +689,10 @@ bool execute(Job *j)
         j->result = present ? provider.apply_dns(&j->payload.dns) : -ENODEV;
         refresh_interface();
         return true;
+    case XNET_OP_CONFIG_READ: j->result = xnet_settings_read(&j->payload.saved); return true;
+    case XNET_OP_CONFIG_SAVE: j->result = xnet_settings_save(j->payload.saved); return true;
+    case XNET_OP_CONFIG_RELOAD: j->result = reload_settings(); return true;
+    case XNET_OP_CONFIG_STATUS: j->payload.config_status = config_status; return true;
     case XNET_OP_WATCH_READ:
         if (o->seen == generation)
         {
@@ -682,6 +720,14 @@ void pump()
     ++turn;
     sweep();
     refresh_interface();
+    if (!boot_config_done && (interface_info.flags & XNET_STACK_READY))
+    {
+        // The root is mounted before module initialization. Run once, before
+        // serving live configuration jobs, so a late boot restore cannot undo
+        // a user's first successful runtime Apply.
+        boot_config_done = true;
+        reload_settings();
+    }
     refresh_objects();
     for (;;)
     {
@@ -777,7 +823,7 @@ int endpoint_input(Job *j, XNetEndpoint &endpoint, uint64_t address)
 int prepare(Job *j)
 {
     XNetCall &c = j->call;
-    if (c.size != sizeof(c) || c.version != XNET_ABI_VERSION || c.flags || c.operation > XNET_OP_UDP_GET)
+    if (c.size != sizeof(c) || c.version != XNET_ABI_VERSION || c.flags || c.operation > XNET_OP_CONFIG_STATUS)
         return -EINVAL;
     if (c.io.size != sizeof(c.io) || c.io.version != XNET_ABI_VERSION || c.io.reserved || c.io.timeout_ms < -1)
         return -EINVAL;
@@ -909,6 +955,22 @@ int prepare(Job *j)
         error = input(j, j->payload.dns, c.input);
         if (!error && j->payload.dns.reserved) error = -EINVAL;
         break;
+    case XNET_OP_CONFIG_READ:
+        error        = input(j, j->payload.saved, c.output);
+        output_bytes = sizeof(XNetSavedConfig);
+        break;
+    case XNET_OP_CONFIG_SAVE:
+        if (!permissions_have(XPERM_CS)) return -EACCES;
+        error = input(j, j->payload.saved, c.input);
+        if (!error) error = xnet_settings_validate(j->payload.saved);
+        break;
+    case XNET_OP_CONFIG_RELOAD:
+        if (!permissions_have(XPERM_CS)) return -EACCES;
+        break;
+    case XNET_OP_CONFIG_STATUS:
+        error        = input(j, j->payload.config_status, c.output);
+        output_bytes = sizeof(XNetConfigStatus);
+        break;
     case XNET_OP_WATCH_READ:
         error        = input(j, j->payload.change, c.output);
         output_bytes = sizeof(XNetChange);
@@ -923,14 +985,15 @@ int prepare(Job *j)
 
 int pin_job(Job *j)
 {
-    uint32_t op       = j->call.operation;
-    bool     socket   = (op >= XNET_OP_BIND && op <= XNET_OP_QUERY && op != XNET_OP_CLOSE) || op >= XNET_OP_TCP_SET;
-    Kind     expected = socket                         ? Socket
-                        : op == XNET_OP_CANCEL_SIGNAL  ? Cancel
-                        : op == XNET_OP_RESOLVE_RESULT ? Resolver
-                        : op == XNET_OP_WATCH_READ     ? Watch
-                                                       : Empty;
-    int      error    = 0;
+    uint32_t op     = j->call.operation;
+    bool     socket = (op >= XNET_OP_BIND && op <= XNET_OP_QUERY && op != XNET_OP_CLOSE) ||
+                  (op >= XNET_OP_TCP_SET && op <= XNET_OP_UDP_GET);
+    Kind expected = socket                         ? Socket
+                    : op == XNET_OP_CANCEL_SIGNAL  ? Cancel
+                    : op == XNET_OP_RESOLVE_RESULT ? Resolver
+                    : op == XNET_OP_WATCH_READ     ? Watch
+                                                   : Empty;
+    int  error    = 0;
     spin_lock(&registry_lock);
     if (expected != Empty || op == XNET_OP_CLOSE)
     {
@@ -1030,6 +1093,8 @@ int copy_result(Job *j)
     case XNET_OP_QUERY: return put(c.output, &j->payload.socket, sizeof(XNetSocketInfo));
     case XNET_OP_INTERFACE: return put(c.output, &j->payload.interface, sizeof(XNetInterfaceInfo));
     case XNET_OP_DNS_GET: return put(c.output, &j->payload.dns, sizeof(XNetDnsConfig));
+    case XNET_OP_CONFIG_READ: return put(c.output, &j->payload.saved, sizeof(XNetSavedConfig));
+    case XNET_OP_CONFIG_STATUS: return put(c.output, &j->payload.config_status, sizeof(XNetConfigStatus));
     case XNET_OP_WATCH_READ: return put(c.output, &j->payload.change, sizeof(XNetChange));
     case XNET_OP_TCP_GET: return put(c.output, &j->payload.tcp, sizeof(XNetTcpOptions));
     case XNET_OP_UDP_GET: return put(c.output, &j->payload.udp, sizeof(XNetUdpOptions));
