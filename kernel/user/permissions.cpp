@@ -9,6 +9,10 @@
 #include <krlibc.h>
 #include <stdio.h>
 
+// The product implements the trusted notification UI. The standalone provider
+// keeps its ordinary VFS semantics when that optional consumer is absent.
+extern void permissions_settings_write_notice(const char *application, uint64_t pid) __attribute__((weak));
+
 // The lock protects session publication, process permissions and the entire FIFO.
 // It never protects allocation, sleeping, rendering or filesystem operations.
 extern spin_t create_thread_lock;
@@ -809,6 +813,69 @@ bool permissions_file_access(vfs_node_t node, const char *path, int operation)
 bool permissions_file_requirements(vfs_node_t node, const char *path, int operation, uint8_t *required)
 {
     return required && file_access(node, path, operation, 0, required);
+}
+
+PermissionFileChange permissions_file_change_begin(vfs_node_t node, const char *destination)
+{
+    PermissionFileChange change = {};
+    if (!permissions_settings_write_notice || !node ||
+        (node->type & (file_dir | file_block | file_pipe | file_socket | file_stream | file_ptmx | file_pts)))
+        return change;
+    tcb_t task = get_current_task();
+    // Authenticated profile creation/migration is kernel maintenance, rather
+    // than a setting edit by the application that happened to log the user in.
+    if (!task || task->task_level != TASK_APPLICATION_LEVEL || !task->parent_group ||
+        task->ime_config_depth || task->permission_profile_owner) return change;
+
+    char owner[64], application[32];
+    spin_lock(&permission_lock);
+    pcb_t process = task->parent_group;
+    memcpy(owner, process->permission_user.name, sizeof(owner));
+    memcpy(application, process->name, sizeof(application));
+    uint64_t pid = process->pid;
+    spin_unlock(&permission_lock);
+    owner[sizeof(owner) - 1] = application[sizeof(application) - 1] = 0;
+    char expected[96];
+    snprintf(expected, sizeof(expected), "/users/%s/settings.json", owner);
+
+    int saved_error = permissions_file_error();
+    bool changed = false;
+    if (destination)
+    {
+        // FAT rename need not republish the cached source node's new name.
+        // Resolve the destination before mutation and retain that identity.
+        char *target = canonical_target(destination);
+        char *source = vfs_get_fullpath(node);
+        changed = target && source && equal_fold(target, expected) && !equal_fold(target, source);
+        free(target);
+        free(source);
+    }
+    else
+    {
+        for (unsigned depth = 0; node && depth < 40; ++depth, node = node->linkto)
+        {
+            char *path = vfs_get_fullpath(node);
+            changed = path && !(node->type & file_dir) && equal_fold(path, expected);
+            free(path);
+            if (changed) break;
+        }
+    }
+    if (changed)
+    {
+        change.pid = pid;
+        memcpy(change.application, application, sizeof(change.application));
+    }
+    permissions_set_file_error(saved_error);
+    return change;
+}
+
+void permissions_file_changed(const PermissionFileChange &change)
+{
+    if (!change.pid || !permissions_settings_write_notice) return;
+    int saved_error = permissions_file_error();
+    // Queue admission never changes a completed write's result or errno.
+    permissions_settings_write_notice(change.application, change.pid);
+    permissions_set_file_error(saved_error);
 }
 
 static bool query_operations(vfs_node_t node, const char *path, uint64_t access, uint8_t *required)

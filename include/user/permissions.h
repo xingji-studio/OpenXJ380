@@ -38,6 +38,15 @@ int permissions_query_file_access(const char *path, uint64_t access, char *resol
 int permissions_request_file_access(const char *path, uint64_t access, uint8_t offered = XPERM_ALL);
 bool permissions_file_move(vfs_node_t node, const char *destination);
 bool permissions_file_link(vfs_node_t node, const char *destination);
+// Capture the resolved target and caller before a mutation, then deliver only
+// after success. The snapshot owns no process/VFS pointers; pid == 0 means no edit.
+struct PermissionFileChange
+{
+    uint64_t pid;
+    char application[32];
+};
+PermissionFileChange permissions_file_change_begin(vfs_node_t node, const char *destination = NULL);
+void permissions_file_changed(const PermissionFileChange &change);
 
 // Future per-directory consent applies only to the NV category. The callback
 // runs outside all permission/VFS spin locks; it must not alter mandatory CS/SR/SW rules.

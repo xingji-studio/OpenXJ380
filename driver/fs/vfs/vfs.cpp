@@ -1275,6 +1275,7 @@ errno_t vfs_rename(vfs_node_t node, const char *nw) {
         !vfs_check_access(NULL, nw, IME_FILE_WRITE) ||
         !permissions_file_move(node, nw)) return VFS_STATUS_FAILED;
     if (node == NULL || nw == NULL) return VFS_STATUS_FAILED;
+    PermissionFileChange change = permissions_file_change_begin(node, nw);
     if ((node->type & file_symlink) && node->linkname != NULL && !vfs_uses_managed_lifetime(node))
     {
         const char *new_name = strrchr(nw, '/');
@@ -1378,11 +1379,14 @@ errno_t vfs_rename(vfs_node_t node, const char *nw) {
         free(copy);
         free(parent_path);
         if (result < 0) permissions_set_file_error(-result);
+        if (result == VFS_STATUS_SUCCESS) permissions_file_changed(change);
         return result;
     }
     do_update(node);
     if (node->handle == NULL) return VFS_STATUS_FAILED;
-    return callbackof(node, rename)(node->handle, nw);
+    int result = callbackof(node, rename)(node->handle, nw);
+    if (result == VFS_STATUS_SUCCESS) permissions_file_changed(change);
+    return result;
 }
 
 errno_t vfs_resize(vfs_node_t node, uint64_t size) {
@@ -1391,11 +1395,14 @@ errno_t vfs_resize(vfs_node_t node, uint64_t size) {
     if (node == NULL) return VFS_STATUS_FAILED;
     do_update(node);
     if (node->type == file_dir) return VFS_STATUS_FAILED;
+    uint64_t previous_size = node->size;
+    PermissionFileChange change = size != previous_size ? permissions_file_change_begin(node) : PermissionFileChange{};
     callbackof(node, resize)(node->handle, size);
     int error = permissions_file_error();
     do_update(node);
     if (!error) error = permissions_file_error();
     if (error) { permissions_set_file_error(error); return -error; }
+    if (size != previous_size) permissions_file_changed(change);
     return VFS_STATUS_SUCCESS;
 }
 
@@ -1404,9 +1411,12 @@ errno_t vfs_resize_fast(vfs_node_t node, uint64_t size) {
     if (!vfs_check_access(node, NULL, IME_FILE_WRITE)) return VFS_STATUS_FAILED;
     if (node == NULL) return VFS_STATUS_FAILED;
     if (node->type == file_dir) return VFS_STATUS_FAILED;
+    uint64_t previous_size = node->size;
+    PermissionFileChange change = size != previous_size ? permissions_file_change_begin(node) : PermissionFileChange{};
     callbackof(node, resize)(node->handle, size);
     int error = permissions_file_error();
     if (error) return -error;
+    if (size != previous_size) permissions_file_changed(change);
     return VFS_STATUS_SUCCESS;
 }
 
@@ -2277,11 +2287,13 @@ size_t vfs_write(vfs_node_t file, void *addr, size_t offset, size_t size) {
     if (file == NULL || addr == NULL) return VFS_STATUS_FAILED;
     do_update(file);
     if (file->type == file_dir) return VFS_STATUS_FAILED;
+    PermissionFileChange change = size ? permissions_file_change_begin(file) : PermissionFileChange{};
     size_t ret = callbackof(file, write)(file->handle, addr, offset, size);
     int error = permissions_file_error();
     if (ret == (size_t)-1 && !error) error = EIO;
     do_update(file);
     if (error) permissions_set_file_error(error);
+    if (ret && ret <= size) permissions_file_changed(change);
     return ret;
 }
 
@@ -2290,7 +2302,10 @@ size_t vfs_write_fast(vfs_node_t file, void *addr, size_t offset, size_t size) {
     if (!vfs_check_access(file, NULL, IME_FILE_WRITE)) return VFS_STATUS_FAILED;
     if (file == NULL || addr == NULL) return VFS_STATUS_FAILED;
     if (file->type == file_dir) return VFS_STATUS_FAILED;
-    return callbackof(file, write)(file->handle, addr, offset, size);
+    PermissionFileChange change = size ? permissions_file_change_begin(file) : PermissionFileChange{};
+    size_t result = callbackof(file, write)(file->handle, addr, offset, size);
+    if (result && result <= size) permissions_file_changed(change);
+    return result;
 }
 
 errno_t vfs_ioctl(vfs_node_t device, size_t options, void *arg) {
