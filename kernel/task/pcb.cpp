@@ -1,3 +1,4 @@
+#include <net/xnet_provider.h>
 #include <screen_capture.h>
 #include <user/permissions.h>
 #include <user/process_launch.h>
@@ -542,7 +543,10 @@ void reap_quiesced_file_descriptors()
     close_process_file_table(target);
     if (target->thread_queue)
         for (lock_node *entry = target->thread_queue->head; entry; entry = entry->next)
+        {
             fd_operation_thread_exit(static_cast<tcb_t>(entry->data));
+            xnet_thread_release(static_cast<tcb_t>(entry->data));
+        }
     uint32_t state = __atomic_load_n(&target->fd_cleanup_state, __ATOMIC_ACQUIRE);
     for (;;)
     {
@@ -850,6 +854,7 @@ void kill_thread0(tcb_t task)
     process_release_wait_claims(task);
     fd_operation_thread_exit(task);
     procfs_operation_thread_exit(task);
+    xnet_thread_release(task);
     permissions_thread_exit(task);
     task->status = OUT;
     clear_child_tid_if_requested(task);
@@ -2050,6 +2055,7 @@ uint64_t process_execve(char *path, char **argv, char **envp)
     process->aux_execfn = image.aux_execfn;
     process->elf_file = image.elf_file;
     process->elf_size = image.elf_size;
+    xnet_process_release(process);
     if (OpenXJ380Audio_ReleaseProcess) OpenXJ380Audio_ReleaseProcess(process);
     process->pagedir = new_page_dir;
     switch_page_directory(new_page_dir);
@@ -2191,6 +2197,7 @@ static bool fd_table_unref(pcb_t pcb)
 
 static void close_process_file_table(pcb_t pcb)
 {
+    xnet_process_release(pcb);
     if (pcb == NULL) return;
     lock_queue *file_open = fd_detach_process_table(pcb);
     if (!file_open) return;

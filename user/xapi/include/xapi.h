@@ -16,3 +16,10 @@
 #include "xtuiapi.h"
 #include "xapi_xml.h"
 #include "webrequest.h"
+
+#include "xnet.h"
+#include "xnet_dns.h"
+#include "xnet_manager.h"
+
+#include "xtls.h"
+#include "xhttp.h"

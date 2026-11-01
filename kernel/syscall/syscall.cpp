@@ -1,3 +1,4 @@
+#include <net/xnet_provider.h>
 #include <user/permissions.h>
 #include <mm/uaccess.h>
 #include <screen_capture.h>
@@ -671,6 +672,9 @@ extern "C" uint64_t c_syscall_handler(struct X64_REGS *regs, uint64_t user_rsp)
 
 
     /* XJ380API XAPI Edition */
+    case XAPI_NET:
+        regs->rax = (uint64_t)xnet_syscall(regs->rdi);
+        break;
     case XAPI_OUTPUT: do_xapi_Output((char *)regs->rdi); break;
     case XAPI_INPUT:
         regs->rax = (uint64_t)do_xapi_Input((char *)regs->rdi, (size_t)regs->rsi, regs->rdx);

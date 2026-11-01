@@ -1,3 +1,4 @@
+#include <net/xnet_provider.h>
 #include "build_settings.h"
 #include "build_config.h"
 #include <ahci/ahci.h>
@@ -727,6 +728,7 @@ extern "C" void KernelMain(const FrameBufferConfig &fbc, EFI_SYSTEM_TABLE &Syste
 
     signal_init();
     init_syscall();
+    if (int error = xnet_init()) write_serial_fmt("XNet worker initialization failed: %d\n", error);
     init_message();
 
     if (!OPENXJ380_INPUT_OUTPUT_DISABLED &&
