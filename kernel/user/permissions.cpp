@@ -604,6 +604,11 @@ static bool shared_resource_path(const char *path)
     return prefix_fold(path, "/system/resources");
 }
 
+static bool public_read_path(const char *path)
+{
+    return shared_resource_path(path) || under(path, "/etc");
+}
+
 static bool system_path(const char *path)
 {
     // Shared resources do not inherit SV/SR/SW from their /system parent.
@@ -644,10 +649,10 @@ static bool path_access(const char *path, bool directory, int operation, uint8_t
     // when the application has broad NV/CS file permissions.
     if (write && network_store_path(path, directory && operation == IME_FILE_REMOVE)) return false;
 
-    // Every application can load/list shared UI assets, including Custom with
-    // no file permissions. Apply this to resolved targets and to preflight
-    // requirements alike; writes and deletion still use the ordinary policy.
-    if (!write && shared_resource_path(path)) return true;
+    // Every application can read shared assets and /etc configuration, including
+    // Custom with no file permissions. Resolved VFS operations and preflight use
+    // the same rule; writes and deletion still use the ordinary policy.
+    if (!write && public_read_path(path)) return true;
 
     if (under(path, "/users"))
     {
@@ -660,6 +665,9 @@ static bool path_access(const char *path, bool directory, int operation, uint8_t
                 size_t length = (size_t)(slash - owner);
                 // Neither NV nor a broad executable directory may authorize another account's settings.
                 if (strlen(user) != length || !prefix_fold(owner, user)) return false;
+                // CS controls changes; reading the process owner's preferences
+                // must not prompt for permission just to render an application.
+                if (!write) return true;
                 if (required_out) { *required_out |= XPERM_CS; return true; }
                 return (mask & XPERM_CS) != 0;
             }
@@ -985,7 +993,7 @@ static int transfer_category(const char *path, const char *application)
     }
     // Public reads are a separate category: a persistent hard link from an
     // ordinary NV/application file must not make that file universally readable.
-    if (shared_resource_path(path)) return 5;
+    if (public_read_path(path)) return 5;
     return system_path(path) ? 0 : under(path, application) ? 1 : 2;
 }
 
