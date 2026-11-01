@@ -599,11 +599,15 @@ int permissions_executable_directory(vfs_node_t executable, char *out, size_t ca
     return 0;
 }
 
+static bool shared_resource_path(const char *path)
+{
+    return prefix_fold(path, "/system/resources");
+}
+
 static bool system_path(const char *path)
 {
-    // The requested resources prefix is ordinary data, even though it lives
-    // below /system. No SV/SR/SW requirements are inherited from that parent.
-    return !prefix_fold(path, "/system/resources") && (under(path, "/system") || under(path, "/EFI"));
+    // Shared resources do not inherit SV/SR/SW from their /system parent.
+    return !shared_resource_path(path) && (under(path, "/system") || under(path, "/EFI"));
 }
 
 static bool network_store_path(const char *path, bool ancestors)
@@ -639,6 +643,11 @@ static bool path_access(const char *path, bool directory, int operation, uint8_t
     // writes must not race its commit marker or create writable aliases, even
     // when the application has broad NV/CS file permissions.
     if (write && network_store_path(path, directory && operation == IME_FILE_REMOVE)) return false;
+
+    // Every application can load/list shared UI assets, including Custom with
+    // no file permissions. Apply this to resolved targets and to preflight
+    // requirements alike; writes and deletion still use the ordinary policy.
+    if (!write && shared_resource_path(path)) return true;
 
     if (under(path, "/users"))
     {
@@ -772,13 +781,11 @@ static bool file_access(vfs_node_t node, const char *path, int operation, unsign
     application[sizeof(application) - 1] = 0;
     char *resolved = node ? vfs_get_fullpath(node) : path ? canonical_target(path) : NULL;
     if (!resolved) { permissions_set_file_error(EACCES); return false; }
-    // Fixed runtime image loading and picker icons have read-only exceptions.
-    // The picker never receives permission to read selected data.
+    // Fixed runtime image loading has read-only exceptions. The picker never
+    // receives permission to read selected data.
     bool service_read = operation == IME_FILE_READ &&
         ((task->permission_dialog_launch_depth && equal_fold(resolved, XJ380_FILE_DIALOG_PATH)) ||
-         (task->permission_terminal_launch && equal_fold(resolved, XJ380_TERMINAL_PATH)) ||
-         (__atomic_load_n(&process->permission_file_dialog, __ATOMIC_ACQUIRE) &&
-          under(resolved, "/system/resources")));
+         (task->permission_terminal_launch && equal_fold(resolved, XJ380_TERMINAL_PATH)));
     bool allowed = service_read || path_access(resolved, node && (node->type & file_dir), operation, mask, username,
                                                application, process, required_out);
     free(resolved);
@@ -976,6 +983,9 @@ static int transfer_category(const char *path, const char *application)
         const char *slash = strchr(path + strlen("/users/"), '/');
         if (slash && equal_fold(slash, "/settings.json")) return 3;
     }
+    // Public reads are a separate category: a persistent hard link from an
+    // ordinary NV/application file must not make that file universally readable.
+    if (shared_resource_path(path)) return 5;
     return system_path(path) ? 0 : under(path, application) ? 1 : 2;
 }
 
