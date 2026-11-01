@@ -39,6 +39,16 @@ terminal before checking, and remove it from its scheduler queue before free.
 Never call these queries while holding any CPU scheduler queue lock. Queries
 perform bounded scans without allocation, yielding or I/O.
 
+Exception, IRQ and syscall entry must preserve x87/MMX/MXCSR/XMM state before
+calling C: optimized kernel helpers, including page clearing for a lazy user
+fault, use SSE. Each nesting level owns a separate 16-byte-aligned 512-byte
+FXSAVE64 image on its kernel stack; the existing GPR frame offsets stay fixed.
+The timer publishes its entry image to the interrupted task before scheduling,
+then restores the selected task's image only after all C helpers return. A
+declined switch restores the private entry image. Do not move FPU save/restore
+back into the middle of `change_proccess`, or share an exception image with a
+TCB or per-CPU scratch buffer: C code and nested entries can overwrite it.
+
 ## Lock and allocator rules
 
 liballoc's internal lock does not mask interrupts. If an interrupt arrives

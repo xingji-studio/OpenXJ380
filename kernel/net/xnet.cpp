@@ -820,13 +820,19 @@ int endpoint_input(Job *j, XNetEndpoint &endpoint, uint64_t address)
     return 0;
 }
 
-int prepare(Job *j)
+int validate_call(const XNetCall &c)
 {
-    XNetCall &c = j->call;
     if (c.size != sizeof(c) || c.version != XNET_ABI_VERSION || c.flags || c.operation > XNET_OP_CONFIG_STATUS)
         return -EINVAL;
     if (c.io.size != sizeof(c.io) || c.io.version != XNET_ABI_VERSION || c.io.reserved || c.io.timeout_ms < -1)
         return -EINVAL;
+    return 0;
+}
+
+int prepare(Job *j)
+{
+    XNetCall &c = j->call;
+    if (int error = validate_call(c)) return error;
     int      error        = 0;
     uint64_t output_bytes = 0;
     switch (c.operation)
@@ -1135,14 +1141,36 @@ int64_t xnet_syscall(uint64_t address)
     tcb_t task    = get_current_task();
     pcb_t process = task ? task->parent_group : NULL;
     if (!process || !process->pagedir) return -EFAULT;
+    page_directory_t *image = process->pagedir;
     XNetCall call;
-    if (!copy_from_user_pagedir(process->pagedir, &call, (void *)address, sizeof(call))) return -EFAULT;
+    if (!copy_from_user_pagedir(image, &call, (void *)address, sizeof(call))) return -EFAULT;
     if (__atomic_load_n(&worker_state, __ATOMIC_ACQUIRE) != 2) return -ENODEV;
+    if (call.operation == XNET_OP_WAIT && !call.count && !call.io.timeout_ms)
+    {
+        // A zero-timeout wait without watched objects only checks cancellation.
+        // Keep the same validation and handle isolation as a queued job, but do
+        // not make every SDK cancellation check wait for a worker round trip.
+        int64_t result = validate_call(call);
+        if (result) return process->pagedir == image ? result : XNET_CANCELLED;
+        spin_lock(&registry_lock);
+        if (call.io.cancel)
+        {
+            Object *cancel = find_locked(process, image, call.io.cancel);
+            result = !cancel || cancel->kind != Cancel ? -EBADF : cancelled(cancel) ? XNET_CANCELLED : 0;
+        }
+        // Read the token while its registry slot cannot be retired/reused. No
+        // backend state is touched and no object reference escapes this lock.
+        spin_unlock(&registry_lock);
+        if (process->pagedir != image) return XNET_CANCELLED;
+        // Invalid handles fail during pinning, before a queued job can wait.
+        if (result != -EBADF && signals_pending_quick(task)) return -EINTR;
+        return result;
+    }
     auto *job = static_cast<Job *>(calloc(1, sizeof(Job)));
     if (!job) return -ENOMEM;
     job->owner   = task;
     job->process = process;
-    job->image   = process->pagedir;
+    job->image   = image;
     job->start   = nanoTime();
     job->call    = call;
     spin_lock(&registry_lock);

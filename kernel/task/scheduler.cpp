@@ -193,6 +193,7 @@ __attribute__((naked)) void save_registers()
 {
     __asm__ volatile(".intel_syntax noprefix\n\t"
                      "cli\n\t"
+                     "cld\n\t"
                      "push 0\n\t" // 对齐
                      "push 0\n\t" // 对齐
                      "push r15\n\t"
@@ -214,8 +215,16 @@ __attribute__((naked)) void save_registers()
                      "push rax\n\t"
                      "mov rax, ds\n\t"
                      "push rax\n\t"
-                     "mov rdi, rsp\n\t"
-                     "call timer_handle\n\t"
+                     // Preserve SIMD before any C scheduler code runs. Keep
+                     // the original registers_t layout and align the call.
+                     "mov r12, rsp\n\t"
+                     "sub rsp, 512\n\t"
+                     "and rsp, -16\n\t"
+                     "fxsave64 [rsp]\n\t"
+                     "mov rdi, r12\n\t"
+                     "mov rsi, rsp\n\t"
+                     "call timer_handle_fpu\n\t"
+                     "fxrstor64 [rsp]\n\t"
                      "mov rsp, rax\n\t"
                      "pop rax\n\t"
                      "mov ds, rax\n\t"
@@ -267,9 +276,6 @@ void change_proccess(registers_t *reg, tcb_t current_task0, tcb_t target)
         __asm__ __volatile__("movq %0, %%fs\n\t" ::"r"(fs_selector));
     }
     write_fsbase(target->fs_base);
-
-    save_fpu_context(&current_task0->fpu_context);
-    restore_fpu_context(&target->fpu_context);
 
     current_task0->context0.r15    = reg->r15;
     current_task0->context0.r14    = reg->r14;
@@ -671,6 +677,27 @@ extern "C" registers_t *timer_handle(registers_t *reg)
     }
     send_eoi();
     return reg;
+}
+
+extern "C" registers_t *timer_handle_fpu(registers_t *reg, fpu_context_t *entry_fpu)
+{
+    // The assembly entry captured these registers before any C code could
+    // change them. The current/selected/previous scheduler references pin both
+    // tasks until the interrupt epilogue has finished using the old stack.
+    PROCESSOR_INFO *cpu = get_current_cpu();
+    tcb_t entry_task = cpu != NULL ? __atomic_load_n(&cpu->current_task, __ATOMIC_ACQUIRE) : NULL;
+    if (entry_task != NULL) memcpy(&entry_task->fpu_context, entry_fpu, sizeof(*entry_fpu));
+
+    registers_t *result = timer_handle(reg);
+
+    tcb_t selected_task = cpu != NULL ? __atomic_load_n(&cpu->current_task, __ATOMIC_ACQUIRE) : NULL;
+    // A declined switch must restore the exact entry image, including during
+    // boot or a nested scheduler-disabled section, rather than a stale TCB.
+    if (selected_task != NULL && selected_task != entry_task)
+        memcpy(entry_fpu, &selected_task->fpu_context, sizeof(*entry_fpu));
+    // Restore in assembly after all C code, not in change_proccess: later C
+    // helpers may use SSE and would otherwise corrupt the selected context.
+    return result;
 }
 
 void scheduler_yield()
