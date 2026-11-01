@@ -22,6 +22,7 @@ typedef uint32_t XNetInterfaceId;
 #define XNET_MAX_HOST_BYTES     254U
 #define XNET_MAX_TRANSFER_BYTES 65536U
 #define XNET_MAX_OBJECTS        256U
+#define XNET_MAX_INTERFACE_ADDRESSES 8U
 #define XNET_CANCELLED          (-125LL) // -ECANCELED, including older SDK errno headers.
 
 #define XNET_CAP_IPV4           1ULL
@@ -67,6 +68,10 @@ typedef uint32_t XNetInterfaceId;
 #define XNET_ADDRESS_READY        4U
 #define XNET_DEFAULT_ROUTE        8U
 #define XNET_DNS_CONFIGURED       16U
+#define XNET_IPV4_ADDRESS_READY   XNET_ADDRESS_READY
+#define XNET_IPV6_ADDRESS_READY   32U
+#define XNET_IPV6_GLOBAL_READY    64U
+#define XNET_IPV6_DEFAULT_ROUTE   128U
 #define XNET_CONNECTIVITY_UNKNOWN 0U
 #define XNET_CHANGE_RESYNC        1U
 

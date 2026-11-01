@@ -92,7 +92,7 @@ bool                 registered;
 int                  worker_state;
 uint64_t             next_id, turn;
 XNetInterfaceInfo    interface_info;
-XNetInterfaceAddress interface_addresses[3];
+XNetInterfaceAddress interface_addresses[XNET_MAX_INTERFACE_ADDRESSES];
 XNetDnsConfig        dns_config;
 uint32_t             address_count;
 uint64_t             generation = 1;
@@ -224,10 +224,10 @@ void refresh_interface()
 {
     if (!__atomic_load_n(&registered, __ATOMIC_ACQUIRE)) return;
     XNetInterfaceInfo    info         = {};
-    XNetInterfaceAddress addresses[3] = {};
+    XNetInterfaceAddress addresses[XNET_MAX_INTERFACE_ADDRESSES] = {};
     XNetDnsConfig        dns          = {};
-    uint32_t             count        = 3;
-    if (provider.interface_info(&info, addresses, &count, &dns) < 0 || count > 3) return;
+    uint32_t             count                                   = XNET_MAX_INTERFACE_ADDRESSES;
+    if (provider.interface_info(&info, addresses, &count, &dns) < 0 || count > XNET_MAX_INTERFACE_ADDRESSES) return;
     info.generation = 0;
     if (memcmp(&info, &interface_info, sizeof(info)) || count != address_count ||
         memcmp(addresses, interface_addresses, sizeof(addresses)) || memcmp(&dns, &dns_config, sizeof(dns)))
