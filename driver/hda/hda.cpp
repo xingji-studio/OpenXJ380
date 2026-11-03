@@ -61,8 +61,9 @@ static pcb_t    use_task;
 // XAudio owns the controller as one shared output. IRQs only account periods;
 // no lock_queue operations (which allocate nodes) occur on this path.
 static spin_t audio_dma_lock = SPIN_INIT;
-static bool audio_owned, audio_failed, audio_ready[HDA_AUDIO_PERIODS];
-static uint64_t audio_sequence, audio_irq_time;
+static bool audio_owned, audio_running, audio_starting, audio_failed, audio_ready[HDA_AUDIO_PERIODS];
+static uint64_t audio_sequence, audio_poll_time, audio_progress_time;
+static uint32_t audio_position;
 static void *audio_buffer;
 static void hda_audio_interrupt();
 
@@ -380,6 +381,12 @@ static void hda_program_pcm(void *buffer, uint32_t size, uint32_t sample_rate, u
 
     mem_set8(hda_output_base + 0x2, 0x1c);
 
+    if (__atomic_load_n(&audio_owned, __ATOMIC_ACQUIRE))
+    {
+        spin_lock(&audio_dma_lock);
+        audio_poll_time = audio_progress_time = nanoTime();
+        spin_unlock(&audio_dma_lock);
+    }
     mem_set8(hda_output_base + 0x0, 0b110);
 }
 
@@ -781,22 +788,48 @@ bool hda_audio_available()
 static void hda_audio_interrupt()
 {
     spin_lock(&audio_dma_lock);
-    if (!(mem_get8(hda_output_base + 3) & 4))
+    uint8_t status = mem_get8(hda_output_base + 3);
+    if (status & 0x1c) mem_set8(hda_output_base + 3, status & 0x1c);
+    // Ownership covers reset/programming too. Ignore stale completions until
+    // the new ring has been programmed and RUN has actually been observed.
+    if (!audio_running)
     {
         spin_unlock(&audio_dma_lock);
         return;
     }
-    mem_set8(hda_output_base + 3, 4);
     const uint64_t now = nanoTime();
-    const unsigned active = (mem_get32(hda_output_base + 4) / HDA_BUF_SIZE) % HDA_AUDIO_PERIODS;
+    const uint32_t position = mem_get32(hda_output_base + 4);
+    const uint64_t poll_elapsed = now - audio_poll_time;
+    const uint64_t ring_ns = (uint64_t)HDA_BUF_SIZE * HDA_AUDIO_PERIODS * 1000000000ULL / (48000U * 4U);
+    audio_poll_time = now;
+    if (position != audio_position)
+    {
+        audio_position = position;
+        audio_progress_time = now;
+    }
+    const uint64_t progress_elapsed = now - audio_progress_time;
+    const unsigned active = (position / HDA_BUF_SIZE) % HDA_AUDIO_PERIODS;
     const unsigned advanced = (active + HDA_AUDIO_PERIODS - audio_sequence % HDA_AUDIO_PERIODS) % HDA_AUDIO_PERIODS;
-    // LPIB accounts coalesced IRQs. A whole-ring lapse is ambiguous and must
-    // fail closed: replayed samples cannot be reported as newly presented data.
-    if (!advanced || !audio_ready[active] ||
-        (audio_irq_time && now - audio_irq_time > 160000000ULL))
+    // BCIS is a notification, not a completion counter. A completion may
+    // arrive between its acknowledgement and the LPIB read, so a later BCIS
+    // can refer to a boundary already counted. Poll position even without it.
+    // Only a gap between position observations can hide an entire ring. Slow
+    // host audio consumption can pause DMA while the worker keeps observing
+    // it; that is not a lost ring and must not invent or discard played frames.
+    const unsigned reason = (position >= HDA_BUF_SIZE * HDA_AUDIO_PERIODS ? 1U : 0U) |
+                            (poll_elapsed >= ring_ns ? 2U : 0U) | (!audio_ready[active] ? 4U : 0U) |
+                            (status & 0x18 ? 8U : 0U) | (progress_elapsed > 5000000000ULL ? 16U : 0U);
+    if (reason)
     {
         audio_failed = true;
+        audio_running = false;
         hda_stop();
+        uint64_t sequence = audio_sequence;
+        spin_unlock(&audio_dma_lock);
+        write_serial_fmt("audio: HDA loss reason=%u lpib=%u advanced=%u sequence=%llu poll_ns=%llu idle_ns=%llu\n",
+                         reason, position, advanced, (unsigned long long)sequence,
+                         (unsigned long long)poll_elapsed, (unsigned long long)progress_elapsed);
+        return;
     }
     else
     {
@@ -806,13 +839,13 @@ static void hda_audio_interrupt()
             if (!audio_ready[finished])
             {
                 audio_failed = true;
+                audio_running = false;
                 hda_stop();
                 break;
             }
             audio_ready[finished] = false;
             ++audio_sequence;
         }
-        audio_irq_time = now;
     }
     spin_unlock(&audio_dma_lock);
 }
@@ -821,34 +854,63 @@ int hda_audio_start()
 {
     if (!hda_audio_available()) return -ENODEV;
     spin_lock(&audio_dma_lock);
-    if (snd->is_using || audio_owned)
+    if ((snd->is_using && !audio_owned) || audio_running || audio_starting)
     {
         spin_unlock(&audio_dma_lock);
         return -EBUSY;
     }
     snd->is_using = true;
+    audio_starting = true;
     audio_failed = false;
     for (bool &ready : audio_ready) ready = true;
-    audio_sequence = audio_irq_time = 0;
+    audio_sequence = audio_poll_time = audio_progress_time = 0;
+    audio_position = 0;
     __atomic_store_n(&audio_owned, true, __ATOMIC_RELEASE);
     spin_unlock(&audio_dma_lock);
-    uint64_t physical;
-    audio_buffer = hda_alloc_dma32(HDA_BUF_SIZE * HDA_AUDIO_PERIODS, &physical);
-    if (!audio_buffer) return -ENOMEM;
+    // Reuse the contiguous DMA allocation across idle periods and failures.
+    // Clear it before each restart so old application samples cannot replay.
+    if (!audio_buffer)
+    {
+        uint64_t physical;
+        audio_buffer = hda_alloc_dma32(HDA_BUF_SIZE * HDA_AUDIO_PERIODS, &physical);
+    }
+    if (!audio_buffer)
+    {
+        spin_lock(&audio_dma_lock);
+        audio_starting = false;
+        audio_failed = true;
+        spin_unlock(&audio_dma_lock);
+        return -ENOMEM;
+    }
+    memset(audio_buffer, 0, HDA_BUF_SIZE * HDA_AUDIO_PERIODS);
     hda_program_pcm(audio_buffer, HDA_BUF_SIZE, 48000, 2, 16, HDA_AUDIO_PERIODS);
     spin_lock(&audio_dma_lock);
     if (!(mem_get8(hda_output_base) & 2)) audio_failed = true;
+    audio_starting = false;
+    audio_running = !audio_failed;
     bool failed = audio_failed;
     spin_unlock(&audio_dma_lock);
     return failed ? -EIO : 0;
 }
 
+void hda_audio_stop()
+{
+    spin_lock(&audio_dma_lock);
+    if (hda_output_base)
+    {
+        hda_stop();
+        mem_set8(hda_output_base + 3, 0x1c);
+    }
+    audio_running = false;
+    spin_unlock(&audio_dma_lock);
+}
+
 int hda_audio_progress(uint64_t *completed)
 {
-    hda_poll();
+    hda_audio_interrupt();
     spin_lock(&audio_dma_lock);
     *completed = audio_sequence;
-    bool failed = audio_failed;
+    bool failed = audio_failed || !audio_running;
     spin_unlock(&audio_dma_lock);
     return failed ? -EIO : 0;
 }
@@ -857,7 +919,7 @@ int hda_audio_refill(uint64_t sequence, const int16_t *pcm)
 {
     spin_lock(&audio_dma_lock);
     bool valid = sequence && sequence <= audio_sequence &&
-                 audio_sequence - sequence < HDA_AUDIO_PERIODS - 1 && !audio_failed;
+                 audio_sequence - sequence < HDA_AUDIO_PERIODS - 1 && audio_running && !audio_failed;
     spin_unlock(&audio_dma_lock);
     if (!valid) return -EIO;
     unsigned slot = (sequence - 1) % HDA_AUDIO_PERIODS;
@@ -866,7 +928,8 @@ int hda_audio_refill(uint64_t sequence, const int16_t *pcm)
     memcpy((uint8_t *)audio_buffer + slot * HDA_BUF_SIZE, pcm, HDA_BUF_SIZE);
     __atomic_thread_fence(__ATOMIC_RELEASE);
     spin_lock(&audio_dma_lock);
-    valid = sequence <= audio_sequence && audio_sequence - sequence < HDA_AUDIO_PERIODS - 1 && !audio_failed;
+    valid = sequence <= audio_sequence && audio_sequence - sequence < HDA_AUDIO_PERIODS - 1 &&
+            audio_running && !audio_failed;
     if (valid) audio_ready[slot] = true;
     spin_unlock(&audio_dma_lock);
     return valid ? 0 : -EIO;
@@ -876,6 +939,7 @@ void hda_audio_abort()
 {
     spin_lock(&audio_dma_lock);
     audio_failed = true;
+    audio_running = false;
     if (hda_output_base) hda_stop();
     spin_unlock(&audio_dma_lock);
 }

@@ -48,6 +48,7 @@ void     hda_poll();
 // Shared-output backend. PCM is always 48 kHz stereo S16, one 1024-frame period.
 bool hda_audio_available();
 int hda_audio_start();
+void hda_audio_stop();
 int hda_audio_progress(uint64_t *completed);
 int hda_audio_refill(uint64_t completed, const int16_t *pcm);
 void hda_audio_abort();
