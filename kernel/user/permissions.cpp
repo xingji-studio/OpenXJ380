@@ -52,6 +52,18 @@ void permissions_session_publish(const UserInfo *info)
     spin_unlock(&permission_lock);
 }
 
+bool permissions_session_name(char *out, size_t capacity)
+{
+    if (!out || !capacity) return false;
+    spin_lock(&permission_lock);
+    out[0] = 0;
+    if (user_session_is_ready() && current_user)
+        strncpy(out, current_user->name, capacity - 1);
+    out[capacity - 1] = 0;
+    spin_unlock(&permission_lock);
+    return out[0] != 0;
+}
+
 static UserType session_type_locked()
 {
     return user_session_is_ready() && current_user ? current_user->user_type : XUT_Admin;

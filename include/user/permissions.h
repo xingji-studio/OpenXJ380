@@ -15,6 +15,8 @@ struct PermissionPrompt
 };
 
 void permissions_session_publish(const UserInfo *info);
+// Copy the logged-in account name under the session publication lock.
+bool permissions_session_name(char *out, size_t capacity);
 enum ProcessCredentialSource { XPCS_SESSION, XPCS_VISITOR, XPCS_INHERIT };
 void permissions_process_init(pcb_t process, pcb_t parent, ProcessCredentialSource source = XPCS_INHERIT);
 bool permissions_launch_matches(pcb_t process, pcb_t parent, ProcessCredentialSource source);
