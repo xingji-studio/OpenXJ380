@@ -19,6 +19,7 @@
 #include <syscall/signal.h>
 #include <syscall/pxapi.h>
 #include <syscall/syscall.h>
+#include <syscall/file_io_scope.h>
 #include <task/poll.h>
 
 // MSR寄存器地址定义
@@ -251,6 +252,7 @@ extern "C" uint64_t c_syscall_handler(struct X64_REGS *regs, uint64_t user_rsp)
     }
 
     uint64_t syscall_number = regs->rax;
+    FileIoSyscallScope file_io(syscall_number);
     bool trace_grep = debug_trace_grep_task();
     if (trace_grep)
     {
@@ -803,6 +805,8 @@ extern "C" uint64_t c_syscall_handler(struct X64_REGS *regs, uint64_t user_rsp)
         write_serial_string("\n");
         break;
     }
+    // Restore the syscall entry IRQ state before signal/TLS return bookkeeping.
+    file_io.finish();
     if (debug_trace_xbps_task() && (int64_t)regs->rax < 0)
     {
         tcb_t task = get_current_task();

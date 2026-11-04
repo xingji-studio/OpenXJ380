@@ -6,6 +6,7 @@
 #include <fs/ext4/ext4.h>
 #include <fs/vfs/vfs.h>
 #include <krlibc.h>
+#include <net/xnet_address.h>
 #include <stdio.h>
 #include <user/permissions.h>
 
@@ -45,6 +46,17 @@ uint32_t number(const XNetAddress &address)
 bool unicast(const XNetAddress &address)
 {
     return ipv4_value(address) && address.bytes[0] && address.bytes[0] < 224 && number(address) != 0xffffffffU;
+}
+
+bool dns_unicast(const XNetAddress &address)
+{
+    if (address.family == XNET_IPV4) return unicast(address);
+    if (address.family != XNET_IPV6 || address.scope_id > 1 || zero(address.bytes, 16) || address.bytes[0] == 0xff)
+        return false;
+    bool linklocal = address.bytes[0] == 0xfe && (address.bytes[1] & 0xc0) == 0x80;
+    if (address.scope_id && !linklocal) return false;
+    // V1 sockets deliberately keep IPv4 and IPv6 address families separate.
+    return !(zero(address.bytes, 10) && address.bytes[10] == 0xff && address.bytes[11] == 0xff);
 }
 
 uint32_t checksum(const char *data, size_t bytes)
@@ -115,17 +127,28 @@ struct Reader
         *out = result;
         return true;
     }
+    bool dns_address(const char *key, XNetAddress *out)
+    {
+        char text[80], canonical[80];
+        if (!field(key, text, sizeof(text)) || xnet_address::parse(text, out) ||
+            xnet_address::format(out, canonical, sizeof(canonical)))
+            return false;
+        return !strcmp(text, canonical);
+    }
 };
 
 int decode(const char *data, size_t bytes, XNetSavedConfig *config)
 {
     Reader   reader = {data, bytes, 0};
     char     text[16];
-    uint64_t enabled, prefix;
+    uint64_t enabled, prefix, count = 0;
+    bool     extended;
     defaults(config);
     if (!reader.field("commit=", text, sizeof(text)) || strcmp(text, committed) ||
-        !reader.field("format=", text, sizeof(text)) || strcmp(text, "xnet-1") ||
-        !reader.integer("revision=", &config->revision) || !config->revision ||
+        !reader.field("format=", text, sizeof(text)))
+        return -EBADMSG;
+    extended = !strcmp(text, "xnet-2");
+    if ((!extended && strcmp(text, "xnet-1")) || !reader.integer("revision=", &config->revision) || !config->revision ||
         config->revision == XNET_CONFIG_ANY_REVISION || !reader.integer("enabled=", &enabled) || enabled > 1 ||
         !reader.field("ipv4=", text, sizeof(text)))
         return -EBADMSG;
@@ -145,7 +168,23 @@ int decode(const char *data, size_t bytes, XNetSavedConfig *config)
     }
     else if (strcmp(text, "auto"))
         return -EBADMSG;
-    if (!reader.address("server=", &config->dns.servers[0])) return -EBADMSG;
+    if (extended)
+    {
+        if (!reader.integer("server_count=", &count) || count > 2 ||
+            !reader.dns_address("server=", &config->dns.servers[0]) ||
+            !reader.dns_address("server2=", &config->dns.servers[1]))
+            return -EBADMSG;
+        if ((config->dns.method == XNET_DNS_MANUAL && !count) || (config->dns.method == XNET_DNS_AUTO && count))
+            return -EBADMSG;
+        config->dns.server_count = uint32_t(count);
+        for (unsigned i = unsigned(count); i < 2; ++i)
+        {
+            if (!ipv4_value(config->dns.servers[i]) || number(config->dns.servers[i])) return -EBADMSG;
+            config->dns.servers[i] = {};
+        }
+    }
+    else if (!reader.address("server=", &config->dns.servers[0]))
+        return -EBADMSG;
     if (config->ipv4.method == XNET_CONFIG_DHCP)
     {
         if (number(config->ipv4.address) || number(config->ipv4.gateway)) return -EBADMSG;
@@ -153,7 +192,7 @@ int decode(const char *data, size_t bytes, XNetSavedConfig *config)
     }
     if (config->dns.method == XNET_DNS_AUTO)
     {
-        if (number(config->dns.servers[0])) return -EBADMSG;
+        if (!extended && number(config->dns.servers[0])) return -EBADMSG;
         config->dns.servers[0] = {};
     }
     size_t crc_offset = reader.offset;
@@ -176,16 +215,30 @@ int decode(const char *data, size_t bytes, XNetSavedConfig *config)
 
 int encode(const XNetSavedConfig &config, char *data, size_t *bytes)
 {
-    const auto &ip  = config.ipv4.address.bytes;
-    const auto &gw  = config.ipv4.gateway.bytes;
-    const auto &dns = config.dns.servers[0].bytes;
-    int         n   = snprintf(data, limit,
-                               "commit=00000000\nformat=xnet-1\nrevision=%llu\nenabled=%u\nipv4=%s\n"
-                                         "address=%u.%u.%u.%u\nprefix=%u\ngateway=%u.%u.%u.%u\ndns=%s\nserver=%u.%u.%u.%u\n",
-                               (unsigned long long)config.revision, config.flags & XNET_SAVED_ENABLED ? 1U : 0U,
+    const auto &ip       = config.ipv4.address.bytes;
+    const auto &gw       = config.ipv4.gateway.bytes;
+    const bool  extended = config.dns.server_count > 1 || config.dns.servers[0].family == XNET_IPV6;
+    char        servers[2][80];
+    for (unsigned i = 0; i < 2; ++i)
+    {
+        XNetAddress address = config.dns.servers[i];
+        if (!address.family) address.family = XNET_IPV4;
+        if (xnet_address::format(&address, servers[i], sizeof(servers[i]))) return -EINVAL;
+    }
+    int n = snprintf(data, limit,
+                     "commit=00000000\nformat=%s\nrevision=%llu\nenabled=%u\nipv4=%s\n"
+                     "address=%u.%u.%u.%u\nprefix=%u\ngateway=%u.%u.%u.%u\ndns=%s\n",
+                     extended ? "xnet-2" : "xnet-1", (unsigned long long)config.revision,
+                     config.flags & XNET_SAVED_ENABLED ? 1U : 0U,
                      config.ipv4.method == XNET_CONFIG_STATIC ? "static" : "dhcp", ip[0], ip[1], ip[2], ip[3],
-                               config.ipv4.prefix_bits, gw[0], gw[1], gw[2], gw[3],
-                     config.dns.method == XNET_DNS_MANUAL ? "manual" : "auto", dns[0], dns[1], dns[2], dns[3]);
+                     config.ipv4.prefix_bits, gw[0], gw[1], gw[2], gw[3],
+                     config.dns.method == XNET_DNS_MANUAL ? "manual" : "auto");
+    if (n < int(body_offset) || size_t(n) >= limit) return -EOVERFLOW;
+    int fields = extended ? snprintf(data + n, limit - size_t(n), "server_count=%u\nserver=%s\nserver2=%s\n",
+                                     config.dns.server_count, servers[0], servers[1])
+                          : snprintf(data + n, limit - size_t(n), "server=%s\n", servers[0]);
+    if (fields < 0 || size_t(fields) >= limit - size_t(n)) return -EOVERFLOW;
+    n += fields;
     if (n < int(body_offset) || size_t(n) >= limit) return -EOVERFLOW;
     int tail =
         snprintf(data + n, limit - size_t(n), "crc32=%08x\n", checksum(data + body_offset, size_t(n) - body_offset));
@@ -358,7 +411,9 @@ int xnet_settings_validate(const XNetSavedConfig &config)
     }
     else
         return -EINVAL;
-    if (!zero(&dns.servers[1], sizeof(dns.servers[1]))) return -EINVAL;
+    if (dns.server_count > 2) return -EOPNOTSUPP;
+    for (unsigned i = dns.server_count; i < 2; ++i)
+        if (!zero(&dns.servers[i], sizeof(dns.servers[i]))) return -EINVAL;
     if (dns.method == XNET_DNS_AUTO)
     {
         if (dns.server_count || !zero(&dns.servers[0], sizeof(dns.servers[0]))) return -EINVAL;
@@ -366,8 +421,9 @@ int xnet_settings_validate(const XNetSavedConfig &config)
     }
     else if (dns.method == XNET_DNS_MANUAL)
     {
-        if (dns.server_count > 1) return -EOPNOTSUPP;
-        if (dns.server_count != 1 || !unicast(dns.servers[0])) return -EINVAL;
+        if (!dns.server_count) return -EINVAL;
+        for (unsigned i = 0; i < dns.server_count; ++i)
+            if (!dns_unicast(dns.servers[i])) return -EINVAL;
     }
     else
         return -EINVAL;

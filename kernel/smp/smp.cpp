@@ -1,6 +1,7 @@
 #include "../build_settings.h"
 #include "cpu/lock.h"
 #include "cpu/regio.h"
+#include <cpu/idle.h>
 #include "pctable/gdt.h"
 #include "pctable/idt.h"
 #include "proto.hpp"
@@ -23,6 +24,7 @@ extern size_t    now_tid;
 extern pcb_t kernel_group;
 
 extern bool smp_scheduler_lock;
+extern bool no_interrupt;
 volatile int scheduler_is_ready = 0;
 
 static tcb_t alloc_zeroed_tcb(void)
@@ -177,7 +179,7 @@ extern "C" void apu_entry(uint64_t cpu_id, uint64_t tr)
 
     while (true)
     {
-        asm volatile("pause");
+        cpu_idle_once(no_interrupt);
     }
 
     asm volatile("hlt"); // Halt if an AP unexpectedly returns from its startup path.
@@ -257,18 +259,64 @@ PROCESSOR_INFO *get_current_cpu()
 {
     if (xsi == NULL) return NULL;
 
+    // IRQs may enter from user mode without swapgs, so an arbitrary GSBASE
+    // cannot identify this CPU. CPUID avoids the xAPIC MMIO/BQL access in
+    // every scheduler/syscall lookup without changing the entry ABI.
+    uint32_t eax, ebx, ecx, edx;
+    asm_cpuid(0, 0, &eax, &ebx, &ecx, &edx);
+    const uint32_t max_basic = eax;
+    uint32_t current_id = 0;
+    bool identified = false;
+    if (max_basic >= 0x1f)
+    {
+        asm_cpuid(0x1f, 0, &eax, &ebx, &ecx, &edx);
+        if ((ebx & 0xffffU) != 0 && (ecx & 0xff00U) != 0)
+        {
+            current_id = edx;
+            identified = true;
+        }
+    }
+    if (!identified && max_basic >= 0x0b)
+    {
+        asm_cpuid(0x0b, 0, &eax, &ebx, &ecx, &edx);
+        if ((ebx & 0xffffU) != 0 && (ecx & 0xff00U) != 0)
+        {
+            current_id = edx;
+            identified = true;
+        }
+    }
+    // The legacy leaf exposes only eight bits. Never truncate an x2APIC ID:
+    // a CPU above 255 could otherwise alias a different initialized CPU.
+    if (!identified && !ApicInfo.x2Apic && max_basic >= 1)
+    {
+        asm_cpuid(1, 0, &eax, &ebx, &ecx, &edx);
+        if (edx & CPUID_EDX_APIC)
+        {
+            current_id = ebx >> 24;
+            identified = true;
+        }
+    }
+    if (identified)
+    {
+        for (size_t i = 0; i < MAX_CPU_NUM; ++i)
+        {
+            PROCESSOR_INFO *cpu = &xsi->pcr_inf[i];
+            if (cpu->scheduler_queue != NULL && cpu->lapic_id == current_id) return cpu;
+        }
+    }
+
+    // Preserve hardware lookup for missing/malformed topology leaves or a
+    // firmware/virtual CPUID identity that does not match the initialized map.
     const uint64_t current_lapic_id = lapic_id();
-    PROCESSOR_INFO *info = NULL;
     for (size_t i = 0; i < MAX_CPU_NUM; i++)
     {
         PROCESSOR_INFO *inter_info = &xsi->pcr_inf[i];
         if (inter_info->scheduler_queue != NULL && inter_info->lapic_id == current_lapic_id)
         {
-            info = inter_info;
-            break;
+            return inter_info;
         }
     }
-    return info;
+    return NULL;
 }
 
 uint64_t get_cpu_num()

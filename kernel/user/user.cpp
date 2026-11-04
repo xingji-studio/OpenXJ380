@@ -15,6 +15,7 @@
 #include <fs/vfs/vfs.h>
 #include <krlibc.h>
 #include <mm/frame.h>
+#include <mm/uaccess.h>
 #include <pci/pci.h>
 #include <proto.hpp>
 #include <ps2/keyboard.h>
@@ -22,6 +23,7 @@
 #include <stdint.h>
 #include <syscall/syscall.h>
 #include <task/pcb.h>
+#include <task/process_preparation.h>
 #include <task/scheduler.h>
 #include <user/user.h>
 #include <user/runfile.h>
@@ -98,14 +100,6 @@ UserInfo *task_effective_user()
     if (task != NULL && task->user_info != NULL) return task->user_info;
     if (current_user != NULL) return current_user;
     return &root_user;
-}
-
-extern bool no_interrupt;
-static void restore_runtime_state(uint64_t scheduler_depth, bool was_interrupt_enabled)
-{
-    scheduler_restore_depth(scheduler_depth);
-    if (was_interrupt_enabled && !no_interrupt) open_interrupt;
-    else close_interrupt;
 }
 
 static bool append_cmdline_char(char *cmdline, size_t cmdline_size, char **cursor, char ch)
@@ -570,6 +564,25 @@ static int find_elf_interpreter(uint8_t *buf, uint64_t file_size, char *interp, 
     return 0;
 }
 
+static bool zero_user_elf_range(page_directory_t *directory, uint64_t address, uint64_t length)
+{
+    // The image is still private to its loader. Its mapped pages are stable,
+    // while the current thread keeps using its own process CR3 and stack.
+    // Clearing through the direct map permits a timer switch between pages.
+    for (uint64_t done = 0; done < length;)
+    {
+        uint64_t current = address + done;
+        uint64_t physical = translate_address(directory, current);
+        if (!physical) return false;
+        void *destination = phys_to_virt(physical);
+        if (!destination) return false;
+        uint64_t count = min(length - done, PAGE_SIZE - (current & (PAGE_SIZE - 1)));
+        memset(destination, 0, count);
+        done += count;
+    }
+    return true;
+}
+
 static int load_user_elf_image(uint8_t *buf, uint64_t file_size, pcb_t group, const char *name,
                                uint64_t dyn_base, loaded_user_elf_t *out)
 {
@@ -650,7 +663,7 @@ static int load_user_elf_image(uint8_t *buf, uint64_t file_size, pcb_t group, co
 
     page_map_range_to_random(group->pagedir, load_start, load_end - load_start,
                              PTE_PRESENT | PTE_WRITEABLE | PTE_USER);
-    memset((void *)load_start, 0, load_end - load_start);
+    if (!zero_user_elf_range(group->pagedir, load_start, load_end - load_start)) return -ENOMEM;
 
     uint64_t phdr_addr = 0;
     for (int i = 0; i < ehdr->e_phnum; i++)
@@ -666,10 +679,13 @@ static int load_user_elf_image(uint8_t *buf, uint64_t file_size, pcb_t group, co
         if (phdrs[i].p_type != PT_LOAD) continue;
 
         uint64_t seg_addr = load_bias + phdrs[i].p_vaddr;
-        memcpy((void *)seg_addr, (void *)(buf + phdrs[i].p_offset), phdrs[i].p_filesz);
+        if (!copy_to_user_pagedir(group->pagedir, (void *)seg_addr, buf + phdrs[i].p_offset, phdrs[i].p_filesz))
+            return -ENOMEM;
         if (phdrs[i].p_memsz > phdrs[i].p_filesz)
         {
-            memset((void *)(seg_addr + phdrs[i].p_filesz), 0, phdrs[i].p_memsz - phdrs[i].p_filesz);
+            if (!zero_user_elf_range(group->pagedir, seg_addr + phdrs[i].p_filesz,
+                                      phdrs[i].p_memsz - phdrs[i].p_filesz))
+                return -ENOMEM;
         }
 
         if (phdr_addr == 0 && ehdr->e_phoff >= phdrs[i].p_offset &&
@@ -777,16 +793,9 @@ uint64_t parse_elf_file(char *path, pcb_t group)
         }
     }
 
-    bool is_sti                = are_interrupts_enabled();
-    uint64_t scheduler_depth = scheduler_disable_depth();
-    if (!no_interrupt) close_interrupt;
-    disable_scheduler();
-
-    // Keep the saved CR3 on this stack. get_current_directory's scratch
-    // object can otherwise be overwritten by another CPU during ELF loading.
-    page_directory_t current_pagedir = {(page_table_t *)phys_to_virt(get_cr3())};
-    switch_page_directory(group->pagedir);
-
+    // The scheduler restores this loader's process CR3 after preemption, not
+    // the child's image. Map and populate the explicit target through HHDM;
+    // never borrow its CR3 across allocation, large copies or timer entries.
     loaded_user_elf_t main_elf;
     memset(&main_elf, 0, sizeof(main_elf));
     ret = load_user_elf_image(buf, file_size, group, group->name, USER_DYN_MAIN_BASE, &main_elf);
@@ -796,9 +805,6 @@ uint64_t parse_elf_file(char *path, pcb_t group)
     {
         ret = load_user_elf_image(interp_buf, interp_size, group, interp_path, USER_INTERP_BASE, &interp_elf);
     }
-
-    switch_page_directory(&current_pagedir); // 恢复页表
-    restore_runtime_state(scheduler_depth, is_sti);
 
     if (ret < 0)
     {
@@ -944,8 +950,16 @@ int create_user_process_with_options(char *path, pcb_t pcb, char *argv[], const 
         write_serial_fmt("Create User Process Failed. Reason: Cannot Clone Page Directory.\n");
         return -ENOMEM;
     }
-    pcb_t group = create_process_group_with_credentials(process_name, pcb, new_directory, (char *)"",
-                                                         options.credentials);
+    struct PreparedImage
+    {
+        ProcessPreparation *ticket;
+        ~PreparedImage() { process_preparation_release(ticket); }
+    } prepared{NULL};
+    // Publish the child only after its construction ticket exists. Until its
+    // first thread is runnable it has no scheduler reference to stop a kill
+    // plus reaper from reclaiming the PCB/page tables under this loader.
+    pcb_t group = create_process_group_prepared(process_name, pcb, new_directory, (char *)"",
+                                                 options.credentials, &prepared.ticket);
     if (group == NULL)
     {
         free_page_directory(new_directory);
@@ -960,19 +974,19 @@ int create_user_process_with_options(char *path, pcb_t pcb, char *argv[], const 
     if (executable_node) vfs_close(executable_node);
     if (directory_error < 0)
     {
-        kill_proc(group, 0, false);
+        kill_proc_deferred(group, 0);
         return directory_error;
     }
     permissions_process_exec(group, executable_directory);
     if (group->exe_path == NULL)
     {
         write_serial_fmt("Create User Process Failed. Reason: Cannot Copy Exec Path.\n");
-        kill_proc(group, 0, false);
+        kill_proc_deferred(group, 0);
         return -ENOMEM;
     }
     if (options.file_dialog && strcmp(group->exe_path, XJ380_FILE_DIALOG_PATH))
     {
-        kill_proc(group, 0, false);
+        kill_proc_deferred(group, 0);
         return -EACCES;
     }
 
@@ -981,14 +995,14 @@ int create_user_process_with_options(char *path, pcb_t pcb, char *argv[], const 
     if (entry == NULL)
     {
         write_serial_fmt("Create User Process Failed. Reason: Cannot Open File.\n");
-        kill_proc(group, 0, false);
+        kill_proc_deferred(group, 0);
         return -ENOENT;
     }
     if ((int64_t)entry < 0)
     {
         write_serial_fmt("Create User Process Failed. Reason: Exec Format Error.\n");
         int ret = (int)(int64_t)entry;
-        kill_proc(group, 0, false);
+        kill_proc_deferred(group, 0);
         return ret;
     }
 
@@ -1005,7 +1019,7 @@ int create_user_process_with_options(char *path, pcb_t pcb, char *argv[], const 
             if (!append_cmdline_arg(cmdline, sizeof(cmdline), &cmdline_ptr, argv[i]))
             {
                 write_serial_fmt("Create User Process Failed. Reason: Command Line Too Long.\n");
-                kill_proc(group, 0, false);
+                kill_proc_deferred(group, 0);
                 return -E2BIG;
             }
             argc++;
@@ -1016,7 +1030,7 @@ int create_user_process_with_options(char *path, pcb_t pcb, char *argv[], const 
         if (!append_cmdline_arg(cmdline, sizeof(cmdline), &cmdline_ptr, path))
         {
             write_serial_fmt("Create User Process Failed. Reason: Command Line Too Long.\n");
-            kill_proc(group, 0, false);
+            kill_proc_deferred(group, 0);
             return -E2BIG;
         }
         argc++;
@@ -1025,7 +1039,7 @@ int create_user_process_with_options(char *path, pcb_t pcb, char *argv[], const 
     if (argc > 0 && thread_argv == NULL)
     {
         write_serial_fmt("Create User Process Failed. Reason: Cannot Copy Argv.\n");
-        kill_proc(group, 0, false);
+        kill_proc_deferred(group, 0);
         return -ENOMEM;
     }
 
@@ -1039,7 +1053,7 @@ int create_user_process_with_options(char *path, pcb_t pcb, char *argv[], const 
     {
         group->cmdline = old_cmdline;
         free_process_argv(thread_argv);
-        kill_proc(group, 0, false);
+        kill_proc_deferred(group, 0);
         return -ENOMEM;
     }
     if (old_cmdline != NULL) free(old_cmdline);
@@ -1047,7 +1061,7 @@ int create_user_process_with_options(char *path, pcb_t pcb, char *argv[], const 
     if (argc > 0 && group->argv == NULL)
     {
         free_process_argv(thread_argv);
-        kill_proc(group, 0, false);
+        kill_proc_deferred(group, 0);
         return -ENOMEM;
     }
     group->argc = argc;
@@ -1055,7 +1069,7 @@ int create_user_process_with_options(char *path, pcb_t pcb, char *argv[], const 
     if (cwd == NULL)
     {
         free_process_argv(thread_argv);
-        kill_proc(group, 0, false);
+        kill_proc_deferred(group, 0);
         return -ENOMEM;
     }
     write_serial_fmt("CWD: %s\n", cwd);
@@ -1067,7 +1081,7 @@ int create_user_process_with_options(char *path, pcb_t pcb, char *argv[], const 
         {
             free(cwd);
             free_process_argv(thread_argv);
-            kill_proc(group, 0, false);
+            kill_proc_deferred(group, 0);
             return -ENOMEM;
         }
         handle->node = writer.node;
@@ -1078,20 +1092,21 @@ int create_user_process_with_options(char *path, pcb_t pcb, char *argv[], const 
             free(handle);
             free(cwd);
             free_process_argv(thread_argv);
-            kill_proc(group, 0, false);
+            kill_proc_deferred(group, 0);
             return -ENOMEM;
         }
         writer.node = NULL; // The child's descriptor table now owns this end.
     }
     __atomic_store_n(&group->permission_file_dialog, options.file_dialog, __ATOMIC_RELEASE);
+    int pid = (int)group->pid;
     size_t tid = create_user_thread(entry, thread_argv, argc, process_name, group, cwd);
     if ((int64_t)tid < 0)
     {
-        kill_proc(group, 0, false);
+        kill_proc_deferred(group, 0);
         return (int)tid;
     }
 
-    return group->pid;
+    return pid;
 }
 
 int create_user_process_singleton_from_file(char *path, pcb_t pcb, char *argv[])
@@ -1107,6 +1122,9 @@ int create_user_process_singleton_from_file(char *path, pcb_t pcb, char *argv[])
 
 void create_user_thread_from_file(char *path, pcb_t pcb)
 {
+    ProcessPreparation *pin = process_preparation_acquire(pcb);
+    if (!pin) return;
+    ProcessPreparationGuard prepared(pin);
     char  thread_name[50];
     void *entry = (void *)parse_elf_file(path, pcb);
     if (entry == NULL || (int64_t)entry < 0) return;

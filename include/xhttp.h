@@ -21,6 +21,7 @@ typedef uint64_t XHttpHandle;
 #define XHTTP_EVENTS_ALL        15U
 #define XHTTP_LENGTH_KNOWN      1U
 #define XHTTP_CHUNKED           2U
+#define XHTTP_REUSE_CONNECTION  1U // Opt-in GET/HEAD reuse within this process/image; default remains close.
 #define XHTTP_MAX_REQUEST_BYTES (1024U * 1024U)
 #define XHTTP_MAX_HEADERS       64U
 #define XHTTP_MAX_HEADER_BYTES  32768U
@@ -41,7 +42,11 @@ typedef struct XHttpRequestDesc
     const void        *body;
     uint64_t           body_bytes;       // Binary-safe, fixed body copied at Start, max 1 MiB.
     int32_t            total_timeout_ms; // 0 = 30000; -1 = no overall deadline.
-    uint32_t           reserved;
+    union
+    {
+        uint32_t flags; // XHTTP_REUSE_CONNECTION; unknown flags are rejected.
+        uint32_t reserved; // Source compatibility with the original zero-only field.
+    };
     uint64_t           max_response_bytes; // 0 = streaming without a total body-size limit.
     XNetHandle         cancel;
     const void        *ca_data;
@@ -76,6 +81,8 @@ XNetResult xapi_HttpGetHeader(XHttpHandle request, const char *name, uint32_t in
 XNetResult xapi_HttpRead(XHttpHandle request, void *data, uint64_t capacity, const XNetIoOptions *io);
 XNetResult xapi_HttpCancel(XHttpHandle request);
 XNetResult xapi_HttpClose(XHttpHandle request);
+// Close only idle opt-in connections. Active requests retain their own lifetime.
+XNetResult xapi_HttpCloseIdleConnections(void);
 
 #ifdef __cplusplus
 }

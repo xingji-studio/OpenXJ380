@@ -13,6 +13,12 @@ FdOperationRecord *fd_operation_acquire(int fd, int &error);
 // acquisition. The returned ticket retains the descriptor independently of
 // table replacement/close; it does not itself retain the process object.
 FdOperationRecord *fd_operation_acquire_process(pcb_t process, int fd, int &error);
+// Prepared, bounded PID lookup for notification delivery; no borrowed PCB escapes.
+FdOperationRecord *fd_operation_acquire_notification(uint64_t pid, uint64_t &callback, int &error);
+// Transfer only while publishing a prepared queue item under its metadata lock.
+// Kernel-owned records are released by the permanent worker, never a dying producer.
+bool fd_operation_transfer_to_kernel(FdOperationRecord *record);
+bool fd_operation_is_retired(FdOperationRecord *record);
 // Snapshot numeric names only. Count is the required capacity; no allocation,
 // VFS callback or borrowed handle escapes either descriptor-table lock.
 int fd_snapshot_numbers(pcb_t process, size_t *numbers, size_t capacity, size_t &count);

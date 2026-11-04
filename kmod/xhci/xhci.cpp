@@ -2678,7 +2678,7 @@ static void xhci_service_worker(void *arg) {
     xhci_controller *xhci = (xhci_controller *)arg;
     for (;;) {
         if (!xhci || !xhci_is_registered_controller(xhci)) {
-            delay_ms_hp(10);
+            scheduler_sleep_ns(10000000ULL);
             continue;
         }
 
@@ -2692,8 +2692,8 @@ static void xhci_service_worker(void *arg) {
             (void)xhci_submit_hid_transfer(xhci, slot);
         }
 
-        cpu_relax();
-        scheduler_yield();
+        // Event and submission locks have been released; wait between polls.
+        scheduler_sleep_ns(1000000ULL);
     }
 }
 

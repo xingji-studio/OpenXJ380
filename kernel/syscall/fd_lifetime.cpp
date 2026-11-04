@@ -76,13 +76,11 @@ fd_file_handle *remove_record_locked(FdOperationRecord *record)
 }
 }
 
-FdOperationRecord *fd_operation_acquire_process(pcb_t process, int fd, int &error)
+static FdOperationRecord *acquire_prepared(pcb_t process, int fd, int &error, FdOperationRecord *record)
 {
     error = -EBADF;
     tcb_t task = get_current_task();
     if (fd < 0 || !process || !task) return NULL;
-    auto *record = static_cast<FdOperationRecord *>(malloc(sizeof(FdOperationRecord)));
-    if (!record) { error = -ENOMEM; return NULL; }
     record->handle = NULL;
     record->owner = task;
     record->retired = false;
@@ -108,8 +106,68 @@ FdOperationRecord *fd_operation_acquire_process(pcb_t process, int fd, int &erro
         spin_unlock(&table->lock);
     }
     spin_unlock(&registry_lock);
-    if (error) { free(record); return NULL; }
+    return error ? NULL : record;
+}
+
+
+FdOperationRecord *fd_operation_acquire_process(pcb_t process, int fd, int &error)
+{
+    auto *prepared = static_cast<FdOperationRecord *>(malloc(sizeof(FdOperationRecord)));
+    if (!prepared) { error = -ENOMEM; return NULL; }
+    FdOperationRecord *record = acquire_prepared(process, fd, error, prepared);
+    if (!record) free(prepared);
     return record;
+}
+
+// The global process list pins the PCB only during this bounded acquisition.
+// The resulting descriptor ticket never retains or dereferences that PCB.
+extern lock_queue *pcb_group_queue;
+FdOperationRecord *fd_operation_acquire_notification(uint64_t pid, uint64_t &callback, int &error)
+{
+    callback = 0;
+    error = -ESRCH;
+    auto *prepared = static_cast<FdOperationRecord *>(malloc(sizeof(FdOperationRecord)));
+    if (!prepared) { error = -ENOMEM; return NULL; }
+    FdOperationRecord *record = NULL;
+    if (pcb_group_queue)
+    {
+        spin_lock(&pcb_group_queue->lock);
+        for (lock_node *entry = pcb_group_queue->head; entry; entry = entry->next)
+        {
+            auto *process = static_cast<pcb_t>(entry->data);
+            if (!process || process->pid != pid) continue;
+            if (process->notify_pcor_registered && process->notify_pcor_func)
+            {
+                record = acquire_prepared(process, process->notify_pcor_pipe_write_fd, error, prepared);
+                if (record) callback = process->notify_pcor_func;
+            }
+            break;
+        }
+        spin_unlock(&pcb_group_queue->lock);
+    }
+    if (!record) free(prepared);
+    return record;
+}
+
+bool fd_operation_transfer_to_kernel(FdOperationRecord *record)
+{
+    if (!record) return false;
+    tcb_t owner = get_current_task();
+    spin_lock(&registry_lock);
+    bool valid = owner && record->owner == owner && !record->retired &&
+                 owner->status != DEATH && owner->status != OUT;
+    if (valid) record->owner = NULL;
+    spin_unlock(&registry_lock);
+    return valid;
+}
+
+bool fd_operation_is_retired(FdOperationRecord *record)
+{
+    if (!record) return true;
+    spin_lock(&registry_lock);
+    bool retired = record->retired;
+    spin_unlock(&registry_lock);
+    return retired;
 }
 
 FdOperationRecord *fd_operation_acquire(int fd, int &error)

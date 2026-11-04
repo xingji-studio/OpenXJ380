@@ -266,6 +266,9 @@ void init_reaper();
 typedef void (*elf_start)(int, char **, char **);
 void kill_proc(pcb_t pcb, int exit_code, bool is_zombie);
 bool kill_proc_deferred(pcb_t pcb, int exit_code);
+// Caller holds the GUI window lifetime gate, pinning task and its PCB.
+// Closes a windowless owner thread; only the last real thread defers process exit.
+bool process_close_window_thread(tcb_t task);
 void kill_thread(tcb_t task);
 void kill_thread0(tcb_t task);
 void kill_proc0(pcb_t pcb);

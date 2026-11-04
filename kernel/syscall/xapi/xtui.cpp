@@ -425,20 +425,17 @@ uint64_t do_xapi_GetMemorySize()
 
 void do_xapi_Run(char *path)
 {
-    page_directory_t *caller_pagedir = get_current_task()->parent_group->pagedir;
     char *upath = NULL;
     if (xapi_copy_string_from_user(&upath, path, XAPI_USER_PATH_MAX) < 0) return;
     char  *fpath = vfs_cwd_path_build(upath);
     free(upath);
     if (fpath == NULL) return;
     runfile(fpath, XPCS_VISITOR);
-    switch_page_directory(caller_pagedir);
     free(fpath);
 }
 
 static uint64_t spawn_from_user(char *path, char **argv, ProcessCredentialSource source)
 {
-    page_directory_t *caller_pagedir = get_current_task()->parent_group->pagedir;
     char *upath = NULL;
     int ret = xapi_copy_string_from_user(&upath, path, XAPI_USER_PATH_MAX);
     if (ret < 0) return (uint64_t)ret;
@@ -466,7 +463,6 @@ static uint64_t spawn_from_user(char *path, char **argv, ProcessCredentialSource
     ProcessLaunchOptions options;
     options.credentials = source;
     ret = create_user_process_with_options(fpath, get_current_task()->parent_group, kargv, options);
-    switch_page_directory(caller_pagedir);
     p_xapi_free_argv(kargv);
     free(fpath);
     return (uint64_t)ret;

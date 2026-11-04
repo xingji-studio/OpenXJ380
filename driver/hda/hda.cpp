@@ -57,13 +57,22 @@ static void     *hda_buffer_ptr = NULL;
 static uint64_t  hda_buffer_phys = 0;
 static bool      hda_stopping   = false;
 static pcb_t    use_task;
+static struct thread_control_block *audio_worker;
+static uint64_t audio_irq_count;
 
 // XAudio owns the controller as one shared output. IRQs only account periods;
 // no lock_queue operations (which allocate nodes) occur on this path.
 static spin_t audio_dma_lock = SPIN_INIT;
-static bool audio_owned, audio_failed, audio_ready[HDA_AUDIO_PERIODS];
-static uint64_t audio_sequence, audio_irq_time;
+static bool audio_owned, audio_running, audio_starting, audio_failed, audio_ready[HDA_AUDIO_PERIODS];
+static uint64_t audio_sequence, audio_poll_time, audio_progress_time;
+static uint32_t audio_position;
 static void *audio_buffer;
+struct AudioFailure
+{
+    unsigned reason, position, advanced;
+    uint64_t sequence, poll_ns, idle_ns;
+};
+static AudioFailure audio_failure;
 static void hda_audio_interrupt();
 
 static constexpr uint32_t HDA_WAIT_STEP_US           = 50;
@@ -136,14 +145,15 @@ uint32_t hda_get_bytes_sent() {
 // 中断与主动轮询共用这段收尾逻辑，避免缓冲区回收路径分叉。
 static void hda_handle_buffer_completion() {
     uint8_t status = mem_get8(hda_output_base + 0x3);
-    if ((status & (1 << 2)) == 0) return;
+    if (!(status & 0x1c)) return;
 
     if (__atomic_load_n(&audio_owned, __ATOMIC_ACQUIRE))
     {
         hda_audio_interrupt();
         return;
     }
-    mem_set8(hda_output_base + 0x3, 1 << 2);
+    mem_set8(hda_output_base + 0x3, status & 0x1c);
+    if (!(status & (1 << 2))) return;
     if (hda_stopping) {
         hda_stop();
     } else {
@@ -380,6 +390,12 @@ static void hda_program_pcm(void *buffer, uint32_t size, uint32_t sample_rate, u
 
     mem_set8(hda_output_base + 0x2, 0x1c);
 
+    if (__atomic_load_n(&audio_owned, __ATOMIC_ACQUIRE))
+    {
+        spin_lock(&audio_dma_lock);
+        audio_poll_time = audio_progress_time = nanoTime();
+        spin_unlock(&audio_dma_lock);
+    }
     mem_set8(hda_output_base + 0x0, 0b110);
 }
 
@@ -542,9 +558,20 @@ void hda_init_codec(uint32_t codec) {
 }
 
 extern "C" void hda_interrupt_handler(struct X64_REGS *frame, uint64_t error_code) {
-    write_serial_fmt("HDA IRQ\n");
-    hda_handle_buffer_completion();
-    __asm__("wbinvd");
+    // MSI belongs to this controller. Ignore an already-acknowledged edge;
+    // polling may have consumed it before delivery. Never log or flush all CPU
+    // caches in an IRQ: the audio thread reports a recorded DMA failure.
+    if (hda_base && hda_output_base && (mem_get32(hda_base + 0x24) & (1U << 31)) &&
+        (mem_get8(hda_output_base + 3) & 0x1c))
+    {
+        __atomic_fetch_add(&audio_irq_count, 1ULL, __ATOMIC_RELAXED);
+        hda_handle_buffer_completion();
+        if (__atomic_load_n(&audio_owned, __ATOMIC_ACQUIRE))
+        {
+            struct thread_control_block *worker = __atomic_load_n(&audio_worker, __ATOMIC_ACQUIRE);
+            if (worker) scheduler_wake_task(worker);
+        }
+    }
     send_eoi();
 }
 extern uint32_t pci_read0(uint32_t b, uint32_t d, uint32_t f, uint32_t arg, uint32_t registeroffset);
@@ -554,6 +581,90 @@ uint8_t pci_get_drive_irq(uint8_t bus, uint8_t slot, uint8_t func) {
     return (uint8_t)pci_read0(bus, slot, func, NULL,0x3c);
 }
 extern void init_idt_desc(uint8_t number, uint8_t gate_type, int_func function, uint8_t privilege, void *data);
+
+static uint32_t hda_pci_read(pci_device_t *device, uint32_t offset)
+{
+    return device->op->read(device->bus, device->slot, device->func, device->segment, offset);
+}
+
+static void hda_pci_write(pci_device_t *device, uint32_t offset, uint32_t value)
+{
+    device->op->write(device->bus, device->slot, device->func, device->segment, offset, value);
+}
+
+static uint32_t hda_find_msi(pci_device_t *device)
+{
+    if (!device->op || !(hda_pci_read(device, PCI_CONF_COMMAND) & (1U << 20))) return 0;
+    uint32_t offset = hda_pci_read(device, PCI_CAPABILITY_LIST) & 0xfc;
+    uint64_t visited = 0;
+    while (offset >= 0x40 && offset <= 0xfc)
+    {
+        uint64_t bit = 1ULL << (offset / 4 - 16);
+        if (visited & bit) break;
+        visited |= bit;
+        uint32_t capability = hda_pci_read(device, offset);
+        if ((capability & 0xff) == PCI_CAP_ID_MSI) return offset;
+        offset = (capability >> 8) & 0xfc;
+    }
+    return 0;
+}
+
+static int hda_reserve_irq_vector()
+{
+    // This driver initializes on the BSP before runtime module loading. Claim
+    // only an unused external vector; never replace another device's handler.
+    extern IDT_GATE_TYPE idt_gate[256];
+    for (unsigned vector = 0x50; vector < 0xe0; ++vector)
+    {
+        const IDT_GATE_TYPE &gate = idt_gate[vector];
+        uintptr_t handler = gate.offset_1 | ((uintptr_t)gate.offset_2 << 16) |
+                            ((uintptr_t)gate.offset_3 << 32);
+        if (handler != (uintptr_t)undefined_interrupt) continue;
+        init_idt_desc(vector, X86_64_INTR_GATE, hda_interrupt, RING0, NULL);
+        return (int)vector;
+    }
+    return -1;
+}
+
+static bool hda_route_msi(pci_device_t *device)
+{
+    uint32_t offset = hda_find_msi(device);
+    uint64_t destination = lapic_id();
+    if (!offset) return false;
+    uint32_t capability = hda_pci_read(device, offset);
+    uint16_t control = capability >> 16;
+    // Firmware may have left MSI enabled. Quiesce its old target even if this
+    // kernel cannot install a usable route and must fall back to polling.
+    control &= ~((7U << 4) | 1U);
+    hda_pci_write(device, offset, (capability & 0xffffU) | ((uint32_t)control << 16));
+    if (destination > 255) return false;
+    bool wide = control & (1U << 7);
+    uint32_t data_offset = offset + (wide ? 12U : 8U);
+    uint32_t mask_offset = data_offset + 4;
+    if (data_offset > 0xfc || ((control & (1U << 8)) && mask_offset > 0xfc)) return false;
+    int vector = hda_reserve_irq_vector();
+    if (vector < 0) return false;
+
+    // Single, edge-triggered, fixed-delivery MSI to this APIC. This avoids the
+    // firmware-specific PCI INTx routing and shared level IRQs, for which this
+    // tree has no ACPI _PRT/interrupt-sharing implementation. Unsupported
+    // devices keep their existing position-polling backend with INTx masked.
+    hda_pci_write(device, offset + 4, 0xfee00000U | ((uint32_t)destination << 12));
+    if (wide) hda_pci_write(device, offset + 8, 0);
+    uint32_t data = hda_pci_read(device, data_offset);
+    hda_pci_write(device, data_offset, (data & 0xffff0000U) | (1U << 14) | (uint32_t)vector);
+    if (control & (1U << 8))
+        hda_pci_write(device, mask_offset, hda_pci_read(device, mask_offset) & ~1U);
+    hda_pci_write(device, offset, (capability & 0xffffU) | ((uint32_t)(control | 1U) << 16));
+    if (!(hda_pci_read(device, offset) & (1U << 16)))
+    {
+        hda_pci_write(device, offset, (capability & 0xffffU) | ((uint32_t)control << 16));
+        return false;
+    }
+    write_serial_fmt("audio: HDA MSI routed vector=%u cpu=%u\n", (unsigned)vector, (unsigned)destination);
+    return true;
+}
+
 void hda_init() {
     pci_device_t *device = pci_find_vid_did(0x8086, 0x2668);
     if (device == NULL) {
@@ -569,10 +680,10 @@ void hda_init() {
     }
     write_serial_fmt( "Loading Intel High Definition Audio driver...\n");
 
-    // 打开中断 | 启用总线主控 | 启用MMIO
-    uint32_t d = pci_read0(device->bus, device->slot, device->func, NULL,0x04);
-    pci_write0(device->bus, device->slot, device->func, NULL, 0x04,
-              ((d & ~((uint32_t)1 << 10)) | (1 << 2) | (1 << 1)));
+    // Keep firmware INTx masked: its PCI line byte is not an ACPI GSI route.
+    // Writing zeros to the status half avoids clearing W1C PCI status bits.
+    uint32_t d = hda_pci_read(device, PCI_CONF_COMMAND) & 0xffffU;
+    hda_pci_write(device, PCI_CONF_COMMAND, d | PCI_RCMD_DISABLE_INTR | PCI_COMMAND_MASTER | PCI_COMMAND_MEMORY);
 
     pci_bar_base_address bar0 = device->bars[0];
     if (!bar0.mmio || bar0.address == 0) {
@@ -605,10 +716,9 @@ void hda_init() {
         return;
     }
 
-    int irq = pci_get_drive_irq(device->bus, device->slot, device->func);
-    write_serial_fmt("HDA irq %d\n",0x20+irq);
-    init_idt_desc(0x20+irq,X86_64_INTR_GATE,hda_interrupt,RING0,NULL);
-    mem_set32(hda_base + 0x20, ((uint32_t)1 << 31) | ((uint32_t)1 << input_stream_count));
+    bool msi_routed = hda_route_msi(device);
+    if (!msi_routed) write_serial_string("audio: HDA MSI unavailable; using position polling\n");
+    mem_set32(hda_base + 0x20, msi_routed ? (1U << 31) | (1U << input_stream_count) : 0);
     uint8_t  rirb_size  = 0;
     uint32_t corb_size  = 0;
 
@@ -778,25 +888,60 @@ bool hda_audio_available()
            (hda_pin_pcm_format_cap & (1U << 17));
 }
 
+void hda_audio_set_worker(struct thread_control_block *worker)
+{
+    // The registered core audio thread is permanent. It never waits on other
+    // objects or exits; a raced sleep publication is covered by its 1ms poll.
+    __atomic_store_n(&audio_worker, worker, __ATOMIC_RELEASE);
+}
+
+uint64_t hda_audio_interrupt_count()
+{
+    return __atomic_load_n(&audio_irq_count, __ATOMIC_RELAXED);
+}
+
 static void hda_audio_interrupt()
 {
     spin_lock(&audio_dma_lock);
-    if (!(mem_get8(hda_output_base + 3) & 4))
+    uint8_t status = mem_get8(hda_output_base + 3);
+    if (status & 0x1c) mem_set8(hda_output_base + 3, status & 0x1c);
+    // Ownership covers reset/programming too. Ignore stale completions until
+    // the new ring has been programmed and RUN has actually been observed.
+    if (!audio_running)
     {
         spin_unlock(&audio_dma_lock);
         return;
     }
-    mem_set8(hda_output_base + 3, 4);
     const uint64_t now = nanoTime();
-    const unsigned active = (mem_get32(hda_output_base + 4) / HDA_BUF_SIZE) % HDA_AUDIO_PERIODS;
+    const uint32_t position = mem_get32(hda_output_base + 4);
+    const uint64_t poll_elapsed = now - audio_poll_time;
+    const uint64_t ring_ns = (uint64_t)HDA_BUF_SIZE * HDA_AUDIO_PERIODS * 1000000000ULL / (48000U * 4U);
+    audio_poll_time = now;
+    if (position != audio_position)
+    {
+        audio_position = position;
+        audio_progress_time = now;
+    }
+    const uint64_t progress_elapsed = now - audio_progress_time;
+    const unsigned active = (position / HDA_BUF_SIZE) % HDA_AUDIO_PERIODS;
     const unsigned advanced = (active + HDA_AUDIO_PERIODS - audio_sequence % HDA_AUDIO_PERIODS) % HDA_AUDIO_PERIODS;
-    // LPIB accounts coalesced IRQs. A whole-ring lapse is ambiguous and must
-    // fail closed: replayed samples cannot be reported as newly presented data.
-    if (!advanced || !audio_ready[active] ||
-        (audio_irq_time && now - audio_irq_time > 160000000ULL))
+    // BCIS is a notification, not a completion counter. A completion may
+    // arrive between its acknowledgement and the LPIB read, so a later BCIS
+    // can refer to a boundary already counted. Poll position even without it.
+    // Only a gap between position observations can hide an entire ring. Slow
+    // host audio consumption can pause DMA while the worker keeps observing
+    // it; that is not a lost ring and must not invent or discard played frames.
+    const unsigned reason = (position >= HDA_BUF_SIZE * HDA_AUDIO_PERIODS ? 1U : 0U) |
+                            (poll_elapsed >= ring_ns ? 2U : 0U) | (!audio_ready[active] ? 4U : 0U) |
+                            (status & 0x18 ? 8U : 0U) | (progress_elapsed > 5000000000ULL ? 16U : 0U);
+    if (reason)
     {
         audio_failed = true;
+        audio_running = false;
         hda_stop();
+        audio_failure = {reason, position, advanced, audio_sequence, poll_elapsed, progress_elapsed};
+        spin_unlock(&audio_dma_lock);
+        return;
     }
     else
     {
@@ -806,13 +951,13 @@ static void hda_audio_interrupt()
             if (!audio_ready[finished])
             {
                 audio_failed = true;
+                audio_running = false;
                 hda_stop();
                 break;
             }
             audio_ready[finished] = false;
             ++audio_sequence;
         }
-        audio_irq_time = now;
     }
     spin_unlock(&audio_dma_lock);
 }
@@ -821,35 +966,71 @@ int hda_audio_start()
 {
     if (!hda_audio_available()) return -ENODEV;
     spin_lock(&audio_dma_lock);
-    if (snd->is_using || audio_owned)
+    if ((snd->is_using && !audio_owned) || audio_running || audio_starting)
     {
         spin_unlock(&audio_dma_lock);
         return -EBUSY;
     }
     snd->is_using = true;
+    audio_starting = true;
     audio_failed = false;
+    audio_failure = {};
     for (bool &ready : audio_ready) ready = true;
-    audio_sequence = audio_irq_time = 0;
+    audio_sequence = audio_poll_time = audio_progress_time = 0;
+    audio_position = 0;
     __atomic_store_n(&audio_owned, true, __ATOMIC_RELEASE);
     spin_unlock(&audio_dma_lock);
-    uint64_t physical;
-    audio_buffer = hda_alloc_dma32(HDA_BUF_SIZE * HDA_AUDIO_PERIODS, &physical);
-    if (!audio_buffer) return -ENOMEM;
+    // Reuse the contiguous DMA allocation across idle periods and failures.
+    // Clear it before each restart so old application samples cannot replay.
+    if (!audio_buffer)
+    {
+        uint64_t physical;
+        audio_buffer = hda_alloc_dma32(HDA_BUF_SIZE * HDA_AUDIO_PERIODS, &physical);
+    }
+    if (!audio_buffer)
+    {
+        spin_lock(&audio_dma_lock);
+        audio_starting = false;
+        audio_failed = true;
+        spin_unlock(&audio_dma_lock);
+        return -ENOMEM;
+    }
+    memset(audio_buffer, 0, HDA_BUF_SIZE * HDA_AUDIO_PERIODS);
     hda_program_pcm(audio_buffer, HDA_BUF_SIZE, 48000, 2, 16, HDA_AUDIO_PERIODS);
     spin_lock(&audio_dma_lock);
     if (!(mem_get8(hda_output_base) & 2)) audio_failed = true;
+    audio_starting = false;
+    audio_running = !audio_failed;
     bool failed = audio_failed;
     spin_unlock(&audio_dma_lock);
     return failed ? -EIO : 0;
 }
 
+void hda_audio_stop()
+{
+    spin_lock(&audio_dma_lock);
+    if (hda_output_base)
+    {
+        hda_stop();
+        mem_set8(hda_output_base + 3, 0x1c);
+    }
+    audio_running = false;
+    spin_unlock(&audio_dma_lock);
+}
+
 int hda_audio_progress(uint64_t *completed)
 {
-    hda_poll();
+    hda_audio_interrupt();
     spin_lock(&audio_dma_lock);
     *completed = audio_sequence;
-    bool failed = audio_failed;
+    bool failed = audio_failed || !audio_running;
+    AudioFailure failure = audio_failure;
+    audio_failure = {};
     spin_unlock(&audio_dma_lock);
+    if (failure.reason)
+        write_serial_fmt("audio: HDA loss reason=%u lpib=%u advanced=%u sequence=%llu poll_ns=%llu idle_ns=%llu\n",
+                         failure.reason, failure.position, failure.advanced, (unsigned long long)failure.sequence,
+                         (unsigned long long)failure.poll_ns, (unsigned long long)failure.idle_ns);
     return failed ? -EIO : 0;
 }
 
@@ -857,7 +1038,7 @@ int hda_audio_refill(uint64_t sequence, const int16_t *pcm)
 {
     spin_lock(&audio_dma_lock);
     bool valid = sequence && sequence <= audio_sequence &&
-                 audio_sequence - sequence < HDA_AUDIO_PERIODS - 1 && !audio_failed;
+                 audio_sequence - sequence < HDA_AUDIO_PERIODS - 1 && audio_running && !audio_failed;
     spin_unlock(&audio_dma_lock);
     if (!valid) return -EIO;
     unsigned slot = (sequence - 1) % HDA_AUDIO_PERIODS;
@@ -866,7 +1047,8 @@ int hda_audio_refill(uint64_t sequence, const int16_t *pcm)
     memcpy((uint8_t *)audio_buffer + slot * HDA_BUF_SIZE, pcm, HDA_BUF_SIZE);
     __atomic_thread_fence(__ATOMIC_RELEASE);
     spin_lock(&audio_dma_lock);
-    valid = sequence <= audio_sequence && audio_sequence - sequence < HDA_AUDIO_PERIODS - 1 && !audio_failed;
+    valid = sequence <= audio_sequence && audio_sequence - sequence < HDA_AUDIO_PERIODS - 1 &&
+            audio_running && !audio_failed;
     if (valid) audio_ready[slot] = true;
     spin_unlock(&audio_dma_lock);
     return valid ? 0 : -EIO;
@@ -876,6 +1058,7 @@ void hda_audio_abort()
 {
     spin_lock(&audio_dma_lock);
     audio_failed = true;
+    audio_running = false;
     if (hda_output_base) hda_stop();
     spin_unlock(&audio_dma_lock);
 }

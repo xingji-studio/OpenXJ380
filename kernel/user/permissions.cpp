@@ -9,6 +9,10 @@
 #include <krlibc.h>
 #include <stdio.h>
 
+// The product implements the trusted notification UI. The standalone provider
+// keeps its ordinary VFS semantics when that optional consumer is absent.
+extern void permissions_settings_write_notice(const char *application, uint64_t pid) __attribute__((weak));
+
 // The lock protects session publication, process permissions and the entire FIFO.
 // It never protects allocation, sleeping, rendering or filesystem operations.
 extern spin_t create_thread_lock;
@@ -46,6 +50,18 @@ void permissions_session_publish(const UserInfo *info)
     *current_user = *info;
     ++session_generation;
     spin_unlock(&permission_lock);
+}
+
+bool permissions_session_name(char *out, size_t capacity)
+{
+    if (!out || !capacity) return false;
+    spin_lock(&permission_lock);
+    out[0] = 0;
+    if (user_session_is_ready() && current_user)
+        strncpy(out, current_user->name, capacity - 1);
+    out[capacity - 1] = 0;
+    spin_unlock(&permission_lock);
+    return out[0] != 0;
 }
 
 static UserType session_type_locked()
@@ -599,11 +615,20 @@ int permissions_executable_directory(vfs_node_t executable, char *out, size_t ca
     return 0;
 }
 
+static bool shared_resource_path(const char *path)
+{
+    return prefix_fold(path, "/system/resources");
+}
+
+static bool public_read_path(const char *path)
+{
+    return shared_resource_path(path) || under(path, "/etc");
+}
+
 static bool system_path(const char *path)
 {
-    // The requested resources prefix is ordinary data, even though it lives
-    // below /system. No SV/SR/SW requirements are inherited from that parent.
-    return !prefix_fold(path, "/system/resources") && (under(path, "/system") || under(path, "/EFI"));
+    // Shared resources do not inherit SV/SR/SW from their /system parent.
+    return !shared_resource_path(path) && (under(path, "/system") || under(path, "/EFI"));
 }
 
 static bool network_store_path(const char *path, bool ancestors)
@@ -640,6 +665,11 @@ static bool path_access(const char *path, bool directory, int operation, uint8_t
     // when the application has broad NV/CS file permissions.
     if (write && network_store_path(path, directory && operation == IME_FILE_REMOVE)) return false;
 
+    // Every application can read shared assets and /etc configuration, including
+    // Custom with no file permissions. Resolved VFS operations and preflight use
+    // the same rule; writes and deletion still use the ordinary policy.
+    if (!write && public_read_path(path)) return true;
+
     if (under(path, "/users"))
     {
         const char *owner = path + strlen("/users/");
@@ -651,6 +681,9 @@ static bool path_access(const char *path, bool directory, int operation, uint8_t
                 size_t length = (size_t)(slash - owner);
                 // Neither NV nor a broad executable directory may authorize another account's settings.
                 if (strlen(user) != length || !prefix_fold(owner, user)) return false;
+                // CS controls changes; reading the process owner's preferences
+                // must not prompt for permission just to render an application.
+                if (!write) return true;
                 if (required_out) { *required_out |= XPERM_CS; return true; }
                 return (mask & XPERM_CS) != 0;
             }
@@ -772,13 +805,11 @@ static bool file_access(vfs_node_t node, const char *path, int operation, unsign
     application[sizeof(application) - 1] = 0;
     char *resolved = node ? vfs_get_fullpath(node) : path ? canonical_target(path) : NULL;
     if (!resolved) { permissions_set_file_error(EACCES); return false; }
-    // Fixed runtime image loading and picker icons have read-only exceptions.
-    // The picker never receives permission to read selected data.
+    // Fixed runtime image loading has read-only exceptions. The picker never
+    // receives permission to read selected data.
     bool service_read = operation == IME_FILE_READ &&
         ((task->permission_dialog_launch_depth && equal_fold(resolved, XJ380_FILE_DIALOG_PATH)) ||
-         (task->permission_terminal_launch && equal_fold(resolved, XJ380_TERMINAL_PATH)) ||
-         (__atomic_load_n(&process->permission_file_dialog, __ATOMIC_ACQUIRE) &&
-          under(resolved, "/system/resources")));
+         (task->permission_terminal_launch && equal_fold(resolved, XJ380_TERMINAL_PATH)));
     bool allowed = service_read || path_access(resolved, node && (node->type & file_dir), operation, mask, username,
                                                application, process, required_out);
     free(resolved);
@@ -794,6 +825,69 @@ bool permissions_file_access(vfs_node_t node, const char *path, int operation)
 bool permissions_file_requirements(vfs_node_t node, const char *path, int operation, uint8_t *required)
 {
     return required && file_access(node, path, operation, 0, required);
+}
+
+PermissionFileChange permissions_file_change_begin(vfs_node_t node, const char *destination)
+{
+    PermissionFileChange change = {};
+    if (!permissions_settings_write_notice || !node ||
+        (node->type & (file_dir | file_block | file_pipe | file_socket | file_stream | file_ptmx | file_pts)))
+        return change;
+    tcb_t task = get_current_task();
+    // Authenticated profile creation/migration is kernel maintenance, rather
+    // than a setting edit by the application that happened to log the user in.
+    if (!task || task->task_level != TASK_APPLICATION_LEVEL || !task->parent_group ||
+        task->ime_config_depth || task->permission_profile_owner) return change;
+
+    char owner[64], application[32];
+    spin_lock(&permission_lock);
+    pcb_t process = task->parent_group;
+    memcpy(owner, process->permission_user.name, sizeof(owner));
+    memcpy(application, process->name, sizeof(application));
+    uint64_t pid = process->pid;
+    spin_unlock(&permission_lock);
+    owner[sizeof(owner) - 1] = application[sizeof(application) - 1] = 0;
+    char expected[96];
+    snprintf(expected, sizeof(expected), "/users/%s/settings.json", owner);
+
+    int saved_error = permissions_file_error();
+    bool changed = false;
+    if (destination)
+    {
+        // FAT rename need not republish the cached source node's new name.
+        // Resolve the destination before mutation and retain that identity.
+        char *target = canonical_target(destination);
+        char *source = vfs_get_fullpath(node);
+        changed = target && source && equal_fold(target, expected) && !equal_fold(target, source);
+        free(target);
+        free(source);
+    }
+    else
+    {
+        for (unsigned depth = 0; node && depth < 40; ++depth, node = node->linkto)
+        {
+            char *path = vfs_get_fullpath(node);
+            changed = path && !(node->type & file_dir) && equal_fold(path, expected);
+            free(path);
+            if (changed) break;
+        }
+    }
+    if (changed)
+    {
+        change.pid = pid;
+        memcpy(change.application, application, sizeof(change.application));
+    }
+    permissions_set_file_error(saved_error);
+    return change;
+}
+
+void permissions_file_changed(const PermissionFileChange &change)
+{
+    if (!change.pid || !permissions_settings_write_notice) return;
+    int saved_error = permissions_file_error();
+    // Queue admission never changes a completed write's result or errno.
+    permissions_settings_write_notice(change.application, change.pid);
+    permissions_set_file_error(saved_error);
 }
 
 static bool query_operations(vfs_node_t node, const char *path, uint64_t access, uint8_t *required)
@@ -976,6 +1070,9 @@ static int transfer_category(const char *path, const char *application)
         const char *slash = strchr(path + strlen("/users/"), '/');
         if (slash && equal_fold(slash, "/settings.json")) return 3;
     }
+    // Public reads are a separate category: a persistent hard link from an
+    // ordinary NV/application file must not make that file universally readable.
+    if (public_read_path(path)) return 5;
     return system_path(path) ? 0 : under(path, application) ? 1 : 2;
 }
 

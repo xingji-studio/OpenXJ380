@@ -577,7 +577,7 @@ static void worker(uint64_t argument)
 {
     (void)argument;
     while ((g_device = get_default_netdev()) == nullptr) {
-        delay_ms_hp(100);
+        scheduler_sleep_ns(100000000ULL);
     }
     int result = start_stack();
     if (result != 0) {
@@ -587,7 +587,7 @@ static void worker(uint64_t argument)
     printk("netserver: lwIP ready on e0\n");
     for (;;) {
         receive_frames();
-        delay_ms_hp(1);
+        scheduler_sleep_ns(1000000ULL);
     }
 }
 

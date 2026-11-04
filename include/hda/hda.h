@@ -47,7 +47,12 @@ void     hda_poll();
 
 // Shared-output backend. PCM is always 48 kHz stereo S16, one 1024-frame period.
 bool hda_audio_available();
+// Register the permanent core audio service thread; IRQ wakeups never replace polling.
+struct thread_control_block;
+void hda_audio_set_worker(struct thread_control_block *worker);
+uint64_t hda_audio_interrupt_count();
 int hda_audio_start();
+void hda_audio_stop();
 int hda_audio_progress(uint64_t *completed);
 int hda_audio_refill(uint64_t completed, const int16_t *pcm);
 void hda_audio_abort();

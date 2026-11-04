@@ -25,6 +25,8 @@ extern const uint64_t MIN_SLICE;
  */
 void scheduler_start();
 void scheduler_stop();
+// Global boot/fatal gate only; an ordinary nested critical section leaves it open.
+bool scheduler_global_enabled();
 bool scheduler_is_enabled();
 // Save/restore only this CPU's nesting, preserving any enclosing section.
 // Restore before a non-returning user-mode handoff as well as error returns.
