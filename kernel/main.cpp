@@ -3,6 +3,7 @@
 #include "build_config.h"
 #include <ahci/ahci.h>
 #include <cpu/regio.h>
+#include <cpu/idle.h>
 #include <device.h>
 #include <cpu/fsgsbase.h>
 #include <console.h>
@@ -637,6 +638,7 @@ extern "C" void KernelMain(const FrameBufferConfig &fbc, EFI_SYSTEM_TABLE &Syste
     tcb_t idle_thread            = (tcb_t)aligned_alloc(16, idle_alloc_size);
     if (idle_thread != NULL) memset(idle_thread, 0, sizeof(struct thread_control_block));
     if (idle_thread == NULL) while (true) { __asm__ volatile("hlt"); }
+    idle_thread->task_level   = TASK_IDLE_LEVEL;
     idle_thread->tid          = __atomic_fetch_add(&now_tid, 1, __ATOMIC_SEQ_CST);
     idle_thread->parent_group = kernel_group;
     idle_thread->kernel_stack = get_rsp();
@@ -749,6 +751,9 @@ extern "C" void KernelMain(const FrameBufferConfig &fbc, EFI_SYSTEM_TABLE &Syste
     }
 
     init_reaper();
+    // Publish the permanent TX worker after all CPU queues exist. Bootstrap
+    // output remains synchronous until this handoff succeeds.
+    if (!serial_runtime_start()) write_serial_string("Serial TX worker initialization failed.\n");
     write_serial_string("Process Reaper is ready\n");
 
     if (BootConfig.is_qemu == 1) pr_warn("XJ380 is running under the QEMU/BOCHS.\n");
@@ -789,11 +794,6 @@ extern "C" void KernelMain(const FrameBufferConfig &fbc, EFI_SYSTEM_TABLE &Syste
 
     while (true)
     {
-        if (!no_interrupt)
-        {
-            enable_intr();
-        }
-
-        __asm__ __volatile__("pause");
+        cpu_idle_once(no_interrupt);
     }
 }

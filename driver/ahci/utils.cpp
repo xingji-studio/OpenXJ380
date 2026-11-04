@@ -32,6 +32,12 @@ static int ahci_command_error(struct hba_port *port)
     return 0;
 }
 
+static bool ahci_command_engine_ready(struct hba_port *port)
+{
+    return !(port->regs[HBA_RPxTFD] & (HBA_PxTFD_BSY | HBA_PxTFD_DRQ)) &&
+           !port->regs[HBA_RPxCI] && !port->regs[HBA_RPxSACT];
+}
+
 int ahci_send_command(struct hba_port *port, int slot, uint64_t timeout_ns)
 {
     if (!port || !port->hba || !port->regs || slot < 0 ||
@@ -45,13 +51,16 @@ int ahci_send_command(struct hba_port *port, int slot, uint64_t timeout_ns)
     // Data I/O and flush hold the same operation mutex. No command may be
     // ordered after an earlier DMA operation whose completion is unknown.
     AhciDeadline deadline(nanoTime());
-    while ((port->regs[HBA_RPxTFD] & (HBA_PxTFD_BSY | HBA_PxTFD_DRQ)) ||
-           port->regs[HBA_RPxCI] || port->regs[HBA_RPxSACT])
+    while (!ahci_command_engine_ready(port))
     {
         if (HBA_PXSSTS_DET(port->regs[HBA_RPxSSTS]) != 3)
             return ahci_fail_port(port, -ENODEV);
         if (deadline.expired(nanoTime(), timeout_ns))
         {
+            // A preemption between the loop's MMIO observation and the clock
+            // sample can outlast the timeout after hardware became ready.
+            io_mfence();
+            if (ahci_command_engine_ready(port)) break;
             ahci_log_timeout(port, slot, "device ready timeout", deadline, timeout_ns);
             return ahci_fail_port(port, -ETIMEDOUT);
         }
@@ -78,6 +87,11 @@ int ahci_send_command(struct hba_port *port, int slot, uint64_t timeout_ns)
         }
         if (deadline.expired(nanoTime(), timeout_ns))
         {
+            // The command can finish while this task is descheduled after
+            // reading PxCI. Re-enter the normal final status checks rather
+            // than poisoning a completed port because of that stale sample.
+            io_mfence();
+            if (!(port->regs[HBA_RPxCI] & bitmask)) break;
             ahci_log_timeout(port, slot, "command completion timeout", deadline, timeout_ns);
             return ahci_fail_port(port, -ETIMEDOUT);
         }
@@ -86,6 +100,7 @@ int ahci_send_command(struct hba_port *port, int slot, uint64_t timeout_ns)
     io_mfence();
     int error = ahci_command_error(port);
     if (!error && (port->regs[HBA_RPxTFD] & (HBA_PxTFD_BSY | HBA_PxTFD_DRQ))) error = -EIO;
+    if (!error && port->regs[HBA_RPxSACT]) error = -EIO;
     if (error)
     {
         if (port->device) sata_read_error(port);

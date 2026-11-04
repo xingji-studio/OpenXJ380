@@ -3583,12 +3583,14 @@ sys_(getdents, int fd, struct dirent *dents, size_t size)
     if (unlikely(handle == NULL)) { return SYSCALL_FAULT_(EBADF); }
     if (handle->node->type != file_dir) { return SYSCALL_FAULT_(ENOTDIR); }
     if (!vfs_check_access(handle->node, NULL, IME_FILE_LIST)) return SYSCALL_FAULT_(vfs_last_error());
-    size_t   child_count   = (uint64_t)list_length(handle->node->child);
     size_t   max_dents_num = size / sizeof(struct dirent);
     size_t   read_count    = 0;
     uint64_t offset        = 0;
     vfs_node_t child_node;
     vfs_child_lock();
+    // Count and enumerate the same protected directory list. File syscalls
+    // may be preempted; a cached count must not traverse detached child nodes.
+    size_t child_count = (uint64_t)list_length(handle->node->child);
     list_foreach(handle->node->child, i)
     {
         if (offset < handle->offset) { goto next; }

@@ -31,6 +31,8 @@
 int    snprintf(char *buf, size_t size, const char *fmt, ...);
 // driver/serial/serial_port.cpp
 int    init_serial();
+bool   serial_runtime_start();
+void   serial_task_quiescent_exit(struct thread_control_block *task);
 void   write_serial(char a);
 void   write_serial_string(const char *str);
 void   write_serial_dec(unsigned long long dec);

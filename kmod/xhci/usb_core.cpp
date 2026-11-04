@@ -1,4 +1,5 @@
 #include "xhci.h"
+#include <task/scheduler.h>
 
 static usb_driver *g_usb_drivers = NULL;
 static usb_hub *g_usb_hubs = NULL;
@@ -9,7 +10,8 @@ static void usb_hotplug_worker(void *arg) {
     (void)arg;
     for (;;) {
         usb_scan_all_hubs();
-        delay_ms_hp(20);
+        // Yield the CPU between scans instead of repeatedly reading HPET MMIO.
+        scheduler_sleep_ns(20000000ULL);
     }
 }
 

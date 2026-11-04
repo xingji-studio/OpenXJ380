@@ -367,10 +367,14 @@ ENTRY(syscall_handler)
     movq %gs:CPU_CURRENT_TASK, %rax
     movq THREAD_SYSCALL_USER_RSP(%rax), %rsi
     call c_syscall_handler
+    // Slow syscalls may enable IRQs after the entry image is complete. Mask
+    // them again before restoring user FPU state and touching return scratch.
+    cli
     fxrstor64 (%rsp)
     movq %r12, %rsp
 
 ENTRY(ret_from_syscall)
+    cli
     movq RIP(%rsp), %rcx
     movq RFLAGS(%rsp), %r11
     // Signal delivery and sigreturn may replace the saved user stack.

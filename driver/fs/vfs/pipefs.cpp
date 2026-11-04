@@ -53,60 +53,122 @@ int pipefs_create_pair(vfs_node_t *reader, vfs_node_t *writer)
     return 0;
 }
 
-static bool pipe_waiter_contains(task_block_list_t *head, tcb_t task) {
-    task_block_list_t *node = head->next;
-    while (node != NULL) {
-        if (node->thread == task) return true;
-        node = node->next;
+// A detached wake list keeps numeric identity, never an unpinned TCB to use
+// after unlocking the pipe. The public list-node prefix remains unchanged.
+struct PipeWaiter
+{
+    task_block_list_t node;
+    size_t tid;
+};
+extern lock_queue *pcb_group_queue;
+
+static void pipe_wake_live_waiter(tcb_t identity, size_t tid)
+{
+    if (!pcb_group_queue) return;
+    spin_lock(&pcb_group_queue->lock);
+    for (lock_node *entry = pcb_group_queue->head; entry; entry = entry->next)
+    {
+        auto *process = static_cast<pcb_t>(entry->data);
+        if (!process || !process->thread_queue) continue;
+        spin_lock(&process->thread_queue->lock);
+        bool found = false;
+        for (lock_node *thread = process->thread_queue->head; thread; thread = thread->next)
+        {
+            if (thread->data != identity) continue;
+            auto *task = static_cast<tcb_t>(thread->data);
+            if (task->tid == tid) scheduler_wake_task(task);
+            found = true;
+            break;
+        }
+        spin_unlock(&process->thread_queue->lock);
+        if (found) break;
     }
-    return false;
+    spin_unlock(&pcb_group_queue->lock);
 }
 
-static bool pipe_add_waiter(task_block_list_t *head, tcb_t task) {
-    if (task == NULL) return false;
-    if (pipe_waiter_contains(head, task)) return true;
-
-    task_block_list_t *node = (task_block_list_t *)malloc(sizeof(task_block_list_t));
-    if (node == NULL) return false;
-    node->thread = task;
-    node->next = head->next;
-    head->next = node;
-    return true;
-}
-
-static void pipe_wake_waiters(task_block_list_t *head) {
-    task_block_list_t *node = head->next;
+static task_block_list_t *pipe_detach_waiters(task_block_list_t *head)
+{
+    task_block_list_t *list = head->next;
     head->next = NULL;
-    while (node != NULL) {
-        task_block_list_t *next = node->next;
-        scheduler_wake_task(node->thread);
-        free(node);
-        node = next;
+    return list;
+}
+
+static void pipe_wake_waiters(task_block_list_t *list)
+{
+    while (list)
+    {
+        task_block_list_t *next = list->next;
+        auto *waiter = reinterpret_cast<PipeWaiter *>(list);
+        pipe_wake_live_waiter(waiter->node.thread, waiter->tid);
+        free(waiter);
+        list = next;
     }
 }
 
-static void pipe_wait_on(pipe_info_t *pipe, task_block_list_t *head) {
-    tcb_t current = get_current_task();
-    if (current == NULL || current->task_level == TASK_IDLE_LEVEL) {
-        spin_unlock(&pipe->lock);
-        scheduler_yield();
-        return;
-    }
+static PipeWaiter *pipe_prepare_waiter()
+{
+    tcb_t task = get_current_task();
+    if (!task || task->task_level == TASK_IDLE_LEVEL) return NULL;
+    auto *waiter = static_cast<PipeWaiter *>(malloc(sizeof(PipeWaiter)));
+    if (waiter) *waiter = {{NULL, task}, task->tid};
+    return waiter;
+}
 
-    if (!pipe_add_waiter(head, current)) {
+// The caller allocates before taking the pipe lock and rechecks readiness
+// under that lock. Publication and WAIT therefore cannot lose a reader wake.
+static bool pipe_wait_on(pipe_info_t *pipe, task_block_list_t *head, PipeWaiter *prepared)
+{
+    if (!prepared)
+    {
         spin_unlock(&pipe->lock);
         scheduler_sleep_ns(1000000ULL);
-        return;
+        return true;
     }
-
+    tcb_t current = prepared->node.thread;
+    TaskStatus expected = __atomic_load_n(&current->status, __ATOMIC_ACQUIRE);
+    prepared->node.next = head->next;
+    head->next = &prepared->node;
     current->wakeup_time = 0;
-    current->status = WAIT;
-    spin_unlock(&pipe->lock);
-
-    while (current->status == WAIT) {
-        scheduler_yield();
+    if ((expected != RUNNING && expected != START) ||
+        !__atomic_compare_exchange_n(&current->status, &expected, WAIT, false,
+                                     __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+    {
+        head->next = prepared->node.next;
+        spin_unlock(&pipe->lock);
+        free(prepared);
+        return false;
     }
-    if (current->status == START) current->status = RUNNING;
+    spin_unlock(&pipe->lock);
+    while (__atomic_load_n(&current->status, __ATOMIC_ACQUIRE) == WAIT) scheduler_yield();
+    expected = START;
+    (void)__atomic_compare_exchange_n(&current->status, &expected, RUNNING, false,
+                                      __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+    TaskStatus status = __atomic_load_n(&current->status, __ATOMIC_ACQUIRE);
+    return status != DEATH && status != OUT;
+}
+
+// An all-or-nothing message packet write. The descriptor operation ticket
+// retained by the caller pins spec/pipe across the unlocked wake phase.
+int pipefs_try_write_packet(vfs_node_t node, const void *data, size_t size)
+{
+    if (!node || !(node->type & file_pipe) || !data || !size || size > PIPE_BUFF) return -EINVAL;
+    auto *spec = static_cast<pipe_specific_t *>(node->handle);
+    if (!spec || !spec->write || !spec->info) return -EBADF;
+    pipe_info_t *pipe = spec->info;
+    task_block_list_t *waiters = NULL;
+    int result = -EAGAIN;
+    spin_lock(&pipe->lock);
+    if (!pipe->buf || pipe->read_fds == 0 || pipe->write_fds == 0) result = -EPIPE;
+    else if (pipe->ptr <= PIPE_BUFF && PIPE_BUFF - pipe->ptr >= size)
+    {
+        memcpy(pipe->buf + pipe->ptr, data, size);
+        pipe->ptr += size;
+        waiters = pipe_detach_waiters(&pipe->blocking_read);
+        result = int(size);
+    }
+    spin_unlock(&pipe->lock);
+    pipe_wake_waiters(waiters);
+    return result;
 }
 
 void pipefs_open(void *parent, const char *name, vfs_node_t node) {
@@ -115,54 +177,84 @@ void pipefs_open(void *parent, const char *name, vfs_node_t node) {
     node->type = file_pipe;
 }
 
-size_t pipefs_read(void *file, void *addr, size_t offset, size_t size) {
+size_t pipefs_read(void *file, void *addr, size_t offset, size_t size)
+{
     (void)offset;
+    if (!size) return 0;
     if (size > PIPE_BUFF) size = PIPE_BUFF;
-
-    pipe_specific_t *spec = (pipe_specific_t *)file;
-    if (!spec) return -EINVAL;
+    auto *spec = static_cast<pipe_specific_t *>(file);
+    if (!spec || !spec->info) return (size_t)-EINVAL;
     pipe_info_t *pipe = spec->info;
-    if (!pipe) return -EINVAL;
-
-    while (true) {
+    PipeWaiter *prepared = NULL;
+    for (;;)
+    {
         spin_lock(&pipe->lock);
-        if (pipe->ptr != 0) {
-            uint32_t to_read = MIN(size, pipe->ptr);
-            memcpy(addr, pipe->buf, to_read);
-            if (pipe->ptr > to_read) {
-                memmove(pipe->buf, pipe->buf + to_read, pipe->ptr - to_read);
-            }
-            pipe->ptr -= to_read;
-            pipe_wake_waiters(&pipe->blocking_write);
+        if (pipe->ptr)
+        {
+            uint32_t count = MIN(size, pipe->ptr);
+            memcpy(addr, pipe->buf, count);
+            if (pipe->ptr > count) memmove(pipe->buf, pipe->buf + count, pipe->ptr - count);
+            pipe->ptr -= count;
+            task_block_list_t *waiters = pipe_detach_waiters(&pipe->blocking_write);
             spin_unlock(&pipe->lock);
-            return to_read;
+            pipe_wake_waiters(waiters);
+            free(prepared);
+            return count;
         }
-        if (pipe->write_fds == 0) {
+        if (!pipe->write_fds)
+        {
             spin_unlock(&pipe->lock);
+            free(prepared);
             return 0;
         }
-        pipe_wait_on(pipe, &pipe->blocking_read);
+        if (!prepared)
+        {
+            spin_unlock(&pipe->lock);
+            prepared = pipe_prepare_waiter();
+            if (!prepared) scheduler_sleep_ns(1000000ULL);
+            continue;
+        }
+        bool alive = pipe_wait_on(pipe, &pipe->blocking_read, prepared);
+        prepared = NULL;
+        if (!alive) return (size_t)-EINTR;
     }
 }
 
-size_t pipe_write_inner(void *file, const void *addr, size_t size) {
-    pipe_specific_t *spec = (pipe_specific_t *)file;
-    pipe_info_t     *pipe = spec->info;
-
-    while (true) {
+size_t pipe_write_inner(void *file, const void *addr, size_t size)
+{
+    auto *spec = static_cast<pipe_specific_t *>(file);
+    if (!spec || !spec->info) return (size_t)-EINVAL;
+    pipe_info_t *pipe = spec->info;
+    PipeWaiter *prepared = NULL;
+    for (;;)
+    {
         spin_lock(&pipe->lock);
-        if (pipe->read_fds == 0) {
+        if (!pipe->read_fds)
+        {
             spin_unlock(&pipe->lock);
+            free(prepared);
             return (size_t)-EPIPE;
         }
-        if ((PIPE_BUFF - pipe->ptr) >= size) {
-            memcpy(&pipe->buf[pipe->ptr], addr, size);
+        if (pipe->ptr <= PIPE_BUFF && PIPE_BUFF - pipe->ptr >= size)
+        {
+            memcpy(pipe->buf + pipe->ptr, addr, size);
             pipe->ptr += size;
-            pipe_wake_waiters(&pipe->blocking_read);
+            task_block_list_t *waiters = pipe_detach_waiters(&pipe->blocking_read);
             spin_unlock(&pipe->lock);
+            pipe_wake_waiters(waiters);
+            free(prepared);
             return size;
         }
-        pipe_wait_on(pipe, &pipe->blocking_write);
+        if (!prepared)
+        {
+            spin_unlock(&pipe->lock);
+            prepared = pipe_prepare_waiter();
+            if (!prepared) scheduler_sleep_ns(1000000ULL);
+            continue;
+        }
+        bool alive = pipe_wait_on(pipe, &pipe->blocking_write, prepared);
+        prepared = NULL;
+        if (!alive) return (size_t)-EINTR;
     }
 }
 
@@ -177,7 +269,7 @@ size_t pipefs_write(void *file, const void *addr, size_t offset, size_t size) {
             while (cycle != PIPE_BUFF)
             {
                 size_t wrote = pipe_write_inner(file, (const char *)addr + i * PIPE_BUFF + cycle, PIPE_BUFF - cycle);
-                if (wrote == (size_t)-EPIPE) return ret ? ret : wrote;
+                if ((int64_t)wrote < 0) return ret ? ret : wrote;
                 cycle += wrote;
             }
             ret += cycle;
@@ -188,7 +280,7 @@ size_t pipefs_write(void *file, const void *addr, size_t offset, size_t size) {
         while (cycle != remainder)
         {
             size_t wrote = pipe_write_inner(file, (const char *)addr + chunks * PIPE_BUFF + cycle, remainder - cycle);
-            if (wrote == (size_t)-EPIPE) return ret ? ret : wrote;
+            if ((int64_t)wrote < 0) return ret ? ret : wrote;
             cycle += wrote;
         }
         ret += cycle;
@@ -216,13 +308,14 @@ bool pipefs_close(void *current) {
     bool free_spec  = false;
     bool free_pipe  = false;
     pipe_specific_t *other_spec = NULL;
+    task_block_list_t *waiters = NULL;
 
     spin_lock(&pipe->lock);
     if (spec->write) {
         if (pipe->write_fds > 0) pipe->write_fds--;
         free_spec = (pipe->write_fds == 0);
         if (free_spec) {
-            pipe_wake_waiters(&pipe->blocking_read);
+            waiters = pipe_detach_waiters(&pipe->blocking_read);
             pipe->write_spec = NULL;
             other_spec = pipe->read_spec;
         }
@@ -230,7 +323,7 @@ bool pipefs_close(void *current) {
         if (pipe->read_fds > 0) pipe->read_fds--;
         free_spec = (pipe->read_fds == 0);
         if (free_spec) {
-            pipe_wake_waiters(&pipe->blocking_write);
+            waiters = pipe_detach_waiters(&pipe->blocking_write);
             pipe->read_spec = NULL;
             other_spec = pipe->write_spec;
         }
@@ -238,6 +331,7 @@ bool pipefs_close(void *current) {
     free_pipe = (pipe->write_fds == 0 && pipe->read_fds == 0);
     spin_unlock(&pipe->lock);
 
+    pipe_wake_waiters(waiters);
     if (free_spec) {
         free(spec);
     }

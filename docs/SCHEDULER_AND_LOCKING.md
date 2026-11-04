@@ -16,6 +16,9 @@ counter. They solve different problems:
   underflow.
 - `scheduler_is_enabled()` is true only when the global gate is open and the
   current CPU's depth is zero.
+- `scheduler_global_enabled()` reads only the global gate. A service that has
+  already started may use it to detect fatal shutdown; a nonzero local depth
+  must never be mistaken for system-wide shutdown.
 
 Never use `enable_scheduler()` to start the system scheduler. Never replace a
 save/restore pair with a naked enable: the caller may have entered with a
@@ -38,6 +41,52 @@ indices rather than ACPI IDs. `scheduler_task_referenced()` and
 terminal before checking, and remove it from its scheduler queue before free.
 Never call these queries while holding any CPU scheduler queue lock. Queries
 perform bounded scans without allocation, yielding or I/O.
+
+Timed sleep publishes its deadline and `WAIT` under the task's CPU scheduler
+queue lock. Remote wake rechecks `WAIT` under that same lock before clearing
+the deadline and preparing wakeup credit; an observation of an older sleep
+must not clear a newer deadline. Published runnable tasks do not migrate, so
+their `cpu_id` remains the queue-array index until terminal removal. Wake,
+timer expiry and the sleep return path use CAS to preserve a concurrent
+`DEATH`/`OUT` publication. Compute the sleep time before locking; these short
+publication sections must not read clocks, log, yield or allocate. The expiry
+helper already runs under the queue lock and must not acquire it recursively.
+`tests/test_scheduler_sleep_wake.py` covers the delayed-old-wake interleaving
+and terminal publication at sleep, expiry and the final resume CAS.
+
+EEVDF runtime is measured from actual elapsed nanoseconds on each CPU, including
+voluntary blocking before the next hardware tick. A task publishes `WAIT` before
+entering the software timer interrupt, so status alone cannot decide whether its
+last CPU burst needs accounting. The timer charges its pinned current task even
+after `WAIT`, `DEATH` or `OUT` publication. A private per-CPU anchor advances once
+per accounted interval; actual handoff charges residual scheduler work before
+starting the selected task's interval. Resuming a task never charges its off-CPU
+sleep. Same-task publication and stale clock samples must not reset or rewind
+the anchor. Read the clock before acquiring a scheduler queue lock; charge TCB
+vruntime under that lock to serialize remote wake placement. No TCB or
+`PROCESSOR_INFO` field or assembly offset is added for this accounting.
+
+Wake placement caps old sleeper lag with `max(old_vruntime, queue_base - credit)`;
+it must never erase consumed CPU time. A remote wake uses the target queue's
+non-idle runnable current task, or its minimum runnable vruntime, rather than the
+calling CPU's unrelated vruntime domain. CPU accounting and placement retain
+terminal-state CAS rules. The 250Hz hardware timer and four-tick switch policy
+remain unchanged; no task class receives an audio-specific priority or slice.
+`tests/test_scheduler_fairness.py` executes the production timer and selection
+with sixteen sub-tick sleepers competing against an ordinary four-ms-slice
+producer. An old-policy control reproduces starvation; the fixed policy has
+bounded dispatch. It also checks exact interval accounting, residual switch
+work, sleep exclusion, clock anomalies, remote queue domains and saturation.
+
+LAPIC timer calibration preserves the 250Hz target. Each endpoint brackets a
+current-count read with HPET reads; subtract two observed counts from the same
+continuous one-shot interval and normalize by their actual midpoint elapsed
+time. Never assume the minimum wait was the full calibration interval: MMIO
+latency before/after HPET samples previously produced different timer periods
+on identical CPUs. Three bounded 10ms samples select the narrowest relative
+brackets; combined uncertainty above 10% is rejected. Clock/counter failures
+retain the existing finite fallback. `tests/test_apic_calibration.py` covers
+delayed endpoints, overshoot, non-QEMU frequencies and failed clocks.
 
 Exception, IRQ and syscall entry must preserve x87/MMX/MXCSR/XMM state before
 calling C: optimized kernel helpers, including page clearing for a lazy user
@@ -69,6 +118,36 @@ blocking mutex while holding a spin lock. Never do blocking work with scheduler
 preemption disabled. If a protected operation needs a large copy or allocation,
 capture/pin the required state, release the spin lock, do the work, then
 validate the generation/lifetime before publishing the result.
+
+## Runtime serial transport
+
+Normal serial output formats into a private per-call writer and publishes
+bounded chunks to static FIFO records. The queue lock protects metadata and
+short copies only; never format, poll UART, render, notify observers, allocate
+or wait while holding it. Only the permanent consumer accesses UART at runtime,
+outside locks, with bounded FIFO batches and cooperative waits. IRQ, nested
+preemption and consumer-reentrant producers must never wait for queue space.
+Log acceptance is decided when a record is enqueued. Keep prompt state and
+console/observer delivery in FIFO record order; raw output retains its original
+log-filter behavior.
+
+The separate serial owner-lifetime lock pins an incomplete record's TCB during
+recovery. The consumer releases the serial queue lock before checking scheduler
+references, then revalidates the record generation before closing it. Producers
+never acquire the lifetime lock. `serial_task_quiescent_exit()` takes that same
+lifetime lock before a TCB is freed, outside CPU scheduler queue locks. A dead
+task may still execute a syscall: terminal status without scheduler quiescence
+is insufficient. The worker also recovers abandoned heads so cleanup logging
+cannot block a reaper before it reaches the before-free hook.
+
+`scheduler_stop()` may call the weak serial panic hook only to publish an atomic
+emergency flag. It must not acquire a lock, wait, allocate or perform I/O. This
+explicit notification covers fatal shutdown before the consumer first runs.
+Emergency output bypasses unfinished FIFO ownership and uses bounded raw UART;
+it must not call console/observer callbacks that the interrupted context may
+already own. An ordinary local preemption depth is never a panic transition.
+`tests/test_serial_transport.py` exercises the actual transport and formatter
+under ASan/UBSan, including these startup, shutdown and lifetime boundaries.
 
 ## Recovering abandoned UI locks
 
@@ -116,7 +195,71 @@ save queue spin lock protects job publication/status only; snapshot allocation,
 free, thread creation and VFS work happen after releasing it. Delayed writes
 must check the policy generation under the storage mutex before writing.
 
+The product window lifetime gate pins `WINDOWLS`, its controls and its sheet
+across preemptible GUI calls. Only the same non-null TCB may acquire it
+recursively; inner releases do not publish an unlocked gate or reset its hold
+timer. Recovery and process-exit cleanup require a terminal owner and absence
+from all scheduler current, selected and previous-stack references. The short
+metadata spin lock protects ownership only: allocation, VFS, painting, logging
+and yielding happen after unlocking. Keep the lock order window gate before
+toast/IME state locks; toast desktop-presence checks take a short window
+snapshot before taking the toast mutex.
+
+GUI input, animation completion and notification actions share a private
+asynchronous message publication queue. Publication copies a record and pins
+the original descriptor, then transfers its operation ticket to kernel
+ownership (`owner == NULL`) while holding the queue metadata lock. Thread-exit
+cleanup must skip those tickets; the permanent delivery worker releases them.
+Queued state retains no PCB or TCB pointer and never resolves a numeric FD
+again. Descriptor retirement cancels pending delivery; private message pipe
+endpoints use `O_CLOEXEC` so old callbacks do not survive exec.
+
+Each original pipe has one FIFO. Only the delivery worker writes these GUI
+records, using an all-or-nothing nonblocking packet write outside the window
+gate. It rotates among pipes with a fixed work budget; one full destination
+cannot block another application. Pipe spin locks cover only packet copies and
+wait-list detachment. Waking detached waiters verifies numeric task identity
+under process/thread list locks before dereferencing a TCB; freeing nodes
+occurs after unlocking. Wait/wake status publication must not replace a
+concurrently published terminal state.
+
+Pending GUI delivery is bounded to 4096 records per pipe and 32768 globally.
+At capacity the kernel returns `-EAGAIN` or `-ENOBUFS` and rejects new records
+while retaining the existing FIFO; legacy void entry points receive a bounded
+serial diagnostic. Allocation failure returns `-ENOMEM`. These bounds cannot
+guarantee lossless delivery to an application that permanently stops reading;
+never wait for pipe capacity while holding the window gate or silently grow
+an unbounded queue to conceal that condition.
+
 ## Exec and IPC publication
+
+Native process creation prepares a complete PCB before publishing it in the
+process/family lists. A private `ProcessPreparation` ticket pins that PCB and
+its page directory through ELF loading and the first thread's publication.
+The same TCB may recurse; another preparer waits outside spin locks. Collection
+and exec publication must check these tickets. Check the cleanup claim again
+under the preparation registry lock before linking a new ticket, so collection
+cannot claim an apparently unpinned PCB between validation and publication.
+An abandoned ticket's draft may be reclaimed only after its owner is terminal
+and no scheduler reference retains that owner.
+
+TCB allocation, kernel/syscall stacks, user-stack reservation, VFS operations,
+message-entry mapping and queue-node allocation belong to the preemptible
+preparation phase. The creation spin lock protects only validation and prepared
+node publication. Cache IDs before publication: another CPU may run and reclaim
+the new thread immediately. Rollback detaches metadata under the lock and frees
+resources after unlocking. A caller with nonzero preemption depth is rejected
+without consuming its arguments, rather than relaxing its enclosing scope.
+
+ELF loading writes through an explicit target page directory and HHDM, without
+borrowing the child's CR3. A timer restores the current TCB's process CR3, so
+large copies through child virtual addresses cannot safely remain preemptible.
+Only `clone_page_directory(kernel, false)` uses the permanent bootstrap-table
+copy path outside the whole-tree lock; other clone modes retain their existing
+source-lock protocol. `free_page_directory` requires an unpublished/private or
+quiescent, withdrawn address space. It detaches the table under a short lock
+and reclaims its private low-half tables afterward, preserving shared high-half
+and huge entries. These rules do not solve arbitrary concurrent fork/exec.
 
 `process_execve()` prepares a private ELF image while scheduling is available,
 then publishes the complete image in a short `create_thread_lock` section.

@@ -14,8 +14,6 @@ spin_t fmt_lock; // For write_serial_fmt
 
 static bool serial_prompt_active  = false;
 static bool serial_line_start     = true;
-static bool serial_restore_prompt = false;
-static bool serial_log_active     = false;
 static uint64_t serial_log_config = LOG_CONFIG_DEFAULT;
 static constexpr const char serial_shell_prompt[] = "xj380$ ";
 
@@ -25,15 +23,17 @@ extern "C" bool serial_logging_allowed() __attribute__((weak));
 
 #define PORT 0x3f8 // COM1
 
+static void serial_tx_reset();
+static size_t serial_tx_fifo_bytes = 1;
+
 int init_serial()
 {
     serial_lock = SPIN_INIT;
     fmt_lock    = SPIN_INIT;
     serial_prompt_active  = false;
     serial_line_start     = true;
-    serial_restore_prompt = false;
-    serial_log_active     = false;
     serial_log_config_set(LOG_CONFIG_DEFAULT);
+    serial_tx_reset();
 
     outb(PORT + 1, 0x00); // Disable all interrupts
     outb(PORT + 3, 0x80); // Enable DLAB (set baud rate divisor)
@@ -41,6 +41,9 @@ int init_serial()
     outb(PORT + 1, 0x00); //                  (hi byte)
     outb(PORT + 3, 0x03); // 8 bits, no parity, one stop bit
     outb(PORT + 2, 0xC7); // Enable FIFO, clear them, with 14-byte threshold
+    // An enabled 16550-compatible FIFO accepts sixteen bytes after THRE.
+    // Unknown/non-FIFO UARTs retain the conservative single-byte path.
+    serial_tx_fifo_bytes = (inb(PORT + 2) & 0xc0) == 0xc0 ? 16 : 1;
     outb(PORT + 4, 0x0B); // IRQs enabled, RTS/DSR set
     outb(PORT + 4, 0x1E); // Set in loopback mode, test the serial chip
     outb(PORT + 0, 0xAE); // Test serial chip (send byte 0xAE and check if serial returns same byte)
@@ -78,24 +81,6 @@ int is_transmit_empty()
     return inb(PORT + 5) & 0x20;
 }
 
-void write_serial(char a)
-{
-    while (is_transmit_empty() == 0)
-        ;
-
-    outb(PORT, a);
-}
-
-static void write_serial_string_unlocked(const char *str)
-{
-    while (*str)
-    {
-        char ch = *str++;
-        write_serial(ch);
-        serial_line_start = ch == '\n';
-    }
-}
-
 static void notify_serial_output_observer(const char *str)
 {
     if (serial_output_observer != nullptr) serial_output_observer(str);
@@ -108,70 +93,19 @@ static bool is_serial_shell_prompt(const char *str)
     return serial_shell_prompt[index] == '\0' && str[index] == '\0';
 }
 
-static bool serial_string_contains_newline(const char *str)
-{
-    while (*str)
-    {
-        if (*str++ == '\n') return true;
-    }
-    return false;
-}
+#include "serial_tx.h"
 
-static void write_serial_output_unlocked(const char *str)
+void write_serial(char byte)
 {
-    if (serial_log_active && serial_logging_allowed != nullptr && !serial_logging_allowed())
-    {
-        return;
-    }
-#if !OPENXJ380_INPUT_OUTPUT_DISABLED
-    console_write(str);
-#endif
-    write_serial_string_unlocked(str);
-    notify_serial_output_observer(str);
+    SerialRecordWriter output(false, false, true);
+    output.put(byte);
 }
-
 
 void write_serial_string(const char *str)
 {
-    if (str == NULL) {
-        return;
-    }
-
-    spin_lock(&serial_lock);
-    write_serial_output_unlocked(str);
-    if (is_serial_shell_prompt(str)) serial_prompt_active = true;
-    else if (serial_prompt_active && serial_string_contains_newline(str)) serial_prompt_active = false;
-    spin_unlock(&serial_lock);
-    notify_serial_output_observer(nullptr);
-}
-
-static void serial_log_begin()
-{
-    spin_lock(&serial_lock);
-    serial_restore_prompt = serial_prompt_active;
-    if (serial_restore_prompt && !serial_line_start)
-    {
-        write_serial_output_unlocked("\n");
-    }
-    serial_prompt_active = false;
-    serial_log_active = true;
-}
-
-static void serial_log_end()
-{
-    if (serial_restore_prompt)
-    {
-        if (!serial_line_start)
-        {
-            write_serial_output_unlocked("\n");
-        }
-        write_serial_output_unlocked(serial_shell_prompt);
-        serial_prompt_active = true;
-    }
-    serial_restore_prompt = false;
-    serial_log_active = false;
-    spin_unlock(&serial_lock);
-    notify_serial_output_observer(nullptr);
+    if (!str) return;
+    SerialRecordWriter output(false, is_serial_shell_prompt(str));
+    output.append(str);
 }
 
 void write_serial_dec(unsigned long long dec)
@@ -506,213 +440,92 @@ size_t vwprintf(Writer *writer, const char *fmt, va_list args)
     return result;
 }
 
-#define SERIAL_WRITE_BUFFER_SIZE 1024
-char   serial_write_buffer[SERIAL_WRITE_BUFFER_SIZE] = {0};
-size_t serial_write_buffer_index                     = 0;
-
-uint8_t serial_write_handler(Writer *writer, char ch)
+// Formatting belongs to the caller's private stack. The queue stores only
+// copied bytes; no formatter, UART wait, console or observer owns an IRQ spin.
+static void serial_format_record(bool log, const char *prefix, const char *fmt, va_list args)
 {
-    (void)writer;
-    serial_write_buffer[serial_write_buffer_index] = ch;
-    ++serial_write_buffer_index;
-    if (serial_write_buffer_index >= SERIAL_WRITE_BUFFER_SIZE - 1) // 1 for '\0'
-    {
-        if (serial_log_active) write_serial_output_unlocked(serial_write_buffer);
-        else write_serial_string(serial_write_buffer);
-        serial_write_buffer_index = 0;
-    } // Flush buffer
-    serial_write_buffer[serial_write_buffer_index] = '\0';
-    return 0;
+    SerialRecordWriter output(log);
+    if (output.discarded) return;
+    if (prefix) output.append(prefix);
+    Writer writer = {.data = &output, .handler = serial_record_write_handler};
+    vwprintf(&writer, fmt, args);
 }
-
-Writer SerialWriter = {
-    .data    = serial_write_buffer,
-    .handler = serial_write_handler,
-};
 
 void serial_wprintf(const char *fmt, ...)
 {
-    spin_lock(&fmt_lock);
     va_list args;
     va_start(args, fmt);
-    vwprintf(&SerialWriter, fmt, args);
-    // flush buffer
-    if (serial_write_buffer_index > 0)
-    {
-        if (serial_log_active) write_serial_output_unlocked(serial_write_buffer);
-        else write_serial_string(serial_write_buffer);
-        serial_write_buffer_index = 0;
-    }
+    serial_format_record(false, nullptr, fmt, args);
     va_end(args);
-    spin_unlock(&fmt_lock);
 }
 
-/**
- * Needn't heap now!!!
- */
 int write_serial_fmt(const char *fmt, ...)
 {
-    spin_lock(&fmt_lock);
     va_list args;
     va_start(args, fmt);
-    vwprintf(&SerialWriter, fmt, args);
-    // flush buffer
-    if (serial_write_buffer_index > 0)
-    {
-        if (serial_log_active) write_serial_output_unlocked(serial_write_buffer);
-        else write_serial_string(serial_write_buffer);
-        serial_write_buffer_index = 0;
-    }
+    serial_format_record(false, nullptr, fmt, args);
     va_end(args);
-    spin_unlock(&fmt_lock);
     return 0;
 }
 
-// 用于输出消息
 int printk(const char *fmt, ...)
 {
-    spin_lock(&fmt_lock);
-
-    serial_log_begin();
-    write_serial_output_unlocked("[XJ380 System Kernel][MESSAGE] ");
-
     va_list args;
     va_start(args, fmt);
-    vwprintf(&SerialWriter, fmt, args);
-    // flush buffer
-    if (serial_write_buffer_index > 0)
-    {
-        write_serial_output_unlocked(serial_write_buffer);
-        serial_write_buffer_index = 0;
-    }
+    serial_format_record(true, "[XJ380 System Kernel][MESSAGE] ", fmt, args);
     va_end(args);
-    serial_log_end();
-    spin_unlock(&fmt_lock);
     return 0;
 }
-
 EXPORT_SYMBOL(printk);
 
-// 用于输出调试消息
 int pr_debug(const char *fmt, ...)
 {
-    spin_lock(&fmt_lock);
-
-    serial_log_begin();
-    write_serial_output_unlocked("[XJ380 System Kernel][DEBUG] ");
-
     va_list args;
     va_start(args, fmt);
-    vwprintf(&SerialWriter, fmt, args);
-    // flush buffer
-    if (serial_write_buffer_index > 0)
-    {
-        write_serial_output_unlocked(serial_write_buffer);
-        serial_write_buffer_index = 0;
-    }
+    serial_format_record(true, "[XJ380 System Kernel][DEBUG] ", fmt, args);
     va_end(args);
-    serial_log_end();
-    spin_unlock(&fmt_lock);
     return 0;
 }
 EXPORT_SYMBOL(pr_debug);
 
-// 用于输出警告消息
 int pr_warn(const char *fmt, ...)
 {
-    spin_lock(&fmt_lock);
-
-    serial_log_begin();
-    write_serial_output_unlocked("[XJ380 System Kernel][WARNING] ");
-
     va_list args;
     va_start(args, fmt);
-    vwprintf(&SerialWriter, fmt, args);
-    // flush buffer
-    if (serial_write_buffer_index > 0)
-    {
-        write_serial_output_unlocked(serial_write_buffer);
-        serial_write_buffer_index = 0;
-    }
+    serial_format_record(true, "[XJ380 System Kernel][WARNING] ", fmt, args);
     va_end(args);
-    serial_log_end();
-    spin_unlock(&fmt_lock);
     return 0;
 }
 EXPORT_SYMBOL(pr_warn);
 
-// 用于输出调试信息消息
 int pr_info(const char *fmt, ...)
 {
-    spin_lock(&fmt_lock);
-
-    serial_log_begin();
-    write_serial_output_unlocked("[XJ380 System Kernel][INFO] ");
-
     va_list args;
     va_start(args, fmt);
-    vwprintf(&SerialWriter, fmt, args);
-    // flush buffer
-    if (serial_write_buffer_index > 0)
-    {
-        write_serial_output_unlocked(serial_write_buffer);
-        serial_write_buffer_index = 0;
-    }
+    serial_format_record(true, "[XJ380 System Kernel][INFO] ", fmt, args);
     va_end(args);
-    serial_log_end();
-    spin_unlock(&fmt_lock);
     return 0;
 }
 EXPORT_SYMBOL(pr_info);
 
-// 用于输出提示消息
 int pr_notice(const char *fmt, ...)
 {
-    spin_lock(&fmt_lock);
-
-    serial_log_begin();
-    write_serial_output_unlocked("[XJ380 System Kernel][NOTICE] ");
-
     va_list args;
     va_start(args, fmt);
-    vwprintf(&SerialWriter, fmt, args);
-    // flush buffer
-    if (serial_write_buffer_index > 0)
-    {
-        write_serial_output_unlocked(serial_write_buffer);
-        serial_write_buffer_index = 0;
-    }
+    serial_format_record(true, "[XJ380 System Kernel][NOTICE] ", fmt, args);
     va_end(args);
-    serial_log_end();
-    spin_unlock(&fmt_lock);
     return 0;
 }
 EXPORT_SYMBOL(pr_notice);
 
-// 用于输出错误消息
 int pr_err(const char *fmt, ...)
 {
-    spin_lock(&fmt_lock);
-
-    serial_log_begin();
-    write_serial_output_unlocked("[XJ380 System Kernel][ERROR] ");
-
     va_list args;
     va_start(args, fmt);
-    vwprintf(&SerialWriter, fmt, args);
-    // flush buffer
-    if (serial_write_buffer_index > 0)
-    {
-        write_serial_output_unlocked(serial_write_buffer);
-        serial_write_buffer_index = 0;
-    }
+    serial_format_record(true, "[XJ380 System Kernel][ERROR] ", fmt, args);
     va_end(args);
-    serial_log_end();
-    spin_unlock(&fmt_lock);
     return 0;
 }
-
-
 
 typedef struct UnsafeBufWriterData
 {
@@ -815,20 +628,12 @@ EXPORT_SYMBOL(snprintf);
 /**
  * Needn't heap now!!!
  */
-void write_serial_fmt_heapless(const char *fmt, ...) // same as write_serial_fmt
+void write_serial_fmt_heapless(const char *fmt, ...)
 {
-    spin_lock(&fmt_lock);
     va_list args;
     va_start(args, fmt);
-    vwprintf(&SerialWriter, fmt, args);
-    // flush buffer
-    if (serial_write_buffer_index > 0)
-    {
-        write_serial_string(serial_write_buffer);
-        serial_write_buffer_index = 0;
-    }
+    serial_format_record(false, nullptr, fmt, args);
     va_end(args);
-    spin_unlock(&fmt_lock);
 }
 
 EXPORT_SYMBOL(write_serial_fmt);

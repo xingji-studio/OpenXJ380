@@ -58,8 +58,17 @@ void reaper_thread()
         fd_reap_abandoned_operations();
         procfs_reap_retired();
         pcb_t target = find_reapable_child(kernel_group);
-        if (target != NULL) process_complete_wait(target);
-        scheduler_yield();
+        if (target != NULL)
+        {
+            process_complete_wait(target);
+            scheduler_yield();
+        }
+        else
+        {
+            // Every reclamation scan has returned and released its locks.
+            // An empty pass is idle work, not a permanently runnable thread.
+            scheduler_sleep_ns(10000000ULL);
+        }
     }
 }
 

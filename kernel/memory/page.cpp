@@ -697,7 +697,7 @@ static page_table_t *copy_page_table_recursive(page_table_t *source_table, int l
     return new_table;
 }
 
-static void free_page_table_recursive(page_table_t *table, int level)
+static void free_page_table_recursive(page_table_t *table, int level, bool failed_clone = false)
 {
     if (table == NULL) return;
     if (level <= 1)
@@ -705,7 +705,10 @@ static void free_page_table_recursive(page_table_t *table, int level)
         for (int i = 0; i < 512; i++)
         {
             uint64_t entry = table->entries[i].value;
-            if ((entry & PTE_PRESENT) && (entry & PTE_FRAME_ALLOCATED))
+            // A failed bootstrap clone owns only the ordinary pages it copied;
+            // a special leaf copied verbatim still belongs to its source.
+            if ((entry & PTE_PRESENT) && (entry & PTE_FRAME_ALLOCATED) &&
+                (!failed_clone || !(entry & PTE_HUGE)))
             {
                 free_frame(entry & PTE_ADDR_MASK);
                 table->entries[i].value = 0;
@@ -722,38 +725,106 @@ static void free_page_table_recursive(page_table_t *table, int level)
         if (entry & PTE_HUGE) continue;//竟然没有检查,还是保险点吧！！！！
 
         page_table_t *page_table_next = (page_table_t *)(phys_to_virt(table->entries[i].value & PTE_ADDR_MASK));
-        free_page_table_recursive(page_table_next, level - 1);
+        free_page_table_recursive(page_table_next, level - 1, failed_clone);
     }
     free_frame((uint64_t)virt_to_phys((uint64_t)table));
 }
 
+// Only the kernel's permanent bootstrap mappings may be read without the
+// legacy clone lock. The destination stays private until the caller publishes
+// the completed image. This deliberately does not alter fork's source contract.
+static page_table_t *copy_bootstrap_user_tables(page_table_t *source, int level)
+{
+    if (source == NULL) return NULL;
+    uint64_t frame = alloc_frames(1);
+    if (frame == 0) return NULL;
+    page_table_t *copy = (page_table_t *)phys_to_virt(frame);
+    page_table_clear(copy);
+
+    for (int i = 0; i < (level == 4 ? 256 : 512); ++i)
+    {
+        uint64_t entry = source->entries[i].value;
+        if (!(entry & PTE_PRESENT)) continue;
+        if (entry & PTE_HUGE)
+        {
+            copy->entries[i].value = entry;
+            continue;
+        }
+
+        uint64_t child;
+        if (level == 1)
+        {
+            child = alloc_frames(1);
+            if (child == 0)
+            {
+                free_page_table_recursive(copy, level, true);
+                return NULL;
+            }
+            memcpy(phys_to_virt(child), phys_to_virt(entry & PTE_ADDR_MASK), PAGE_SIZE);
+            copy->entries[i].value = child | (entry & ~PTE_ADDR_MASK) | PTE_FRAME_ALLOCATED;
+        }
+        else
+        {
+            page_table_t *table = copy_bootstrap_user_tables(
+                (page_table_t *)phys_to_virt(entry & PTE_ADDR_MASK), level - 1);
+            if (table == NULL)
+            {
+                free_page_table_recursive(copy, level, true);
+                return NULL;
+            }
+            child = (uint64_t)virt_to_phys((uint64_t)table);
+            copy->entries[i].value = child | (entry & ~PTE_ADDR_MASK);
+        }
+    }
+    return copy;
+}
+
 page_directory_t *clone_page_directory(page_directory_t *dir, bool all_copy)
 {
-    spin_lock(&page_lock);
+    // Kernel low-half bootstrap tables have a permanent lifetime and are not
+    // mutated after boot. Other sources still require the existing whole-copy
+    // protocol; an entry snapshot alone cannot pin a live process's child table.
+    bool bootstrap_copy = dir == &kernel_page_dir && !all_copy;
+    if (!bootstrap_copy) spin_lock(&page_lock);
     page_directory_t *new_directory = (page_directory_t *)(malloc(sizeof(page_directory_t)));
     if (new_directory == NULL)
     {
-        spin_unlock(&page_lock);
+        if (!bootstrap_copy) spin_unlock(&page_lock);
         return NULL;
     }
-    new_directory->table = copy_page_table_recursive(dir->table, 4, all_copy, false);
+    new_directory->table = bootstrap_copy ? copy_bootstrap_user_tables(dir->table, 4) :
+                                           copy_page_table_recursive(dir->table, 4, all_copy, false);
     if (new_directory->table == NULL)
     {
         free(new_directory);
-        spin_unlock(&page_lock);
+        if (!bootstrap_copy) spin_unlock(&page_lock);
         return NULL;
     }
-    if (!all_copy) memcpy((uint64_t *)new_directory->table + 256, (uint64_t *)dir->table + 256, PAGE_SIZE / 2);
-    spin_unlock(&page_lock);
+    if (!all_copy)
+    {
+        // This is a bounded root-entry snapshot, not a physical-page copy. All
+        // upper-half mappings retain their existing shared ownership.
+        if (bootstrap_copy) spin_lock(&page_lock);
+        memcpy((uint64_t *)new_directory->table + 256, (uint64_t *)dir->table + 256, PAGE_SIZE / 2);
+        if (bootstrap_copy) spin_unlock(&page_lock);
+    }
+    if (!bootstrap_copy) spin_unlock(&page_lock);
     return new_directory;
 }
 
 void free_page_directory(page_directory_t *dir)
 {
+    if (dir == NULL) return;
+    // The caller exclusively owns an unpublished directory, or has withdrawn
+    // its process and proved that no CPU/thread can still use the address space.
+    // Detach only metadata under the lock; recursive frame/heap reclamation
+    // must remain preemptible. This is not a concurrent-exec lifetime mechanism.
     spin_lock(&page_lock);
-    free_page_table_recursive(dir->table, 4);
-    free(dir);
+    page_table_t *table = dir->table;
+    dir->table = NULL;
     spin_unlock(&page_lock);
+    free_page_table_recursive(table, 4);
+    free(dir);
 }
 
 void unmap_page(page_directory_t *directory, uint64_t vaddr)
