@@ -15,6 +15,7 @@ generates a distributable bundle at `out/compliance/third-party`.
 | libvterm | MIT | `third_party/libvterm/LICENSE` |
 | Mbed TLS | Apache-2.0 | `third_party/mbedtls-license-selection.json` |
 | Lexbor | Apache-2.0 | `third_party/lexbor/LICENSE` and `NOTICE` |
+| parson JSON parser | MIT | `third_party/parson/LICENSE`; `third_party/parson/SOURCE.md`; `lib/xapi_json_impl.inc` |
 | Rust alloc/compiler_builtins | Apache-2.0 OR MIT | `third_party/rust-runtime/LICENSE-APACHE`; `third_party/rust-runtime/LICENSE-MIT`; `third_party/rust-runtime/SOURCE.md`; `licenses/liballoc.txt`; `liballoc-x86_64.a` |
 | talc allocator | MIT | `third_party/talc/LICENSE.md`; `third_party/talc/SOURCE.md`; `liballoc-x86_64.a` |
 | BusyBox 1.31.1 | GPL-2.0-only | `third_party/busybox-source` |
