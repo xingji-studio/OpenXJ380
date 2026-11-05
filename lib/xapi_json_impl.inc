@@ -1,9 +1,9 @@
-typedef struct xapi_JsonParser
+typedef struct XJsonParser
 {
     const char *cursor;
-} xapi_JsonParser;
+} XJsonParser;
 
-static void xapi_jsonSkipSpaces(xapi_JsonParser *parser)
+static void xapi_jsonSkipSpaces(XJsonParser *parser)
 {
     while (*parser->cursor && isspace((unsigned char)*parser->cursor))
     {
@@ -22,19 +22,19 @@ static int xapi_jsonStartsWith(const char *text, const char *pattern)
     return 1;
 }
 
-static xapi_JsonValue *xapi_jsonCreateValue(xapi_JsonValueType type)
+static XJsonValue *xapi_jsonCreateValue(XJsonValueType type)
 {
-    xapi_JsonValue *value = (xapi_JsonValue *)calloc(1, sizeof(xapi_JsonValue));
+    XJsonValue *value = (XJsonValue *)calloc(1, sizeof(XJsonValue));
     if (!value) { return NULL; }
     value->type = type;
     return value;
 }
 
-static void xapi_jsonFreeObjectEntries(xapi_JsonObjectEntry *entry)
+static void xapi_jsonFreeObjectEntries(XJsonObjectEntry *entry)
 {
     while (entry)
     {
-        xapi_JsonObjectEntry *next = entry->next;
+        XJsonObjectEntry *next = entry->next;
         free(entry->key);
         xapi_freeJsonValue(entry->value);
         free(entry);
@@ -42,11 +42,11 @@ static void xapi_jsonFreeObjectEntries(xapi_JsonObjectEntry *entry)
     }
 }
 
-void xapi_freeJsonValue(xapi_JsonValue *value)
+void xapi_freeJsonValue(XJsonValue *value)
 {
     while (value)
     {
-        xapi_JsonValue *next = value->next;
+        XJsonValue *next = value->next;
 
         if (value->type == XAPI_JSON_VALUE_STRING)
         {
@@ -66,7 +66,7 @@ void xapi_freeJsonValue(xapi_JsonValue *value)
     }
 }
 
-void xapi_freeJsonDocument(xapi_JsonDocument *document)
+void xapi_freeJsonDocument(XJsonDocument *document)
 {
     if (!document) { return; }
 
@@ -74,7 +74,7 @@ void xapi_freeJsonDocument(xapi_JsonDocument *document)
     document->root = NULL;
 }
 
-static int xapi_jsonAppendArrayItem(xapi_JsonValue *arrayValue, xapi_JsonValue *item)
+static int xapi_jsonAppendArrayItem(XJsonValue *arrayValue, XJsonValue *item)
 {
     if (!arrayValue || !item || arrayValue->type != XAPI_JSON_VALUE_ARRAY) { return XAPI_JSON_PARSE_INVALID_PARAM; }
 
@@ -84,7 +84,7 @@ static int xapi_jsonAppendArrayItem(xapi_JsonValue *arrayValue, xapi_JsonValue *
         return XAPI_JSON_PARSE_OK;
     }
 
-    xapi_JsonValue *tail = arrayValue->as.arrayValue;
+    XJsonValue *tail = arrayValue->as.arrayValue;
     while (tail->next)
     {
         tail = tail->next;
@@ -93,7 +93,7 @@ static int xapi_jsonAppendArrayItem(xapi_JsonValue *arrayValue, xapi_JsonValue *
     return XAPI_JSON_PARSE_OK;
 }
 
-static int xapi_jsonAppendObjectEntry(xapi_JsonValue *objectValue, xapi_JsonObjectEntry *entry)
+static int xapi_jsonAppendObjectEntry(XJsonValue *objectValue, XJsonObjectEntry *entry)
 {
     if (!objectValue || !entry || objectValue->type != XAPI_JSON_VALUE_OBJECT) { return XAPI_JSON_PARSE_INVALID_PARAM; }
 
@@ -103,7 +103,7 @@ static int xapi_jsonAppendObjectEntry(xapi_JsonValue *objectValue, xapi_JsonObje
         return XAPI_JSON_PARSE_OK;
     }
 
-    xapi_JsonObjectEntry *tail = objectValue->as.objectValue;
+    XJsonObjectEntry *tail = objectValue->as.objectValue;
     while (tail->next)
     {
         tail = tail->next;
@@ -139,7 +139,7 @@ static int xapi_jsonAppendChar(char **buffer, size_t *length, size_t *capacity, 
     return XAPI_JSON_PARSE_OK;
 }
 
-static int xapi_jsonParseStringRaw(xapi_JsonParser *parser, char **outString)
+static int xapi_jsonParseStringRaw(XJsonParser *parser, char **outString)
 {
     char  *buffer   = NULL;
     size_t length   = 0;
@@ -314,11 +314,11 @@ static int xapi_jsonParseNumberValue(const char *begin, const char *end, double 
     return XAPI_JSON_PARSE_OK;
 }
 
-static int xapi_jsonParseValue(xapi_JsonParser *parser, xapi_JsonValue **outValue);
+static int xapi_jsonParseValue(XJsonParser *parser, XJsonValue **outValue);
 
-static int xapi_jsonParseObject(xapi_JsonParser *parser, xapi_JsonValue **outValue)
+static int xapi_jsonParseObject(XJsonParser *parser, XJsonValue **outValue)
 {
-    xapi_JsonValue *objectValue = NULL;
+    XJsonValue *objectValue = NULL;
 
     if (*parser->cursor != '{') { return XAPI_JSON_PARSE_SYNTAX_ERROR; }
     parser->cursor++;
@@ -336,7 +336,7 @@ static int xapi_jsonParseObject(xapi_JsonParser *parser, xapi_JsonValue **outVal
 
     for (;;)
     {
-        xapi_JsonObjectEntry *entry = NULL;
+        XJsonObjectEntry *entry = NULL;
         int                   ret   = XAPI_JSON_PARSE_OK;
 
         xapi_jsonSkipSpaces(parser);
@@ -346,7 +346,7 @@ static int xapi_jsonParseObject(xapi_JsonParser *parser, xapi_JsonValue **outVal
             return XAPI_JSON_PARSE_SYNTAX_ERROR;
         }
 
-        entry = (xapi_JsonObjectEntry *)calloc(1, sizeof(xapi_JsonObjectEntry));
+        entry = (XJsonObjectEntry *)calloc(1, sizeof(XJsonObjectEntry));
         if (!entry)
         {
             xapi_freeJsonValue(objectValue);
@@ -400,9 +400,9 @@ static int xapi_jsonParseObject(xapi_JsonParser *parser, xapi_JsonValue **outVal
     }
 }
 
-static int xapi_jsonParseArray(xapi_JsonParser *parser, xapi_JsonValue **outValue)
+static int xapi_jsonParseArray(XJsonParser *parser, XJsonValue **outValue)
 {
-    xapi_JsonValue *arrayValue = NULL;
+    XJsonValue *arrayValue = NULL;
 
     if (*parser->cursor != '[') { return XAPI_JSON_PARSE_SYNTAX_ERROR; }
     parser->cursor++;
@@ -420,7 +420,7 @@ static int xapi_jsonParseArray(xapi_JsonParser *parser, xapi_JsonValue **outValu
 
     for (;;)
     {
-        xapi_JsonValue *item = NULL;
+        XJsonValue *item = NULL;
         int             ret  = XAPI_JSON_PARSE_OK;
 
         xapi_jsonSkipSpaces(parser);
@@ -450,10 +450,10 @@ static int xapi_jsonParseArray(xapi_JsonParser *parser, xapi_JsonValue **outValu
     }
 }
 
-static int xapi_jsonParseNumber(xapi_JsonParser *parser, xapi_JsonValue **outValue)
+static int xapi_jsonParseNumber(XJsonParser *parser, XJsonValue **outValue)
 {
     const char     *begin = parser->cursor;
-    xapi_JsonValue *value = NULL;
+    XJsonValue *value = NULL;
     double          numberValue;
 
     if (*parser->cursor == '-') { parser->cursor++; }
@@ -506,9 +506,9 @@ static int xapi_jsonParseNumber(xapi_JsonParser *parser, xapi_JsonValue **outVal
     return XAPI_JSON_PARSE_OK;
 }
 
-static int xapi_jsonParseLiteral(xapi_JsonParser *parser, xapi_JsonValue **outValue)
+static int xapi_jsonParseLiteral(XJsonParser *parser, XJsonValue **outValue)
 {
-    xapi_JsonValue *value = NULL;
+    XJsonValue *value = NULL;
 
     if (xapi_jsonStartsWith(parser->cursor, "null"))
     {
@@ -538,9 +538,9 @@ static int xapi_jsonParseLiteral(xapi_JsonParser *parser, xapi_JsonValue **outVa
     return XAPI_JSON_PARSE_OK;
 }
 
-static int xapi_jsonParseStringValue(xapi_JsonParser *parser, xapi_JsonValue **outValue)
+static int xapi_jsonParseStringValue(XJsonParser *parser, XJsonValue **outValue)
 {
-    xapi_JsonValue *value = xapi_jsonCreateValue(XAPI_JSON_VALUE_STRING);
+    XJsonValue *value = xapi_jsonCreateValue(XAPI_JSON_VALUE_STRING);
     if (!value) { return XAPI_JSON_PARSE_NO_MEMORY; }
 
     int ret = xapi_jsonParseStringRaw(parser, &value->as.stringValue);
@@ -554,7 +554,7 @@ static int xapi_jsonParseStringValue(xapi_JsonParser *parser, xapi_JsonValue **o
     return XAPI_JSON_PARSE_OK;
 }
 
-static int xapi_jsonParseValue(xapi_JsonParser *parser, xapi_JsonValue **outValue)
+static int xapi_jsonParseValue(XJsonParser *parser, XJsonValue **outValue)
 {
     xapi_jsonSkipSpaces(parser);
 
@@ -573,9 +573,9 @@ static int xapi_jsonParseValue(xapi_JsonParser *parser, xapi_JsonValue **outValu
     return XAPI_JSON_PARSE_SYNTAX_ERROR;
 }
 
-int xapi_parseJson(const char *jsonText, xapi_JsonDocument *outDocument)
+int xapi_parseJson(const char *jsonText, XJsonDocument *outDocument)
 {
-    xapi_JsonParser parser;
+    XJsonParser parser;
     int             ret = XAPI_JSON_PARSE_OK;
 
     if (!jsonText || !outDocument) { return XAPI_JSON_PARSE_INVALID_PARAM; }
@@ -597,9 +597,9 @@ int xapi_parseJson(const char *jsonText, xapi_JsonDocument *outDocument)
     return XAPI_JSON_PARSE_OK;
 }
 
-xapi_JsonValue *xapi_jsonObjectGet(const xapi_JsonValue *objectValue, const char *key)
+XJsonValue *xapi_jsonObjectGet(const XJsonValue *objectValue, const char *key)
 {
-    xapi_JsonObjectEntry *entry;
+    XJsonObjectEntry *entry;
 
     if (!objectValue || objectValue->type != XAPI_JSON_VALUE_OBJECT || !key) { return NULL; }
 
@@ -612,10 +612,10 @@ xapi_JsonValue *xapi_jsonObjectGet(const xapi_JsonValue *objectValue, const char
     return NULL;
 }
 
-int xapi_jsonArraySize(const xapi_JsonValue *arrayValue)
+int xapi_jsonArraySize(const XJsonValue *arrayValue)
 {
     int             count = 0;
-    xapi_JsonValue *item;
+    XJsonValue *item;
 
     if (!arrayValue || arrayValue->type != XAPI_JSON_VALUE_ARRAY) { return 0; }
 
@@ -628,10 +628,10 @@ int xapi_jsonArraySize(const xapi_JsonValue *arrayValue)
     return count;
 }
 
-xapi_JsonValue *xapi_jsonArrayAt(const xapi_JsonValue *arrayValue, int index)
+XJsonValue *xapi_jsonArrayAt(const XJsonValue *arrayValue, int index)
 {
     int             current = 0;
-    xapi_JsonValue *item;
+    XJsonValue *item;
 
     if (!arrayValue || arrayValue->type != XAPI_JSON_VALUE_ARRAY || index < 0) { return NULL; }
 
