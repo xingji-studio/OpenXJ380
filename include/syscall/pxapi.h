@@ -1,4 +1,5 @@
 #pragma once
+#include <xauth.h>
 
 #include <proto.hpp>
 #include <installer/native_protocol.h>
@@ -397,3 +398,7 @@ uint64_t message_ask(uint64_t msg_type_p, uint64_t hdatap, uint64_t ldatap, uint
 #define XAPI_REQUEST_FILE_ACCESS 7501
 
 #define XAPI_REQUEST_SPECIAL_PERMISSION 7502
+
+uint64_t do_xapi_AuthBegin(uint64_t request, uint64_t output);
+uint64_t do_xapi_AuthFinish(uint64_t request, uint64_t output);
+uint64_t do_xapi_AccountInfo(uint64_t output);

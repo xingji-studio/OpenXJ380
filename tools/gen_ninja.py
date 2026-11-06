@@ -356,9 +356,24 @@ def root_objects(
         objs.append(obj)
     for src in cpp_files:
         obj = Path("out") / src.relative_to(ROOT).with_suffix(".o")
-        n.build(obj, "root_cxx", src, implicit=[settings, config])
+        auth_flags = {"cpp_flags": "$CPP_FLAGS -I./include/auth_compat -I./third_party/mbedtls-src/include -DMBEDTLS_CONFIG_FILE='\"user/auth_mbedtls_config.h\"'"} if src.name == "auth_crypto.cpp" else None
+        n.build(obj, "root_cxx", src, implicit=[settings, config], variables=auth_flags)
         objs.append(obj)
     return objs
+
+
+def auth_crypto_objects(n: Ninja) -> list[Path]:
+    # Each selected Mbed TLS source is Apache-2.0 OR GPL-2.0-or-later;
+    # this integration selects Apache-2.0. No vendored source is modified.
+    n.rule("auth_cc", "mkdir -p $$(dirname $out) && $cc -fno-pic -fno-pie -mcmodel=large $c_flags -I./include/auth_compat -I./third_party/mbedtls-src/include -DMBEDTLS_CONFIG_FILE='\"user/auth_mbedtls_config.h\"' -MF $out.d -c $in -o $out", log_desc("CC", "$in"), depfile="$out.d")
+    objects = []
+    for name in ("asn1parse", "asn1write", "bignum", "bignum_core", "bignum_mod", "bignum_mod_raw", "constant_time",
+                 "hmac_drbg", "md", "oid", "pkcs5", "platform", "platform_util", "rsa", "rsa_alt_helpers", "sha256"):
+        obj = Path("out/auth") / (name + ".o")
+        n.build(obj, "auth_cc", Path("third_party/mbedtls-src/library") / (name + ".c"),
+                implicit=[Path("include/user/auth_mbedtls_config.h")])
+        objects.append(obj)
+    return objects
 
 
 def xapi(n: Ninja) -> tuple[list[Path], Path, Path]:
@@ -708,6 +723,7 @@ def main() -> None:
     n.build("kernel/build_config.h", "gen_config")
 
     kernel_objs = root_objects(n, nasm_files, asm_files, c_files, cpp_files)
+    kernel_objs += auth_crypto_objects(n)
     n.build("out/BOOTX64.efi", "boot", ["boot/bootx64.c", "boot/bootlib.c"],
             implicit=find_files("boot/include", (".h",)) + [Path("include/efi/root_binding.h")])
     n.build("font/hankaku.o", "objcopy_bin", "font/hankaku.bin", variables={"bin_input": "./font/hankaku.bin"})

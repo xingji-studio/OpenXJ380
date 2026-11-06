@@ -1,3 +1,4 @@
+#include <user/auth.h>
 #include <input_method.h>
 #include <user/process_launch.h>
 #include <ahci/ahci.h>
@@ -167,7 +168,7 @@ void do_xapi_GetCurrentUser(uint64_t dst)
 
 uint64_t do_xapi_UserOobeRequired()
 {
-    return user_session_needs_oobe() ? 1 : 0;
+    return (uint64_t)(int64_t)user_auth_oobe_state();
 }
 
 uint64_t do_xapi_UserList(uint64_t buffer, uint64_t max_count)
@@ -196,44 +197,14 @@ uint64_t do_xapi_UserList(uint64_t buffer, uint64_t max_count)
     return (uint64_t)count;
 }
 
-uint64_t do_xapi_UserLogin(uint64_t username, uint64_t password)
+uint64_t do_xapi_UserLogin(uint64_t, uint64_t)
 {
-    char *kusername = NULL;
-    char *kpassword = NULL;
-    int ret = xapi_copy_string_from_user(&kusername, (const char *)username, sizeof(((UserInfo *)0)->name));
-    if (ret < 0) return (uint64_t)ret;
-    ret = xapi_copy_string_from_user(&kpassword, (const char *)password, sizeof(((UserInfo *)0)->password));
-    if (ret < 0)
-    {
-        free(kusername);
-        return (uint64_t)ret;
-    }
-
-    ret = user_session_login(kusername, kpassword);
-    memset(kpassword, 0, sizeof(((UserInfo *)0)->password));
-    free(kusername);
-    free(kpassword);
-    return (uint64_t)ret;
+    return (uint64_t)-ENOSYS;
 }
 
-uint64_t do_xapi_UserCreateFirst(uint64_t username, uint64_t password)
+uint64_t do_xapi_UserCreateFirst(uint64_t, uint64_t)
 {
-    char *kusername = NULL;
-    char *kpassword = NULL;
-    int ret = xapi_copy_string_from_user(&kusername, (const char *)username, sizeof(((UserInfo *)0)->name));
-    if (ret < 0) return (uint64_t)ret;
-    ret = xapi_copy_string_from_user(&kpassword, (const char *)password, sizeof(((UserInfo *)0)->password));
-    if (ret < 0)
-    {
-        free(kusername);
-        return (uint64_t)ret;
-    }
-
-    ret = user_session_create_first(kusername, kpassword);
-    memset(kpassword, 0, sizeof(((UserInfo *)0)->password));
-    free(kusername);
-    free(kpassword);
-    return (uint64_t)ret;
+    return (uint64_t)-ENOSYS;
 }
 
 void do_xapi_Output(char *str)

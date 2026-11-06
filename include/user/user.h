@@ -14,9 +14,10 @@ typedef struct
     char          **envp;       // 环境变量指针
     size_t          envc;       // 环境变量数量
     int             fgproc;     // 前台进程
-    char            password[64];   // 用户密码
+    char            password[64]; // Reserved legacy ABI; zero in live sessions.
 } UserInfo;
 
+// Legacy disk ABI, read only during migration. New credentials use auth_store.h.
 typedef struct
 {
     int         user_count; // 用户数量
