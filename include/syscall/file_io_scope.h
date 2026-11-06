@@ -1,6 +1,7 @@
 #pragma once
 
 #include <krlibc.h>
+#include <xauth.h>
 #include <proto.hpp>
 #include <syscall/syscall.h>
 #include <task/scheduler.h>
@@ -94,6 +95,11 @@ static inline bool syscall_file_io_may_block(uint64_t number)
     case SYS_PSELECT6:
     case SYS_EPOLL_WAIT:
     case SYS_EPOLL_PWAIT:
+    case XAPI_AUTH_BEGIN:
+    case XAPI_AUTH_FINISH:
+    case XAPI_ACCOUNT_INFO:
+    case XAPI_USER_OOBE_REQUIRED:
+    case XAPI_USER_LIST:
     case XAPI_OPEN_FILE:
     case XAPI_CLOSE_FILE:
     case XAPI_SEARCH_FILE:

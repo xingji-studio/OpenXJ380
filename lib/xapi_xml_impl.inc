@@ -1,7 +1,7 @@
-typedef struct xapi_XmlParser
+typedef struct XXmlParser
 {
     const char *cursor;
-} xapi_XmlParser;
+} XXmlParser;
 
 static int xapi_xmlIsNameStart(char ch)
 {
@@ -24,7 +24,7 @@ static int xapi_xmlStartsWith(const char *text, const char *pattern)
     return 1;
 }
 
-static void xapi_xmlSkipSpaces(xapi_XmlParser *parser)
+static void xapi_xmlSkipSpaces(XXmlParser *parser)
 {
     while (*parser->cursor && isspace((unsigned char)*parser->cursor))
     {
@@ -45,15 +45,15 @@ static char *xapi_xmlDupRange(const char *begin, const char *end)
     return out;
 }
 
-static xapi_XmlNode *xapi_xmlCreateNode(xapi_XmlNodeType type)
+static XXmlNode *xapi_xmlCreateNode(XXmlNodeType type)
 {
-    xapi_XmlNode *node = (xapi_XmlNode *)calloc(1, sizeof(xapi_XmlNode));
+    XXmlNode *node = (XXmlNode *)calloc(1, sizeof(XXmlNode));
     if (!node) { return NULL; }
     node->type = type;
     return node;
 }
 
-static int xapi_xmlAppendChild(xapi_XmlNode *parent, xapi_XmlNode *child)
+static int xapi_xmlAppendChild(XXmlNode *parent, XXmlNode *child)
 {
     if (!parent || !child) { return XAPI_XML_PARSE_INVALID_PARAM; }
 
@@ -82,11 +82,11 @@ static int xapi_xmlIsAllSpaces(const char *begin, const char *end)
     return 1;
 }
 
-static void xapi_xmlFreeAttributes(xapi_XmlAttribute *attr)
+static void xapi_xmlFreeAttributes(XXmlAttribute *attr)
 {
     while (attr)
     {
-        xapi_XmlAttribute *next = attr->next;
+        XXmlAttribute *next = attr->next;
         free(attr->name);
         free(attr->value);
         free(attr);
@@ -94,14 +94,14 @@ static void xapi_xmlFreeAttributes(xapi_XmlAttribute *attr)
     }
 }
 
-void xapi_freeXmlNode(xapi_XmlNode *node)
+void xapi_freeXmlNode(XXmlNode *node)
 {
     if (!node) { return; }
 
-    xapi_XmlNode *child = node->firstChild;
+    XXmlNode *child = node->firstChild;
     while (child)
     {
-        xapi_XmlNode *next = child->nextSibling;
+        XXmlNode *next = child->nextSibling;
         xapi_freeXmlNode(child);
         child = next;
     }
@@ -112,14 +112,14 @@ void xapi_freeXmlNode(xapi_XmlNode *node)
     free(node);
 }
 
-void xapi_freeXmlTree(xapi_XmlTree *tree)
+void xapi_freeXmlTree(XXmlTree *tree)
 {
     if (!tree) { return; }
     xapi_freeXmlNode(tree->root);
     tree->root = NULL;
 }
 
-static int xapi_xmlSkipComment(xapi_XmlParser *parser)
+static int xapi_xmlSkipComment(XXmlParser *parser)
 {
     const char *p = parser->cursor + 4;
     while (*p)
@@ -134,7 +134,7 @@ static int xapi_xmlSkipComment(xapi_XmlParser *parser)
     return XAPI_XML_PARSE_SYNTAX_ERROR;
 }
 
-static int xapi_xmlSkipInstruction(xapi_XmlParser *parser)
+static int xapi_xmlSkipInstruction(XXmlParser *parser)
 {
     const char *p = parser->cursor + 2;
     while (*p)
@@ -149,7 +149,7 @@ static int xapi_xmlSkipInstruction(xapi_XmlParser *parser)
     return XAPI_XML_PARSE_SYNTAX_ERROR;
 }
 
-static int xapi_xmlSkipDeclaration(xapi_XmlParser *parser)
+static int xapi_xmlSkipDeclaration(XXmlParser *parser)
 {
     const char *p           = parser->cursor + 2;
     int         squareDepth = 0;
@@ -198,7 +198,7 @@ static int xapi_xmlSkipDeclaration(xapi_XmlParser *parser)
     return XAPI_XML_PARSE_SYNTAX_ERROR;
 }
 
-static int xapi_xmlSkipMisc(xapi_XmlParser *parser)
+static int xapi_xmlSkipMisc(XXmlParser *parser)
 {
     int ret = XAPI_XML_PARSE_OK;
 
@@ -233,7 +233,7 @@ static int xapi_xmlSkipMisc(xapi_XmlParser *parser)
     return ret;
 }
 
-static int xapi_xmlParseTextNode(xapi_XmlParser *parser, xapi_XmlNode *parent)
+static int xapi_xmlParseTextNode(XXmlParser *parser, XXmlNode *parent)
 {
     const char *begin = parser->cursor;
     const char *end   = begin;
@@ -246,7 +246,7 @@ static int xapi_xmlParseTextNode(xapi_XmlParser *parser, xapi_XmlNode *parent)
     parser->cursor = end;
     if (begin == end || xapi_xmlIsAllSpaces(begin, end)) { return XAPI_XML_PARSE_OK; }
 
-    xapi_XmlNode *textNode = xapi_xmlCreateNode(XAPI_XML_NODE_TEXT);
+    XXmlNode *textNode = xapi_xmlCreateNode(XAPI_XML_NODE_TEXT);
     if (!textNode) { return XAPI_XML_PARSE_NO_MEMORY; }
 
     textNode->text = xapi_xmlDupRange(begin, end);
@@ -259,7 +259,7 @@ static int xapi_xmlParseTextNode(xapi_XmlParser *parser, xapi_XmlNode *parent)
     return xapi_xmlAppendChild(parent, textNode);
 }
 
-static int xapi_xmlParseCDataNode(xapi_XmlParser *parser, xapi_XmlNode *parent)
+static int xapi_xmlParseCDataNode(XXmlParser *parser, XXmlNode *parent)
 {
     const char *begin = parser->cursor + 9;
     const char *p     = begin;
@@ -268,7 +268,7 @@ static int xapi_xmlParseCDataNode(xapi_XmlParser *parser, xapi_XmlNode *parent)
     {
         if (p[0] == ']' && p[1] == ']' && p[2] == '>')
         {
-            xapi_XmlNode *textNode = xapi_xmlCreateNode(XAPI_XML_NODE_TEXT);
+            XXmlNode *textNode = xapi_xmlCreateNode(XAPI_XML_NODE_TEXT);
             if (!textNode) { return XAPI_XML_PARSE_NO_MEMORY; }
 
             textNode->text = xapi_xmlDupRange(begin, p);
@@ -287,7 +287,7 @@ static int xapi_xmlParseCDataNode(xapi_XmlParser *parser, xapi_XmlNode *parent)
     return XAPI_XML_PARSE_SYNTAX_ERROR;
 }
 
-static int xapi_xmlParseName(xapi_XmlParser *parser, char **outName)
+static int xapi_xmlParseName(XXmlParser *parser, char **outName)
 {
     const char *begin = parser->cursor;
     const char *p     = begin;
@@ -306,9 +306,9 @@ static int xapi_xmlParseName(xapi_XmlParser *parser, char **outName)
     return XAPI_XML_PARSE_OK;
 }
 
-static int xapi_xmlParseAttribute(xapi_XmlParser *parser, xapi_XmlNode *node)
+static int xapi_xmlParseAttribute(XXmlParser *parser, XXmlNode *node)
 {
-    xapi_XmlAttribute *attr = (xapi_XmlAttribute *)calloc(1, sizeof(xapi_XmlAttribute));
+    XXmlAttribute *attr = (XXmlAttribute *)calloc(1, sizeof(XXmlAttribute));
     if (!attr) { return XAPI_XML_PARSE_NO_MEMORY; }
 
     int ret = xapi_xmlParseName(parser, &attr->name);
@@ -361,7 +361,7 @@ static int xapi_xmlParseAttribute(xapi_XmlParser *parser, xapi_XmlNode *node)
     }
     else
     {
-        xapi_XmlAttribute *tail = node->attributes;
+        XXmlAttribute *tail = node->attributes;
         while (tail->next)
         {
             tail = tail->next;
@@ -372,12 +372,12 @@ static int xapi_xmlParseAttribute(xapi_XmlParser *parser, xapi_XmlNode *node)
     return XAPI_XML_PARSE_OK;
 }
 
-static int xapi_xmlParseElement(xapi_XmlParser *parser, xapi_XmlNode **outNode)
+static int xapi_xmlParseElement(XXmlParser *parser, XXmlNode **outNode)
 {
     if (*parser->cursor != '<') { return XAPI_XML_PARSE_SYNTAX_ERROR; }
     parser->cursor++;
 
-    xapi_XmlNode *node = xapi_xmlCreateNode(XAPI_XML_NODE_ELEMENT);
+    XXmlNode *node = xapi_xmlCreateNode(XAPI_XML_NODE_ELEMENT);
     if (!node) { return XAPI_XML_PARSE_NO_MEMORY; }
 
     int ret = xapi_xmlParseName(parser, &node->name);
@@ -487,7 +487,7 @@ static int xapi_xmlParseElement(xapi_XmlParser *parser, xapi_XmlNode **outNode)
 
         if (*parser->cursor == '<')
         {
-            xapi_XmlNode *child = NULL;
+            XXmlNode *child = NULL;
             ret                 = xapi_xmlParseElement(parser, &child);
             if (ret != XAPI_XML_PARSE_OK)
             {
@@ -513,19 +513,19 @@ static int xapi_xmlParseElement(xapi_XmlParser *parser, xapi_XmlNode **outNode)
     }
 }
 
-int xapi_parseXml(const char *xmlText, xapi_XmlTree *outTree)
+int xapi_parseXml(const char *xmlText, XXmlTree *outTree)
 {
     if (!xmlText || !outTree) { return XAPI_XML_PARSE_INVALID_PARAM; }
 
     outTree->root = NULL;
 
-    xapi_XmlParser parser;
+    XXmlParser parser;
     parser.cursor = xmlText;
 
     int ret = xapi_xmlSkipMisc(&parser);
     if (ret != XAPI_XML_PARSE_OK) { return ret; }
 
-    xapi_XmlNode *root = NULL;
+    XXmlNode *root = NULL;
     ret                = xapi_xmlParseElement(&parser, &root);
     if (ret != XAPI_XML_PARSE_OK) { return ret; }
 

@@ -1,4 +1,5 @@
 #include <user/permissions.h>
+#include <user/auth.h>
 #include <user/process_launch.h>
 #include <user/file_access.h>
 #include <user/special_permissions.h>
@@ -48,6 +49,7 @@ void permissions_session_publish(const UserInfo *info)
 {
     spin_lock(&permission_lock);
     *current_user = *info;
+    memset(current_user->password, 0, sizeof(current_user->password));
     ++session_generation;
     spin_unlock(&permission_lock);
 }
@@ -62,6 +64,16 @@ bool permissions_session_name(char *out, size_t capacity)
     out[capacity - 1] = 0;
     spin_unlock(&permission_lock);
     return out[0] != 0;
+}
+
+bool permissions_session_snapshot(UserInfo *out, uint64_t *generation)
+{
+    spin_lock(&permission_lock);
+    *generation = session_generation;
+    bool ready = user_session_is_ready() && current_user;
+    if (ready) *out = *current_user;
+    spin_unlock(&permission_lock);
+    return ready;
 }
 
 static UserType session_type_locked()
@@ -265,6 +277,7 @@ static void unlink_locked(PermissionRequest *r)
 void permissions_thread_exit(tcb_t task)
 {
     special_permissions_store_exit(task->parent_group);
+    user_auth_process_exit(task->parent_group);
     vfs_node_t dialog_reader = __atomic_exchange_n(&task->permission_dialog_reader, (vfs_node_t)NULL, __ATOMIC_ACQ_REL);
     if (dialog_reader) vfs_close(dialog_reader);
     PermissionRequest *garbage = NULL;
@@ -631,6 +644,14 @@ static bool system_path(const char *path)
     return !shared_resource_path(path) && (under(path, "/system") || under(path, "/EFI"));
 }
 
+static bool account_store_path(const char *path, bool ancestors)
+{
+    return equal_fold(path, "/system/config/usereg.dat") ||
+           equal_fold(path, "/system/config/usereg.dat.pending") ||
+           equal_fold(path, "/system/config/usereg.dat.commit") ||
+           (ancestors && (equal_fold(path, "/system/config") || equal_fold(path, "/system") || equal_fold(path, "/")));
+}
+
 static bool network_store_path(const char *path, bool ancestors)
 {
     return under(path, "/config/network") ||
@@ -649,6 +670,7 @@ static bool path_access(const char *path, bool directory, int operation, uint8_t
     }
 
     if (operation == IME_FILE_LOOKUP) return true; // Internal name lookup exposes no contents or listing.
+    if (account_store_path(path, directory && (operation == IME_FILE_REMOVE || operation == IME_FILE_EXPORT))) return false;
     if (operation == IME_FILE_MOUNT) return false;
     int special = special_permissions_access(process, user, path, operation);
     if (special)
@@ -1097,7 +1119,8 @@ static bool file_transfer(vfs_node_t node, const char *destination, bool hard_li
         (prefix_fold(source, "/users/") && !strchr(source + strlen("/users/"), '/'));
     bool allowed = !((node->type & file_dir) && account_root) &&
         !special_permissions_store_path(source, true) && !special_permissions_store_path(target, true) &&
-        !network_store_path(source, true) && !network_store_path(target, true);
+        !network_store_path(source, true) && !network_store_path(target, true) &&
+        !account_store_path(source, true) && !account_store_path(target, true);
     char application[4096], username[64];
     spin_lock(&permission_lock);
     pcb_t process = task->parent_group;

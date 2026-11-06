@@ -1,4 +1,5 @@
 #include <input_method.h>
+#include <user/auth.h>
 #include <user/permissions.h>
 #include <user/special_permissions.h>
 #include <user/process_launch.h>
@@ -144,121 +145,13 @@ static bool append_cmdline_arg(char *cmdline, size_t cmdline_size, char **cursor
     return true;
 }
 
-static bool user_registry_login_entry_valid(const UserInfo *user)
-{
-    if (user == NULL || user->name[0] == '\0') return false;
-    if (memchr(user->name, '\0', sizeof(user->name)) == NULL ||
-        memchr(user->password, '\0', sizeof(user->password)) == NULL) return false;
-    if (user->user_type == XUT_Root || user->user_type == XUT_System) return false;
-    if (user->user_type < XUT_Root || user->user_type > XUT_Custom) return false;
-    for (const char *p = user->name; *p != '\0'; p++)
-    {
-        if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
-              (*p >= '0' && *p <= '9') || *p == '_' || *p == '-' || *p == ' '))
-            return false;
-    }
-    return true;
-}
-
-static bool user_registry_needs_oobe(UserRegisterList *urf_data, size_t bytes_read)
-{
-    if (urf_data == NULL) return true;
-    if (bytes_read < sizeof(UserRegisterList)) return true;
-    if (urf_data->user_count <= 1 || urf_data->user_count > 128) return true;
-    for (int i = 1; i < urf_data->user_count; i++)
-    {
-        if (user_registry_login_entry_valid(&urf_data->uinf[i])) return false;
-    }
-    return true;
-}
-
-static bool user_registry_has_real_user(const UserRegisterList *registry)
-{
-    if (registry == NULL || registry->user_count <= 1 || registry->user_count > 128) return false;
-    for (int i = 1; i < registry->user_count; i++)
-    {
-        if (user_registry_login_entry_valid(&registry->uinf[i])) return true;
-    }
-    return false;
-}
-
-static bool user_registry_first_user_matches(const UserRegisterList *registry, const char *username,
-                                             const char *password)
-{
-    if (registry == NULL || username == NULL || password == NULL) return false;
-    if (registry->user_count <= 1 || registry->user_count > 128) return false;
-
-    for (int i = 1; i < registry->user_count; i++)
-    {
-        if (!user_registry_login_entry_valid(&registry->uinf[i])) continue;
-        return strcmp(username, registry->uinf[i].name) == 0 && strcmp(password, registry->uinf[i].password) == 0;
-    }
-    return false;
-}
-
-// Authentication may read its fixed account database regardless of the caller's SR bit.
-// The scope is kernel-only and never survives a return into application code.
-struct UserRegistryScope
-{
-    tcb_t task;
-    UserRegistryScope() : task(get_current_task()) { if (task) ++task->ime_config_depth; }
-    ~UserRegistryScope() { if (task) --task->ime_config_depth; }
-};
-
-static bool load_user_registry(UserRegisterList *registry, size_t *bytes_read)
-{
-    if (registry == NULL) return false;
-    memset(registry, 0, sizeof(UserRegisterList));
-    if (bytes_read != NULL) *bytes_read = 0;
-
-    UserRegistryScope scope;
-    vfs_node_t node = vfs_open("/system/config/usereg.dat");
-    if (node == NULL) return false;
-
-    size_t read_size = vfs_read(node, registry, 0, sizeof(UserRegisterList));
-    vfs_close(node);
-    if (bytes_read != NULL) *bytes_read = read_size;
-    return read_size >= sizeof(int);
-}
-
-static bool write_first_user_registry(const char *username, const char *password)
-{
-    UserRegistryScope scope;
-    if (username == NULL || password == NULL) return false;
-
-    vfs_mkdir("/system");
-    vfs_mkdir("/system/config");
-
-    vfs_node_t file = vfs_open("/system/config/usereg.dat");
-    if (file == NULL)
-    {
-        if (vfs_mkfile("/system/config/usereg.dat") != EOK) return false;
-        file = vfs_open("/system/config/usereg.dat");
-    }
-    if (file == NULL) return false;
-
-    UserRegisterList registry;
-    memset(&registry, 0, sizeof(registry));
-    registry.user_count = 2;
-    strcpy(registry.uinf[0].name, "Root");
-    strcpy(registry.uinf[0].password, "");
-    registry.uinf[0].user_type = XUT_Root;
-    strncpy(registry.uinf[1].name, username, sizeof(registry.uinf[1].name) - 1);
-    strncpy(registry.uinf[1].password, password, sizeof(registry.uinf[1].password) - 1);
-    registry.uinf[1].user_type = XUT_Admin;
-
-    vfs_resize(file, 0);
-    size_t wrote = vfs_write(file, &registry, 0, sizeof(registry));
-    vfs_close(file);
-    return wrote == sizeof(registry);
-}
-
 static void set_current_user_from_info(UserInfo *info)
 {
     if (info == NULL) return;
     if (current_user == NULL) current_user = (UserInfo *)malloc(sizeof(UserInfo));
     if (current_user == NULL) return;
     UserInfo snapshot = *info;
+    memset(snapshot.password, 0, sizeof(snapshot.password));
     snapshot.envc = 3;
     snapshot.envp = current_user_envp;
     permissions_session_publish(&snapshot);
@@ -292,135 +185,35 @@ void user_session_use_login()
 
 bool user_session_needs_oobe()
 {
-    UserRegisterList registry;
-    size_t           bytes_read = 0;
-    load_user_registry(&registry, &bytes_read);
-    return user_registry_needs_oobe(&registry, bytes_read);
+    return user_auth_oobe_state() == 1;
 }
 
 int user_session_list(UserInfo *out, int max_count)
 {
-    if (out == NULL || max_count < 0) return -EINVAL;
+    return user_auth_list(out, max_count);
+}
 
-    UserRegisterList registry;
-    size_t           bytes_read = 0;
-    load_user_registry(&registry, &bytes_read);
-    if (user_registry_needs_oobe(&registry, bytes_read)) return 0;
-
-    int copied = 0;
-    for (int i = 1; i < registry.user_count && i < 128; i++)
-    {
-        if (!user_registry_login_entry_valid(&registry.uinf[i])) continue;
-        if (copied >= max_count) break;
-        out[copied] = registry.uinf[i];
-        memset(out[copied].password, 0, sizeof(out[copied].password));
-        copied++;
-    }
-    return copied;
+static int activate_account(UserInfo *info)
+{
+    user_session_set_ready(false);
+    set_current_user_from_info(info);
+    if (current_user == NULL || !init_user_profile(current_user->name)) return -EIO;
+    (void)special_permissions_load_user(current_user->name);
+    return 0;
 }
 
 int user_session_login(const char *username, const char *password)
 {
-    if (username == NULL || password == NULL || username[0] == '\0') return -EINVAL;
-
-    static spin_t login_lock = SPIN_INIT;
-    static uint64_t retry_after_ns = 0;
-    static unsigned failed_attempts = 0;
-    spin_lock(&login_lock);
-    uint64_t now = nanoTime();
-    if (now < retry_after_ns) { spin_unlock(&login_lock); return -EAGAIN; }
-    spin_unlock(&login_lock);
-
-    UserRegisterList registry;
-    size_t           bytes_read = 0;
-    load_user_registry(&registry, &bytes_read);
-    if (user_registry_needs_oobe(&registry, bytes_read)) return -ENOENT;
-
-    for (int i = 1; i < registry.user_count && i < 128; i++)
-    {
-        if (!user_registry_login_entry_valid(&registry.uinf[i])) continue;
-        if (strcmp(username, registry.uinf[i].name) != 0) continue;
-        if (strcmp(password, registry.uinf[i].password) != 0)
-        {
-            spin_lock(&login_lock);
-            failed_attempts++;
-            uint64_t delay_seconds = 1ULL << min(failed_attempts, 5U);
-            retry_after_ns = now + delay_seconds * 1000000000ULL;
-            spin_unlock(&login_lock);
-            return -EACCES;
-        }
-
-        user_session_set_ready(false);
-        set_current_user_from_info(&registry.uinf[i]);
-        spin_lock(&login_lock);
-        failed_attempts = 0;
-        retry_after_ns = 0;
-        spin_unlock(&login_lock);
-        if (current_user == NULL || !init_user_profile(current_user->name)) return -EIO;
-        (void)special_permissions_load_user(current_user->name);
-        return 0;
-    }
-    spin_lock(&login_lock);
-    failed_attempts++;
-    retry_after_ns = now + (1ULL << min(failed_attempts, 5U)) * 1000000000ULL;
-    spin_unlock(&login_lock);
-    return -ENOENT;
+    UserInfo info = {};
+    int error = user_auth_login(username, password, &info);
+    return error ? error : activate_account(&info);
 }
 
 int user_session_create_first(const char *username, const char *password)
 {
-    if (username == NULL || username[0] == '\0' || password == NULL || password[0] == '\0') return -EINVAL;
-    user_session_set_ready(false);
-    for (const char *p = username; *p != '\0'; p++)
-    {
-        if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
-              (*p >= '0' && *p <= '9') || *p == '_' || *p == '-' || *p == ' '))
-            return -EINVAL;
-    }
-
-    UserRegisterList registry;
-    size_t           bytes_read = 0;
-    bool registry_loaded = load_user_registry(&registry, &bytes_read);
-    vfs_node_t existing_registry = vfs_open("/system/config/usereg.dat");
-    bool registry_exists = existing_registry != NULL;
-    if (existing_registry != NULL) vfs_close(existing_registry);
-    if (registry_exists && (!registry_loaded || bytes_read != sizeof(UserRegisterList) ||
-                            registry.user_count < 1 || registry.user_count > 128)) return -EIO;
-    if (!user_registry_needs_oobe(&registry, bytes_read))
-    {
-        if (user_registry_first_user_matches(&registry, username, password))
-        {
-            UserInfo *first_user = NULL;
-            for (int i = 1; i < registry.user_count && i < 128; i++)
-            {
-                if (user_registry_login_entry_valid(&registry.uinf[i]))
-                {
-                    first_user = &registry.uinf[i];
-                    break;
-                }
-            }
-            if (first_user != NULL)
-            {
-                set_current_user_from_info(first_user);
-                if (current_user == NULL || !init_user_profile(current_user->name)) return -EIO;
-                (void)special_permissions_load_user(current_user->name);
-                return 0;
-            }
-        }
-        return -EEXIST;
-    }
-
-    if (user_registry_has_real_user(&registry)) return -EEXIST;
-    if (!write_first_user_registry(username, password) || !init_user_profile(username)) return -EIO;
-
-    UserInfo info;
-    memset(&info, 0, sizeof(info));
-    strncpy(info.name, username, sizeof(info.name) - 1);
-    strncpy(info.password, password, sizeof(info.password) - 1);
-    info.user_type = XUT_Admin;
-    set_current_user_from_info(&info);
-    (void)special_permissions_load_user(info.name);
-    return 0;
+    UserInfo info = {};
+    int error = user_auth_create_first(username, password, &info);
+    return error ? error : activate_account(&info);
 }
 
 void init_user()
