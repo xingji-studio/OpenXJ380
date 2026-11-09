@@ -1,6 +1,13 @@
 """Shared native ELF milestone targets for the product and public build graphs."""
 from pathlib import Path
 
+PRODUCT_XAPI_SOURCES = (
+    "libsys", "krlibc", "string", "ctype", "errno", "stdlib", "stdio", "unistd",
+    "posix_ret", "posix_fs", "posix_mman", "posix_time", "posix_ioctl", "posix_select",
+    "posix_uio", "poll", "permissions", "xtuiapi", "xguiapi", "xclipboard",
+)
+PUBLIC_XAPI_SOURCES = ("libsys", "xgui_stubs", "installer_native")
+
 
 def emit(n, base="."):
     base = Path(base)
@@ -55,4 +62,65 @@ def emit_debug_demo(n, source="user/rtld_demo"):
                                "-rpath '$$ORIGIN'"})
     outputs = [program, library]
     n.build("rtld_demo", "phony", outputs + [Path("out/ld-xj380-x86_64.so.1")])
+    return outputs
+
+
+def emit_xapi(n, base=".", product=False):
+    """Build a separate PIC runtime; never reuse the static application's objects."""
+    base = Path(base)
+    source = base / "user/rtld"
+    includes = Path("user/xapi/include")
+    flags = ("-O2 -g -ffreestanding -fno-builtin -fno-stack-protector -fno-strict-aliasing "
+             "-fno-asynchronous-unwind-tables -mno-red-zone -fPIC -fshort-wchar -nostdinc "
+             "-Wall -Wextra -Wno-write-strings -DXAPI_SHARED_RUNTIME=1 -I" + includes.as_posix())
+    n.rule("xapi_shared_cxx", "mkdir -p $$(dirname $out) && $user_cxx " + flags +
+           " -std=gnu++17 -fno-exceptions -fno-rtti -MMD -MF $out.d -c $in -o $out",
+           "[XAPI PIC] $in", depfile="$out.d")
+    n.rule("xapi_shared_cc", "mkdir -p $$(dirname $out) && $user_cc " + flags +
+           " -std=c11 $profile -I" + source.as_posix() + " -MMD -MF $out.d -c $in -o $out",
+           "[XAPI PIC] $in", depfile="$out.d")
+    if product:
+        # Core libc/POSIX and native GUI syscall wrappers. The network/TLS and
+        # media archives keep their separate dependency and licensing scopes.
+        names = PRODUCT_XAPI_SOURCES
+    else:
+        names = PUBLIC_XAPI_SOURCES
+    objects = []
+    for name in names:
+        obj = Path("out/xapi-shared") / (name + ".cpp.o")
+        n.build(obj, "xapi_shared_cxx", Path("user/xapi") / (name + ".cpp"))
+        objects.append(obj)
+    runtime = Path("out/xapi-shared/runtime.c.o")
+    n.build(runtime, "xapi_shared_cc", source / "xapi_runtime.c",
+            variables={"profile": "" if product else "-DXAPI_MINIMAL_RUNTIME=1"})
+    crt = Path("out/rtld/xapi_crt0.S.o")
+    n.build(crt, "native_rtld_as", source / "xapi_crt0.S")
+    note = Path("out/rtld/abi_note.S.o")
+    library = Path("out/libxapi.so.1")
+    n.build(library, "native_rtld_link", objects + [runtime, note],
+            variables={"mode": "-shared -soname libxapi.so.1"})
+    outputs = [library, crt]
+    if product:
+        demo_source = Path("user/xapi_demo")
+        demo_objects = []
+        for name in ("main.c", "library.c"):
+            obj = Path("out/xapi_demo") / (name + ".o")
+            n.build(obj, "xapi_shared_cc", demo_source / name)
+            demo_objects.append(obj)
+        companion = Path("out/libxapi-demo.so.1")
+        n.build(companion, "native_rtld_link", [demo_objects[1], note, library],
+                variables={"mode": "-shared -soname libxapi-demo.so.1 -rpath '$$ORIGIN'"})
+        program = Path("out/xapi-demo.elf")
+        n.build(program, "native_rtld_link", [demo_objects[0], crt, note, companion, library],
+                variables={"mode": "-pie -e _start --dynamic-linker /system/lib/ld-xj380-x86_64.so.1 "
+                                   "-rpath '$$ORIGIN'"})
+        outputs += [program, companion]
+    else:
+        obj = Path("out/xapi-shared/demo.c.o")
+        n.build(obj, "xapi_shared_cc", source / "xapi_demo.c")
+        program = Path("out/xapi-shared-demo.elf")
+        n.build(program, "native_rtld_link", [obj, crt, note, library],
+                variables={"mode": "-pie -e _start --dynamic-linker /system/lib/ld-xj380-x86_64.so.1"})
+        outputs.append(program)
+    n.build("shared_xapi", "phony", outputs + [Path("out/ld-xj380-x86_64.so.1")])
     return outputs

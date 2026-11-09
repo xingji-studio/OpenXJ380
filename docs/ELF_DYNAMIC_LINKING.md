@@ -1,4 +1,4 @@
-# Native ELF dynamic linking: first milestone
+# Native ELF dynamic linking
 
 The native x86-64 ELF interpreter is `/system/lib/ld-xj380-x86_64.so.1`.
 The kernel maps the executable and interpreter, builds the initial stack and
@@ -83,11 +83,56 @@ dependencies per object, 65536 symbols, 32 MiB library files and 64 MiB image
 spans. Unsupported relocations and necessary features fail with an explanatory
 stderr diagnostic and exit status 127. Libraries need not have an entry point.
 
-This milestone provides startup linking and its example, while shared XAPI,
+The first milestone provides startup linking and its example. The shared XAPI
+milestone below adds a runtime usable by ordinary native applications.
 `dlopen/dlsym/dlclose`, TLS, lazy PLT binding, COPY/IFUNC, symbol versions and
 general C++ runtime integration remain subsequent work. Existing applications
 still use their established runtime and link rules. Text-page sharing between
 processes and ELF ASLR are not claimed by this milestone.
+
+## Second milestone: shared XAPI
+
+`./ninja shared_xapi` builds `out/libxapi.so.1` from separate PIC objects and
+`out/rtld/xapi_crt0.S.o`. Static XAPI objects and entry shims retain their build
+rules. The system image and installer roots install the shared runtime at
+`/system/lib/libxapi.so.1`.
+
+The product runtime reuses its existing core libc/POSIX, permission, terminal,
+and GUI syscall wrappers. It includes the existing heap, standard streams,
+`errno` and `environ`; applications and their dependent libraries use one copy
+per process. Its explicit source list is `PRODUCT_XAPI_SOURCES` in
+`tools/native_rtld.py`. Network/TLS and media archives retain their independent
+build and dependency scopes. The public tree supplies its existing minimal
+syscall API and a small `xapi-shared-demo.elf`, without importing product code.
+This profile distinction matches the existing static runtimes.
+
+After relocation and page protection, the interpreter looks up
+`__xapi_rtld_init_v1` **in the object whose SONAME is `libxapi.so.1`**. It passes
+`argc`, `argv`, `envp` and the loader finalizer before any preinit or constructor.
+A runtime with that SONAME must export this versioned function. It initializes
+`environ` and records the finalizer. The shared CRT subsequently calls
+`__xapi_start_main` with the same data and the application main function.
+Initialization is idempotent, so constructor changes to the environment survive
+entry to main. A standalone startup demo without shared XAPI keeps the original
+dynamic CRT and does not use this handshake.
+
+Returning from main or calling shared `exit()` runs loader finalizers exactly
+once before exiting the process, including exit from a main constructor.
+`_exit` and raw exit syscalls bypass finalizers. This step supplies ELF
+init/fini lifecycle integration; it does not add `atexit`, `__cxa_atexit`, TLS,
+or thread-safe libc state. `errno` retains its existing process-global model.
+
+Use `-fPIC` for both application and library objects, and link applications as
+PIE with the shared CRT, native ABI note, and `libxapi.so.1`. PIC avoids COPY
+relocations and preserves a single address for imported data such as `errno`.
+All shared outputs use immediate binding, RELRO, separate LOAD pages and a
+non-executable stack; `libxapi.so.1` has no external library dependency.
+
+The product example is installed as `/user/xapi-demo.elf` with its companion
+`/user/libxapi-demo.so.1` and `/user/README-xapi-demo.md`. It checks constructor
+and preinit environment, shared errno/environment, POSIX error translation,
+allocation and free across ELF objects, file I/O, process isolation and ordered
+finalization. `./ninja all` includes this runtime and example in both builds.
 
 ## Verification
 
@@ -95,9 +140,11 @@ From the product checkout:
 
 ```sh
 python3 -m unittest discover -s tests -p test_native_rtld.py
+python3 -m unittest discover -s tests -p test_shared_xapi.py
 python3 -m unittest discover -s tests -p test_elf_loader.py
 python3 -m unittest discover -s tests -p test_permissions.py
 python3 tests/run_native_rtld_qemu.py
+python3 tests/run_native_rtld_qemu.py --shared-xapi
 ```
 
 The host tests execute toolchain-generated binaries through the real

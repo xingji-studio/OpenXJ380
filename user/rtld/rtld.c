@@ -604,6 +604,28 @@ static void finalize(void)
 // bound PC-relatively by -Bsymbolic. This pointer is used only after bootstrap.
 static void (*volatile finalizer_entry)(void) = finalize;
 
+static void initialize_runtime(int argc, char **argv, char **envp)
+{
+    for (size_t i = 1; i < object_count; ++i)
+    {
+        Object *object = &objects[i];
+        if (!object->soname || !equal(object->soname, "libxapi.so.1")) continue;
+        for (size_t j = 1; j < object->symbol_count; ++j)
+        {
+            const Elf64_Sym *symbol = &object->symbols[j];
+            if (symbol->st_shndx == SHN_UNDEF || ELF64_ST_BIND(symbol->st_info) != STB_GLOBAL ||
+                ELF64_ST_VISIBILITY(symbol->st_other) != STV_DEFAULT ||
+                !equal(string(object, symbol->st_name), "__xapi_rtld_init_v1")) continue;
+            uint64_t address = symbol_address(object, symbol);
+            if (ELF64_ST_TYPE(symbol->st_info) != STT_FUNC || !loaded(object, address, 1, PF_X))
+                fail("invalid shared XAPI bootstrap", object->path);
+            ((void (*)(int, char **, char **, void (*)(void)))address)(argc, argv, envp, finalize);
+            return;
+        }
+        fail("missing shared XAPI bootstrap v1", object->path);
+    }
+}
+
 void rtld_start(uint64_t *stack)
 {
     TRACE("bootstrap");
@@ -687,6 +709,7 @@ void rtld_start(uint64_t *stack)
     for (size_t i = 0; i < object_count; ++i) protect(&objects[i]);
     protect(&self);
     TRACE("protected");
+    initialize_runtime((int)argc, argv, envp);
     call_array(main, main->preinit_array, main->preinit_size, 0, (int)argc, argv, envp);
     initialize(0, (int)argc, argv, envp);
     TRACE("initialized");

@@ -761,6 +761,7 @@ def main() -> None:
     rtld_module = importlib.util.module_from_spec(rtld_spec)
     rtld_spec.loader.exec_module(rtld_module)
     native_rtld_targets = rtld_module.emit(n)
+    native_rtld_targets += rtld_module.emit_xapi(n)
     kmod_targets = kmods(n)
 
     n.comment("PHONY TARGETS - compatibility names for common build workflows")

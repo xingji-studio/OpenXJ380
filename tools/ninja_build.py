@@ -193,10 +193,11 @@ def stage_linux_compat(root: Path) -> None:
 
 def copy_native_rtld(root: Path) -> None:
     mkdir(root / "system/lib")
-    for name in ("ld-xj380-x86_64.so.1", "libnative-demo.so.1"):
+    for name in ("ld-xj380-x86_64.so.1", "libnative-demo.so.1", "libxapi.so.1"):
         cp(ROOT / "out" / name, root / "system/lib" / name)
     mkdir(root / "apps/native-dynamic-demo")
     cp(ROOT / "out/native-dynamic-demo.elf", root / "apps/native-dynamic-demo/native-dynamic-demo.elf")
+    cp(ROOT / "out/xapi-shared-demo.elf", root / "apps/native-dynamic-demo/xapi-shared-demo.elf")
     cp(ROOT / "docs/ELF_DYNAMIC_LINKING.md", root / "apps/native-dynamic-demo/README.md")
 
 
