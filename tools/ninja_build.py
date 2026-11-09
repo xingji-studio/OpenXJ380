@@ -191,7 +191,17 @@ def stage_linux_compat(root: Path) -> None:
         raise SystemExit(1)
 
 
+def copy_native_rtld(root: Path) -> None:
+    mkdir(root / "system/lib")
+    for name in ("ld-xj380-x86_64.so.1", "libnative-demo.so.1"):
+        cp(ROOT / "out" / name, root / "system/lib" / name)
+    mkdir(root / "apps/native-dynamic-demo")
+    cp(ROOT / "out/native-dynamic-demo.elf", root / "apps/native-dynamic-demo/native-dynamic-demo.elf")
+    cp(ROOT / "docs/ELF_DYNAMIC_LINKING.md", root / "apps/native-dynamic-demo/README.md")
+
+
 def copy_system_apps(root: Path) -> None:
+    copy_native_rtld(root)
     system = root / "apps/system/shell"
     mkdir(system)
     cp(ROOT / "out/shell.elf", system / "shell.elf")

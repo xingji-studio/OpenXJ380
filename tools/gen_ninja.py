@@ -9,6 +9,7 @@ instead of hand-editing build.ninja, because build.ninja is regenerated.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import shutil
@@ -691,6 +692,7 @@ def main() -> None:
 
     n.comment("MANIFEST - regenerate build.ninja before every normal Ninja execution")
     manifest_inputs = [
+        "tools/native_rtld.py",
         "LICENSES.md",
         "THIRD_PARTY_NOTICES.md",
         *[str(path) for path in sorted(Path("licenses").rglob("*")) if path.is_file()],
@@ -701,7 +703,7 @@ def main() -> None:
     n.build(
         "build.ninja",
         "regen",
-        ["tools/gen_ninja.py", "tools/ninja_build.py"],
+        ["tools/gen_ninja.py", "tools/ninja_build.py", "tools/native_rtld.py"],
         use_default_order_only=False,
     )
     # Ninja cannot safely force the build.ninja self-edge every run: that causes
@@ -755,10 +757,15 @@ def main() -> None:
     n.comment("USERLAND AND KMODS - first-class ELF/module outputs")
     core_objs, constart_obj, xapi_liballoc = xapi(n)
     user_targets = user_apps(n, core_objs, constart_obj)
+    rtld_spec = importlib.util.spec_from_file_location("native_rtld", ROOT / "tools/native_rtld.py")
+    rtld_module = importlib.util.module_from_spec(rtld_spec)
+    rtld_spec.loader.exec_module(rtld_module)
+    native_rtld_targets = rtld_module.emit(n)
     kmod_targets = kmods(n)
 
     n.comment("PHONY TARGETS - compatibility names for common build workflows")
-    all_deps = [Path("out/BOOTX64.efi"), Path("out/kernel.krl"), compliance_bundle] + user_targets + kmod_targets
+    all_deps = ([Path("out/BOOTX64.efi"), Path("out/kernel.krl"), compliance_bundle] + user_targets +
+                native_rtld_targets + kmod_targets)
     phony(n, "all", all_deps)
     phony(n, "build_xapi", core_objs + [constart_obj, xapi_liballoc])
     phony(n, "kmods", kmod_targets)

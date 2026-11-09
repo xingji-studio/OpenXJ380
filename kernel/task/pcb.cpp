@@ -1163,7 +1163,8 @@ static uint64_t build_user_stack(tcb_t task, uint64_t sp, uint64_t entry_point, 
     char **envp = task->parent_group->envp ? task->parent_group->envp : current_user->envp;
 
     uint64_t tmp_stack = sp;
-    tmp_stack          = push_slice(task, tmp_stack, (const uint8_t *)task->name, strlen(task->name) + 1);
+    const char *executable = task->parent_group->exe_path ? task->parent_group->exe_path : task->name;
+    tmp_stack          = push_slice(task, tmp_stack, (const uint8_t *)executable, strlen(executable) + 1);
     ok                 = tmp_stack != 0;
     uint64_t aux_execfn = tmp_stack;
     static const char platform[] = "x86_64";
@@ -1208,8 +1209,6 @@ static uint64_t build_user_stack(tcb_t task, uint64_t sp, uint64_t entry_point, 
         ok             = tmp_stack != 0;
         argvps[argv_i] = tmp_stack;
     }
-    if (ok && argv_i > 0) aux_execfn = argvps[0];
-
     uint8_t aux_random[16];
     fill_aux_random(aux_random, task, sp);
     if (ok) tmp_stack = push_slice(task, tmp_stack, aux_random, sizeof(aux_random));

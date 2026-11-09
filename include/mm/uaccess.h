@@ -50,7 +50,7 @@ static inline bool copy_user_bytes_pagedir(page_directory_t *pagedir, void *dst,
     return true;
 }
 
-static inline bool user_range_mapped(page_directory_t *pagedir, const void *ptr, size_t size)
+static inline bool user_range_mapped(page_directory_t *pagedir, const void *ptr, size_t size, bool writable = false)
 {
     if (size == 0) return true;
     if (pagedir == NULL || ptr == NULL) return false;
@@ -69,6 +69,7 @@ static inline bool user_range_mapped(page_directory_t *pagedir, const void *ptr,
         if (!fault_in_user_page(pagedir, page)) return false;
         if (!page_table_get_flags(pagedir, page, &flags)) return false;
         if ((flags & (PTE_PRESENT | PTE_USER)) != (PTE_PRESENT | PTE_USER)) return false;
+        if (writable && !(flags & PTE_WRITEABLE)) return false;
         if (page == last_page) break;
         if (~page < (uint64_t)PAGE_SIZE - 1) return false;
         page += PAGE_SIZE;
@@ -89,6 +90,8 @@ static inline bool copy_to_user_pagedir(page_directory_t *pagedir, void *dst, co
 {
     if (size == 0) return true;
     if (src == NULL) return false;
-    if (!user_range_mapped(pagedir, dst, size)) return false;
+    // HHDM writes bypass the target PTE's hardware protection. Check it before
+    // copying, so read/IPC/syscall results cannot overwrite read-only EPF code.
+    if (!user_range_mapped(pagedir, dst, size, true)) return false;
     return copy_user_bytes_pagedir(pagedir, dst, src, size, true);
 }

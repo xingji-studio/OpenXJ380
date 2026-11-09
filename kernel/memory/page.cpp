@@ -498,7 +498,7 @@ bool page_table_get_flags(page_directory_t *directory, uint64_t addr, uint64_t *
     if (!(pml4->entries[l4_index].value & PTE_PRESENT)) return false;
     if (pml4->entries[l4_index].value & PTE_HUGE)
     {
-        *out_flags = pml4->entries[l4_index].value & 0xFFF;
+        *out_flags = pml4->entries[l4_index].value & ~PTE_ADDR_MASK;
         return true;
     }
 
@@ -507,7 +507,7 @@ bool page_table_get_flags(page_directory_t *directory, uint64_t addr, uint64_t *
     if (!(pdpt->entries[l3_index].value & PTE_PRESENT)) return false;
     if (pdpt->entries[l3_index].value & PTE_HUGE)
     {
-        *out_flags = pdpt->entries[l3_index].value & 0xFFF;
+        *out_flags = pdpt->entries[l3_index].value & ~PTE_ADDR_MASK;
         return true;
     }
 
@@ -516,7 +516,7 @@ bool page_table_get_flags(page_directory_t *directory, uint64_t addr, uint64_t *
     if (!(pd->entries[l2_index].value & PTE_PRESENT)) return false;
     if (pd->entries[l2_index].value & PTE_HUGE)
     {
-        *out_flags = pd->entries[l2_index].value & 0xFFF;
+        *out_flags = pd->entries[l2_index].value & ~PTE_ADDR_MASK;
         return true;
     }
 
@@ -524,7 +524,7 @@ bool page_table_get_flags(page_directory_t *directory, uint64_t addr, uint64_t *
     if (pt == NULL) return false;
     if (!(pt->entries[l1_index].value & PTE_PRESENT)) return false;
 
-    *out_flags = pt->entries[l1_index].value & 0xFFF;
+    *out_flags = pt->entries[l1_index].value & ~PTE_ADDR_MASK;
     return true;
 }
 
@@ -869,6 +869,71 @@ void unmap_page_range(page_directory_t *directory, uint64_t vaddr, uint64_t size
     {
         unmap_page(directory, va);
     }
+}
+
+bool page_map_new_user_page(page_directory_t *directory, uint64_t addr, uint64_t frame, uint64_t flags)
+{
+    if (directory == NULL || directory->table == NULL || (addr & (PAGE_SIZE - 1)) || addr < PAGE_SIZE ||
+        check_user_overflow(addr, PAGE_SIZE) || frame == 0 || (frame & ~PTE_ADDR_MASK) ||
+        (flags & (PTE_PRESENT | PTE_USER)) != (PTE_PRESENT | PTE_USER)) return false;
+
+    page_table_t *table = directory->table;
+    page_table_entry_t *created[3] = {};
+    uint32_t created_count = 0;
+    bool ready = true;
+    for (int shift = 39; shift >= 21; shift -= 9)
+    {
+        page_table_entry_t *entry = &table->entries[(addr >> shift) & ENTRY_MASK];
+        if (entry->value == 0)
+        {
+            uint64_t physical = alloc_frames(1);
+            if (!physical)
+            {
+                ready = false;
+                break;
+            }
+            page_table_t *next = (page_table_t *)phys_to_virt(physical);
+            if (next == NULL)
+            {
+                free_frames(physical, 1);
+                ready = false;
+                break;
+            }
+            page_table_clear(next);
+            entry->value = physical | PTE_PRESENT | PTE_WRITEABLE | PTE_USER;
+            created[created_count++] = entry;
+        }
+        // A huge page, supervisor path, or NX parent cannot implement the
+        // requested independent user-page permissions. Do not split or widen it.
+        if ((entry->value & (PTE_PRESENT | PTE_USER | PTE_WRITEABLE | PTE_HUGE | PTE_NO_EXECUTE)) !=
+            (PTE_PRESENT | PTE_USER | PTE_WRITEABLE))
+        {
+            ready = false;
+            break;
+        }
+        table = (page_table_t *)phys_to_virt(entry->value & PTE_ADDR_MASK);
+        if (table == NULL)
+        {
+            ready = false;
+            break;
+        }
+    }
+    if (ready && table->entries[(addr >> 12) & ENTRY_MASK].value == 0)
+    {
+        table->entries[(addr >> 12) & ENTRY_MASK].value = frame | flags;
+        flush_tlb(addr);
+        return true;
+    }
+    // Every newly created table is still empty on failure. Detach before free,
+    // in reverse order, without freeing the caller's data frame.
+    while (created_count)
+    {
+        page_table_entry_t *entry = created[--created_count];
+        uint64_t physical = entry->value & PTE_ADDR_MASK;
+        entry->value = 0;
+        free_frames(physical, 1);
+    }
+    return false;
 }
 
 void page_map_to(page_directory_t *directory, uint64_t addr, uint64_t frame, uint64_t flags)

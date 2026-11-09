@@ -49,9 +49,10 @@ class GenNinjaDependencyTests(unittest.TestCase):
         self.assertIn("build out/cli_shell.o: user_cxx_custom user/cli_shell.cpp", self.text)
         self.assertIn("build out/shell.elf: user_ld", self.text)
 
-    def test_user_tree_keeps_only_xapi_and_the_cli_example(self) -> None:
+    def test_user_tree_keeps_xapi_cli_and_the_native_linker(self) -> None:
         user_entries = {path.name for path in (ROOT / "user").iterdir()}
-        self.assertEqual(user_entries, {"AGENTS.md", "cli_shell.cpp", "xapi"})
+        self.assertEqual(user_entries, {"AGENTS.md", "cli_shell.cpp", "xapi", "rtld"})
+        self.assertIn("build out/rtld/rtld.c.o: native_rtld_cc user/rtld/rtld.c", self.text)
 
     def test_gui_sources_are_absent_from_build_graph(self) -> None:
         source_section = self.text.split("CPP_FILES =", 1)[1].split("HEADER_FILES =", 1)[0]
