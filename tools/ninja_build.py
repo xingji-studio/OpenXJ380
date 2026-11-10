@@ -332,8 +332,10 @@ def vdisk(*, complete: bool, filesystem: str | None = None, image_path: Path | N
     stage_full_system(vdisk_root, include_linux_compat=complete, filesystem=filesystem)
     command = [sys.executable, str(ROOT / "tools/make_disk_image.py"),
                "--root", str(vdisk_root), "--image", str(image), "--fs", filesystem,
-               "--size-mib", env("VDISK_SIZE_MIB", "3072"), "--esp-mib", env("VDISK_ESP_MIB", "64"),
                "--sudo", env("VDISK_SUDO", "")]
+    for variable, option in (("VDISK_SIZE_MIB", "--size-mib"), ("VDISK_ESP_MIB", "--esp-mib")):
+        if variable in os.environ:
+            command += [option, os.environ[variable]]
     if filesystem == "fat32" and os.environ.get("VDISK_FAT_MIB"):
         command += ["--fat-mib", os.environ["VDISK_FAT_MIB"]]
     run(command)
