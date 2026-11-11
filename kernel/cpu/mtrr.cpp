@@ -4,111 +4,138 @@
 
 extern uint64_t *saved_mtrrs;
 
-void mtrr_save()
+namespace
 {
-    if (!mtrr_supported()) { return; }
+constexpr uint64_t CR0_NW = 1ULL << 29;
+constexpr uint64_t CR0_CD = 1ULL << 30;
+constexpr uint64_t CR4_PGE = 1ULL << 7;
+constexpr uint64_t MTRR_ENABLE = 1ULL << 11;
+constexpr uint64_t MTRR_FIXED = 1ULL << 8;
+constexpr uint32_t PAT_MSR = 0x277;
+constexpr uint32_t MTRR_DEFAULT_MSR = 0x2ff;
+constexpr uint32_t fixed_mtrrs[] = {0x250, 0x258, 0x259, 0x268, 0x269, 0x26a,
+                                  0x26b, 0x26c, 0x26d, 0x26e, 0x26f};
 
-    uint64_t ia32_mtrrcap = rdmsr(0xfe);
+uint64_t saved_pat;
+uint8_t saved_variable_count;
+bool saved_fixed, saved_has_mtrr, saved_has_pat, cache_snapshot_ready;
 
-    uint8_t var_reg_count = ia32_mtrrcap & 0xff;
-
-    // 此处应有malloc，没有也没关系炸不了
-    /* save variable range MTRRs */
-    for (uint8_t i = 0; i < var_reg_count * 2; i += 2)
-    {
-        saved_mtrrs[i]     = rdmsr(0x200 + i);
-        saved_mtrrs[i + 1] = rdmsr(0x200 + i + 1);
-    }
-
-    /* save fixed range MTRRs */
-    saved_mtrrs[var_reg_count * 2 + 0]  = rdmsr(0x250);
-    saved_mtrrs[var_reg_count * 2 + 1]  = rdmsr(0x258);
-    saved_mtrrs[var_reg_count * 2 + 2]  = rdmsr(0x259);
-    saved_mtrrs[var_reg_count * 2 + 3]  = rdmsr(0x268);
-    saved_mtrrs[var_reg_count * 2 + 4]  = rdmsr(0x269);
-    saved_mtrrs[var_reg_count * 2 + 5]  = rdmsr(0x26a);
-    saved_mtrrs[var_reg_count * 2 + 6]  = rdmsr(0x26b);
-    saved_mtrrs[var_reg_count * 2 + 7]  = rdmsr(0x26c);
-    saved_mtrrs[var_reg_count * 2 + 8]  = rdmsr(0x26d);
-    saved_mtrrs[var_reg_count * 2 + 9]  = rdmsr(0x26e);
-    saved_mtrrs[var_reg_count * 2 + 10] = rdmsr(0x26f);
-
-    /* save MTRR default type */
-    saved_mtrrs[var_reg_count * 2 + 11] = rdmsr(0x2ff);
-
-    /* make sure that the saved MTRR default has MTRRs off */
-    saved_mtrrs[var_reg_count * 2 + 11] &= ~((uint64_t)1 << 11);
+uint32_t cache_features()
+{
+    uint32_t eax, ebx, ecx, edx;
+    asm_cpuid(1, 0, &eax, &ebx, &ecx, &edx);
+    return edx;
 }
 
+uint64_t cache_read_cr0()
+{
+    uint64_t value;
+    asm volatile("mov %%cr0, %0" : "=r"(value) :: "memory");
+    return value;
+}
+
+void cache_write_cr0(uint64_t value)
+{
+    asm volatile("mov %0, %%cr0" :: "r"(value) : "memory");
+}
+
+uint64_t cache_read_cr4()
+{
+    uint64_t value;
+    asm volatile("mov %%cr4, %0" : "=r"(value) :: "memory");
+    return value;
+}
+
+void cache_write_cr4(uint64_t value)
+{
+    asm volatile("mov %0, %%cr4" :: "r"(value) : "memory");
+}
+
+void cache_flush_tlb()
+{
+    uint64_t cr3;
+    asm volatile("mov %%cr3, %0\n\tmov %0, %%cr3" : "=&r"(cr3) :: "memory");
+}
+
+void cache_flush()
+{
+    asm volatile("wbinvd" ::: "memory");
+}
+
+[[noreturn]] void cache_init_failed()
+{
+    write_serial_string("Fatal AP cache initialization: incompatible or missing BSP snapshot.\n");
+    for (;;) asm volatile("cli; hlt" ::: "memory");
+}
+} // namespace
+
+// Called on the BSP before any AP is started. The boot-owned buffer is sized
+// for this CPU's variable MTRRs, eleven fixed MTRRs and the exact default MSR.
+void mtrr_save()
+{
+    uint32_t features = cache_features();
+    saved_has_mtrr = (features & (1U << 12)) != 0;
+    saved_has_pat = (features & (1U << 16)) != 0;
+    if (saved_has_pat) saved_pat = rdmsr(PAT_MSR);
+    if (saved_has_mtrr)
+    {
+        if (saved_mtrrs == NULL) cache_init_failed();
+        uint64_t capability = rdmsr(0xfe);
+        saved_variable_count = capability & 0xff;
+        saved_fixed = (capability & MTRR_FIXED) != 0;
+        for (unsigned i = 0; i < unsigned(saved_variable_count) * 2; ++i)
+            saved_mtrrs[i] = rdmsr(0x200 + i);
+        unsigned base = unsigned(saved_variable_count) * 2;
+        if (saved_fixed)
+            for (unsigned i = 0; i < 11; ++i) saved_mtrrs[base + i] = rdmsr(fixed_mtrrs[i]);
+        // Preserve enable/fixed-enable bits and memory types exactly. Disabling
+        // MTRRs belongs to the local restore sequence, not the saved snapshot.
+        saved_mtrrs[base + 11] = rdmsr(MTRR_DEFAULT_MSR);
+    }
+    __atomic_store_n(&cache_snapshot_ready, true, __ATOMIC_RELEASE);
+}
+
+// AP startup only, with IRQs disabled and before publishing a runnable task.
+// INIT leaves CR0.CD/NW set. Restoring those entry bits would leave every AP
+// in no-fill mode indefinitely; the final transition must enable caching.
 void mtrr_restore()
 {
-    if (!mtrr_supported()) { return; }
-
-    uint64_t ia32_mtrrcap = rdmsr(0xfe);
-
-    uint8_t var_reg_count = ia32_mtrrcap & 0xff;
-
-    if (saved_mtrrs == NULL) { write_serial_string("[PANIC][MTRR] Attempted Restore Without Prior Save."); }
-
-    /* according to the Intel SDM 12.11.7.2 "MemTypeSet() Function",
-       we need to follow this precedure before changing MTRR set up */
-
-    /* save old cr0 and then enable the CD flag and disable the NW flag */
-    size_t old_cr0;
-    asm volatile("mov %%cr0, %0" : "=r"(old_cr0)::"memory");
-    size_t new_cr0 = (old_cr0 | (1 << 30)) & ~((size_t)1 << 29);
-    asm volatile("mov %0, %%cr0" ::"r"(new_cr0) : "memory");
-
-    /* then invalidate the caches */
-    asm volatile("wbinvd" ::: "memory");
-
-    /* do a cr3 read/write to flush the TLB */
-    size_t cr3;
-    asm volatile("mov %%cr3, %0" : "=r"(cr3)::"memory");
-    asm volatile("mov %0, %%cr3" ::"r"(cr3) : "memory");
-
-    /* disable the MTRRs */
-    uint64_t mtrr_def  = rdmsr(0x2ff);
-    mtrr_def          &= ~((uint64_t)1 << 11);
-    wrmsr(0x2ff, mtrr_def);
-
-    /* restore variable range MTRRs */
-    for (uint8_t i = 0; i < var_reg_count * 2; i += 2)
+    if (!__atomic_load_n(&cache_snapshot_ready, __ATOMIC_ACQUIRE)) cache_init_failed();
+    uint32_t features = cache_features();
+    if (saved_has_mtrr != ((features & (1U << 12)) != 0) ||
+        (saved_has_pat && !(features & (1U << 16)))) cache_init_failed();
+    if (saved_has_mtrr)
     {
-        wrmsr(0x200 + i, saved_mtrrs[i]);
-        wrmsr(0x200 + i + 1, saved_mtrrs[i + 1]);
+        uint64_t capability = rdmsr(0xfe);
+        if ((capability & 0xff) != saved_variable_count ||
+            (saved_fixed && !(capability & MTRR_FIXED))) cache_init_failed();
     }
 
-    /* restore fixed range MTRRs */
-    wrmsr(0x250, saved_mtrrs[var_reg_count * 2 + 0]);
-    wrmsr(0x258, saved_mtrrs[var_reg_count * 2 + 1]);
-    wrmsr(0x259, saved_mtrrs[var_reg_count * 2 + 2]);
-    wrmsr(0x268, saved_mtrrs[var_reg_count * 2 + 3]);
-    wrmsr(0x269, saved_mtrrs[var_reg_count * 2 + 4]);
-    wrmsr(0x26a, saved_mtrrs[var_reg_count * 2 + 5]);
-    wrmsr(0x26b, saved_mtrrs[var_reg_count * 2 + 6]);
-    wrmsr(0x26c, saved_mtrrs[var_reg_count * 2 + 7]);
-    wrmsr(0x26d, saved_mtrrs[var_reg_count * 2 + 8]);
-    wrmsr(0x26e, saved_mtrrs[var_reg_count * 2 + 9]);
-    wrmsr(0x26f, saved_mtrrs[var_reg_count * 2 + 10]);
+    uint64_t original_cr0 = cache_read_cr0();
+    uint64_t original_cr4 = cache_read_cr4();
+    cache_write_cr0((original_cr0 | CR0_CD) & ~CR0_NW);
+    cache_flush();
+    // Remove global as well as ordinary TLB entries while changing types.
+    cache_write_cr4(original_cr4 & ~CR4_PGE);
+    cache_flush_tlb();
 
-    /* restore MTRR default type */
-    wrmsr(0x2ff, saved_mtrrs[var_reg_count * 2 + 11]);
-
-    /* now do the opposite of the cache disable and flush from above */
-
-    /* re-enable MTRRs */
-    mtrr_def  = rdmsr(0x2ff);
-    mtrr_def |= (1 << 11);
-    wrmsr(0x2ff, mtrr_def);
-
-    /* do a cr3 read/write to flush the TLB */
-    asm volatile("mov %%cr3, %0" : "=r"(cr3)::"memory");
-    asm volatile("mov %0, %%cr3" ::"r"(cr3) : "memory");
-
-    /* then invalidate the caches */
-    asm volatile("wbinvd" ::: "memory");
-
-    /* restore old value of cr0 */
-    asm volatile("mov %0, %%cr0" ::"r"(old_cr0) : "memory");
+    if (saved_has_mtrr)
+    {
+        wrmsr(MTRR_DEFAULT_MSR, rdmsr(MTRR_DEFAULT_MSR) & ~MTRR_ENABLE);
+        for (unsigned i = 0; i < unsigned(saved_variable_count) * 2; ++i)
+            wrmsr(0x200 + i, saved_mtrrs[i]);
+        unsigned base = unsigned(saved_variable_count) * 2;
+        if (saved_fixed)
+            for (unsigned i = 0; i < 11; ++i) wrmsr(fixed_mtrrs[i], saved_mtrrs[base + i]);
+        if (saved_has_pat) wrmsr(PAT_MSR, saved_pat);
+        wrmsr(MTRR_DEFAULT_MSR, saved_mtrrs[base + 11]);
+    }
+    else if (saved_has_pat)
+    {
+        wrmsr(PAT_MSR, saved_pat);
+    }
+    cache_flush();
+    cache_flush_tlb();
+    cache_write_cr4(original_cr4);
+    cache_write_cr0(original_cr0 & ~(CR0_CD | CR0_NW));
 }

@@ -16,32 +16,77 @@ def emit(n, base="."):
     flags = ("-O2 -g -std=c11 -ffreestanding -fno-builtin -fno-stack-protector "
              "-fno-asynchronous-unwind-tables -mno-red-zone -fPIC -Wall -Wextra -Werror")
     n.rule("native_rtld_cc", "mkdir -p $$(dirname $out) && $user_cc " + flags +
-           " $visibility -I" + includes.as_posix() + " -I" + source.as_posix() +
+           " $visibility $tls_model -I" + includes.as_posix() + " -I" + source.as_posix() +
            " -MMD -MF $out.d -c $in -o $out",
            "[RTLD CC] $in", depfile="$out.d")
-    n.rule("native_rtld_as", "mkdir -p $$(dirname $out) && $user_cc -fPIC -c $in -o $out", "[RTLD AS] $in")
+    n.rule("native_rtld_as", "mkdir -p $$(dirname $out) && $user_cc -fPIC $abi -c $in -o $out", "[RTLD AS] $in")
+    n.rule("native_rtld_cxx", "mkdir -p $$(dirname $out) && $user_cxx " + flags.replace("-std=c11", "-std=c++17") +
+           " -fno-exceptions -fno-rtti $tls_model -I" + includes.as_posix() +
+           " -MMD -MF $out.d -c $in -o $out", "[RTLD CXX] $in", depfile="$out.d")
     link_flags = ("--hash-style=both --build-id=none --no-undefined -z max-page-size=0x1000 "
                   "-z separate-code -z now -z relro -z noexecstack")
     n.rule("native_rtld_link", "$user_ld " + link_flags + " $mode $in -o $out", "[RTLD LD] $out")
     objects = {}
-    for filename in ("rtld.c", "start.S", "abi_note.S", "crt0.S", "demo.c", "demo_library.c"):
+    for filename in ("rtld.c", "tls.c", "thread.S", "cxx_abi.c", "start.S", "abi_note.S",
+                     "crt0.S", "demo.c", "demo_library.c"):
         obj = Path("out/rtld") / (filename + ".o")
         n.build(obj, "native_rtld_cc" if filename.endswith(".c") else "native_rtld_as", source / filename,
-                implicit=[source / "platform.h", includes / "elf.h"],
-                variables={"visibility": "-fvisibility=hidden" if filename == "rtld.c" else ""})
+                implicit=[source / "platform.h", source / "tls.h", includes / "elf.h", includes / "native_runtime.h"],
+                variables={"visibility": "-fvisibility=hidden" if filename in ("rtld.c", "tls.c") else ""})
         objects[filename] = obj
+    for version in (2, 3):
+        obj = Path(f"out/rtld/abi_v{version}.S.o")
+        n.build(obj, "native_rtld_as", source / "abi_note.S", variables={"abi": f"-DXJ380_NATIVE_ABI={version}"})
+        objects[f"abi_v{version}"] = obj
     interpreter = Path("out/ld-xj380-x86_64.so.1")
     library = Path("out/libnative-demo.so.1")
     example = Path("out/native-dynamic-demo.elf")
-    n.build(interpreter, "native_rtld_link", [objects[name] for name in ("rtld.c", "start.S", "abi_note.S")],
+    n.build(interpreter, "native_rtld_link",
+            [objects[name] for name in ("rtld.c", "tls.c", "thread.S", "start.S", "abi_v3")],
             variables={"mode": "-shared -Bsymbolic -e _start -soname ld-xj380-x86_64.so.1"})
     n.build(library, "native_rtld_link", [objects["demo_library.c"], objects["abi_note.S"]],
             variables={"mode": "-shared -soname libnative-demo.so.1"})
     n.build(example, "native_rtld_link", [objects[name] for name in ("demo.c", "crt0.S", "abi_note.S")] + [library],
             variables={"mode": "-pie -e _start --dynamic-linker /system/lib/ld-xj380-x86_64.so.1"})
-    outputs = [interpreter, library, example]
+    outputs = [interpreter, library, example] + emit_tls(n, base, objects, interpreter)
     n.build("native_rtld", "phony", outputs)
     return outputs
+
+
+def emit_tls(n, base, objects, interpreter):
+    """Use the same compiler TLS/lifetime probes for native ELF and EPF."""
+    probes = base / "user/epf_rtld"
+    compiled = {}
+    for name in ("tls_library.c", "tls_ie.c", "tls_demo.c", "cxx_tls_library.cpp", "cxx_tls_demo.cpp"):
+        obj = Path("out/rtld") / (name + ".o")
+        mode = "-ftls-model=initial-exec" if name == "tls_ie.c" else ""
+        n.build(obj, "native_rtld_cxx" if name.endswith(".cpp") else "native_rtld_cc", probes / name,
+                implicit=[probes / "fixture_runtime.h", probes / "cxx_tls_probe.h"],
+                variables={"tls_model": mode + " -DXJ380_NATIVE_ELF=1"})
+        compiled[name] = obj
+    runtime = Path("out/libnative-runtime.so.1")
+    gd = Path("out/libnative-tls.so.1")
+    ie = Path("out/libnative-tls-ie.so.1")
+    demo = Path("out/native-tls-demo.elf")
+    cxx = Path("out/libnative-cxx-tls.so.1")
+    cxx_demo = Path("out/native-cxx-tls-demo.elf")
+    n.build(runtime, "native_rtld_link", [objects["tls.c"], objects["thread.S"], objects["abi_v3"]],
+            variables={"mode": "-shared -soname libnative-runtime.so.1"})
+    n.build(gd, "native_rtld_link", [compiled["tls_library.c"], objects["abi_v2"], runtime],
+            variables={"mode": "-shared -soname libnative-tls.so.1"})
+    n.build(ie, "native_rtld_link", [compiled["tls_ie.c"], objects["abi_v2"]],
+            variables={"mode": "-shared -soname libnative-tls-ie.so.1"})
+    n.build(demo, "native_rtld_link", [compiled["tls_demo.c"], objects["crt0.S"], objects["abi_v2"], gd, ie, runtime],
+            variables={"mode": "-pie -e _start --dynamic-linker /system/lib/ld-xj380-x86_64.so.1"})
+    n.build(cxx, "native_rtld_link",
+            [compiled["cxx_tls_library.cpp"], objects["cxx_abi.c"], objects["abi_v3"], runtime],
+            variables={"mode": "-shared -soname libnative-cxx-tls.so.1"})
+    n.build(cxx_demo, "native_rtld_link", [compiled["cxx_tls_demo.cpp"], objects["cxx_abi.c"], objects["crt0.S"],
+                                         objects["abi_v3"], cxx, runtime],
+            variables={"mode": "-pie -e _start --dynamic-linker /system/lib/ld-xj380-x86_64.so.1"})
+    n.build("native_tls", "phony", [interpreter, runtime, gd, ie, demo])
+    n.build("native_cxx_tls", "phony", [interpreter, runtime, cxx, cxx_demo])
+    return [runtime, gd, ie, demo, cxx, cxx_demo]
 
 
 def emit_debug_demo(n, source="user/rtld_demo"):

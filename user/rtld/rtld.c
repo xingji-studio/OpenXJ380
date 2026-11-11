@@ -2,6 +2,7 @@
 // Native x86-64 ELF interpreter. All pointers below belong to this process;
 // no kernel symbol table, kernel callback or cross-process handle is involved.
 #include "platform.h"
+#include "tls.h"
 #include <elf.h>
 
 #define PAGE 4096UL
@@ -38,12 +39,17 @@ typedef struct
     size_t needed[MAX_NEEDED], needed_count;
     unsigned dependencies[MAX_NEEDED], dependency_count;
     unsigned initialized, symbolic;
+    unsigned abi_version, required_abi;
+    Elf64_Phdr tls;
+    uint64_t tls_end;
 } Object;
 
 static Object objects[MAX_OBJECTS];
+static Object interpreter_object;
 static size_t object_count;
 static unsigned init_order[MAX_OBJECTS];
 static size_t init_count;
+static unsigned runtime_abi;
 
 extern void rtld_enter(uint64_t entry, uint64_t *stack, void (*finalizer)(void)) __attribute__((noreturn));
 
@@ -128,11 +134,24 @@ static void layout(Object *object)
 {
     object->start = USER_LIMIT;
     object->end = 0;
+    unsigned tls_count = 0;
     for (size_t i = 0; i < object->phnum; ++i)
     {
         Elf64_Phdr *p = &object->phdr[i];
         if (p->p_type == PT_INTERP && object != &objects[0]) fail("nested interpreter", object->path);
-        if (p->p_type == PT_TLS && p->p_memsz) fail("TLS is not supported by native ELF ABI v1", object->path);
+        if (p->p_type == PT_TLS)
+        {
+            // The native profile requires an aligned TLS image. Its BSS is
+            // separate storage and need not fit in the ordinary LOAD image.
+            uint64_t alignment = p->p_align ? p->p_align : 1;
+            if (++tls_count != 1 || p->p_filesz > p->p_memsz || p->p_memsz > XJ_TLS_MAX_MODULE ||
+                alignment > XJ_TLS_MAX_ALIGN || (alignment & (alignment - 1)) ||
+                p->p_vaddr % alignment || !range(p->p_vaddr, p->p_memsz, USER_LIMIT))
+                fail("invalid TLS segment", object->path);
+            object->tls = *p;
+            object->tls.p_align = alignment;
+            object->required_abi = 2;
+        }
         if (p->p_type != PT_LOAD) continue;
         if (!p->p_memsz) continue;
         if (p->p_filesz > p->p_memsz || !range(p->p_vaddr, p->p_memsz, USER_LIMIT - PAGE) ||
@@ -180,7 +199,8 @@ static void native_note(Object *object)
             {
                 uint32_t version;
                 copy_bytes(&version, notes + offset + name_size, sizeof(version));
-                if (version != 1) fail("unsupported native ABI version", object->path);
+                if (version < 1 || version > 3) fail("unsupported native ABI version", object->path);
+                object->abi_version = version;
                 return;
             }
             offset += name_size + desc_size;
@@ -266,9 +286,10 @@ static void dynamic(Object *object)
             break;
         case DT_TEXTREL: fail("text relocations are unsupported", object->path);
         case DT_FLAGS:
-            if (value & ~((uint64_t)DF_BIND_NOW | DF_ORIGIN | DF_SYMBOLIC))
+            if (value & ~((uint64_t)DF_BIND_NOW | DF_ORIGIN | DF_SYMBOLIC | DF_STATIC_TLS))
                 fail("unsupported dynamic flags", object->path);
             if (value & DF_SYMBOLIC) object->symbolic = 1;
+            if (value & DF_STATIC_TLS) object->required_abi = 2;
             break;
         case DT_FLAGS_1:
             if (value & ~((uint64_t)DF_1_NOW | DF_1_PIE)) fail("unsupported dynamic flags", object->path);
@@ -328,6 +349,45 @@ static void dynamic(Object *object)
     }
     if (!object->symbol_count) object->symbol_count = 1;
     object->symbols = pointer(object, symbols, object->symbol_count * sizeof(Elf64_Sym));
+}
+
+static void validate_abi(Object *object)
+{
+    for (size_t i = 1; i < object->symbol_count; ++i)
+    {
+        const Elf64_Sym *symbol = &object->symbols[i];
+        const char *name = string(object, symbol->st_name);
+        if ((ELF64_ST_TYPE(symbol->st_info) == STT_TLS || equal(name, "__tls_get_addr") ||
+             equal(name, "xj_thread_create") || equal(name, "xj_thread_join")) && object->required_abi < 2)
+            object->required_abi = 2;
+        if (equal(name, "__cxa_thread_atexit") || equal(name, "__cxa_thread_atexit_impl")) object->required_abi = 3;
+    }
+    for (unsigned t = 0; t < 2; ++t)
+    {
+        const Elf64_Rela *table = t ? object->jmprel : object->rela;
+        size_t bytes = t ? object->jmprel_size : object->rela_size;
+        for (size_t i = 0; i < bytes / sizeof(*table); ++i)
+        {
+            unsigned type = ELF64_R_TYPE(table[i].r_info);
+            if ((type == R_X86_64_DTPMOD64 || type == R_X86_64_DTPOFF64 || type == R_X86_64_TPOFF64) &&
+                object->required_abi < 2) object->required_abi = 2;
+        }
+    }
+    if (object->abi_version < object->required_abi) fail("native ABI note understates required features", object->path);
+    if (object->abi_version > runtime_abi) fail("interpreter native ABI is too old", object->path);
+    if (object->tls.p_filesz)
+    {
+        int found = 0;
+        for (size_t i = 0; i < object->phnum; ++i)
+        {
+            const Elf64_Phdr *p = &object->phdr[i];
+            if (p->p_type == PT_LOAD && (p->p_flags & PF_R) && object->tls.p_vaddr >= p->p_vaddr &&
+                range(object->tls.p_vaddr - p->p_vaddr, object->tls.p_filesz, p->p_filesz) &&
+                range(p->p_offset, object->tls.p_vaddr - p->p_vaddr, ~0ULL) &&
+                object->tls.p_offset == p->p_offset + object->tls.p_vaddr - p->p_vaddr) found = 1;
+        }
+        if (!found) fail("TLS template outside file-backed LOAD", object->path);
+    }
 }
 
 static long open_library(Object *requester, const char *name, char path[MAX_PATH])
@@ -452,6 +512,7 @@ static unsigned load_library(Object *requester, const char *name)
     TRACE("dependency mapped");
     native_note(object);
     dynamic(object);
+    validate_abi(object);
     return index;
 }
 
@@ -468,18 +529,24 @@ static uint64_t symbol_address(Object *object, const Elf64_Sym *symbol)
     return value;
 }
 
-static uint64_t resolve(Object *requester, size_t index)
+typedef struct
+{
+    Object *object;
+    const Elf64_Sym *symbol;
+} Definition;
+
+static Definition resolve(Object *requester, size_t index)
 {
     if (index >= requester->symbol_count) fail("relocation symbol out of bounds", requester->path);
     const Elf64_Sym *symbol = &requester->symbols[index];
     unsigned bind = ELF64_ST_BIND(symbol->st_info), visibility = ELF64_ST_VISIBILITY(symbol->st_other);
     if (symbol->st_shndx != SHN_UNDEF && (bind == STB_LOCAL || visibility != STV_DEFAULT || requester->symbolic))
-        return symbol_address(requester, symbol);
+        return (Definition){requester, symbol};
     const char *name = string(requester, symbol->st_name);
     // objects[] is populated breadth first, preserving each DT_NEEDED order.
-    for (size_t i = 0; i < object_count; ++i)
+    for (size_t i = 0; i <= object_count; ++i)
     {
-        Object *object = &objects[i];
+        Object *object = i == object_count ? &interpreter_object : &objects[i];
         for (size_t j = 1; j < object->symbol_count; ++j)
         {
             const Elf64_Sym *candidate = &object->symbols[j];
@@ -487,11 +554,42 @@ static uint64_t resolve(Object *requester, size_t index)
             unsigned candidate_visibility = ELF64_ST_VISIBILITY(candidate->st_other);
             if (candidate->st_shndx == SHN_UNDEF || (candidate_bind != STB_GLOBAL && candidate_bind != STB_WEAK) ||
                 candidate_visibility == STV_HIDDEN || candidate_visibility == STV_INTERNAL) continue;
-            if (equal(name, string(object, candidate->st_name))) return symbol_address(object, candidate);
+            if (equal(name, string(object, candidate->st_name))) return (Definition){object, candidate};
         }
     }
-    if (bind == STB_WEAK) return 0;
+    if (bind == STB_WEAK) return (Definition){NULL, NULL};
     fail("undefined symbol", name);
+}
+
+static uint64_t tls_relocation(Object *object, unsigned type, size_t symbol, int64_t addend)
+{
+    Definition definition = symbol ? resolve(object, symbol) : (Definition){object, NULL};
+    if (symbol && ELF64_ST_TYPE(object->symbols[symbol].st_info) != STT_TLS)
+        fail("TLS relocation requires a TLS symbol", object->path);
+    if (!definition.object)
+    {
+        if (type == R_X86_64_TPOFF64 || addend) fail("unsupported weak TLS reference", object->path);
+        return 0; // An unresolved weak GD pair is {0, 0}.
+    }
+    Object *owner = definition.object;
+    uint64_t offset = 0;
+    if (definition.symbol)
+    {
+        const Elf64_Sym *s = definition.symbol;
+        if (ELF64_ST_TYPE(s->st_info) != STT_TLS || s->st_shndx == SHN_ABS || s->st_shndx >= SHN_LORESERVE ||
+            s->st_value >= owner->tls.p_memsz || !range(s->st_value, s->st_size, owner->tls.p_memsz))
+            fail("invalid TLS symbol definition", owner->path);
+        offset = s->st_value;
+    }
+    if (!owner->tls.p_memsz) fail("TLS relocation has no TLS storage", owner->path);
+    if (type == R_X86_64_DTPMOD64)
+    {
+        if (addend) fail("DTPMOD64 requires a zero addend", object->path);
+        return (uint64_t)(owner - objects) + 1;
+    }
+    __int128 value = (__int128)offset + addend;
+    if (value < 0 || value >= owner->tls.p_memsz) fail("TLS offset outside storage", owner->path);
+    return (uint64_t)value - (type == R_X86_64_TPOFF64 ? owner->tls_end : 0);
 }
 
 static void relocate(Object *object, const Elf64_Rela *table, size_t bytes, int bootstrap)
@@ -513,10 +611,18 @@ static void relocate(Object *object, const Elf64_Rela *table, size_t bytes, int 
         }
         else
         {
-            if (bootstrap || (type != R_X86_64_64 && type != R_X86_64_GLOB_DAT && type != R_X86_64_JUMP_SLOT))
+            if (!bootstrap && (type == R_X86_64_DTPMOD64 || type == R_X86_64_DTPOFF64 || type == R_X86_64_TPOFF64))
+                value = tls_relocation(object, type, symbol, relocation.r_addend);
+            else if (!bootstrap && (type == R_X86_64_64 || type == R_X86_64_GLOB_DAT || type == R_X86_64_JUMP_SLOT))
+            {
+                if (ELF64_ST_TYPE(object->symbols[symbol].st_info) == STT_TLS)
+                    fail("ordinary relocation references TLS", object->path);
+                Definition definition = resolve(object, symbol);
+                value = definition.object ? symbol_address(definition.object, definition.symbol) : 0;
+                if (type == R_X86_64_64) value += (uint64_t)relocation.r_addend;
+            }
+            else
                 fail("unsupported relocation type", object->path);
-            value = resolve(object, symbol);
-            if (type == R_X86_64_64) value += (uint64_t)relocation.r_addend;
         }
         *(uint64_t *)target = value;
     }
@@ -550,12 +656,74 @@ static void protect(Object *object)
     {
         const Elf64_Phdr *p = &object->phdr[i];
         if (p->p_type != PT_GNU_RELRO || !p->p_memsz) continue;
+        if (!range(p->p_vaddr, p->p_memsz, USER_LIMIT)) fail("invalid RELRO range", object->path);
         uint64_t start = PAGE_DOWN(biased(object, p->p_vaddr));
         uint64_t end = PAGE_UP(biased(object, p->p_vaddr + p->p_memsz));
-        if (!loaded(object, biased(object, p->p_vaddr), p->p_memsz, PF_R | PF_W) ||
-            rtld_syscall(10, (long)start, (long)(end - start), 1, 0, 0, 0))
+        int contained = 0;
+        // GNU ld may include the mapped tail of a LOAD's last page in RELRO,
+        // notably when .tbss itself occupies no ordinary image storage.
+        for (size_t j = 0; j < object->phnum; ++j)
+        {
+            const Elf64_Phdr *q = &object->phdr[j];
+            if (q->p_type == PT_LOAD && q->p_memsz && (q->p_flags & (PF_R | PF_W)) == (PF_R | PF_W) &&
+                p->p_vaddr >= q->p_vaddr && range(p->p_vaddr - q->p_vaddr, p->p_memsz,
+                                               PAGE_UP(q->p_vaddr + q->p_memsz) - q->p_vaddr)) contained = 1;
+        }
+        if (!contained || rtld_syscall(10, (long)start, (long)(end - start), 1, 0, 0, 0))
             fail("cannot protect RELRO pages", object->path);
     }
+}
+
+static uint64_t tls_size, tls_alignment = 16;
+
+static void layout_tls(void)
+{
+    // Main comes first, nearest TP, matching GNU ld's local-exec offsets.
+    // Module IDs retain the native breadth-first dependency discovery order.
+    for (size_t i = 0; i < object_count; ++i)
+    {
+        Object *object = &objects[i];
+        if (!object->tls.p_memsz) continue;
+        uint64_t alignment = object->tls.p_align;
+        tls_size = (tls_size + object->tls.p_memsz + alignment - 1) & ~(alignment - 1);
+        if (tls_size > XJ_TLS_MAX_TOTAL) fail("aggregate TLS size limit", object->path);
+        object->tls_end = tls_size;
+        if (alignment > tls_alignment) tls_alignment = alignment;
+    }
+    tls_size = (tls_size + tls_alignment - 1) & ~(tls_alignment - 1);
+    if (tls_size > XJ_TLS_MAX_TOTAL) fail("aggregate TLS size limit", NULL);
+}
+
+static void initialize_tls(void)
+{
+    XjTlsContext *context = allocate(sizeof(*context));
+    context->magic = XJ_TLS_CONTEXT_MAGIC;
+    context->version = 1;
+    context->module_count = object_count;
+    context->block_size = tls_size;
+    context->alignment = tls_alignment;
+    if (rtld_syscall(318, (long)&context->canary, 8, 0, 0, 0, 0) != 8) fail("TLS canary entropy", NULL);
+    context->canary &= ~255ULL;
+    for (size_t i = 0; i < object_count; ++i)
+    {
+        Object *object = &objects[i];
+        XjTlsModule *module = &context->modules[i];
+        module->end = object->tls_end;
+        module->memory_size = object->tls.p_memsz;
+        module->file_size = object->tls.p_filesz;
+        if (!module->file_size) continue;
+        void *snapshot = allocate(module->file_size);
+        // Snapshot after every relocation, before any initializer. Workers
+        // inherit original relocated values, never the main thread's writes.
+        copy_bytes(snapshot, pointer(object, object->tls.p_vaddr, module->file_size), module->file_size);
+        if (rtld_syscall(10, (long)snapshot, (long)PAGE_UP(module->file_size), 1, 0, 0, 0))
+            fail("cannot protect TLS template", object->path);
+        module->template_address = (uint64_t)snapshot;
+    }
+    if (rtld_syscall(10, (long)context, (long)PAGE_UP(sizeof(*context)), 1, 0, 0, 0))
+        fail("cannot protect TLS context", NULL);
+    uint64_t pointer = xj_tls_allocate(context);
+    if (!pointer || xj_tls_install(pointer)) fail("main TLS allocation or FS setup", NULL);
 }
 
 static void call_function(Object *object, uint64_t address, int argc, char **argv, char **envp)
@@ -592,12 +760,15 @@ static void initialize(unsigned index, int argc, char **argv, char **envp)
 
 static void finalize(void)
 {
+    xj_tls_run_destructors();
     while (init_count)
     {
         Object *object = &objects[init_order[--init_count]];
         call_array(object, object->fini_array, object->fini_size, 1, 0, NULL, NULL);
         if (object->fini) call_function(object, biased(object, object->fini), 0, NULL, NULL);
     }
+    // FINI may first access a thread_local with its own destructor.
+    xj_tls_run_destructors();
 }
 
 // Exercise interpreter self relocation even when every code reference can be
@@ -671,6 +842,11 @@ void rtld_start(uint64_t *stack)
     if (self.needed_count || self.jmprel_size) fail("interpreter has external dependencies", NULL);
     relocate(&self, self.rela, self.rela_size, 1);
     native_note(&self);
+    if (self.tls.p_memsz) fail("interpreter cannot use compiler TLS", NULL);
+    runtime_abi = self.abi_version;
+    // Last in the lookup scope. GNU ld can retain an unused __tls_get_addr
+    // PLT entry after relaxing main's GD access to LE, even without a DSO.
+    copy_bytes(&interpreter_object, &self, sizeof(self));
     TRACE("self relocated");
 
     Object *main = &objects[0];
@@ -692,6 +868,7 @@ void rtld_start(uint64_t *stack)
     main->entry = entry;
     native_note(main);
     dynamic(main);
+    validate_abi(main);
     TRACE("main validated");
     object_count = 1;
     for (size_t i = 0; i < object_count; ++i)
@@ -700,6 +877,7 @@ void rtld_start(uint64_t *stack)
         for (size_t j = 0; j < object->needed_count; ++j)
             object->dependencies[object->dependency_count++] = load_library(object, string(object, object->needed[j]));
     }
+    layout_tls();
     for (size_t i = 0; i < object_count; ++i)
     {
         relocate(&objects[i], objects[i].rela, objects[i].rela_size, 0);
@@ -709,6 +887,7 @@ void rtld_start(uint64_t *stack)
     for (size_t i = 0; i < object_count; ++i) protect(&objects[i]);
     protect(&self);
     TRACE("protected");
+    initialize_tls();
     initialize_runtime((int)argc, argv, envp);
     call_array(main, main->preinit_array, main->preinit_size, 0, (int)argc, argv, envp);
     initialize(0, (int)argc, argv, envp);

@@ -262,6 +262,7 @@ void get_thread_name_from_filepath(char *path, char *name);
 size_t create_message_thread(void *_start, char *name, pcb_t pcb, char *cwd, uint64_t arg);
 
 void init_reaper();
+void reap_quiesced_thread_tids();
 
 typedef void (*elf_start)(int, char **, char **);
 void kill_proc(pcb_t pcb, int exit_code, bool is_zombie);

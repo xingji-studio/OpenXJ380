@@ -1,6 +1,29 @@
 #include <proto.hpp>
 #include <mm/lazyalloc.h>
 #include <errno.h>
+#include <mutex.h>
+#include <task/scheduler.h>
+
+// Faulting in a user buffer can recurse from an existing mmap/VFS operation.
+// Keep the gate preemptible and recursive; queue spin locks protect metadata
+// only, never allocation, page clearing or frame/table publication.
+static mutex_t user_memory_lock = {SPIN_INIT, MUTEX_UNLOCKED, NULL, NULL, 0, true};
+
+void mm_op_lock_acquire()
+{
+    mutex_lock(&user_memory_lock);
+}
+
+void mm_op_lock_release()
+{
+    mutex_unlock(&user_memory_lock);
+}
+
+struct LazyMemoryOperation
+{
+    LazyMemoryOperation() { mm_op_lock_acquire(); }
+    ~LazyMemoryOperation() { mm_op_lock_release(); }
+};
 
 
 void *virt_copy(void *ptr) {
@@ -26,6 +49,12 @@ static bool lazy_range_end(uint64_t start, uint64_t count, uint64_t *end)
 }
 
 errno_t lazy_tryalloc(pcb_t pcb, uint64_t address) {
+    if (!pcb || !pcb->pagedir || !pcb->virt_queue) return -EINVAL;
+    if (scheduler_disable_depth()) return -EWOULDBLOCK;
+    LazyMemoryOperation operation;
+    // Another CPU may have satisfied the same not-present fault while this
+    // caller waited. Do not allocate or consume the reservation a second time.
+    if (translate_address(pcb->pagedir, address) != 0) return EOK;
     mm_virtual_page_t *virt_page = NULL;
     spin_lock(&pcb->virt_queue->lock);
     queue_foreach(pcb->virt_queue, node) {
@@ -40,6 +69,7 @@ errno_t lazy_tryalloc(pcb_t pcb, uint64_t address) {
     if (virt_page == NULL) {
         return -1;
     } else {
+        if (!(virt_page->pte_flags & PTE_PRESENT)) return -EACCES;
         size_t   fault_index = (address - virt_page->start) / PAGE_SIZE;
         uint64_t page_addr   = virt_page->start + fault_index * PAGE_SIZE;
 
@@ -73,10 +103,9 @@ errno_t lazy_tryalloc(pcb_t pcb, uint64_t address) {
             free(right);
             return -ENOMEM;
         }
-        page_map_to(pcb->pagedir, page_addr, phys, virt_page->pte_flags | PTE_FRAME_ALLOCATED);
-
-        // 直接通过物理地址映射到内核空间来清零页面，不需要切换页目录
+        // Initialize through HHDM before publishing a present user PTE.
         memset((void *)phys_to_virt(phys), 0, PAGE_SIZE);
+        page_map_to(pcb->pagedir, page_addr, phys, virt_page->pte_flags | PTE_FRAME_ALLOCATED);
 
         if (left != NULL) {
             left->index     = queue_enqueue(pcb->virt_queue, left);
@@ -109,6 +138,7 @@ errno_t lazy_tryalloc(pcb_t pcb, uint64_t address) {
 }
 
 void unmap_virtual_page(pcb_t process, uint64_t vaddr, size_t length) {
+    LazyMemoryOperation operation;
     uint64_t vaddr_end = vaddr + length;
     do {
         mm_virtual_page_t *vpage = NULL;
@@ -182,6 +212,7 @@ bool lazy_infoalloc(pcb_t process, uint64_t vaddr, size_t length, uint64_t page_
                     uint64_t flags) {
     uint64_t count = (length + PAGE_SIZE - 1) / PAGE_SIZE;
     if (process == NULL || process->virt_queue == NULL || count == 0) return false;
+    LazyMemoryOperation operation;
 
     if (flags & MAP_FIXED) {
         unmap_virtual_page(process, vaddr, length);
@@ -243,6 +274,7 @@ bool lazy_infoalloc(pcb_t process, uint64_t vaddr, size_t length, uint64_t page_
 
 void lazy_free(pcb_t process) {
     if (process == NULL || process->virt_queue == NULL) return;
+    LazyMemoryOperation operation;
     if (process->virt_queue->size > 0) {
     refree_virt:
         mm_virtual_page_t *virt_page = NULL;

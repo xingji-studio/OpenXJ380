@@ -693,6 +693,7 @@ def main() -> None:
     n.comment("MANIFEST - regenerate build.ninja before every normal Ninja execution")
     manifest_inputs = [
         "tools/native_rtld.py",
+        "tools/epf_rtld.py",
         "LICENSES.md",
         "THIRD_PARTY_NOTICES.md",
         *[str(path) for path in sorted(Path("licenses").rglob("*")) if path.is_file()],
@@ -703,7 +704,7 @@ def main() -> None:
     n.build(
         "build.ninja",
         "regen",
-        ["tools/gen_ninja.py", "tools/ninja_build.py", "tools/native_rtld.py"],
+        ["tools/gen_ninja.py", "tools/ninja_build.py", "tools/native_rtld.py", "tools/epf_rtld.py"],
         use_default_order_only=False,
     )
     # Ninja cannot safely force the build.ninja self-edge every run: that causes
@@ -762,11 +763,23 @@ def main() -> None:
     rtld_spec.loader.exec_module(rtld_module)
     native_rtld_targets = rtld_module.emit(n)
     native_rtld_targets += rtld_module.emit_xapi(n)
+    epf_rtld_spec = importlib.util.spec_from_file_location("epf_rtld", ROOT / "." / "tools/epf_rtld.py")
+    epf_rtld_module = importlib.util.module_from_spec(epf_rtld_spec)
+    epf_rtld_spec.loader.exec_module(epf_rtld_module)
+    epf_rtld_targets = epf_rtld_module.emit(n, ".")
     kmod_targets = kmods(n)
+
+    n.comment("EPF - explicit native companion outputs; normal all/image targets retain their ELF paths")
+    epf_converter = Path("tools/elf_to_epf.py")
+    n.rule("elf_to_epf", "python3 tools/elf_to_epf.py $in --output $out", log_desc("GEN", "$out"))
+    for target in user_targets:
+        if target.suffix == ".elf":
+            n.build(target.with_suffix(".epf"), "elf_to_epf", target, implicit=[epf_converter])
+    phony(n, "epf", [Path("out/shell.epf")])
 
     n.comment("PHONY TARGETS - compatibility names for common build workflows")
     all_deps = ([Path("out/BOOTX64.efi"), Path("out/kernel.krl"), compliance_bundle] + user_targets +
-                native_rtld_targets + kmod_targets)
+                native_rtld_targets + epf_rtld_targets + kmod_targets)
     phony(n, "all", all_deps)
     phony(n, "build_xapi", core_objs + [constart_obj, xapi_liballoc])
     phony(n, "kmods", kmod_targets)

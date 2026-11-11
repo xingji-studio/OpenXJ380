@@ -9,6 +9,7 @@
 #include <efi/efi.h>
 #include <efi/fbc.h>
 #include <elf.h>
+#include <epf.h>
 #include <errno.h>
 #include <fs/fatfs/fatfs.h>
 #include <fs/partition.h>
@@ -301,7 +302,7 @@ typedef struct loaded_user_elf
 static void free_file_image(uint8_t *buf, uint64_t size)
 {
     if (buf == NULL || size == 0) return;
-    free_frames((uint64_t)virt_to_phys((uint64_t)buf), (size + PAGE_SIZE - 1) / PAGE_SIZE);
+    free_frames((uint64_t)virt_to_phys((uint64_t)buf), size / PAGE_SIZE + (size % PAGE_SIZE != 0));
 }
 
 static int read_vfs_file(vfs_node_t file, uint8_t **out, uint64_t *out_size)
@@ -309,12 +310,26 @@ static int read_vfs_file(vfs_node_t file, uint8_t **out, uint64_t *out_size)
     if (file == NULL || out == NULL || out_size == NULL) return -EINVAL;
     uint64_t size = file->size;
     if (size == 0) return -ENOEXEC;
+    if (size > ~0ULL - (PAGE_SIZE - 1)) return -EFBIG;
+
+    // Identify EPF before allocating its complete file buffer, so an invalid
+    // oversized file cannot exhaust contiguous physical memory first.
+    if (size > EPF_MAX_FILE_SIZE)
+    {
+        uint8_t magic[4];
+        if (vfs_read(file, magic, 0, sizeof(magic)) != sizeof(magic)) return -EIO;
+        if (epf_has_magic(magic, sizeof(magic))) return -EFBIG;
+    }
 
     uint64_t pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
     uint64_t phys = alloc_frames(pages);
     if (phys == 0) return -ENOMEM;
     uint8_t *buf = (uint8_t *)phys_to_virt(phys);
-    if (buf == NULL) return -ENOMEM;
+    if (buf == NULL)
+    {
+        free_frames(phys, pages);
+        return -ENOMEM;
+    }
     memset(buf, 0, pages * PAGE_SIZE);
 
     size_t got = vfs_read(file, buf, 0, size);
@@ -624,17 +639,15 @@ uint64_t parse_elf_file(char *path, pcb_t group)
         return (uint64_t)ret;
     }
 
-    if (file_size < sizeof(Elf64_Ehdr))
+    if (file_size < 4)
     {
         free_file_image(buf, file_size);
         write_serial_fmt("Parse ELF/EPF file failed. Reason: Truncated header: %s.\n", path);
         return (uint64_t)-ENOEXEC;
     }
-    Elf64_Ehdr ehdr = *(Elf64_Ehdr *)buf;
-
     // 验证ELF/EPF魔数 (0x7F,'E','L','F') (0x24, 'E', 'P', 'F')
-    if ((*(uint32_t *)ehdr.e_ident != 0x464C457F)     // ELF
-        && (*(uint32_t *)ehdr.e_ident != 0x46504524)) // EPF
+    bool is_epf = epf_has_magic(buf, file_size);
+    if (memcmp(buf, "\177ELF", 4) != 0 && !is_epf)
     {
         pr_warn("Parse ELF/EPF file failed.\n");
         write_serial_fmt("Reason:   Bad Format path=%s size=%llu magic=%02x %02x %02x %02x.\n",
@@ -645,8 +658,40 @@ uint64_t parse_elf_file(char *path, pcb_t group)
                          file_size > 2 ? buf[2] : 0,
                          file_size > 3 ? buf[3] : 0);
         free_file_image(buf, file_size);
-        return NULL;
+        return (uint64_t)-ENOEXEC;
     }
+
+    // ELF/EPF 分流：EPF 使用自己的文件头、段表和 RVA 地址模型。
+    if (is_epf)
+    {
+        uint8_t *epf_interpreter = nullptr;
+        uint64_t epf_interpreter_size = 0;
+        int needs_interpreter = epf_get_interpreter(buf, file_size);
+        if (needs_interpreter > 0)
+        {
+            vfs_node_t interpreter_file = vfs_open(EPF_INTERPRETER_PATH);
+            if (!interpreter_file) ret = -ENOENT;
+            else
+            {
+                ret = read_vfs_file(interpreter_file, &epf_interpreter, &epf_interpreter_size);
+                vfs_close(interpreter_file);
+            }
+        }
+        else ret = needs_interpreter;
+        uint64_t entry = ret < 0 ? (uint64_t)ret :
+            load_user_epf_image(buf, file_size, group, epf_interpreter, epf_interpreter_size);
+        free_file_image(epf_interpreter, epf_interpreter_size);
+        free_file_image(buf, file_size);
+        if ((int64_t)entry < 0) write_serial_fmt("Cannot load EPF %s: ret=%d\n", path, (int)(int64_t)entry);
+        return entry;
+    }
+
+    if (file_size < sizeof(Elf64_Ehdr))
+    {
+        free_file_image(buf, file_size);
+        return (uint64_t)-ENOEXEC;
+    }
+    Elf64_Ehdr ehdr = *(Elf64_Ehdr *)buf;
 
     char interp_path[256];
     ret = find_elf_interpreter(buf, file_size, interp_path, sizeof(interp_path));

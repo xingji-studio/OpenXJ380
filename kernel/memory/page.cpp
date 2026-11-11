@@ -355,20 +355,27 @@ extern "C" void handle_page_fault(struct X64_REGS *frame, uint64_t error_code)
     if (current_task != NULL)
     {
         pcb_t current_proc = current_task->parent_group;
-        if (current_proc != NULL && current_proc->task_level == TASK_APPLICATION_LEVEL)
+        if (current_proc != NULL && current_proc->task_level == TASK_APPLICATION_LEVEL && !scheduler_depth &&
+            !(error_code & (0x1 | 0x8)) && faulting_address >= PAGE_SIZE &&
+            !check_user_overflow(faulting_address, 1))
         {
+            // The exception/FPU frame is already private to this stack. Lazy
+            // allocation may wait for another CPU's VM operation or allocate;
+            // it must not inherit this handler's temporary preemption disable.
+            scheduler_restore_depth(scheduler_depth);
+            if (!no_interrupt) open_interrupt;
+            mm_op_lock_acquire();
             errno_t status = lazy_tryalloc(current_proc, faulting_address);
-            if (status == 0)
+            bool mapped = status == 0 || (status == -1 && try_map_user_stack_fault(current_task, faulting_address));
+            mm_op_lock_release();
+            close_interrupt;
+            if (mapped)
             {
                 scheduler_restore_depth(scheduler_depth);
                 // The exception return restores the faulting context's IF.
                 return;
             }
-            if (try_map_user_stack_fault(current_task, faulting_address))
-            {
-                scheduler_restore_depth(scheduler_depth);
-                return;
-            }
+            disable_scheduler();
             goto err;
         }
     }

@@ -7,7 +7,7 @@ retains the XAPI syscall ABI. Existing Linux interpreters retain their Linux
 ABI selection; static ELF and EPF keep their existing entry paths.
 
 `user/rtld/` contains the freestanding interpreter, a dynamic CRT, the native
-ABI note and a small shared-library example. This common implementation is
+ABI note, TLS/thread runtime and shared-library examples. This common implementation is
 built by both the public and product Ninja generators through
 `tools/native_rtld.py`. It has no libc, allocator archive or kernel symbol-table
 dependency. The existing kernel module linker remains separate.
@@ -31,7 +31,8 @@ The outputs are:
 | `out/libnative-demo.so.1` | `/system/lib/libnative-demo.so.1` |
 | `out/native-dynamic-demo.elf` | `/apps/native-dynamic-demo/native-dynamic-demo.elf` |
 
-Full image staging and installer temporary roots install all three. The
+Full image staging and installer temporary roots install these artifacts and the
+TLS/runtime artifacts described below. The
 `/system/lib` runtime directory is publicly readable; writes continue to use
 the protected-system permission policy. Resolved aliases cannot grant access
 to protected files outside that directory. No loader configuration file or
@@ -85,8 +86,9 @@ stderr diagnostic and exit status 127. Libraries need not have an entry point.
 
 The first milestone provides startup linking and its example. The shared XAPI
 milestone below adds a runtime usable by ordinary native applications.
-`dlopen/dlsym/dlclose`, TLS, lazy PLT binding, COPY/IFUNC, symbol versions and
-general C++ runtime integration remain subsequent work. Existing applications
+`dlopen/dlsym/dlclose`, lazy PLT binding, COPY/IFUNC, symbol versions and
+general C++ runtime integration remain subsequent work. TLS and the supported
+C++ `thread_local` subset are implemented by the milestones below. Existing applications
 still use their established runtime and link rules. Text-page sharing between
 processes and ELF ASLR are not claimed by this milestone.
 
@@ -119,8 +121,8 @@ dynamic CRT and does not use this handshake.
 Returning from main or calling shared `exit()` runs loader finalizers exactly
 once before exiting the process, including exit from a main constructor.
 `_exit` and raw exit syscalls bypass finalizers. This step supplies ELF
-init/fini lifecycle integration; it does not add `atexit`, `__cxa_atexit`, TLS,
-or thread-safe libc state. `errno` retains its existing process-global model.
+init/fini lifecycle integration; it does not add `atexit`, `__cxa_atexit`,
+or thread-safe libc state. TLS lifecycle integration is described below. `errno` retains its existing process-global model.
 
 Use `-fPIC` for both application and library objects, and link applications as
 PIE with the shared CRT, native ABI note, and `libxapi.so.1`. PIC avoids COPY
@@ -134,6 +136,113 @@ and preinit environment, shared errno/environment, POSIX error translation,
 allocation and free across ELF objects, file I/O, process isolation and ordered
 finalization. `./ninja all` includes this runtime and example in both builds.
 
+## Third milestone: native ELF TLS
+
+`./ninja native_tls` builds the interpreter, `libnative-runtime.so.1`,
+`libnative-tls.so.1`, `libnative-tls-ie.so.1` and `native-tls-demo.elf`.
+`./ninja all` includes them in both project graphs. Image and installer staging
+place libraries in `/system/lib`, demos in `/apps/native-dynamic-demo`, and the
+public `native_runtime.h` in `/system/include`.
+
+The native ABI note now records the minimum required runtime capability:
+
+| Note version | Required capability |
+| --- | --- |
+| 1 | Original native ELF dynamic linking and shared XAPI |
+| 2 | TLS layout, access and native worker threads |
+| 3 | C++ thread-local destructor registration and exit lifecycle |
+
+The interpreter advertises version 3 and accepts versions 1 through 3. The
+interpreter path and `.so.1` names are unchanged. Objects whose note understates
+TLS/C++ requirements, or exceeds the interpreter's capability, fail before
+constructors with exit 127. Compile `abi_note.S` with
+`-DXJ380_NATIVE_ABI=2` for TLS objects and `=3` for nontrivial C++ TLS objects;
+the default remains 1 for existing callers. The runtime DSO advertises 3.
+This profile applies to the dedicated native interpreter, not Linux binaries
+or legacy static ELF startup.
+
+Supported TLS features:
+
+- One validated `PT_TLS` per object, initialized `.tdata`, zero-filled `.tbss`,
+  and power-of-two alignment up to 2 MiB. The template must start at that
+  alignment and match a readable file-backed LOAD range; TLS BSS need not fit
+  in ordinary image storage. Each module permits 1 MiB of TLS, all modules
+  together 16 MiB. The existing 32-object limit includes modules without TLS.
+- x86-64 variant-II layout below FS, main nearest the thread pointer, with
+  stable module IDs in the original breadth-first dependency order. TLS
+  definitions follow the existing native ELF preemption/visibility and
+  `DT_SYMBOLIC` rules, including binding a library reference to main's TLS.
+- GD and LD through `__tls_get_addr`, IE through `DF_STATIC_TLS` and GOT
+  offsets, and linker-resolved LE in the main executable. Dynamic RELA types
+  `R_X86_64_DTPMOD64`, `R_X86_64_DTPOFF64`, and `R_X86_64_TPOFF64` are supported.
+  TLS symbols carry offsets, not ordinary image addresses. Ordinary relocation
+  types cannot address TLS. Unresolved weak GD yields a null address; weak IE
+  and TLS descriptors (`TLSDESC`) are rejected.
+- The interpreter installs main's FS before the shared XAPI bootstrap, preinit
+  or constructors. Worker TLS comes from read-only snapshots taken after
+  relocation and before constructors; main's subsequent writes cannot alter
+  another thread's initial values. Snapshots preserve pointers relocated in
+  `.tdata`. A control block is installed even without compiler TLS.
+
+The interpreter's exported helpers are searched after main and all ordinary
+objects. This also resolves an unused `__tls_get_addr` PLT entry left by GNU ld
+after relaxing main's access to LE. The normal global lookup order is preserved.
+There is no runtime module loading or TLS layout growth in this milestone.
+
+Applications link `libnative-runtime.so.1` and include `native_runtime.h`:
+
+```c
+XjThread thread = {0};
+int64_t result;
+int64_t status = xj_thread_create(&thread, worker, argument);
+if (!status) status = xj_thread_join(&thread, &result);
+```
+
+A worker has fresh TLS, a 1 MiB user stack with guard pages and its own FS base.
+Its entry returns `int64_t`. Join waits for the kernel to quiesce the child,
+then reclaims TLS, stack and the user control record and resets the handle.
+The caller serializes access to each handle; a single join owns reclamation.
+Errors are negative errno values. Raw worker exit before completing the entry
+returns `-ECANCELED` from join, preserves the result argument and discards
+pending destructor records without invoking them on the joiner's FS. Detach,
+cancellation, POSIX pthreads and thread-safe libc state are outside this API.
+Kernel TCB/kernel stack retention still follows the process collector's existing
+lifetime; join's user-memory reclamation does not change that limitation.
+
+The runtime implementation (`user/rtld/tls.c`, `tls.h`, `thread.S`) is shared
+with EPF. Existing `epf_thread_create/join` entry points and the EPF thread-pointer
+layout are retained. This does not make EPF and ELF modules interchangeable.
+
+## Fourth milestone: C++ thread_local
+
+`./ninja native_cxx_tls` additionally builds `libnative-cxx-tls.so.1` and
+`native-cxx-tls-demo.elf`. Compile application/library C++ objects with `-fPIC`,
+`-fno-exceptions`, and `-fno-rtti`. Link one `out/rtld/cxx_abi.c.o` into each
+C++ executable/DSO to supply its own hidden `__dso_handle`, and use ABI note 3.
+Use the dynamic CRT, or the shared XAPI CRT and `libxapi.so.1` when calling
+shared `exit()` or other XAPI functions. No host C++ standard library is linked.
+
+Both GCC and Clang namespace and function-local `thread_local` objects support
+nonthrowing dynamic initialization on first use, per-thread guards and explicit
+alignment, plus nontrivial destructors. Objects never touched are not constructed.
+`__cxa_thread_atexit` and `__cxa_thread_atexit_impl` share the current thread's
+private LIFO registration list. Each thread permits 64 pages / 10,816 pending
+records; null callbacks, allocation failure or exhaustion return -1 without
+losing earlier registrations. No module unload occurs while callbacks are pending.
+
+A normally returning worker drains its destructors before publishing completion,
+so join observes destructor side effects. Returning from main or calling shared
+XAPI `exit()` drains main's TLS destructors before module FINI. Registrations
+created by a destructor also run in LIFO order; callbacks first registered by FINI
+are drained afterward. Shared XAPI's existing single finalization guard also
+covers exit from a main constructor. Raw process exit bypasses finalization.
+
+This adds no exception unwinding, throwing/retrying TLS initialization, C++
+standard library, global-object `__cxa_atexit`, `atexit`, dynamic unload, or
+POSIX pthread support. Shared XAPI's `errno`, streams, environment and allocator
+retain their existing concurrency properties; TLS support alone does not make
+those APIs thread safe.
+
 ## Verification
 
 From the product checkout:
@@ -141,10 +250,15 @@ From the product checkout:
 ```sh
 python3 -m unittest discover -s tests -p test_native_rtld.py
 python3 -m unittest discover -s tests -p test_shared_xapi.py
+python3 -m unittest discover -s tests -p test_native_tls.py
+python3 -m unittest discover -s tests -p test_epf_rtld.py
+python3 -m unittest discover -s tests -p test_epf_cxx_tls.py
 python3 -m unittest discover -s tests -p test_elf_loader.py
 python3 -m unittest discover -s tests -p test_permissions.py
 python3 tests/run_native_rtld_qemu.py
 python3 tests/run_native_rtld_qemu.py --shared-xapi
+python3 tests/run_native_rtld_qemu.py --tls
+python3 tests/run_native_rtld_qemu.py --cxx-tls
 ```
 
 The host tests execute toolchain-generated binaries through the real
@@ -162,3 +276,10 @@ regression ran. `--no-epf` explicitly selects ELF-only verification.
 `--trace-loader` builds a diagnostic
 interpreter only for that clone. The original image and launch configuration
 are preserved.
+
+The native TLS host suite executes the real native interpreter and compiler
+outputs, including GD/LD/IE/LE, main interposition and SYMBOLIC, pure TLS BSS,
+relocated templates, malformed TLS records, eight workers, GCC/Clang C++
+initialization, reentrant destructors, shared exit and late FINI registrations.
+`--tls` and `--cxx-tls` run the corresponding eight-worker probes concurrently
+in separate guest processes, including spawn, exec and ordinary format regressions.

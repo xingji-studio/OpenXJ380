@@ -51,7 +51,7 @@ class GenNinjaDependencyTests(unittest.TestCase):
 
     def test_user_tree_keeps_xapi_cli_and_the_native_linker(self) -> None:
         user_entries = {path.name for path in (ROOT / "user").iterdir()}
-        self.assertEqual(user_entries, {"AGENTS.md", "cli_shell.cpp", "xapi", "rtld"})
+        self.assertEqual(user_entries, {"AGENTS.md", "cli_shell.cpp", "xapi", "rtld", "epf_rtld"})
         self.assertIn("build out/rtld/rtld.c.o: native_rtld_cc user/rtld/rtld.c", self.text)
 
     def test_gui_sources_are_absent_from_build_graph(self) -> None:
