@@ -1,4 +1,7 @@
+#include <net/xnet_provider.h>
 #include <screen_capture.h>
+#include <user/permissions.h>
+#include <user/process_launch.h>
 #include <input_method.h>
 #include "task/pcb.h"
 #include "cpu/fsgsbase.h"
@@ -13,6 +16,8 @@
 #include <elf.h>
 #include <errno.h>
 #include <fs/vfs/vfs.h>
+#include <fs/ext4/ext4.h>
+#include <fs/fatfs/fatfs.h>
 #if defined(XJ380)
 #include <graphics/window/window.h>
 #endif
@@ -22,7 +27,15 @@
 #include <pctable/gdt.h>
 #include <procfs.h>
 #include <syscall/syscall.h>
+#include <syscall/fd_lifetime.h>
+#include <block_access.h>
+#include <installer/jobs.h>
 #include <task/ipc.h>
+#include <task/process_preparation.h>
+#include <smp/smp.h>
+
+// Product audio resources are revoked at successful image publication.
+extern "C" void OpenXJ380Audio_ReleaseProcess(void *) __attribute__((weak));
 
 #define SA_RPL3 3
 
@@ -116,12 +129,8 @@ static bool ensure_message_entry_stub(page_directory_t *pagedir)
         page_map_range_to_random(pagedir, stub_page, PAGE_SIZE, PTE_PRESENT | PTE_WRITEABLE | PTE_USER);
     }
 
-    page_directory_t current_dir;
-    current_dir.table = (page_table_t *)phys_to_virt(get_cr3());
-    switch_page_directory(pagedir);
-    memcpy((void *)(stub_page + XPSR_OFFEST), (void *)message_thread, message_thread_size);
-    switch_page_directory(&current_dir);
-    return true;
+    return copy_to_user_pagedir(pagedir, (void *)(stub_page + XPSR_OFFEST),
+                                (const void *)message_thread, message_thread_size);
 }
 
 static void restore_runtime_state(uint64_t scheduler_depth, bool was_interrupt_enabled)
@@ -246,6 +255,56 @@ tcb_t found_thread(pcb_t pcb, int tid)
     return ret;
 }
 
+static bool process_list_contains_locked(pcb_t process)
+{
+    for (lock_node *entry = pcb_group_queue->head; entry; entry = entry->next)
+        if (entry->data == process) return true;
+    return false;
+}
+
+static bool notify_parent_exit(pcb_t child, int exit_code)
+{
+    // Parent collection changes parent_task under the process-list lock. Both
+    // allocations precede that lock; publication transfers ownership at unlock.
+    auto *message = static_cast<ipc_message_t>(malloc(sizeof(struct ipc_message)));
+    if (!message) return false;
+    auto *node = static_cast<lock_node *>(malloc(sizeof(lock_node)));
+    if (!node) { free(message); return false; }
+    memset(message, 0, sizeof(*message));
+    message->type = IPC_MSG_TYPE_EPID;
+    for (unsigned i = 0; i < 4; ++i) message->data[i] = uint8_t(uint32_t(exit_code) >> (i * 8));
+    node->data = message;
+    node->next = NULL;
+    bool published = false;
+    spin_lock(&pcb_group_queue->lock);
+    if (process_list_contains_locked(child))
+    {
+        pcb_t parent = child->parent_task;
+        lock_queue *queue = parent ? parent->ipc_queue : NULL;
+        if (queue)
+        {
+            spin_lock(&queue->lock);
+            if (queue->next_index != size_t(-1))
+            {
+                message->pid = int(child->pid);
+                node->index = queue->next_index++;
+                node->prev = queue->tail;
+                if (queue->tail) queue->tail->next = node;
+                else queue->head = node;
+                queue->tail = node;
+                if (!queue->rr_cursor) queue->rr_cursor = queue->head;
+                ++queue->size;
+                published = true;
+            }
+            spin_unlock(&queue->lock);
+        }
+    }
+    spin_unlock(&pcb_group_queue->lock);
+    // A receiver may already have freed both objects after publication.
+    if (!published) { free(node); free(message); }
+    return published;
+}
+
 void kill_proc(pcb_t pcb, int exit_code, bool is_zombie)
 {
     if (pcb == NULL) return;
@@ -259,36 +318,27 @@ void kill_proc(pcb_t pcb, int exit_code, bool is_zombie)
 
     if (is_zombie)
     {
-        close_process_file_table(pcb);
-        pcb->status = ZOMBIE;
+        // Exit may run with interrupts or scheduling disabled. The reaper
+        // drains descriptors only after every exiting thread leaves all CPUs.
+        pcb->status = DEATH;
         if (pcb->thread_queue->size > 0)
         {
             spin_lock(&pcb->thread_queue->lock);
             queue_foreach(pcb->thread_queue, node)
             {
                 tcb_t tcb = (tcb_t)node->data;
-                kill_thread(tcb);
+                if (tcb) tcb->status = DEATH;
             }
             spin_unlock(&pcb->thread_queue->lock);
         }
-        ipc_message_t msg = (ipc_message_t)malloc(sizeof(struct ipc_message));
-        if (msg == NULL)
+        __atomic_store_n(&pcb->status, ZOMBIE, __ATOMIC_RELEASE);
+        if (!notify_parent_exit(pcb, exit_code))
         {
             write_serial_fmt("task: cannot notify parent of process %s exit.\n", pcb->name);
-            return;
         }
-        msg->pid          = pcb->pid;
-        msg->type         = IPC_MSG_TYPE_EPID;
-        msg->data[0]      = exit_code & 0xFF;
-        msg->data[1]      = (exit_code >> 8) & 0xFF;
-        msg->data[2]      = (exit_code >> 16) & 0xFF;
-        msg->data[3]      = (exit_code >> 24) & 0xFF;
-        ipc_send(pcb->parent_task, msg);
     }
     else
     {
-        if (pcb->parent_task != NULL && pcb->parent_task->child_pcb != NULL)
-            queue_remove_data(pcb->parent_task->child_pcb, pcb);
         pcb->status = DEATH;
         kill_proc0(pcb);
     }
@@ -296,35 +346,80 @@ void kill_proc(pcb_t pcb, int exit_code, bool is_zombie)
 
 bool kill_proc_deferred(pcb_t pcb, int exit_code)
 {
-    if (pcb == NULL || kernel_group == NULL || pcb->pid == kernel_group->pid) return false;
-
+    if (!pcb || !kernel_group || !pcb_group_queue) return false;
+    // A raw lookup may race withdrawal. Establish list membership before any
+    // PCB dereference, and retain this lock until every terminal write is done.
+    spin_lock(&pcb_group_queue->lock);
+    if (!process_list_contains_locked(pcb) || pcb == kernel_group)
+    {
+        spin_unlock(&pcb_group_queue->lock);
+        return false;
+    }
     if (pcb->parent_task != kernel_group)
     {
-        size_t reaper_index = queue_enqueue(kernel_group->child_pcb, pcb);
-        if (reaper_index == (size_t)-1) return false;
-
-        if (pcb->parent_task != NULL && pcb->parent_task->child_pcb != NULL)
-            queue_remove_data(pcb->parent_task->child_pcb, pcb);
+        lock_queue *siblings = pcb->parent_task ? pcb->parent_task->child_pcb : NULL;
+        lock_queue *adopted = kernel_group->child_pcb;
+        if (!siblings || !adopted)
+        {
+            spin_unlock(&pcb_group_queue->lock);
+            return false;
+        }
+        spin_lock(&siblings->lock);
+        spin_lock(&adopted->lock);
+        lock_node *entry = siblings->head;
+        while (entry && entry->data != pcb) entry = entry->next;
+        if (!entry)
+        {
+            spin_unlock(&adopted->lock);
+            spin_unlock(&siblings->lock);
+            spin_unlock(&pcb_group_queue->lock);
+            return false;
+        }
+        size_t index = 0;
+        for (;;)
+        {
+            bool used = false;
+            for (lock_node *other = adopted->head; other; other = other->next)
+                if (other->index == index) { used = true; break; }
+            if (!used) break;
+            ++index;
+        }
+        if (entry->prev) entry->prev->next = entry->next;
+        else siblings->head = entry->next;
+        if (entry->next) entry->next->prev = entry->prev;
+        else siblings->tail = entry->prev;
+        if (siblings->rr_cursor == entry) siblings->rr_cursor = entry->next ? entry->next : siblings->head;
+        if (siblings->size) --siblings->size;
+        entry->index = index;
+        entry->prev = adopted->tail;
+        entry->next = NULL;
+        if (adopted->tail) adopted->tail->next = entry;
+        else adopted->head = entry;
+        adopted->tail = entry;
+        if (!adopted->rr_cursor) adopted->rr_cursor = entry;
+        ++adopted->size;
+        if (index >= adopted->next_index) adopted->next_index = index + 1;
         pcb->parent_task = kernel_group;
         pcb->ppid = kernel_group->pid;
-        pcb->child_index = reaper_index;
+        pcb->child_index = index;
+        spin_unlock(&adopted->lock);
+        spin_unlock(&siblings->lock);
     }
 
     pcb->exit_code = exit_code;
-    close_process_file_table(pcb);
-    pcb->status = DEATH;
-
     if (pcb->thread_queue != NULL)
     {
         spin_lock(&pcb->thread_queue->lock);
         queue_foreach(pcb->thread_queue, node)
         {
             tcb_t tcb = (tcb_t)node->data;
-            kill_thread(tcb);
+            if (tcb) tcb->status = DEATH;
         }
         spin_unlock(&pcb->thread_queue->lock);
     }
-
+    __atomic_store_n(&pcb->status, DEATH, __ATOMIC_RELEASE);
+    spin_unlock(&pcb_group_queue->lock);
+    // Reaper collection may free pcb immediately after the unlock.
     return true;
 }
 
@@ -361,11 +456,408 @@ static char **copy_kernel_string_vector_owned(char **argv, size_t argc)
     return copy;
 }
 
+// Private pins stabilize PCB/page-directory lifetime and stack reservations
+// while preparation runs with IRQs and scheduling available.
+struct ProcessPreparation
+{
+    pcb_t process;
+    page_directory_t *directory;
+    tcb_t owner;
+    uint64_t owner_tid;
+    ProcessPreparation *next;
+    size_t depth;
+    bool construction, cleaning;
+    tcb_t draft;
+    lock_node *group_node, *schedule_node;
+    char *cwd;
+    char **arguments;
+    vfs_node_t opened_cwd;
+};
+static spin_t preparation_lock = SPIN_INIT;
+static ProcessPreparation *process_preparations;
+static void cleanup_thread_draft(ProcessPreparation *pin);
+
+static bool process_has_preparation(pcb_t process)
+{
+    bool found = false;
+    spin_lock(&preparation_lock);
+    for (ProcessPreparation *pin = process_preparations; pin; pin = pin->next)
+        if (pin->process == process) { found = true; break; }
+    spin_unlock(&preparation_lock);
+    return found;
+}
+
+static void preparation_link(ProcessPreparation *pin, pcb_t process, bool construction)
+{
+    *pin = {};
+    pin->process = process;
+    pin->directory = process->pagedir;
+    pin->owner = get_current_task();
+    pin->owner_tid = pin->owner ? pin->owner->tid : 0;
+    pin->depth = 1;
+    pin->construction = construction;
+    spin_lock(&preparation_lock);
+    pin->next = process_preparations;
+    process_preparations = pin;
+    spin_unlock(&preparation_lock);
+}
+
+ProcessPreparation *process_preparation_acquire(pcb_t process)
+{
+    if (!process || !pcb_group_queue || scheduler_disable_depth()) return NULL;
+    auto *candidate = static_cast<ProcessPreparation *>(calloc(1, sizeof(ProcessPreparation)));
+    if (!candidate) return NULL;
+    tcb_t owner = get_current_task();
+    for (;;)
+    {
+        ProcessPreparation *result = NULL;
+        bool valid = false, busy = false;
+        // Fork uses create-thread -> process-list order. Collection never
+        // takes create_thread_lock; keep that established order here.
+        spin_lock(&create_thread_lock);
+        spin_lock(&pcb_group_queue->lock);
+        valid = process_list_contains_locked(process) && process->pagedir && process->thread_queue &&
+                process->status != DEATH && process->status != OUT && process->status != ZOMBIE &&
+                __atomic_load_n(&process->fd_cleanup_state, __ATOMIC_ACQUIRE) == 0 && owner &&
+                owner->status != DEATH && owner->status != OUT;
+        if (valid)
+        {
+            spin_lock(&preparation_lock);
+            // A collector may have claimed state 4 since the list check.
+            // Its final lifetime query takes this same metadata lock.
+            valid = __atomic_load_n(&process->fd_cleanup_state, __ATOMIC_ACQUIRE) == 0 &&
+                    process->status != DEATH && process->status != OUT && process->status != ZOMBIE;
+            for (ProcessPreparation *pin = valid ? process_preparations : NULL; pin; pin = pin->next)
+            {
+                if (pin->process != process) continue;
+                busy = true;
+                if (!pin->cleaning && pin->owner == owner && pin->owner_tid == owner->tid)
+                { ++pin->depth; result = pin; }
+                break;
+            }
+            if (valid && !busy)
+            {
+                candidate->process = process;
+                candidate->directory = process->pagedir;
+                candidate->owner = owner;
+                candidate->owner_tid = owner->tid;
+                candidate->depth = 1;
+                candidate->next = process_preparations;
+                process_preparations = candidate;
+                result = candidate;
+                candidate = NULL;
+            }
+            spin_unlock(&preparation_lock);
+        }
+        spin_unlock(&pcb_group_queue->lock);
+        spin_unlock(&create_thread_lock);
+        if (result || !valid) { free(candidate); return result; }
+        scheduler_yield();
+    }
+}
+
+void process_preparation_release(ProcessPreparation *pin)
+{
+    if (!pin) return;
+    bool remove = false;
+    spin_lock(&preparation_lock);
+    if (--pin->depth == 0)
+    {
+        ProcessPreparation **link = &process_preparations;
+        while (*link && *link != pin) link = &(*link)->next;
+        if (*link) { *link = pin->next; remove = true; }
+    }
+    spin_unlock(&preparation_lock);
+    if (remove) free(pin);
+}
+
+static void abandon_process_preparations(tcb_t owner)
+{
+    for (;;)
+    {
+        ProcessPreparation *abandoned = NULL;
+        spin_lock(&preparation_lock);
+        for (ProcessPreparation *pin = process_preparations; pin; pin = pin->next)
+        {
+            tcb_t task = pin->owner;
+            if (pin->cleaning || !task || (owner && task != owner)) continue;
+            if ((task->status == DEATH || task->status == OUT) && task->tid == pin->owner_tid &&
+                !scheduler_task_referenced(task))
+            {
+                pin->cleaning = true;
+                pin->owner = NULL;
+                pin->depth = 1;
+                abandoned = pin;
+                break;
+            }
+        }
+        spin_unlock(&preparation_lock);
+        if (!abandoned) return;
+        cleanup_thread_draft(abandoned);
+        if (abandoned->construction) kill_proc_deferred(abandoned->process, -EINTR);
+        process_preparation_release(abandoned);
+    }
+}
+
+static bool process_current_on_cpu(pcb_t process)
+{
+    return process_has_preparation(process) || scheduler_process_referenced(process);
+}
+
+static bool wait_owner_quiescent(tcb_t owner)
+{
+    return owner && (owner->status == DEATH || owner->status == OUT) && !scheduler_task_referenced(owner);
+}
+
+static void release_wait_claims(tcb_t owner, bool only_quiescent)
+{
+    spin_lock(&pcb_group_queue->lock);
+    for (lock_node *entry = pcb_group_queue->head; entry; entry = entry->next)
+    {
+        pcb_t child = static_cast<pcb_t>(entry->data);
+        tcb_t waiter = child ? __atomic_load_n(&child->wait_owner, __ATOMIC_ACQUIRE) : NULL;
+        if (!waiter || (owner && waiter != owner) || (only_quiescent && !wait_owner_quiescent(waiter))) continue;
+        lock_queue *children = child->parent_task ? child->parent_task->child_pcb : NULL;
+        if (children) spin_lock(&children->lock);
+        __atomic_store_n(&child->wait_owner, (tcb_t)NULL, __ATOMIC_RELEASE);
+        if (child->status == WAIT) __atomic_store_n(&child->status, ZOMBIE, __ATOMIC_RELEASE);
+        if (children) spin_unlock(&children->lock);
+    }
+    spin_unlock(&pcb_group_queue->lock);
+}
+
+void process_release_wait_claims(tcb_t owner) { release_wait_claims(owner, false); }
+void process_reap_wait_claims() { release_wait_claims(NULL, true); }
+
+static void collect_quiesced_process(pcb_t pcb);
+
+static void abandon_quiesced_block_access(pcb_t process)
+{
+    // The caller's collection/drain pin keeps this withdrawn or terminal
+    // process and its thread queue alive. Do not use the reaper's own TCB as
+    // the dead I/O owner, and never revoke a still selected/current stack.
+    if (!process || !process->thread_queue) return;
+    for (lock_node *entry = process->thread_queue->head; entry; entry = entry->next)
+    {
+        tcb_t task = static_cast<tcb_t>(entry->data);
+        if (task && (task->status == DEATH || task->status == OUT) && !scheduler_task_referenced(task))
+        {
+            block_access_abandon_owner(task, task->tid);
+            installer::jobs_abandon_worker(task, task->tid);
+        }
+    }
+}
+
+// A PCB-tail state pins a quiescent zombie while its descriptors are drained.
+// Collection competes with this claim before unlinking/freeing the PCB. No
+// allocation or filesystem work occurs while the process-list lock is held.
+void reap_quiesced_file_descriptors()
+{
+    abandon_process_preparations(NULL);
+    pcb_t target = NULL;
+    bool already_drained = false;
+    spin_lock(&pcb_group_queue->lock);
+    for (lock_node *entry = pcb_group_queue->head; entry; entry = entry->next)
+    {
+        pcb_t process = static_cast<pcb_t>(entry->data);
+        if (!process || (process->status != ZOMBIE && process->status != DEATH) || process_current_on_cpu(process))
+            continue;
+        uint32_t expected = 0;
+        if (__atomic_compare_exchange_n(&process->fd_cleanup_state, &expected, 1, false, __ATOMIC_ACQ_REL,
+                                        __ATOMIC_ACQUIRE)) { target = process; break; }
+        if (expected == 2 && process->status == DEATH &&
+            !__atomic_load_n(&process->wait_owner, __ATOMIC_ACQUIRE) &&
+            __atomic_compare_exchange_n(&process->fd_cleanup_state, &expected, 3, false, __ATOMIC_ACQ_REL,
+                                        __ATOMIC_ACQUIRE))
+        {
+            target = process;
+            already_drained = true;
+            break;
+        }
+    }
+    spin_unlock(&pcb_group_queue->lock);
+    if (!target) return;
+    if (already_drained) { collect_quiesced_process(target); return; }
+    abandon_quiesced_block_access(target);
+    ext4fs_quiescent_exit();
+    fatfs_quiescent_exit();
+    close_process_file_table(target);
+    if (target->thread_queue)
+        for (lock_node *entry = target->thread_queue->head; entry; entry = entry->next)
+        {
+            fd_operation_thread_exit(static_cast<tcb_t>(entry->data));
+            xnet_thread_release(static_cast<tcb_t>(entry->data));
+        }
+    uint32_t state = __atomic_load_n(&target->fd_cleanup_state, __ATOMIC_ACQUIRE);
+    for (;;)
+    {
+        bool collect = !__atomic_load_n(&target->wait_owner, __ATOMIC_ACQUIRE) &&
+                       (state == 5 || target->status == DEATH);
+        if (__atomic_compare_exchange_n(&target->fd_cleanup_state, &state, collect ? 3U : 2U, false,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+        {
+            // A concurrent waitpid records its request as state 5. Transfer
+            // directly from the drain pin to collection, with no unpinned gap.
+            if (collect) collect_quiesced_process(target);
+            return;
+        }
+    }
+}
+
+// 0: another collector/drain owns the PCB, 1: exclusive collection,
+// 2: exclusive preparation retained while a running process is deferred.
+static int claim_process_collection(pcb_t pcb, bool transfer_waiter = false)
+{
+    if (__atomic_load_n(&pcb->wait_owner, __ATOMIC_ACQUIRE) && !transfer_waiter) return 0;
+    if (transfer_waiter) __atomic_store_n(&pcb->status, DEATH, __ATOMIC_RELEASE);
+    uint32_t state = __atomic_load_n(&pcb->fd_cleanup_state, __ATOMIC_ACQUIRE);
+    for (;;)
+    {
+        if (state == 1)
+        {
+            if (__atomic_compare_exchange_n(&pcb->fd_cleanup_state, &state, 5, false, __ATOMIC_ACQ_REL,
+                                            __ATOMIC_ACQUIRE))
+            {
+                if (transfer_waiter) __atomic_store_n(&pcb->wait_owner, (tcb_t)NULL, __ATOMIC_RELEASE);
+                return 0;
+            }
+            continue;
+        }
+        if (state == 3 || state == 4 || state == 5)
+        {
+            if (transfer_waiter) __atomic_store_n(&pcb->wait_owner, (tcb_t)NULL, __ATOMIC_RELEASE);
+            return 0;
+        }
+        if (__atomic_compare_exchange_n(&pcb->fd_cleanup_state, &state, 4, false, __ATOMIC_ACQ_REL,
+                                        __ATOMIC_ACQUIRE)) break;
+    }
+    if (transfer_waiter) __atomic_store_n(&pcb->wait_owner, (tcb_t)NULL, __ATOMIC_RELEASE);
+    if (process_current_on_cpu(pcb)) return 2;
+    __atomic_store_n(&pcb->fd_cleanup_state, 3, __ATOMIC_RELEASE);
+    return 1;
+}
+
 void kill_proc0(pcb_t pcb)
 {
+    int claim = claim_process_collection(pcb);
+    if (!claim) return;
+    if (claim == 2)
+    {
+        kill_proc_deferred(pcb, pcb->exit_code);
+        // The preparation pin covers reparenting; no PCB access follows its
+        // release, since the existing reaper may immediately collect it.
+        __atomic_store_n(&pcb->fd_cleanup_state, 0, __ATOMIC_RELEASE);
+        return;
+    }
+    collect_quiesced_process(pcb);
+}
+
+// Couple list withdrawal to the waiter claim. A lookup either publishes
+// wait_owner first, or finds no list entry after collection has withdrawn it.
+static lock_node *detach_process_entry(lock_queue *queue, void *data)
+{
+    if (!queue) return NULL;
+    for (lock_node *entry = queue->head; entry; entry = entry->next)
+    {
+        if (entry->data != data) continue;
+        if (entry->prev) entry->prev->next = entry->next;
+        else queue->head = entry->next;
+        if (entry->next) entry->next->prev = entry->prev;
+        else queue->tail = entry->prev;
+        if (queue->rr_cursor == entry) queue->rr_cursor = entry->next ? entry->next : queue->head;
+        if (queue->size) --queue->size;
+        return entry;
+    }
+    return NULL;
+}
+
+static bool detach_process_child(pcb_t pcb)
+{
+    spin_lock(&pcb_group_queue->lock);
+    pcb_t parent = pcb->parent_task;
+    lock_queue *siblings = parent ? parent->child_pcb : NULL;
+    if (siblings) spin_lock(&siblings->lock);
+    if (__atomic_load_n(&pcb->wait_owner, __ATOMIC_ACQUIRE))
+    {
+        if (siblings) spin_unlock(&siblings->lock);
+        spin_unlock(&pcb_group_queue->lock);
+        return false;
+    }
+    lock_node *family_entry = detach_process_entry(siblings, pcb);
+    if (siblings) spin_unlock(&siblings->lock);
+    // Move existing child queue nodes rather than allocating while locked.
+    // Every parent pointer changes before this PCB leaves the protected list.
+    lock_queue *children = pcb->child_pcb;
+    lock_queue *adopted = kernel_group->child_pcb;
+    if (children)
+    {
+        spin_lock(&children->lock);
+        spin_lock(&adopted->lock);
+        while (children->head)
+        {
+            lock_node *entry = children->head;
+            auto *child = static_cast<pcb_t>(entry->data);
+            detach_process_entry(children, child);
+            size_t index = adopted->next_index;
+            for (;;)
+            {
+                bool used = false;
+                for (lock_node *other = adopted->head; other; other = other->next)
+                    if (other->index == index) { used = true; break; }
+                if (!used) break;
+                ++index;
+            }
+            adopted->next_index = index + 1;
+            entry->index = index;
+            entry->prev = adopted->tail;
+            entry->next = NULL;
+            if (adopted->tail) adopted->tail->next = entry;
+            else adopted->head = entry;
+            adopted->tail = entry;
+            if (!adopted->rr_cursor) adopted->rr_cursor = entry;
+            ++adopted->size;
+            child->parent_task = kernel_group;
+            child->ppid = kernel_group->pid;
+            child->child_index = index;
+            if (child->status == ZOMBIE || child->status == WAIT)
+            {
+                __atomic_store_n(&child->wait_owner, (tcb_t)NULL, __ATOMIC_RELEASE);
+                __atomic_store_n(&child->status, DEATH, __ATOMIC_RELEASE);
+            }
+        }
+        spin_unlock(&adopted->lock);
+        spin_unlock(&children->lock);
+    }
+    lock_node *global_entry = detach_process_entry(pcb_group_queue, pcb);
+    spin_unlock(&pcb_group_queue->lock);
+    free(family_entry);
+    free(global_entry);
+    return true;
+}
+
+void process_complete_wait(pcb_t child)
+{
+    int claim = claim_process_collection(child, true);
+    if (!claim) return;
+    if (claim == 2)
+    {
+        kill_proc_deferred(child, child->exit_code);
+        __atomic_store_n(&child->fd_cleanup_state, 0, __ATOMIC_RELEASE);
+        return;
+    }
+    collect_quiesced_process(child);
+}
+
+static void collect_quiesced_process(pcb_t pcb)
+{
+    if (!detach_process_child(pcb))
+    {
+        __atomic_store_n(&pcb->fd_cleanup_state, 2, __ATOMIC_RELEASE);
+        return;
+    }
+    pcb->status = DEATH;
     // Withdraw before destroying thread_queue: terminal group-signal delivery
     // holds the process-list lock while visiting that queue.
-    queue_remove_data(pcb_group_queue, pcb);
     /*
      * Mark every thread dead before notifying product subsystems. Exit hooks
      * use the status to reclaim process-owned locks while TCB pointers are
@@ -385,6 +877,9 @@ void kill_proc0(pcb_t pcb)
      * and PCB. Generic OpenXJ380 builds do not include the product window
      * implementation and use the socket hook as a no-op.
      */
+    abandon_quiesced_block_access(pcb);
+    ext4fs_quiescent_exit();
+    fatfs_quiescent_exit();
     ime_process_exit(pcb);
 #if defined(XJ380)
     OpenXJ380Socket_NotifyProcessExit(pcb);
@@ -404,6 +899,10 @@ void kill_proc0(pcb_t pcb)
     } while (true);
 
     queue_destroy(pcb->thread_queue);
+    // Withdrawal already transferred every child node to the reaper. Release
+    // the empty queue as well, so repeated application exits do not leak it.
+    if (pcb->child_pcb) queue_destroy(pcb->child_pcb);
+    pcb->child_pcb = NULL;
 
     // 保存需要在free之后访问的字段
     char *cmdline = pcb->cmdline;
@@ -457,6 +956,54 @@ static void clear_child_tid_if_requested(tcb_t task)
     task->tid_directory = NULL;
 }
 
+// A live process may join a finished worker long before process collection.
+// Pin its PCB/directory under the existing preparation registry, then perform
+// the user-memory store only after dropping every spin lock and checking CPU
+// references. Marking DEATH alone is not a TLS/stack reclamation boundary.
+void reap_quiesced_thread_tids()
+{
+    if (!pcb_group_queue || scheduler_disable_depth()) return;
+    auto *pin = static_cast<ProcessPreparation *>(calloc(1, sizeof(ProcessPreparation)));
+    if (!pin) return;
+    tcb_t target = NULL, owner = get_current_task();
+    if (!owner) { free(pin); return; }
+    spin_lock(&create_thread_lock);
+    spin_lock(&pcb_group_queue->lock);
+    for (lock_node *entry = pcb_group_queue->head; entry && !target; entry = entry->next)
+    {
+        pcb_t process = static_cast<pcb_t>(entry->data);
+        if (!process || !process->pagedir || !process->thread_queue || process->status == DEATH ||
+            process->status == OUT || process->status == ZOMBIE ||
+            __atomic_load_n(&process->fd_cleanup_state, __ATOMIC_ACQUIRE) != 0) continue;
+        spin_lock(&preparation_lock);
+        bool busy = false;
+        for (ProcessPreparation *existing = process_preparations; existing; existing = existing->next)
+            if (existing->process == process) { busy = true; break; }
+        if (!busy && __atomic_load_n(&process->fd_cleanup_state, __ATOMIC_ACQUIRE) == 0)
+        {
+            spin_lock(&process->thread_queue->lock);
+            for (lock_node *node = process->thread_queue->head; node; node = node->next)
+            {
+                tcb_t task = static_cast<tcb_t>(node->data);
+                if (!task || (task->status != DEATH && task->status != OUT) || !task->clear_child_tid ||
+                    task->tid_directory != process->pagedir) continue;
+                target = task;
+                pin->process = process; pin->directory = process->pagedir;
+                pin->owner = owner; pin->owner_tid = owner->tid; pin->depth = 1;
+                pin->next = process_preparations; process_preparations = pin;
+                break;
+            }
+            spin_unlock(&process->thread_queue->lock);
+        }
+        spin_unlock(&preparation_lock);
+    }
+    spin_unlock(&pcb_group_queue->lock);
+    spin_unlock(&create_thread_lock);
+    if (!target) { free(pin); return; }
+    if (!scheduler_task_referenced(target)) clear_child_tid_if_requested(target);
+    process_preparation_release(pin);
+}
+
 static void free_user_stack_mapping(tcb_t task)
 {
     if (task == NULL || task->parent_group == NULL || task->parent_group->pagedir == NULL ||
@@ -477,16 +1024,76 @@ void kill_thread(tcb_t task)
         write_serial_fmt("Cannot stop kernel thread.");
         return;
     }
-    clear_child_tid_if_requested(task);
-    task->status = DEATH;
+    __atomic_store_n(&task->status, DEATH, __ATOMIC_RELEASE);
     // kill_thread0(task); 瑕佺敤鐨勮В鎺?浣嗗彲鑳借鍔犻攣
+}
+
+// GUI close calls this while its window lifetime gate pins the task/PCB.
+// Mark only the window-owning thread first; private message-reader threads do
+// not keep an otherwise closed application alive. Actual cleanup remains with
+// the reaper, after this gate and every scheduler reference have been released.
+bool process_close_window_thread(tcb_t task)
+{
+    if (task == NULL || task->parent_group == NULL || task->task_level == TASK_IDLE_LEVEL ||
+        task->window_count != 0)
+        return false;
+
+    pcb_t process = task->parent_group;
+    kill_thread(task);
+    if (process == kernel_group) return true;
+
+    // Thread publication takes this same gate. Do not let a new application
+    // thread appear between the last-thread check and deferred termination.
+    spin_lock(&create_thread_lock);
+    TaskStatus status = __atomic_load_n(&process->status, __ATOMIC_ACQUIRE);
+    if (status == DEATH || status == OUT || status == ZOMBIE)
+    {
+        spin_unlock(&create_thread_lock);
+        return true;
+    }
+
+    bool other_live_thread = false;
+    if (process->thread_queue != NULL)
+    {
+        spin_lock(&process->thread_queue->lock);
+        queue_foreach(process->thread_queue, node)
+        {
+            tcb_t other = (tcb_t)node->data;
+            if (other == NULL || other == task) continue;
+            TaskStatus state = __atomic_load_n(&other->status, __ATOMIC_ACQUIRE);
+            if (state == DEATH || state == OUT) continue;
+            if (other->window_count == 0 && strcmp(other->name, "Window Message Thread") == 0) continue;
+            other_live_thread = true;
+            break;
+        }
+        spin_unlock(&process->thread_queue->lock);
+    }
+    if (!other_live_thread) kill_proc_deferred(process, 0);
+    spin_unlock(&create_thread_lock);
+    return true;
 }
 
 extern void remove_task(tcb_t task);
 
 void kill_thread0(tcb_t task)
 {
-    task->status = OUT;
+    if ((task->status == DEATH || task->status == OUT) && !scheduler_task_referenced(task))
+    {
+        // A killed formatter may own an incomplete static serial record.
+        // Close it only after it has stopped running, before reclaiming its TCB.
+        serial_task_quiescent_exit(task);
+        block_access_abandon_owner(task, task->tid);
+        installer::jobs_abandon_worker(task, task->tid);
+    }
+    abandon_process_preparations(task);
+    ext4fs_quiescent_exit();
+    fatfs_quiescent_exit();
+    process_release_wait_claims(task);
+    fd_operation_thread_exit(task);
+    procfs_operation_thread_exit(task);
+    xnet_thread_release(task);
+    permissions_thread_exit(task);
+    __atomic_store_n(&task->status, OUT, __ATOMIC_RELEASE);
     clear_child_tid_if_requested(task);
     if (task->argv != NULL)
     {
@@ -603,7 +1210,8 @@ static uint64_t build_user_stack(tcb_t task, uint64_t sp, uint64_t entry_point, 
     char **envp = task->parent_group->envp ? task->parent_group->envp : current_user->envp;
 
     uint64_t tmp_stack = sp;
-    tmp_stack          = push_slice(task, tmp_stack, (const uint8_t *)task->name, strlen(task->name) + 1);
+    const char *executable = task->parent_group->exe_path ? task->parent_group->exe_path : task->name;
+    tmp_stack          = push_slice(task, tmp_stack, (const uint8_t *)executable, strlen(executable) + 1);
     ok                 = tmp_stack != 0;
     uint64_t aux_execfn = tmp_stack;
     static const char platform[] = "x86_64";
@@ -648,8 +1256,6 @@ static uint64_t build_user_stack(tcb_t task, uint64_t sp, uint64_t entry_point, 
         ok             = tmp_stack != 0;
         argvps[argv_i] = tmp_stack;
     }
-    if (ok && argv_i > 0) aux_execfn = argvps[0];
-
     uint8_t aux_random[16];
     fill_aux_random(aux_random, task, sp);
     if (ok) tmp_stack = push_slice(task, tmp_stack, aux_random, sizeof(aux_random));
@@ -805,9 +1411,9 @@ static void switch_task_to_user_mode(tcb_t task)
             fd_file_handle *stderr = (fd_file_handle *)calloc(1, sizeof(fd_file_handle));
             stderr->node           = stdio;
             stderr->offset         = 0;
-            stdin->fd              = queue_enqueue(task->parent_group->file_open, stdin);
-            stdout->fd             = queue_enqueue(task->parent_group->file_open, stdout);
-            stderr->fd             = queue_enqueue(task->parent_group->file_open, stderr);
+            stdin->fd              = queue_enqueue_lowest(task->parent_group->file_open, stdin);
+            stdout->fd             = queue_enqueue_lowest(task->parent_group->file_open, stdout);
+            stderr->fd             = queue_enqueue_lowest(task->parent_group->file_open, stderr);
         }
         else
         {
@@ -1167,163 +1773,84 @@ static constexpr uint64_t CLONE_PARENT_SETTID_FLAG  = 0x00100000;
 static constexpr uint64_t CLONE_CHILD_CLEARTID_FLAG = 0x00200000;
 static constexpr uint64_t CLONE_CHILD_SETTID_FLAG   = 0x01000000;
 
+// Clone state is private to the preparing caller. No pointers to its register
+// frame survive publication, and the preparation ticket pins the directory.
+struct ThreadCloneState
+{
+    X64_REGS registers;
+    uint64_t flags, stack, tls;
+    int *parent_tid, *child_tid;
+};
+
+static size_t
+prepare_application_thread(void *entry, void *arguments, int argc, char *name,
+                            pcb_t process, char *cwd, bool message, uint64_t argument,
+                            const ThreadCloneState *clone);
+
+static void prepare_clone_context(tcb_t task, const ThreadCloneState *clone, tcb_t creator)
+{
+    task->context0.rip    = clone->registers.rcx;
+    task->context0.rflags = clone->registers.r11;
+    task->context0.cs     = clone->registers.cs;
+    task->context0.ss     = clone->registers.ss;
+    task->context0.es     = clone->registers.es;
+    task->context0.ds     = clone->registers.ds;
+    task->context0.rax    = 0;//子进程返回零
+    task->context0.rdi    = clone->registers.rdi;
+    task->context0.rsi    = clone->registers.rsi;
+    task->context0.rdx    = clone->registers.rdx;
+    task->context0.r9     = clone->registers.r9;
+    task->context0.r8     = clone->registers.r8;
+    task->context0.r10    = clone->registers.r10;
+    task->context0.r11    = clone->registers.r11;
+    task->context0.r12    = clone->registers.r12;
+    task->context0.r13    = clone->registers.r13;
+    task->context0.r14    = clone->registers.r14;
+    task->context0.r15    = clone->registers.r15;
+    task->context0.rbx    = clone->registers.rbx;
+    task->context0.rbp    = clone->registers.rbp;
+    task->context0.rsp    = clone->stack != 0 ? clone->stack : clone->registers.rsp;
+    task->context0.rcx    = clone->registers.rcx;
+
+    task->user_stack = clone->stack ? clone->stack : creator->user_stack;
+    task->user_stack_top = clone->stack ? clone->stack : creator->user_stack_top;
+    task->fs = (clone->flags & CLONE_SETTLS_FLAG) ? 0 : creator->fs;
+    task->fs_base = (clone->flags & CLONE_SETTLS_FLAG) ? clone->tls : creator->fs_base;
+    memcpy(task->actions, creator->actions, sizeof(task->actions));
+    task->blocked = creator->blocked;
+}
+
 uint64_t thread_clone(struct X64_REGS *reg, uint64_t flags, uint64_t stack, int *parent_tid, int *child_tid,
                       uint64_t tls)
 {
     if (reg == NULL) return SYSCALL_FAULT_(EINVAL);
-
     if ((flags & CLONE_THREAD_FLAG) == 0)
         return process_fork(reg, (flags & CLONE_VFORK_FLAG) != 0, stack, flags, parent_tid, child_tid);
-
     const uint64_t required = CLONE_VM_FLAG | CLONE_FS_FLAG | CLONE_FILES_FLAG | CLONE_SIGHAND_FLAG;
     if ((flags & required) != required) return SYSCALL_FAULT_(EINVAL);
-
-    bool is_sti                = are_interrupts_enabled();
-    uint64_t scheduler_depth = scheduler_disable_depth();
-    tcb_t parent_task          = get_current_task();
-    if (parent_task == NULL || parent_task->parent_group == NULL || parent_task->parent_group->pagedir == NULL)
+    tcb_t creator = get_current_task();
+    if (!creator || !creator->parent_group || !creator->parent_group->pagedir) return SYSCALL_FAULT_(EFAULT);
+    if (scheduler_disable_depth()) return SYSCALL_FAULT_(EWOULDBLOCK);
+    if (((flags & CLONE_PARENT_SETTID_FLAG) && !parent_tid) ||
+        ((flags & (CLONE_CHILD_SETTID_FLAG | CLONE_CHILD_CLEARTID_FLAG)) && !child_tid))
         return SYSCALL_FAULT_(EFAULT);
-    uint64_t parent_fs_base = read_fsbase();
-    if (parent_fs_base != 0 || parent_task->fs_base == 0)
-        parent_task->fs_base = parent_fs_base;
-
-    pcb_t process = parent_task->parent_group;
-    page_directory_t *pagedir = process->pagedir;
-
-    if ((flags & CLONE_PARENT_SETTID_FLAG) && parent_tid == NULL) return SYSCALL_FAULT_(EFAULT);
-    if ((flags & (CLONE_CHILD_SETTID_FLAG | CLONE_CHILD_CLEARTID_FLAG)) && child_tid == NULL)
-        return SYSCALL_FAULT_(EFAULT);
-
-    close_interrupt;
-    disable_scheduler();
-
-    spin_lock(&create_thread_lock);
-
-    tcb_t new_task = alloc_zeroed_tcb();
-    if (new_task == NULL)
+    if ((stack && check_user_overflow(stack, 1)) ||
+        ((flags & CLONE_SETTLS_FLAG) && tls && check_user_overflow(tls, 1))) return SYSCALL_FAULT_(EINVAL);
+    creator->fs_base = read_fsbase();
+    ThreadCloneState clone = {*reg, flags, stack, tls, parent_tid, child_tid};
+    bool was_interrupt_enabled = are_interrupts_enabled();
+    if (!no_interrupt) open_interrupt;
+    char *cwd = strdup(creator->str_cwd ? creator->str_cwd : "/");
+    if (!cwd)
     {
-        spin_unlock(&create_thread_lock);
-        restore_runtime_state(scheduler_depth, is_sti);
+        restore_runtime_state(0, was_interrupt_enabled);
         return SYSCALL_FAULT_(ENOMEM);
     }
-
-    new_task->task_level = TASK_APPLICATION_LEVEL;
-    new_task->cpu_id     = get_current_cpu()->processor_id;
-    new_task->status     = START;
-    new_task->parent_group = process;
-    strncpy(new_task->name, parent_task->name, sizeof(new_task->name) - 1);
-
-    uint64_t kernel_stack_phys = alloc_frames(KERNEL_STACK_SIZE / PAGE_SIZE);
-    if (kernel_stack_phys == 0)
-    {
-        free(new_task);
-        spin_unlock(&create_thread_lock);
-        restore_runtime_state(scheduler_depth, is_sti);
-        return SYSCALL_FAULT_(ENOMEM);
-    }
-    uint64_t syscall_stack_phys = alloc_frames(KERNEL_STACK_SIZE / PAGE_SIZE);
-    if (syscall_stack_phys == 0)
-    {
-        free_frames(kernel_stack_phys, KERNEL_STACK_SIZE / PAGE_SIZE);
-        free(new_task);
-        spin_unlock(&create_thread_lock);
-        restore_runtime_state(scheduler_depth, is_sti);
-        return SYSCALL_FAULT_(ENOMEM);
-    }
-
-    new_task->kernel_stack  = (uint64_t)phys_to_virt(kernel_stack_phys) + KERNEL_STACK_SIZE;
-    new_task->syscall_stack = (uint64_t)phys_to_virt(syscall_stack_phys) + KERNEL_STACK_SIZE;
-    new_task->main          = parent_task->main;
-    new_task->user_stack    = stack != 0 ? stack : parent_task->user_stack;
-    new_task->user_stack_top = stack != 0 ? stack : parent_task->user_stack_top;
-
-    new_task->context0.rip    = reg->rcx;
-    new_task->context0.rflags = reg->r11;
-    new_task->context0.cs     = reg->cs;
-    new_task->context0.ss     = reg->ss;
-    new_task->context0.es     = reg->es;
-    new_task->context0.ds     = reg->ds;
-    new_task->context0.rax    = 0;//子进程返回零
-    new_task->context0.rdi    = reg->rdi;
-    new_task->context0.rsi    = reg->rsi;
-    new_task->context0.rdx    = reg->rdx;
-    new_task->context0.r9     = reg->r9;
-    new_task->context0.r8     = reg->r8;
-    new_task->context0.r10    = reg->r10;
-    new_task->context0.r11    = reg->r11;
-    new_task->context0.r12    = reg->r12;
-    new_task->context0.r13    = reg->r13;
-    new_task->context0.r14    = reg->r14;
-    new_task->context0.r15    = reg->r15;
-    new_task->context0.rbx    = reg->rbx;
-    new_task->context0.rbp    = reg->rbp;
-    new_task->context0.rsp    = stack != 0 ? stack : reg->rsp;
-    new_task->context0.rcx    = reg->rcx;
-
-    memcpy(new_task->fpu_context.fxsave_area, parent_task->fpu_context.fxsave_area, 512);
-    memcpy(new_task->actions, parent_task->actions, sizeof(new_task->actions));
-    new_task->blocked = parent_task->blocked;
-    new_task->signal  = 0;
-    new_task->fs      = parent_task->fs;
-    new_task->fs_base = (flags & CLONE_SETTLS_FLAG) ? tls : parent_task->fs_base;
-
-    new_task->cwd = parent_task->cwd;
-    if (new_task->cwd != NULL) new_task->cwd->refcount++;
-    new_task->str_cwd = parent_task->str_cwd != NULL ? strdup(parent_task->str_cwd) : NULL;
-    new_task->user_info = parent_task->user_info;
-    new_task->winnum = 0;
-    new_task->hasfscr = false;
-    new_task->window_count = 0;
-    new_task->tid = alloc_tid();
-    int tid = (int)new_task->tid;
-    if ((flags & CLONE_PARENT_SETTID_FLAG) && !copy_to_user_pagedir(pagedir, parent_tid, &tid, sizeof(tid)))
-    {
-        if (new_task->cwd != NULL) vfs_close(new_task->cwd);
-        free(new_task->str_cwd);
-        free_frames(syscall_stack_phys, KERNEL_STACK_SIZE / PAGE_SIZE);
-        free_frames(kernel_stack_phys, KERNEL_STACK_SIZE / PAGE_SIZE);
-        free(new_task);
-        spin_unlock(&create_thread_lock);
-        restore_runtime_state(scheduler_depth, is_sti);
-        return SYSCALL_FAULT_(EFAULT);
-    }
-    if ((flags & CLONE_CHILD_SETTID_FLAG) && !copy_to_user_pagedir(pagedir, child_tid, &tid, sizeof(tid)))
-    {
-        if (new_task->cwd != NULL) vfs_close(new_task->cwd);
-        free(new_task->str_cwd);
-        free_frames(syscall_stack_phys, KERNEL_STACK_SIZE / PAGE_SIZE);
-        free_frames(kernel_stack_phys, KERNEL_STACK_SIZE / PAGE_SIZE);
-        free(new_task);
-        spin_unlock(&create_thread_lock);
-        restore_runtime_state(scheduler_depth, is_sti);
-        return SYSCALL_FAULT_(EFAULT);
-    }
-    if (flags & CLONE_CHILD_CLEARTID_FLAG)
-    {
-        new_task->clear_child_tid = (uint64_t)child_tid;
-        new_task->tid_directory   = pagedir;
-    }
-
-    new_task->group_index = queue_enqueue(process->thread_queue, new_task);
-    if (new_task->group_index == (size_t)-1)
-    {
-        if (new_task->cwd != NULL) vfs_close(new_task->cwd);
-        free(new_task->str_cwd);
-        free_frames(syscall_stack_phys, KERNEL_STACK_SIZE / PAGE_SIZE);
-        free_frames(kernel_stack_phys, KERNEL_STACK_SIZE / PAGE_SIZE);
-        free(new_task);
-        spin_unlock(&create_thread_lock);
-        restore_runtime_state(scheduler_depth, is_sti);
-        return SYSCALL_FAULT_(ENOMEM);
-    }
-
-    add_task(new_task);
-    spin_unlock(&create_thread_lock);
-    restore_runtime_state(scheduler_depth, is_sti);
-    return new_task->tid;
+    uint64_t result = prepare_application_thread((void *)reg->rcx, NULL, 0, creator->name,
+                                                  creator->parent_group, cwd, false, 0, &clone);
+    restore_runtime_state(0, was_interrupt_enabled);
+    return result;
 }
-
-
 
 uint64_t process_execve(char *path, char **argv, char **envp)
 {
@@ -1398,6 +1925,8 @@ uint64_t process_execve(char *path, char **argv, char **envp)
         restore_runtime_state(scheduler_depth, is_sti);
         return (uint64_t)-ENOENT;
     }
+    PermissionTerminalLaunchScope console_host(kargc == 1 && kargv &&
+                                               !strcmp(kargv[0], "-xj380sys-terminal-app-mode"));
     int shebang_ret = rewrite_shebang_exec(&node, &norm_path, &kargv, &kargc);
     if (shebang_ret < 0)
     {
@@ -1408,6 +1937,19 @@ uint64_t process_execve(char *path, char **argv, char **envp)
         free_envp(kenvp);
         restore_runtime_state(scheduler_depth, is_sti);
         return (uint64_t)shebang_ret;
+    }
+
+    char executable_directory[4096];
+    int directory_error = permissions_executable_directory(node, executable_directory, sizeof(executable_directory));
+    if (directory_error < 0)
+    {
+        vfs_close(node);
+        free(norm_path);
+        free(kpath);
+        free_envp(kargv);
+        free_envp(kenvp);
+        restore_runtime_state(scheduler_depth, is_sti);
+        return (uint64_t)directory_error;
     }
 
     // ELF reads can wait for filesystem mutexes. Stage the image privately with
@@ -1491,7 +2033,7 @@ uint64_t process_execve(char *path, char **argv, char **envp)
             return (uint64_t)-ENOMEM;
         }
     }
-    new_exe_path = strdup(norm_path);
+    new_exe_path = vfs_get_fullpath(node);
     if (new_exe_path == NULL)
     {
         vfs_close(node);
@@ -1577,6 +2119,7 @@ uint64_t process_execve(char *path, char **argv, char **envp)
 
     write_serial_fmt("execve process name :%s \n", image.name);
     uint64_t e_entry = (uint64_t)parse_elf_file(norm_path, &image);
+    console_host.finish();
     if (e_entry == NULL || (int64_t)e_entry < 0)
     {
         int exec_ret = e_entry == NULL ? -ENOENT : (int)(int64_t)e_entry;
@@ -1619,7 +2162,7 @@ uint64_t process_execve(char *path, char **argv, char **envp)
     close_interrupt;
     disable_scheduler();
     spin_lock(&create_thread_lock);
-    if (process->pagedir != old_page_dir)
+    if (process->pagedir != old_page_dir || process_has_preparation(process))
     {
         // Another thread committed exec while this image was being prepared.
         // Discard only our private image; never roll back the newer process.
@@ -1647,6 +2190,7 @@ uint64_t process_execve(char *path, char **argv, char **envp)
      * naming the new image. Do not move ELF/VFS work or heap allocation under
      * create_thread_lock or this scheduler-disabled section.
      */
+    permissions_process_exec(process, executable_directory);
     bool was_vfork = process->vfork;
     lock_queue *old_virt_queue = process->virt_queue;
     vma_manager_t old_vma_manager = process->vma_manager;
@@ -1668,6 +2212,8 @@ uint64_t process_execve(char *path, char **argv, char **envp)
     process->aux_execfn = image.aux_execfn;
     process->elf_file = image.elf_file;
     process->elf_size = image.elf_size;
+    xnet_process_release(process);
+    if (OpenXJ380Audio_ReleaseProcess) OpenXJ380Audio_ReleaseProcess(process);
     process->pagedir = new_page_dir;
     switch_page_directory(new_page_dir);
     if (current_task->tid_directory == old_page_dir) current_task->tid_directory = new_page_dir;
@@ -1764,35 +2310,7 @@ static void *file_copy(void *ptr)
 
 static void close_exec_file_descriptors(pcb_t process)
 {
-    if (process == NULL || process->file_open == NULL) return;
-
-    while (true)
-    {
-        size_t fd_to_close = (size_t)-1;
-
-        spin_lock(&process->file_open->lock);
-        lock_node *node = process->file_open->head;
-        while (node != NULL)
-        {
-            fd_file_handle *handle = (fd_file_handle *)node->data;
-            if (handle != NULL && (handle->flags & O_CLOEXEC))
-            {
-                fd_to_close = node->index;
-                break;
-            }
-            node = node->next;
-        }
-        spin_unlock(&process->file_open->lock);
-
-        if (fd_to_close == (size_t)-1) break;
-
-        fd_file_handle *handle = (fd_file_handle *)queue_remove_at(process->file_open, fd_to_close);
-        if (handle != NULL)
-        {
-            vfs_close(handle->node);
-            free(handle);
-        }
-    }
+    while (fd_file_handle *handle = fd_detach_matching(process, 0, size_t(-1), true)) fd_retire_handle(handle);
 }
 
 static void free_fd_handle_queue(lock_queue *queue)
@@ -1800,10 +2318,9 @@ static void free_fd_handle_queue(lock_queue *queue)
     if (queue == NULL) return;
     while (true)
     {
-        fd_file_handle *handle = (fd_file_handle *)queue_dequeue(queue);
+        fd_file_handle *handle = fd_detach_first(queue);
         if (handle == NULL) break;
-        vfs_close(handle->node);
-        free(handle);
+        fd_retire_handle(handle);
     }
     queue_destroy(queue);
 }
@@ -1837,20 +2354,19 @@ static bool fd_table_unref(pcb_t pcb)
 
 static void close_process_file_table(pcb_t pcb)
 {
-    if (pcb == NULL || pcb->file_open == NULL) return;
-
-    lock_queue *file_open = pcb->file_open;
+    xnet_process_release(pcb);
+    if (pcb == NULL) return;
+    lock_queue *file_open = fd_detach_process_table(pcb);
+    if (!file_open) return;
     bool close_fd_table = fd_table_unref(pcb);
-    pcb->file_open = NULL;
 
     if (!close_fd_table) return;
 
     while (true)
     {
-        fd_file_handle *handle = (fd_file_handle *)queue_dequeue(file_open);
+        fd_file_handle *handle = fd_detach_first(file_open);
         if (handle == NULL) break;
-        vfs_close(handle->node);
-        free(handle);
+        fd_retire_handle(handle);
     }
     queue_destroy(file_open);
 }
@@ -1876,6 +2392,10 @@ static void free_partial_process(pcb_t pcb, bool owns_pagedir)
         queue_remove_data(pcb->parent_task->child_pcb, pcb);
     if (pcb_group_queue != NULL && pcb->queue_index != (size_t)-1)
         queue_remove_data(pcb_group_queue, pcb);
+
+    // A failed fork may already have appeared in a lazy /proc snapshot.
+    // Withdraw it before retiring observers, then wait outside creator locks.
+    procfs_on_exit_task(pcb);
 
     if (pcb->thread_queue) queue_destroy(pcb->thread_queue);
     if (pcb->child_pcb) queue_destroy(pcb->child_pcb);
@@ -1999,6 +2519,7 @@ uint64_t process_fork(struct X64_REGS *reg, bool is_vfork, uint64_t user_stack, 
     memset(new_pcb, 0, sizeof(struct process_control_block));
     new_pcb->queue_index = (size_t)-1;
     new_pcb->child_index = (size_t)-1;
+    permissions_process_init(new_pcb, current_pcb);
     new_pcb->pid = alloc_pid();
     strcpy(new_pcb->name, current_pcb->name);
     write_serial_fmt("fork name: %s\n", new_pcb->name);
@@ -2028,9 +2549,9 @@ uint64_t process_fork(struct X64_REGS *reg, bool is_vfork, uint64_t user_stack, 
     if (!vma_manager_clone(&current_pcb->vma_manager, &new_pcb->vma_manager))//calloc灏辨垜鐙楀懡
     {
         write_serial_fmt("task: cannot clone process vma information.\n");
-        free_partial_process(new_pcb, !is_vfork);
         spin_unlock(&create_thread_lock);
         restore_runtime_state(scheduler_depth, is_sti);
+        free_partial_process(new_pcb, !is_vfork);
         return -ENOMEM;
     }
     new_pcb->brk_start   = current_pcb->brk_start;
@@ -2067,9 +2588,9 @@ uint64_t process_fork(struct X64_REGS *reg, bool is_vfork, uint64_t user_stack, 
         new_pcb->ipc_queue == NULL ||
         new_pcb->tty == NULL || new_pcb->xtttp_stc == NULL)
     {
-        free_partial_process(new_pcb, !is_vfork);
         spin_unlock(&create_thread_lock);
         restore_runtime_state(scheduler_depth, is_sti);
+        free_partial_process(new_pcb, !is_vfork);
         return (uint64_t)-ENOMEM;
     }
     memset(new_pcb->xtttp_stc, 0, sizeof(xtttp_dtt));
@@ -2077,27 +2598,27 @@ uint64_t process_fork(struct X64_REGS *reg, bool is_vfork, uint64_t user_stack, 
     new_pcb->queue_index = queue_enqueue(pcb_group_queue, new_pcb);
     if (new_pcb->queue_index == (size_t)-1)
     {
-        free_partial_process(new_pcb, !is_vfork);
         spin_unlock(&create_thread_lock);
         restore_runtime_state(scheduler_depth, is_sti);
+        free_partial_process(new_pcb, !is_vfork);
         return (uint64_t)-ENOMEM;
     }
 
     new_pcb->child_index = queue_enqueue(current_pcb->child_pcb, new_pcb);
     if (new_pcb->child_index == (size_t)-1)
     {
-        free_partial_process(new_pcb, !is_vfork);
         spin_unlock(&create_thread_lock);
         restore_runtime_state(scheduler_depth, is_sti);
+        free_partial_process(new_pcb, !is_vfork);
         return (uint64_t)-ENOMEM;
     }
 
     tcb_t new_task = alloc_zeroed_tcb();
     if (new_task == NULL)
     {
-        free_partial_process(new_pcb, !is_vfork);
         spin_unlock(&create_thread_lock);
         restore_runtime_state(scheduler_depth, is_sti);
+        free_partial_process(new_pcb, !is_vfork);
         return (uint64_t)-(ENOMEM);
     }
     new_task->task_level     = TASK_APPLICATION_LEVEL;
@@ -2107,20 +2628,20 @@ uint64_t process_fork(struct X64_REGS *reg, bool is_vfork, uint64_t user_stack, 
     uint64_t kernel_stack_phys = alloc_frames(KERNEL_STACK_SIZE / PAGE_SIZE);
     if (kernel_stack_phys == 0)
     {
-        free_partial_process(new_pcb, !is_vfork);
-        free_fork_task(new_task);
         spin_unlock(&create_thread_lock);
         restore_runtime_state(scheduler_depth, is_sti);
+        free_partial_process(new_pcb, !is_vfork);
+        free_fork_task(new_task);
         return (uint64_t)-ENOMEM;
     }
     uint64_t syscall_stack_phys = alloc_frames(KERNEL_STACK_SIZE / PAGE_SIZE);
     if (syscall_stack_phys == 0)
     {
+        spin_unlock(&create_thread_lock);
+        restore_runtime_state(scheduler_depth, is_sti);
         free_partial_process(new_pcb, !is_vfork);
         free_frames(kernel_stack_phys, KERNEL_STACK_SIZE / PAGE_SIZE);
         free_fork_task(new_task);
-        spin_unlock(&create_thread_lock);
-        restore_runtime_state(scheduler_depth, is_sti);
         return (uint64_t)-ENOMEM;
     }
     new_task->kernel_stack  = ((uint64_t)phys_to_virt(kernel_stack_phys)) + KERNEL_STACK_SIZE;
@@ -2129,7 +2650,7 @@ uint64_t process_fork(struct X64_REGS *reg, bool is_vfork, uint64_t user_stack, 
     new_task->cwd           = parent_task->cwd;
     if (new_task->cwd != NULL) new_task->cwd->refcount++;
     new_task->str_cwd       = parent_task->str_cwd != NULL ? strdup(parent_task->str_cwd) : NULL;
-    new_task->user_info     = parent_task->user_info;
+    new_task->user_info     = &new_pcb->permission_user;
     strcpy(new_task->name, parent_task->name);
     new_task->winnum  = 0;
     new_task->hasfscr = false;
@@ -2151,19 +2672,19 @@ uint64_t process_fork(struct X64_REGS *reg, bool is_vfork, uint64_t user_stack, 
     if ((clone_flags & CLONE_PARENT_SETTID_FLAG) &&
         !copy_to_user_pagedir(current_pcb->pagedir, parent_tid, &child_tid_value, sizeof(child_tid_value)))
     {
-        free_partial_process(new_pcb, !is_vfork);
-        free_fork_task(new_task);
         spin_unlock(&create_thread_lock);
         restore_runtime_state(scheduler_depth, is_sti);
+        free_partial_process(new_pcb, !is_vfork);
+        free_fork_task(new_task);
         return (uint64_t)-EFAULT;
     }
     if ((clone_flags & CLONE_CHILD_SETTID_FLAG) &&
         !copy_to_user_pagedir(new_pcb->pagedir, child_tid, &child_tid_value, sizeof(child_tid_value)))
     {
-        free_partial_process(new_pcb, !is_vfork);
-        free_fork_task(new_task);
         spin_unlock(&create_thread_lock);
         restore_runtime_state(scheduler_depth, is_sti);
+        free_partial_process(new_pcb, !is_vfork);
+        free_fork_task(new_task);
         return (uint64_t)-EFAULT;
     }
     if (clone_flags & CLONE_CHILD_CLEARTID_FLAG)
@@ -2174,10 +2695,10 @@ uint64_t process_fork(struct X64_REGS *reg, bool is_vfork, uint64_t user_stack, 
     new_task->group_index  = queue_enqueue(new_pcb->thread_queue, new_task);
     if (new_task->group_index == (size_t)-1)
     {
-        free_partial_process(new_pcb, !is_vfork);
-        free_fork_task(new_task);
         spin_unlock(&create_thread_lock);
         restore_runtime_state(scheduler_depth, is_sti);
+        free_partial_process(new_pcb, !is_vfork);
+        free_fork_task(new_task);
         return (uint64_t)-ENOMEM;
     }
 
@@ -2188,10 +2709,10 @@ uint64_t process_fork(struct X64_REGS *reg, bool is_vfork, uint64_t user_stack, 
     if (add_task(new_task) == (size_t)-1)
     {
         queue_remove_at(new_pcb->thread_queue, new_task->group_index);
-        free_partial_process(new_pcb, !is_vfork);
-        free_fork_task(new_task);
         spin_unlock(&create_thread_lock);
         restore_runtime_state(scheduler_depth, is_sti);
+        free_partial_process(new_pcb, !is_vfork);
+        free_fork_task(new_task);
         return (uint64_t)-ENOMEM;
     }
     spin_unlock(&create_thread_lock);
@@ -2313,461 +2834,348 @@ size_t create_kernel_thread(void *_start, void *args, char *name, pcb_t pcb)
 }
 
 
-size_t create_user_thread(void *_start, void *args, int argc, char *name, pcb_t pcb, char *cwd)
+size_t add_task_preallocated(tcb_t task, lock_node *prepared);
+
+static void cleanup_thread_draft(ProcessPreparation *pin)
 {
-    bool is_sti                = are_interrupts_enabled();
-    uint64_t scheduler_depth = scheduler_disable_depth();
-    if (!no_interrupt) open_interrupt;
-
-    write_serial_fmt("[task-debug] create_user_thread begin name=%s cwd=%s\n", name ? name : "(null)",
-                     cwd ? cwd : "(null)");
-    if (_start == NULL || name == NULL || pcb == NULL || pcb->thread_queue == NULL || pcb->pagedir == NULL || !cwd)
+    tcb_t task = pin->draft;
+    vfs_node_t cwd_node = pin->opened_cwd;
+    char *cwd = pin->cwd;
+    char **arguments = pin->arguments;
+    lock_node *group_node = pin->group_node, *schedule_node = pin->schedule_node;
+    // Withdraw ownership before interruptible cleanup. A killed cleanup owner
+    // cannot make the reaper repeat frees already performed on this stack.
+    pin->draft = NULL;
+    pin->opened_cwd = NULL;
+    pin->cwd = NULL;
+    pin->arguments = NULL;
+    pin->group_node = pin->schedule_node = NULL;
+    if (task)
     {
-        write_serial_fmt("You can't create an user thread WITHOUT A CWD \n");
-        free(cwd);
-        free_envp((char **)args);
-        restore_runtime_state(scheduler_depth, is_sti);
-        return (size_t)-(EINVAL);
+        if (task->owns_user_stack) free_user_stack_mapping(task);
+        if (task->syscall_stack)
+            free_frames((uint64_t)virt_to_phys(task->syscall_stack - KERNEL_STACK_SIZE),
+                        KERNEL_STACK_SIZE / PAGE_SIZE);
+        if (task->kernel_stack)
+            free_frames((uint64_t)virt_to_phys(task->kernel_stack - KERNEL_STACK_SIZE),
+                        KERNEL_STACK_SIZE / PAGE_SIZE);
+        free(task);
     }
-
-    // Opening a directory may block on the filesystem mutex. Resolve it before
-    // holding the thread-creation spinlock or suppressing this CPU's scheduler.
-    write_serial_fmt("[task-debug] create_user_thread before-vfs-open name=%s\n", name);
-    vfs_node_t opened_cwd = vfs_open(cwd);
-    write_serial_fmt("[task-debug] create_user_thread after-vfs-open name=%s node=%p\n", name, (void *)opened_cwd);
-    if (opened_cwd == NULL)
-    {
-        free(cwd);
-        free_envp((char **)args);
-        restore_runtime_state(scheduler_depth, is_sti);
-        return (size_t)-ENOENT;
-    }
-
-    spin_lock(&create_thread_lock);
-    write_serial_fmt("[task-debug] create_user_thread lock-acquired name=%s\n", name);
-    close_interrupt;
-    disable_scheduler();
-    tcb_t new_task = alloc_zeroed_tcb();
-    write_serial_fmt("[task-debug] create_user_thread alloc-tcb name=%s task=%p\n", name ? name : "(null)",
-                     (void *)new_task);
-    if (new_task == NULL)
-    {
-        free(cwd);
-        free_envp((char **)args);
-        spin_unlock(&create_thread_lock);
-        restore_runtime_state(scheduler_depth, is_sti);
-        vfs_close(opened_cwd);
-        return (size_t)-ENOMEM;
-    }
-
-    new_task->task_level = TASK_APPLICATION_LEVEL;
-    new_task->cpu_id     = get_current_cpu()->processor_id;
-    strncpy(new_task->name, name, sizeof(new_task->name) - 1);
-    new_task->parent_group = pcb;
-
-    write_serial_fmt("[task-debug] create_user_thread before-kstack name=%s\n", name ? name : "(null)");
-    uint64_t kernel_stack_phys = alloc_frames(KERNEL_STACK_SIZE / PAGE_SIZE);
-    write_serial_fmt("[task-debug] create_user_thread after-kstack name=%s phys=%llx\n", name ? name : "(null)",
-                     (unsigned long long)kernel_stack_phys);
-    if (kernel_stack_phys == 0)
-    {
-        free(cwd);
-        free_envp((char **)args);
-        free(new_task);
-        spin_unlock(&create_thread_lock);
-        restore_runtime_state(scheduler_depth, is_sti);
-        vfs_close(opened_cwd);
-        return (size_t)-ENOMEM;
-    }
-    uint64_t kernel_stack     = (uint64_t)phys_to_virt(kernel_stack_phys) + KERNEL_STACK_SIZE;
-    uint64_t *stack_top       = (uint64_t *)kernel_stack;
-    *(--stack_top)            = 0;
-    *(--stack_top)            = 0;
-    *(--stack_top)            = (uint64_t)switch_to_user_mode;
-    new_task->context0.rflags = 0x202;
-    new_task->context0.rip    = (uint64_t)switch_to_user_mode;
-    new_task->context0.rsp    = (uint64_t)stack_top;
-    new_task->kernel_stack    = kernel_stack;
-
-    write_serial_fmt("[task-debug] create_user_thread before-sysstack name=%s\n", name ? name : "(null)");
-    uint64_t syscall_stack_phys = alloc_frames(KERNEL_STACK_SIZE / PAGE_SIZE);
-    write_serial_fmt("[task-debug] create_user_thread after-sysstack name=%s phys=%llx\n", name ? name : "(null)",
-                     (unsigned long long)syscall_stack_phys);
-    if (syscall_stack_phys == 0)
-    {
-        free(cwd);
-        free_envp((char **)args);
-        free_frames(kernel_stack_phys, KERNEL_STACK_SIZE / PAGE_SIZE);
-        free(new_task);
-        spin_unlock(&create_thread_lock);
-        restore_runtime_state(scheduler_depth, is_sti);
-        vfs_close(opened_cwd);
-        return (size_t)-ENOMEM;
-    }
-    new_task->syscall_stack = (uint64_t)phys_to_virt(syscall_stack_phys) + KERNEL_STACK_SIZE;
-
-    new_task->cwd = opened_cwd;
-    new_task->str_cwd = cwd;
-
-    new_task->winnum  = 0;
-    new_task->hasfscr = false;
-
-    new_task->argv = (char **)args;
-    new_task->argc = argc;
-
-    new_task->user_info = current_user != NULL ? current_user : &root_user;
-
-    write_serial_fmt("[task-debug] create_user_thread before-user-stack name=%s\n", name ? name : "(null)");
-    new_task->user_stack     = page_reserve_user_range(pcb->pagedir, BIG_USER_STACK);
-    write_serial_fmt("[task-debug] create_user_thread after-user-stack name=%s stack=%llx\n", name ? name : "(null)",
-                     (unsigned long long)new_task->user_stack);
-    if (new_task->user_stack == 0)
-    {
-        free(cwd);
-        free_envp((char **)args);
-        free_frames(syscall_stack_phys, KERNEL_STACK_SIZE / PAGE_SIZE);
-        free_frames(kernel_stack_phys, KERNEL_STACK_SIZE / PAGE_SIZE);
-        free(new_task);
-        spin_unlock(&create_thread_lock);
-        restore_runtime_state(scheduler_depth, is_sti);
-        vfs_close(opened_cwd);
-        return (size_t)-ENOMEM;
-    }
-    new_task->user_stack_top = new_task->user_stack + BIG_USER_STACK;
-    new_task->owns_user_stack = true;
-
-    new_task->main           = (uint64_t)_start;
-    new_task->context0.cs    = 0x8;
-    new_task->context0.ss = new_task->context0.es = new_task->context0.ds = 0x10;
-    new_task->fs                                                   = 0;
-    new_task->status                                                      = CREATE;
-    new_task->eevdf_slice = 1000000ULL;
-    save_fpu_context(&new_task->fpu_context);
-
-    new_task->fs_base = 0;
-
-    new_task->window_count = 0;
-
-    write_serial_fmt("[task-debug] create_user_thread before-group-enqueue name=%s\n", name ? name : "(null)");
-    new_task->group_index = queue_enqueue(pcb->thread_queue, new_task);
-    write_serial_fmt("[task-debug] create_user_thread after-group-enqueue name=%s index=%llu\n",
-                     name ? name : "(null)", (unsigned long long)new_task->group_index);
-    if (new_task->group_index == (size_t)-1)
-    {
-        free(cwd);
-        free_envp((char **)args);
-        free_user_stack_mapping(new_task);
-        free_frames(syscall_stack_phys, KERNEL_STACK_SIZE / PAGE_SIZE);
-        free_frames(kernel_stack_phys, KERNEL_STACK_SIZE / PAGE_SIZE);
-        free(new_task);
-        spin_unlock(&create_thread_lock);
-        restore_runtime_state(scheduler_depth, is_sti);
-        vfs_close(opened_cwd);
-        return (size_t)-ENOMEM;
-    }
-    new_task->tid = alloc_tid();
-
-    procfs_on_new_task(pcb);
-    write_serial_fmt("[task-debug] create_user_thread before-add-task name=%s\n", name ? name : "(null)");
-    add_task(new_task);
-    write_serial_fmt("[task-debug] create_user_thread after-add-task name=%s tid=%u\n", name ? name : "(null)",
-                     (unsigned)new_task->tid);
-    spin_unlock(&create_thread_lock);
-    restore_runtime_state(scheduler_depth, is_sti);
-    return new_task->tid;
+    if (cwd_node) vfs_close(cwd_node);
+    free(cwd);
+    free_envp(arguments);
+    free(group_node);
+    free(schedule_node);
 }
 
-size_t create_message_thread(void *_start, char *name, pcb_t pcb, char *cwd, uint64_t arg)
+static size_t prepare_application_thread(void *entry, void *arguments, int argc, char *name,
+                                         pcb_t process, char *cwd, bool message, uint64_t argument,
+                                         const ThreadCloneState *clone = nullptr)
 {
-    bool is_sti                = are_interrupts_enabled();
+    bool was_interrupt_enabled = are_interrupts_enabled();
     uint64_t scheduler_depth = scheduler_disable_depth();
+    // A nonzero inherited depth is a precondition failure: ownership of cwd
+    // and arguments has not transferred. The caller must restore its scope
+    // before disposing them; freeing here would violate allocator invariants.
+    if (scheduler_depth) return (size_t)-EWOULDBLOCK;
     if (!no_interrupt) open_interrupt;
-
-    tcb_t creator_task = get_current_task();
-
-    if (_start == NULL || name == NULL || pcb == NULL || pcb->thread_queue == NULL || pcb->pagedir == NULL || !cwd)
+    ProcessPreparation *pin = entry && name && cwd ? process_preparation_acquire(process) : NULL;
+    if (!pin)
     {
-        write_serial_fmt("You can't create an message thread WITHOUT A CWD \n");
         free(cwd);
-        restore_runtime_state(scheduler_depth, is_sti);
-        return (size_t)-(EINVAL);
+        free_envp(static_cast<char **>(arguments));
+        restore_runtime_state(scheduler_depth, was_interrupt_enabled);
+        return (size_t)-EINVAL;
     }
-    vfs_node_t opened_cwd = vfs_open(cwd);
-    if (opened_cwd == NULL)
+    if (pin->draft || pin->cwd || pin->arguments)
     {
         free(cwd);
-        restore_runtime_state(scheduler_depth, is_sti);
-        return (size_t)-ENOENT;
+        free_envp(static_cast<char **>(arguments));
+        process_preparation_release(pin);
+        restore_runtime_state(scheduler_depth, was_interrupt_enabled);
+        return (size_t)-EBUSY;
     }
-
-    spin_lock(&create_thread_lock);
-    close_interrupt;
-    disable_scheduler();
-    tcb_t new_task = alloc_zeroed_tcb();
-    if (new_task == NULL)
+    pin->cwd = cwd;
+    pin->arguments = static_cast<char **>(arguments);
+    pin->draft = alloc_zeroed_tcb();
+    pin->group_node = static_cast<lock_node *>(malloc(sizeof(lock_node)));
+    pin->schedule_node = static_cast<lock_node *>(malloc(sizeof(lock_node)));
+    int error = !pin->draft || !pin->group_node || !pin->schedule_node ? -ENOMEM : 0;
+    tcb_t task = pin->draft;
+    if (!error)
     {
-        free(cwd);
+        task->parent_group = process;
+        task->task_level = TASK_APPLICATION_LEVEL;
+        task->status = CREATE;
+        strncpy(task->name, name, sizeof(task->name) - 1);
+        pin->opened_cwd = vfs_open(cwd);
+        if (!pin->opened_cwd) error = -ENOENT;
+    }
+    if (!error)
+    {
+        uint64_t stack = alloc_frames(KERNEL_STACK_SIZE / PAGE_SIZE);
+        if (!stack) error = -ENOMEM;
+        else task->kernel_stack = (uint64_t)phys_to_virt(stack) + KERNEL_STACK_SIZE;
+    }
+    if (!error)
+    {
+        uint64_t stack = alloc_frames(KERNEL_STACK_SIZE / PAGE_SIZE);
+        if (!stack) error = -ENOMEM;
+        else task->syscall_stack = (uint64_t)phys_to_virt(stack) + KERNEL_STACK_SIZE;
+    }
+    if (!error && !clone)
+    {
+        task->user_stack = page_reserve_process_user_range(process, BIG_USER_STACK);
+        if (!task->user_stack) error = -ENOMEM;
+        else
+        {
+            task->user_stack_top = task->user_stack + BIG_USER_STACK;
+            task->owns_user_stack = true;
+        }
+    }
+    if (!error && message && !ensure_message_entry_stub(pin->directory)) error = -ENOMEM;
+    size_t tid = 0;
+    if (!error)
+    {
+        uint64_t trampoline = message ? (uint64_t)jump_to_message : (uint64_t)switch_to_user_mode;
+        auto *top = reinterpret_cast<uint64_t *>(task->kernel_stack);
+        *--top = 0;
+        *--top = 0;
+        *--top = trampoline;
+        task->context0.rflags = 0x202;
+        task->context0.rip = trampoline;
+        task->context0.rsp = reinterpret_cast<uint64_t>(top);
+        task->context0.cs = 8;
+        task->context0.ss = task->context0.es = task->context0.ds = 0x10;
+        task->context0.rdi = argument;
+        task->main = reinterpret_cast<uint64_t>(entry);
+        task->cwd = pin->opened_cwd;
+        task->str_cwd = cwd;
+        task->argv = static_cast<char **>(arguments);
+        task->argc = argc;
+        task->user_info = &process->permission_user;
+        task->eevdf_slice = message ? 0 : 1000000ULL;
+        tcb_t creator = get_current_task();
+        if (message && creator && creator->parent_group == process)
+        {
+            task->fs = creator->fs;
+            task->fs_base = creator->fs_base;
+        }
+        else if (message) task->fs_base = reinterpret_cast<uint64_t>(task);
+        if (clone) prepare_clone_context(task, clone, creator);
+        save_fpu_context(&task->fpu_context);
+        tid = alloc_tid();
+        task->tid = tid;
+        if (tid == size_t(-1)) error = -EOVERFLOW;
+    }
+    bool wrote_parent_tid = false, wrote_child_tid = false;
+    if (!error && clone)
+    {
+        if (tid > 0x7fffffff) error = -EOVERFLOW;
+        int value = (int)tid;
+        if (!error && (clone->flags & CLONE_PARENT_SETTID_FLAG))
+        {
+            wrote_parent_tid = copy_to_user_pagedir(pin->directory, clone->parent_tid, &value, sizeof(value));
+            if (!wrote_parent_tid) error = -EFAULT;
+        }
+        if (!error && (clone->flags & CLONE_CHILD_SETTID_FLAG))
+        {
+            wrote_child_tid = copy_to_user_pagedir(pin->directory, clone->child_tid, &value, sizeof(value));
+            if (!wrote_child_tid) error = -EFAULT;
+        }
+        if (!error && (clone->flags & CLONE_CHILD_CLEARTID_FLAG))
+        {
+            task->clear_child_tid = (uint64_t)clone->child_tid;
+            task->tid_directory = pin->directory;
+        }
+    }
+    if (!error)
+    {
+        spin_lock(&create_thread_lock);
+        if (process->pagedir != pin->directory || process->status == DEATH || process->status == OUT ||
+            process->status == ZOMBIE || __atomic_load_n(&process->fd_cleanup_state, __ATOMIC_ACQUIRE) != 0)
+            error = -ESRCH;
+        else
+        {
+            size_t index = queue_enqueue_preallocated(process->thread_queue, task, pin->group_node, NULL, NULL);
+            if (index == size_t(-1)) error = -EOVERFLOW;
+            else
+            {
+                task->group_index = index;
+                if (add_task_preallocated(task, pin->schedule_node) == size_t(-1))
+                {
+                    if (!queue_detach_preallocated(process->thread_queue, pin->group_node))
+                    {
+                        // Retain uncertain linkage instead of freeing a linked TCB.
+                        spin_lock(&preparation_lock);
+                        pin->cleaning = true;
+                        pin->owner = NULL;
+                        spin_unlock(&preparation_lock);
+                        spin_unlock(&create_thread_lock);
+                        restore_runtime_state(scheduler_depth, was_interrupt_enabled);
+                        return (size_t)-EIO;
+                    }
+                    error = -EAGAIN;
+                }
+                else
+                {
+                    // Another CPU can already run/exit the TCB. Clear private
+                    // ownership without dereferencing that published TCB again.
+                    pin->draft = NULL;
+                    pin->group_node = pin->schedule_node = NULL;
+                    pin->opened_cwd = NULL;
+                    pin->cwd = NULL;
+                    pin->arguments = NULL;
+                }
+            }
+        }
         spin_unlock(&create_thread_lock);
-        restore_runtime_state(scheduler_depth, is_sti);
-        vfs_close(opened_cwd);
-        return (size_t)-ENOMEM;
     }
-
-    new_task->task_level = TASK_APPLICATION_LEVEL;
-    new_task->cpu_id     = get_current_cpu()->processor_id;
-    strncpy(new_task->name, name, sizeof(new_task->name) - 1);
-    new_task->parent_group = pcb;
-
-    new_task->context0.rdi = arg;
-
-    uint64_t kernel_stack_phys = alloc_frames(KERNEL_STACK_SIZE / PAGE_SIZE);
-    if (kernel_stack_phys == 0)
+    if (error)
     {
-        free(cwd);
-        free(new_task);
-        spin_unlock(&create_thread_lock);
-        restore_runtime_state(scheduler_depth, is_sti);
-        vfs_close(opened_cwd);
-        return (size_t)-ENOMEM;
+        if (clone)
+        {
+            int zero = 0;
+            if (wrote_parent_tid) copy_to_user_pagedir(pin->directory, clone->parent_tid, &zero, sizeof(zero));
+            if (wrote_child_tid) copy_to_user_pagedir(pin->directory, clone->child_tid, &zero, sizeof(zero));
+        }
+        cleanup_thread_draft(pin);
     }
-    uint64_t kernel_stack     = (uint64_t)phys_to_virt(kernel_stack_phys) + KERNEL_STACK_SIZE;
-    uint64_t *stack_top       = (uint64_t *)kernel_stack;
-    *(--stack_top)            = 0;
-    *(--stack_top)            = 0;
-    *(--stack_top)            = (uint64_t)jump_to_message;
-    new_task->context0.rflags = 0x202;
-    new_task->context0.rip    = (uint64_t)jump_to_message;
-    new_task->context0.rsp    = (uint64_t)stack_top;
-    new_task->kernel_stack    = kernel_stack;
-    uint64_t syscall_stack_phys = alloc_frames(KERNEL_STACK_SIZE / PAGE_SIZE);
-    if (syscall_stack_phys == 0)
-    {
-        free(cwd);
-        free_frames(kernel_stack_phys, KERNEL_STACK_SIZE / PAGE_SIZE);
-        free(new_task);
-        spin_unlock(&create_thread_lock);
-        restore_runtime_state(scheduler_depth, is_sti);
-        vfs_close(opened_cwd);
-        return (size_t)-ENOMEM;
-    }
-    new_task->syscall_stack   = (uint64_t)phys_to_virt(syscall_stack_phys) + KERNEL_STACK_SIZE;
+    else if (!message && !clone) procfs_on_new_task(process);
+    process_preparation_release(pin);
+    restore_runtime_state(scheduler_depth, was_interrupt_enabled);
+    return error ? size_t(error) : tid;
+}
 
-    new_task->cwd = opened_cwd;
-    new_task->str_cwd = cwd;
+size_t create_user_thread(void *entry, void *arguments, int argc, char *name, pcb_t process, char *cwd)
+{
+    return prepare_application_thread(entry, arguments, argc, name, process, cwd, false, 0);
+}
 
-    new_task->winnum  = 0;
-    new_task->hasfscr = false;
-
-    new_task->user_info = current_user;
-
-    new_task->user_stack     = page_reserve_user_range(pcb->pagedir, BIG_USER_STACK);
-    if (new_task->user_stack == 0)
-    {
-        free(cwd);
-        free_frames(syscall_stack_phys, KERNEL_STACK_SIZE / PAGE_SIZE);
-        free_frames(kernel_stack_phys, KERNEL_STACK_SIZE / PAGE_SIZE);
-        free(new_task);
-        spin_unlock(&create_thread_lock);
-        restore_runtime_state(scheduler_depth, is_sti);
-        vfs_close(opened_cwd);
-        return (size_t)-ENOMEM;
-    }
-    new_task->user_stack_top = new_task->user_stack + BIG_USER_STACK;
-    new_task->owns_user_stack = true;
-
-    if (!ensure_message_entry_stub(pcb->pagedir))
-    {
-        free(cwd);
-        free_user_stack_mapping(new_task);
-        free_frames(syscall_stack_phys, KERNEL_STACK_SIZE / PAGE_SIZE);
-        free_frames(kernel_stack_phys, KERNEL_STACK_SIZE / PAGE_SIZE);
-        free(new_task);
-        spin_unlock(&create_thread_lock);
-        restore_runtime_state(scheduler_depth, is_sti);
-        vfs_close(opened_cwd);
-        write_serial_string("Failed to prepare message thread entry stub.\n");
-        return (size_t)-ENOMEM;
-    }
-
-    new_task->main           = (uint64_t)_start;
-    new_task->context0.cs    = 0x8;
-    new_task->context0.ss = new_task->context0.es = new_task->context0.ds = 0x10;
-    new_task->fs                                                   = 0;
-    new_task->status                                                      = CREATE;
-    save_fpu_context(&new_task->fpu_context);
-
-    // The user-mode message stub runs as a normal application thread. If it
-    // inherits the default kernel-side TCB pointer as FSBASE, any libstdc++
-    // or stack-canary access through %fs will fault in user mode.
-    if (creator_task != NULL && creator_task->parent_group == pcb)
-    {
-        new_task->fs      = creator_task->fs;
-        new_task->fs_base = creator_task->fs_base;
-    }
-    else
-    {
-        new_task->fs_base = (uint64_t)new_task;
-    }
-
-    new_task->window_count = 0;
-
-    new_task->group_index = queue_enqueue(pcb->thread_queue, new_task);
-    if (new_task->group_index == (size_t)-1)
-    {
-        free(cwd);
-        free_user_stack_mapping(new_task);
-        free_frames(syscall_stack_phys, KERNEL_STACK_SIZE / PAGE_SIZE);
-        free_frames(kernel_stack_phys, KERNEL_STACK_SIZE / PAGE_SIZE);
-        free(new_task);
-        spin_unlock(&create_thread_lock);
-        restore_runtime_state(scheduler_depth, is_sti);
-        vfs_close(opened_cwd);
-        return (size_t)-ENOMEM;
-    }
-    new_task->tid = alloc_tid();
-
-    add_task(new_task);
-    spin_unlock(&create_thread_lock);
-    restore_runtime_state(scheduler_depth, is_sti);
-    return new_task->tid;
+size_t create_message_thread(void *entry, char *name, pcb_t process, char *cwd, uint64_t argument)
+{
+    return prepare_application_thread(entry, NULL, 0, name, process, cwd, true, argument);
 }
 
 pcb_t create_process_group(const char *name, pcb_t parent, page_directory_t *directory, char *cmdline)
 {
-    pcb_t pcb        = (pcb_t)calloc(1, sizeof(struct process_control_block));
-    if (pcb == NULL) return NULL;
+    return create_process_group_with_credentials(name, parent, directory, cmdline, XPCS_SESSION);
+}
 
-    pcb_t parent_group = parent == NULL ? kernel_group : parent;
-    if (parent_group == NULL || parent_group->child_pcb == NULL)
-    {
-        free(pcb);
-        return NULL;
-    }
+pcb_t create_process_group_with_credentials(const char *name, pcb_t parent, page_directory_t *directory,
+                                           char *cmdline, ProcessCredentialSource source)
+{
+    ProcessPreparation *pin = NULL;
+    pcb_t process = create_process_group_prepared(name, parent, directory, cmdline, source, &pin);
+    process_preparation_release(pin);
+    return process;
+}
 
-    pcb->pid         = alloc_pid();
-    pcb->parent_task = parent_group;
-    pcb->status      = START;
-    pcb->task_level  = TASK_APPLICATION_LEVEL;
-    pcb->notify_pcor_pipe_read_fd  = -1;
-    pcb->notify_pcor_pipe_write_fd = -1;
-    pcb->notify_pcor_tid           = 0;
-    pcb->notify_pcor_func          = 0;
-    pcb->notify_pcor_registered    = false;
-    pcb->queue_index = queue_enqueue(pcb_group_queue, pcb);
-    if (pcb->queue_index == (size_t)-1)
-    {
-        free(pcb);
-        return NULL;
-    }
-    strncpy(pcb->name, name != NULL ? name : "", sizeof(pcb->name) - 1);
-    pcb->thread_queue = queue_init();
-    pcb->ppid         = 0;
-    pcb->pagedir      = directory ? directory : get_kernel_pagedir();
-    pcb->child_pcb    = queue_init();
-    pcb->vfork        = false;
-    pcb->file_open    = queue_init();
-    pcb->file_open_shared_refs = alloc_fd_table_ref();
-    pcb->virt_queue   = queue_init();
-    pcb->ipc_queue    = queue_init();
-    pcb->tty          = alloc_default_tty();
-    if (pcb->thread_queue == NULL || pcb->child_pcb == NULL || pcb->file_open == NULL ||
-        pcb->file_open_shared_refs == NULL || pcb->virt_queue == NULL || pcb->ipc_queue == NULL || pcb->tty == NULL)
-    {
-        if (pcb->thread_queue) queue_destroy(pcb->thread_queue);
-        if (pcb->child_pcb) queue_destroy(pcb->child_pcb);
-        if (pcb->file_open) queue_destroy(pcb->file_open);
-        free(pcb->file_open_shared_refs);
-        if (pcb->virt_queue) queue_destroy(pcb->virt_queue);
-        if (pcb->ipc_queue) queue_destroy(pcb->ipc_queue);
-        free_tty(pcb->tty);
-        queue_remove_at(pcb_group_queue, pcb->queue_index);
-        free(pcb);
-        return NULL;
-    }
+// Both queue locks are held; storage and capacity are already prepared.
+static size_t publish_process_node(lock_queue *queue, pcb_t process, lock_node *node)
+{
+    size_t index = queue->next_index++;
+    *node = {process, NULL, queue->tail, index};
+    if (queue->tail) queue->tail->next = node;
+    else queue->head = node;
+    queue->tail = node;
+    if (!queue->rr_cursor) queue->rr_cursor = node;
+    ++queue->size;
+    return index;
+}
 
-    if (parent == NULL)
+pcb_t create_process_group_prepared(const char *name, pcb_t parent, page_directory_t *directory,
+                                     char *cmdline, ProcessCredentialSource source, ProcessPreparation **out_pin)
+{
+    if (!out_pin) return NULL;
+    *out_pin = NULL;
+    pcb_t parent_group = parent ? parent : kernel_group;
+    ProcessPreparation *parent_pin = parent_group == kernel_group ? NULL : process_preparation_acquire(parent_group);
+    if (!parent_group || (parent_group != kernel_group && !parent_pin)) return NULL;
+    auto *pcb = static_cast<pcb_t>(calloc(1, sizeof(struct process_control_block)));
+    auto *pin = static_cast<ProcessPreparation *>(calloc(1, sizeof(ProcessPreparation)));
+    auto *global_node = static_cast<lock_node *>(malloc(sizeof(lock_node)));
+    auto *family_node = static_cast<lock_node *>(malloc(sizeof(lock_node)));
+    bool global_linked = false, pinned = false;
+    if (pcb)
     {
-        UserInfo *user = current_user != NULL ? current_user : &root_user;
-        pcb->envc = user->envc;
-        pcb->envp = copy_envp(user->envp);
+        pcb->queue_index = pcb->child_index = size_t(-1);
+        pcb->parent_task = parent_group;
+        pcb->pagedir = directory ? directory : get_kernel_pagedir();
+        pcb->pid = alloc_pid();
+        pcb->ppid = parent_group->pid;
+        pcb->status = START;
+        pcb->task_level = TASK_APPLICATION_LEVEL;
+        pcb->notify_pcor_pipe_read_fd = pcb->notify_pcor_pipe_write_fd = -1;
+        strncpy(pcb->name, name ? name : "", sizeof(pcb->name) - 1);
+        permissions_process_init(pcb, parent, source);
+        pcb->thread_queue = queue_init();
+        pcb->child_pcb = queue_init();
+        pcb->file_open = queue_init();
+        pcb->file_open_shared_refs = alloc_fd_table_ref();
+        pcb->virt_queue = queue_init();
+        pcb->ipc_queue = queue_init();
+        pcb->tty = alloc_default_tty();
+        UserInfo *user = &pcb->permission_user;
+        if (source == XPCS_INHERIT && parent)
+        {
+            UserInfo *fallback = current_user ? current_user : &root_user;
+            pcb->envc = parent->envp ? parent->envc : fallback->envc;
+            pcb->envp = copy_envp(parent->envp ? parent->envp : fallback->envp);
+        }
+        else
+        {
+            pcb->envc = user->envc;
+            pcb->envp = copy_envp(user->envp);
+        }
+        pcb->cmdline = strdup(cmdline ? cmdline : "");
+        pcb->xtttp_stc = static_cast<xtttp_dtt *>(calloc(1, sizeof(xtttp_dtt)));
+        pcb->brk_start = USER_BRK_START;
+        pcb->brk_end = USER_BRK_END;
+        pcb->brk_current = pcb->brk_start;
+        pcb->mmap_start = USER_MMAP_START;
     }
-    else
+    bool ready = pcb && pin && global_node && family_node && parent_group->child_pcb &&
+                 pcb->thread_queue && pcb->child_pcb && pcb->file_open && pcb->file_open_shared_refs &&
+                 pcb->virt_queue && pcb->ipc_queue && pcb->tty && pcb->envp && pcb->cmdline && pcb->xtttp_stc;
+    if (ready)
     {
-        UserInfo *user = current_user != NULL ? current_user : &root_user;
-        pcb->envc = parent->envp == NULL ? user->envc : parent->envc;
-        pcb->envp = copy_envp(parent->envp == NULL ? user->envp : parent->envp);
+        // Complete every field before public lists can name this child. Its
+        // construction pin precedes both publications, including rollback.
+        spin_lock(&create_thread_lock);
+        spin_lock(&pcb_group_queue->lock);
+        spin_lock(&parent_group->child_pcb->lock);
+        if (parent_group->status != DEATH && parent_group->status != OUT && parent_group->status != ZOMBIE &&
+            pcb_group_queue->next_index != size_t(-1) && parent_group->child_pcb->next_index != size_t(-1))
+        {
+            preparation_link(pin, pcb, true);
+            pinned = true;
+            pcb->child_index = publish_process_node(parent_group->child_pcb, pcb, family_node);
+            pcb->queue_index = publish_process_node(pcb_group_queue, pcb, global_node);
+            global_linked = true;
+        }
+        spin_unlock(&parent_group->child_pcb->lock);
+        spin_unlock(&pcb_group_queue->lock);
+        spin_unlock(&create_thread_lock);
     }
-    if (pcb->envp == NULL)
+    if (global_linked)
     {
-        queue_destroy(pcb->thread_queue);
-        queue_destroy(pcb->child_pcb);
-        queue_destroy(pcb->file_open);
-        free(pcb->file_open_shared_refs);
-        queue_destroy(pcb->virt_queue);
-        queue_destroy(pcb->ipc_queue);
-        free_tty(pcb->tty);
-        queue_remove_at(pcb_group_queue, pcb->queue_index);
-        free(pcb);
-        return NULL;
+        process_preparation_release(parent_pin);
+        *out_pin = pin;
+        return pcb;
     }
-
-    pcb->cmdline     = strdup(cmdline != NULL ? cmdline : "");
-    if (pcb->cmdline == NULL)
+    if (pinned) process_preparation_release(pin);
+    else free(pin);
+    free(global_node);
+    free(family_node);
+    if (pcb)
     {
         free_envp(pcb->envp);
-        queue_destroy(pcb->thread_queue);
-        queue_destroy(pcb->child_pcb);
-        queue_destroy(pcb->file_open);
-        free(pcb->file_open_shared_refs);
-        queue_destroy(pcb->virt_queue);
-        queue_destroy(pcb->ipc_queue);
-        free_tty(pcb->tty);
-        queue_remove_at(pcb_group_queue, pcb->queue_index);
-        free(pcb);
-        return NULL;
+        pcb->envp = NULL;
+        free_partial_process(pcb, false);
     }
-    pcb->child_index = queue_enqueue(pcb->parent_task->child_pcb, pcb);
-    if (pcb->child_index == (size_t)-1)
-    {
-        free(pcb->cmdline);
-        free_envp(pcb->envp);
-        queue_destroy(pcb->thread_queue);
-        queue_destroy(pcb->child_pcb);
-        queue_destroy(pcb->file_open);
-        free(pcb->file_open_shared_refs);
-        queue_destroy(pcb->virt_queue);
-        queue_destroy(pcb->ipc_queue);
-        free_tty(pcb->tty);
-        queue_remove_at(pcb_group_queue, pcb->queue_index);
-        free(pcb);
-        return NULL;
-    }
-
-    pcb->brk_start   = USER_BRK_START;
-    pcb->brk_end     = USER_BRK_END;
-    pcb->brk_current = pcb->brk_start;
-    pcb->mmap_start  = USER_MMAP_START;
-    // pcb->msgprci = false;
-
-    pcb->xtttp_stc = (xtttp_dtt *)malloc(sizeof(xtttp_dtt));
-    if (pcb->xtttp_stc == NULL)
-    {
-        queue_remove_at(pcb->parent_task->child_pcb, pcb->child_index);
-        free(pcb->cmdline);
-        free_envp(pcb->envp);
-        queue_destroy(pcb->thread_queue);
-        queue_destroy(pcb->child_pcb);
-        queue_destroy(pcb->file_open);
-        queue_destroy(pcb->virt_queue);
-        queue_destroy(pcb->ipc_queue);
-        free_tty(pcb->tty);
-        queue_remove_at(pcb_group_queue, pcb->queue_index);
-        free(pcb);
-        return NULL;
-    }
-    memset(pcb->xtttp_stc, 0, sizeof(xtttp_dtt));
-
-    return pcb;
+    process_preparation_release(parent_pin);
+    return NULL;
 }
 
 extern "C" uint64_t switch_to_kernel_stack()

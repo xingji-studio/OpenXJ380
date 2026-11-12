@@ -3,6 +3,7 @@
 /*------------------------------------------------------------------------*/
 
 #include "fs/fatfs/ff.h"
+#include <fs/fatfs/private.h>
 
 #if FF_USE_LFN == 3 /* Use dynamic memory allocation */
 
@@ -14,13 +15,19 @@ void *ff_memalloc(           /* Returns pointer to the allocated memory block (n
                   uint msize /* Number of bytes to allocate */
 )
 {
-    return malloc((size_t)msize); /* Allocate a new memory block */
+    // Original Apache-2.0 port addition; existing FatFs sample terms are retained.
+    // Original port hook: factory sessions own bounded slabs before any I/O.
+    // Exhaustion must not fall back to a heap allocation after publication.
+    bool handled = false;
+    void *storage = fatfs_esp_memalloc(msize, &handled);
+    return handled ? storage : malloc((size_t)msize); /* Existing ordinary allocation. */
 }
 
 void ff_memfree(void *mblock /* Pointer to the memory block to free (no effect if null) */
 )
 {
-    free(mblock); /* Free the memory block */
+    // Original Apache-2.0 port addition; existing FatFs sample terms are retained.
+    if (!fatfs_esp_memfree(mblock)) free(mblock); /* Existing ordinary release. */
 }
 
 #endif

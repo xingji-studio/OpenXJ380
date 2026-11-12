@@ -4,38 +4,38 @@
 extern "C" {
 #endif
 
-typedef enum xapi_XmlNodeType
+typedef enum XXmlNodeType
 {
     XAPI_XML_NODE_ELEMENT = 1,
     XAPI_XML_NODE_TEXT    = 2
-} xapi_XmlNodeType;
+} XXmlNodeType;
 
-typedef struct xapi_XmlAttribute
+typedef struct XXmlAttribute
 {
-    char                     *name;
-    char                     *value;
-    struct xapi_XmlAttribute *next;
-} xapi_XmlAttribute;
+    char                 *name;
+    char                 *value;
+    struct XXmlAttribute *next;
+} XXmlAttribute;
 
-typedef struct xapi_XmlNode
+typedef struct XXmlNode
 {
-    xapi_XmlNodeType   type;
-    char              *name;
-    char              *text;
-    xapi_XmlAttribute *attributes;
+    XXmlNodeType   type;
+    char          *name;
+    char          *text;
+    XXmlAttribute *attributes;
 
-    struct xapi_XmlNode *parent;
-    struct xapi_XmlNode *firstChild;
-    struct xapi_XmlNode *lastChild;
-    struct xapi_XmlNode *nextSibling;
-} xapi_XmlNode;
+    struct XXmlNode *parent;
+    struct XXmlNode *firstChild;
+    struct XXmlNode *lastChild;
+    struct XXmlNode *nextSibling;
+} XXmlNode;
 
-typedef struct xapi_XmlTree
+typedef struct XXmlTree
 {
-    xapi_XmlNode *root;
-} xapi_XmlTree;
+    XXmlNode *root;
+} XXmlTree;
 
-typedef enum xapi_XmlParseResult
+typedef enum XXmlParseResult
 {
     XAPI_XML_PARSE_OK               = 0,
     XAPI_XML_PARSE_INVALID_PARAM    = 1,
@@ -43,11 +43,11 @@ typedef enum xapi_XmlParseResult
     XAPI_XML_PARSE_SYNTAX_ERROR     = 3,
     XAPI_XML_PARSE_MISMATCH_TAG     = 4,
     XAPI_XML_PARSE_TRAILING_CONTENT = 5
-} xapi_XmlParseResult;
+} XXmlParseResult;
 
-int xapi_parseXml(const char *xmlText, xapi_XmlTree *outTree);
-void xapi_freeXmlNode(xapi_XmlNode *node);
-void xapi_freeXmlTree(xapi_XmlTree *tree);
+int xapi_parseXml(const char *xmlText, XXmlTree *outTree);
+void xapi_freeXmlNode(XXmlNode *node);
+void xapi_freeXmlTree(XXmlTree *tree);
 
 #ifdef __cplusplus
 }

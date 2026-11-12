@@ -1,4 +1,5 @@
 #include <dlinker.h>
+#include <mm/boot_memory.h>
 #include <mm/buddy.h>
 #include <mm/frame.h>
 #include <mm/memory.h>
@@ -11,36 +12,48 @@ Bitmap         usable_regions;
 uint64_t       memory_size       = 0;
 uint64_t       memory_total_size = 0;
 
-static uint64_t get_memory_top(MEMORY_MAP map)
+namespace
 {
-    uint64_t       top         = 0;
-    EfiMemoryDesc *EfiMemory   = (EfiMemoryDesc *)((uint64_t)(map.Buffer) + 0xFFFF800000000000);
-
-    for (int i = 0; i < (map.MapSize / map.DescriptorSize); i++)
-    {
-        if (EfiMemory->Type == EfiConventionalMemory)
-        {
-            uint64_t region_end = EfiMemory->PhysicalStart + EfiMemory->NumberOfPages * PAGE_SIZE;
-            if (region_end > top) top = region_end;
-        }
-        EfiMemory++;
-    }
-
-    return top;
+[[noreturn]] void frame_init_failed(const char *reason)
+{
+    write_serial_string("Fatal boot memory map: ");
+    write_serial_string(reason);
+    write_serial_string("\n");
+    for (;;) asm volatile("cli; hlt" ::: "memory");
 }
+
+boot_memory::MapView frame_map_view(MEMORY_MAP map)
+{
+    uint64_t physical = reinterpret_cast<uintptr_t>(map.Buffer);
+    uint64_t offset   = get_physical_memory_offset();
+    if (!physical || !map.MapSize || physical > __UINT64_MAX__ - map.MapSize ||
+        physical > __UINTPTR_MAX__ - offset || physical + offset > __UINTPTR_MAX__ - map.MapSize)
+    {
+        frame_init_failed("invalid map buffer range");
+    }
+    // Boot already provides this mapped HHDM buffer. These arithmetic checks do
+    // not prove mappings; callers retaining boot blobs must validate those separately.
+    return {phys_to_virt(physical), map.MapSize, map.MapSize, map.DescriptorSize};
+}
+
+boot_memory::Summary checked_memory_map(const boot_memory::MapView &view, MEMORY_MAP map)
+{
+    boot_memory::Summary      summary     = {};
+    boot_memory::PhysicalSpan map_storage = {};
+    if (!boot_memory::validate_map(view, &summary) ||
+        !boot_memory::covered_span(view, reinterpret_cast<uintptr_t>(map.Buffer), map.MapSize,
+                                   boot_memory::SpanPolicy::loader_and_boot_services, &map_storage))
+    {
+        frame_init_failed("invalid or allocatable map storage");
+    }
+    return summary;
+}
+} // namespace
 
 uint64_t get_memory_all_size(MEMORY_MAP map)
 {
-    uint64_t       total_pages = 0;
-    EfiMemoryDesc *EfiMemory   = (EfiMemoryDesc *)((uint64_t)(map.Buffer) + 0xFFFF800000000000);
-
-    for (int i = 0; i < (map.MapSize / map.DescriptorSize); i++)
-    {
-        total_pages += EfiMemory->NumberOfPages;
-        EfiMemory++;
-    }
-
-    return total_pages * PAGE_SIZE;
+    boot_memory::MapView view = frame_map_view(map);
+    return checked_memory_map(view, map).total_bytes;
 }
 
 static uint64_t get_zone_boundary(enum zone_type type)
@@ -112,94 +125,60 @@ static void process_memory_region(uintptr_t start, uintptr_t end)
 
 void init_frame(MEMORY_MAP map)
 {
-    // `memory_size` is used to size frame bitmaps and page metadata, so it must
-    // cover the highest usable PFN rather than only the sum of usable pages.
-    memory_size       = get_memory_top(map);
-    memory_total_size = get_memory_all_size(map);
-
-    size_t         bitmap_size    = (memory_size / 4096 + 7) / 8;
-    uint64_t       bitmap_address = 0;
-    EfiMemoryDesc *EfiMemory      = (EfiMemoryDesc *)((uint64_t)(map.Buffer) + 0xFFFF800000000000);
-
-    for (uint64_t i = 0; i < (map.MapSize / map.DescriptorSize); i++)
+    boot_memory::MapView           view    = frame_map_view(map);
+    boot_memory::Summary           summary = checked_memory_map(view, map);
+    boot_memory::FrameBitmapLayout layout = {};
+    if (!boot_memory::plan_frame_bitmaps(view, &layout) ||
+        layout.reserved_end > __UINTPTR_MAX__ - get_physical_memory_offset())
     {
-        if (EfiMemory->PhysicalStart >= 0x100000 && (EfiMemory->Type == EfiConventionalMemory))
-        {
-            if (EfiMemory->NumberOfPages * PAGE_SIZE > ((bitmap_size + PAGE_SIZE - 1) & (~PAGE_SIZE - 1)) * 2)
-            {
-                bitmap_address = EfiMemory->PhysicalStart;
-                break;
-            }
-        }
-        EfiMemory++;
+        frame_init_failed("no suitable region for both frame bitmaps");
     }
 
-    // if (!bitmap_address) return;
-
+    // Metadata indexes physical frames, including holes, rather than their sum.
+    memory_size       = summary.conventional_top;
+    memory_total_size = summary.total_bytes;
     Bitmap *bitmap = &frame_allocator.bitmap;
-    bitmap_init(bitmap, (uint8_t *)(bitmap_address + 0xFFFF800000000000), bitmap_size);
-    bitmap_init(&usable_regions,
-                (uint8_t *)(bitmap_address + ((bitmap_size + PAGE_SIZE - 1) & (~PAGE_SIZE - 1)) + 0xFFFF800000000000),
-                bitmap_size);
-    EfiMemory            = (EfiMemoryDesc *)((uint64_t)(map.Buffer) + 0xFFFF800000000000);
+    bitmap_init(bitmap, static_cast<uint8_t *>(phys_to_virt(layout.first)), layout.bitmap_bytes);
+    bitmap_init(&usable_regions, static_cast<uint8_t *>(phys_to_virt(layout.second)), layout.bitmap_bytes);
+
     size_t origin_frames = 0;
-    for (uint64_t i = 0; i < (map.MapSize / map.DescriptorSize); i++)
+    for (uint64_t index = 0; index < summary.descriptor_count; ++index)
     {
-        if (EfiMemory->PhysicalStart >= 0x100000 && (EfiMemory->Type == EfiConventionalMemory))
-        {
-            size_t start_frame = EfiMemory->PhysicalStart / PAGE_SIZE;
-            size_t frame_count = EfiMemory->NumberOfPages;
-            serial_wprintf("%p~%p\n", start_frame * PAGE_SIZE, (start_frame + frame_count) * PAGE_SIZE);
-            origin_frames += frame_count;
-            bitmap_set_range(bitmap, start_frame, start_frame + frame_count, true);
-            bitmap_set_range(&usable_regions, start_frame, start_frame + frame_count, true);
-        }
-        EfiMemory++;
+        boot_memory::Descriptor descriptor = {};
+        if (!boot_memory::descriptor_at(view, index, &descriptor)) frame_init_failed("map changed during frame init");
+        if (descriptor.physical_start < 0x100000 || descriptor.type != EfiConventionalMemory) continue;
+        size_t first = descriptor.physical_start / PAGE_SIZE;
+        size_t end   = first + descriptor.pages;
+        serial_wprintf("%p~%p\n", first * PAGE_SIZE, end * PAGE_SIZE);
+        origin_frames += descriptor.pages;
+        bitmap_set_range(bitmap, first, end, true);
+        bitmap_set_range(&usable_regions, first, end, true);
     }
 
-    size_t bitmap_frame_start = bitmap_address / PAGE_SIZE;
-    size_t bitmap_frame_count = (((bitmap_size + PAGE_SIZE - 1) & (~PAGE_SIZE - 1)) * 2) / PAGE_SIZE;
-    size_t bitmap_frame_end   = bitmap_frame_start + bitmap_frame_count;
+    // Both complete page-aligned allocations stay unavailable to early and buddy allocators.
+    size_t bitmap_frame_start = layout.first / PAGE_SIZE;
+    size_t bitmap_frame_end   = layout.reserved_end / PAGE_SIZE;
+    size_t bitmap_frame_count = bitmap_frame_end - bitmap_frame_start;
     bitmap_set_range(bitmap, bitmap_frame_start, bitmap_frame_end, false);
     bitmap_set_range(&usable_regions, bitmap_frame_start, bitmap_frame_end, false);
-
     frame_allocator.origin_frames = origin_frames;
     frame_allocator.usable_frames = origin_frames - bitmap_frame_count;
 
     write_serial_string("Available memory: ");
-    write_serial_dec((origin_frames / 256));
+    write_serial_dec(origin_frames / 256);
     write_serial_string(" MiB\n");
-
     page_setup();
     page_init();
     buddy_init();
 
-    EfiMemory = (EfiMemoryDesc *)((uint64_t)(map.Buffer) + 0xFFFF800000000000);
-    for (uint64_t i = 0; i < (map.MapSize / map.DescriptorSize); i++)
+    for (uint64_t index = 0; index < summary.descriptor_count; ++index)
     {
-        if (EfiMemory->PhysicalStart >= 0x100000 && (EfiMemory->Type == EfiConventionalMemory))
-        {
-            size_t addr       = EfiMemory->PhysicalStart;
-            size_t region_end = EfiMemory->PhysicalStart + EfiMemory->NumberOfPages * PAGE_SIZE;
-
-            // 跳过 bitmap 占用的部分
-            if (addr <= bitmap_address && bitmap_address < region_end)
-            {
-                // bitmap 在这个区域内
-                uintptr_t bitmap_end = PADDING_UP(bitmap_address + bitmap_size, PAGE_SIZE);
-
-                // 处理 bitmap 之前的部分
-                if (addr < bitmap_address) { process_memory_region(addr, bitmap_address); }
-
-                // 处理 bitmap 之后的部分
-                if (bitmap_end < region_end) { process_memory_region(bitmap_end, region_end); }
-            }
-            else
-            {
-                process_memory_region(addr, region_end);
-            }
-        }
-        EfiMemory++;
+        boot_memory::Descriptor descriptor = {};
+        if (!boot_memory::descriptor_at(view, index, &descriptor)) frame_init_failed("map changed during buddy init");
+        if (descriptor.physical_start < 0x100000 || descriptor.type != EfiConventionalMemory) continue;
+        // This routine scans the bitmap and therefore excludes both bitmaps as
+        // well as any frames consumed by page_setup/page_init/buddy_init.
+        process_memory_region(descriptor.physical_start, descriptor.physical_start + descriptor.pages * PAGE_SIZE);
     }
 }
 

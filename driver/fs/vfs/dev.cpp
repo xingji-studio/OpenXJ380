@@ -10,16 +10,160 @@
 #include "krlibc.h"
 // #include "sprintf.h"
 #include "fs/vfs/vfs.h"
+#include <block_access.h>
 
-extern device_t device_ctl[26]; // vdisk.c
+extern device_t device_ctl[256];
 
 int             devfs_id    = 0;
 static int      devfs_inode = 2;
 vfs_node_t      devfs_root  = NULL;
 device_handle_t root_handle = NULL;
 
+// Keep the published device_handle ABI as the first member. Cached handles
+// retain the original registration identity even when a device ID is reused.
+struct RegisteredDeviceHandle
+{
+    struct device_handle handle;
+    uint64_t generation;
+};
+
+static uint64_t handle_generation(device_handle_t handle)
+{
+    return reinterpret_cast<RegisteredDeviceHandle *>(handle)->generation;
+}
+
+int block_access_resolve_node(vfs_node_t node, BlockExtent *extent)
+{
+    if (!node || node->fsid != devfs_id || !(node->type & file_block) || !node->handle) return -ENODEV;
+    auto *handle = static_cast<device_handle_t>(node->handle);
+    if (handle->is_dir || !handle->device || !handle_generation(handle)) return -ENODEV;
+    uintptr_t first = reinterpret_cast<uintptr_t>(&device_ctl[0]);
+    uintptr_t value = reinterpret_cast<uintptr_t>(handle->device);
+    if (value < first || value - first >= 256 * sizeof(device_t) || (value - first) % sizeof(device_t))
+        return -ENODEV;
+    if (handle->device->type != DEVICE_BLOCK) return -ENODEV;
+    return block_access_resolve(uint32_t((value - first) / sizeof(device_t)), handle_generation(handle), extent);
+}
+
+// Original registration-based node capture (Apache-2.0). The walk is bounded
+// and performs only tree/handle inspection and a reference increment under the
+// existing VFS child lock. No device name is accepted as identity.
+namespace
+{
+constexpr unsigned devfs_capture_nodes = 4096;
+constexpr unsigned devfs_capture_depth = 32;
+
+struct DevfsCapture
+{
+    device_t *device;
+    uint64_t generation;
+    vfs_node_t match;
+    unsigned visited;
+    int error;
+};
+
+void devfs_capture_tree(vfs_node_t node, unsigned depth, DevfsCapture &capture)
+{
+    if (capture.error) return;
+    if (!node || depth > devfs_capture_depth || ++capture.visited > devfs_capture_nodes)
+    {
+        capture.error = -E2BIG;
+        return;
+    }
+    if (vfs_node_retiring_locked(node) || (node->type & (file_delete | file_unlinked))) return;
+    if (node->fsid == devfs_id && node->handle && !(node->type & file_dir))
+    {
+        auto *handle = static_cast<device_handle_t>(node->handle);
+        if (!handle->is_dir && handle->device == capture.device && handle_generation(handle) == capture.generation)
+        {
+            if (capture.match) { capture.error = -EEXIST; return; }
+            capture.match = node;
+        }
+    }
+    for (list_t entry = node->child; entry && !capture.error; entry = entry->next)
+        devfs_capture_tree(static_cast<vfs_node_t>(entry->data), depth + 1, capture);
+}
+
+bool devfs_same_extent(const BlockExtent &a, const BlockExtent &b)
+{
+    return a.device == b.device && a.physical_device == b.physical_device && a.generation == b.generation &&
+           a.physical_generation == b.physical_generation && a.start == b.start && a.bytes == b.bytes;
+}
+} // namespace
+
+int devfs_retain_block(uint32_t device, uint64_t generation, DevfsBlockReference *output)
+{
+    if (!output) return -EINVAL;
+    *output = {};
+    if (device >= 256 || !generation) return -EINVAL;
+    BlockAccessToken publication = 0;
+    int result = block_access_management_begin(&publication);
+    if (result) return result;
+    DevfsBlockReference captured = {};
+    BlockExtent before = {};
+    result = block_access_resolve(device, generation, &before);
+    if (!result)
+    {
+        device_t *hardware = &device_ctl[device];
+        if (!hardware->flag || hardware->type != DEVICE_BLOCK || hardware->vdiskid != device ||
+            !hardware->size || hardware->size != before.bytes || !hardware->sector_size ||
+            hardware->sector_size > __UINT32_MAX__ || hardware->size % hardware->sector_size)
+            result = -ESTALE;
+        else
+        {
+            captured.extent = before;
+            captured.bytes = hardware->size;
+            captured.sector_size = hardware->sector_size;
+            captured.writable = hardware->write && hardware->write != (void *)empty;
+            DevfsCapture capture = {hardware, generation, nullptr, 0, 0};
+            vfs_child_lock();
+            if (!devfs_root || devfs_root->fsid != devfs_id || vfs_node_retiring_locked(devfs_root))
+                result = -ENODEV;
+            else
+            {
+                devfs_capture_tree(devfs_root, 0, capture);
+                result = capture.error;
+                if (!result && !capture.match) result = -ENODEV;
+                if (!result && capture.match->refcount == __UINT32_MAX__) result = -EOVERFLOW;
+                if (!result)
+                {
+                    ++capture.match->refcount;
+                    captured.node = capture.match;
+                }
+            }
+            vfs_child_unlock();
+        }
+    }
+    if (!result)
+    {
+        BlockExtent current = {}, from_node = {};
+        result = block_access_resolve(device, generation, &current);
+        if (!result) result = block_access_resolve_node(captured.node, &from_node);
+        if (!result && (!devfs_same_extent(before, current) || !devfs_same_extent(before, from_node) ||
+                        captured.node->size != captured.bytes || captured.node->realsize != captured.sector_size))
+            result = -ESTALE;
+    }
+    block_access_management_end(publication);
+    if (result && captured.node)
+    {
+        int closed = vfs_close(captured.node);
+        if (closed)
+        {
+            captured.quarantined = true;
+            *output = captured;
+            return closed < 0 ? closed : -EIO;
+        }
+        captured = {};
+    }
+    if (!result) *output = captured;
+    return result;
+}
+
 static errno_t devfs_register0(const char *path, size_t id) {
     device_t *device = &device_ctl[id];
+    if (device->flag < 1) return EOK;
+    uint64_t generation = device->type == DEVICE_BLOCK ? block_access_generation(id) : 0;
+    if (device->type == DEVICE_BLOCK && !generation) return -ENODEV;
     char     *buf    = NULL;
     if (path != NULL) {
         buf = (char*)malloc(strlen(path) + 6);
@@ -48,14 +192,37 @@ static errno_t devfs_register0(const char *path, size_t id) {
         return ENOTDIR;
     }
 
-    device_handle_t handle = (device_handle_t)calloc(1, sizeof(struct device_handle));
+    auto *registered = static_cast<RegisteredDeviceHandle *>(calloc(1, sizeof(RegisteredDeviceHandle)));
+    if (!registered) { vfs_close(node); free(buf); return -ENOMEM; }
+    registered->generation = generation;
+    device_handle_t handle = &registered->handle;
     // not_null_assets(handle, "device handle is null.");
     handle->is_dir = false;
     handle->device = device;
     handle->name   = strdup(device->drive_name);
-    node->rdev     = device->vdiskid;
-    vfs_child_append(node, device->drive_name, handle);
+    if (!handle->name) { free(registered); vfs_close(node); free(buf); return -ENOMEM; }
+    vfs_node_t published = vfs_child_append(node, device->drive_name, handle);
+    if (!published)
+    {
+        free(handle->name);
+        free(registered);
+        vfs_close(node);
+        free(buf);
+        return -ENOMEM;
+    }
+    vfs_child_lock();
+    if (device->type == DEVICE_BLOCK)
+    {
+        // Block capture must work before a pathname lookup initializes metadata.
+        // Other endpoints retain their existing lazy-open/stat behavior.
+        published->fsid = devfs_id;
+        published->type = file_block;
+        published->size = device->size;
+        published->realsize = device->sector_size;
+        published->rdev = device->vdiskid;
+    }
     llist_append(&parent->child, &handle->curr);
+    vfs_child_unlock();
     vfs_close(node);
     free(buf);
     return EOK;
@@ -165,6 +332,13 @@ size_t devfs_read(void *file, void *addr, size_t offset, size_t size) {
     device_t device = *deivce;
     spin_unlock(&RD_lk);
 
+    if ((device.type == DEVICE_BLOCK) != (handle_generation(handle) != 0)) return VFS_STATUS_FAILED;
+    if (device.type == DEVICE_BLOCK && offset > device.size) return VFS_STATUS_SUCCESS;
+    size_t transfer = device.type == DEVICE_BLOCK ? MIN(size, device.size - offset) : size;
+    BlockAccessIo access(device.vdiskid, device.type == DEVICE_BLOCK ? handle_generation(handle) : 0,
+                          offset, transfer, device.type == DEVICE_BLOCK);
+    if (!access.ready()) return VFS_STATUS_FAILED;
+
     if (device.type == DEVICE_STREAM) {
         size_t bounce_size = size == 0 ? 1 : size;
         uint8_t *bounce = (uint8_t *)malloc(bounce_size);
@@ -205,6 +379,13 @@ size_t devfs_write(void *file, const void *addr, size_t offset, size_t size) {
     device_t device = *deivce;
     spin_unlock(&WR_lk);
 
+    if ((device.type == DEVICE_BLOCK) != (handle_generation(handle) != 0)) return VFS_STATUS_FAILED;
+    if (device.type == DEVICE_BLOCK && offset > device.size) return VFS_STATUS_SUCCESS;
+    size_t transfer = device.type == DEVICE_BLOCK ? MIN(size, device.size - offset) : size;
+    BlockAccessIo access(device.vdiskid, device.type == DEVICE_BLOCK ? handle_generation(handle) : 0,
+                          offset, transfer, device.type == DEVICE_BLOCK);
+    if (!access.ready()) return VFS_STATUS_FAILED;
+
     if (device.type == DEVICE_STREAM) {
         return device.write(device.vdiskid, (uint8_t *)addr, size, offset);
     }
@@ -220,7 +401,13 @@ size_t devfs_write(void *file, const void *addr, size_t offset, size_t size) {
 
 static errno_t devfs_ioctl(void *file, size_t req, void *arg) {
     device_handle_t handle =  (device_handle_t)file;
-    if (handle->device->flag == 0) return VFS_STATUS_FAILED;
+    if (!handle || handle->is_dir || !handle->device || handle->device->flag == 0 || !handle->device->ioctl)
+        return VFS_STATUS_FAILED;
+    device_t device = *handle->device;
+    if ((device.type == DEVICE_BLOCK) != (handle_generation(handle) != 0)) return -ENODEV;
+    BlockAccessIo access(device.vdiskid, device.type == DEVICE_BLOCK ? handle_generation(handle) : 0,
+                          0, device.size, device.type == DEVICE_BLOCK);
+    if (!access.ready()) return access.error();
     return handle->device->ioctl(handle->device, req, arg);
 }
 
@@ -239,8 +426,13 @@ static vfs_node_t devfs_dup(vfs_node_t node) {
 
 static errno_t devfs_poll(void *file, size_t events) {
     device_handle_t handle =  (device_handle_t)file;
-    if (handle->device->flag == 0) return VFS_STATUS_FAILED;
-    if (handle->device->poll != (void *)empty) {
+    if (!handle || handle->is_dir || !handle->device || handle->device->flag == 0) return VFS_STATUS_FAILED;
+    device_t device = *handle->device;
+    if ((device.type == DEVICE_BLOCK) != (handle_generation(handle) != 0)) return -ENODEV;
+    BlockAccessIo access(device.vdiskid, device.type == DEVICE_BLOCK ? handle_generation(handle) : 0,
+                          0, device.size, device.type == DEVICE_BLOCK);
+    if (!access.ready()) return access.error();
+    if (handle->device->poll && handle->device->poll != (void *)empty) {
         return handle->device->poll(events);
     } else
         return VFS_STATUS_SUCCESS;
@@ -249,7 +441,10 @@ static errno_t devfs_poll(void *file, size_t events) {
 static void *devfs_map(void *file, void *addr, size_t offset, size_t size, size_t prot,
                        size_t flags) {
     device_handle_t handle =  (device_handle_t)file;
-    if (handle->device->flag == 0) return NULL;
+    if (!handle || handle->is_dir || !handle->device || handle->device->flag == 0) return NULL;
+    // A transient ticket cannot pin an mmap until munmap. Block mappings are
+    // unsupported until the VMA layer can own a complete extent lease.
+    if (handle_generation(handle) || handle->device->type == DEVICE_BLOCK) return NULL;
     if (handle->device->map) { return handle->device->map(handle->device->vdiskid, addr, size); }
     return NULL;
 }
@@ -310,10 +505,12 @@ errno_t devfs_delete(const char *path) {
         free(buf);
         return -ENOENT;
     }
-    node->parent->child = list_delete(node->parent->child, node);
-    vfs_free(node);
+    // The operation owns this lookup reference; the checked request consumes
+    // it only on success. Descendant or cache references keep the name linked.
+    int result = vfs_prune_child(node->parent, node, 1, false);
+    if (result) vfs_close(node);
     free(buf);
-    return EOK;
+    return result;
 }
 
 errno_t devfs_register(const char *path, size_t id) {

@@ -11,6 +11,11 @@ typedef struct mm_virtual_page {
     size_t   index;
 } mm_virtual_page_t;
 
+// Preemptible, recursive scope shared by user VM operations and lazy faults.
+// Callers must not hold spin locks or disable scheduler preemption.
+void mm_op_lock_acquire();
+void mm_op_lock_release();
+
 void *virt_copy(void *ptr); // fork 懒分配信息复制回调函数
 
 /**

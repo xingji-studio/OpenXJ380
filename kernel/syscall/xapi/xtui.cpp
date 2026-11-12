@@ -1,4 +1,6 @@
+#include <user/auth.h>
 #include <input_method.h>
+#include <user/process_launch.h>
 #include <ahci/ahci.h>
 #include <efi/boot.h>
 #include <efi/efi.h>
@@ -155,17 +157,18 @@ void do_xapi_GetSystemVersion(uint64_t str)
 
 void do_xapi_GetCurrentUser(uint64_t dst)
 {
-    if (dst == 0 || current_user == NULL) return;
+    UserInfo *user = task_effective_user();
+    if (dst == 0 || user == NULL) return;
     xapi_type_UserInfo info;
     memset(&info, 0, sizeof(info));
-    strncpy(info.name, current_user->name, sizeof(info.name) - 1);
-    info.user_type = current_user->user_type;
+    strncpy(info.name, user->name, sizeof(info.name) - 1);
+    info.user_type = user->user_type;
     copy_to_user_pagedir(xapi_current_pagedir(), (void *)dst, &info, sizeof(info));
 }
 
 uint64_t do_xapi_UserOobeRequired()
 {
-    return user_session_needs_oobe() ? 1 : 0;
+    return (uint64_t)(int64_t)user_auth_oobe_state();
 }
 
 uint64_t do_xapi_UserList(uint64_t buffer, uint64_t max_count)
@@ -194,44 +197,14 @@ uint64_t do_xapi_UserList(uint64_t buffer, uint64_t max_count)
     return (uint64_t)count;
 }
 
-uint64_t do_xapi_UserLogin(uint64_t username, uint64_t password)
+uint64_t do_xapi_UserLogin(uint64_t, uint64_t)
 {
-    char *kusername = NULL;
-    char *kpassword = NULL;
-    int ret = xapi_copy_string_from_user(&kusername, (const char *)username, sizeof(((UserInfo *)0)->name));
-    if (ret < 0) return (uint64_t)ret;
-    ret = xapi_copy_string_from_user(&kpassword, (const char *)password, sizeof(((UserInfo *)0)->password));
-    if (ret < 0)
-    {
-        free(kusername);
-        return (uint64_t)ret;
-    }
-
-    ret = user_session_login(kusername, kpassword);
-    memset(kpassword, 0, sizeof(((UserInfo *)0)->password));
-    free(kusername);
-    free(kpassword);
-    return (uint64_t)ret;
+    return (uint64_t)-ENOSYS;
 }
 
-uint64_t do_xapi_UserCreateFirst(uint64_t username, uint64_t password)
+uint64_t do_xapi_UserCreateFirst(uint64_t, uint64_t)
 {
-    char *kusername = NULL;
-    char *kpassword = NULL;
-    int ret = xapi_copy_string_from_user(&kusername, (const char *)username, sizeof(((UserInfo *)0)->name));
-    if (ret < 0) return (uint64_t)ret;
-    ret = xapi_copy_string_from_user(&kpassword, (const char *)password, sizeof(((UserInfo *)0)->password));
-    if (ret < 0)
-    {
-        free(kusername);
-        return (uint64_t)ret;
-    }
-
-    ret = user_session_create_first(kusername, kpassword);
-    memset(kpassword, 0, sizeof(((UserInfo *)0)->password));
-    free(kusername);
-    free(kpassword);
-    return (uint64_t)ret;
+    return (uint64_t)-ENOSYS;
 }
 
 void do_xapi_Output(char *str)
@@ -423,20 +396,17 @@ uint64_t do_xapi_GetMemorySize()
 
 void do_xapi_Run(char *path)
 {
-    page_directory_t *caller_pagedir = get_current_task()->parent_group->pagedir;
     char *upath = NULL;
     if (xapi_copy_string_from_user(&upath, path, XAPI_USER_PATH_MAX) < 0) return;
     char  *fpath = vfs_cwd_path_build(upath);
     free(upath);
     if (fpath == NULL) return;
-    runfile(fpath);
-    switch_page_directory(caller_pagedir);
+    runfile(fpath, XPCS_VISITOR);
     free(fpath);
 }
 
-uint64_t do_xapi_RunArgs(char *path, char **argv)
+static uint64_t spawn_from_user(char *path, char **argv, ProcessCredentialSource source)
 {
-    page_directory_t *caller_pagedir = get_current_task()->parent_group->pagedir;
     char *upath = NULL;
     int ret = xapi_copy_string_from_user(&upath, path, XAPI_USER_PATH_MAX);
     if (ret < 0) return (uint64_t)ret;
@@ -461,11 +431,22 @@ uint64_t do_xapi_RunArgs(char *path, char **argv)
         }
     }
 
-    ret = create_user_process_from_file(fpath, get_current_task()->parent_group, kargv);
-    switch_page_directory(caller_pagedir);
+    ProcessLaunchOptions options;
+    options.credentials = source;
+    ret = create_user_process_with_options(fpath, get_current_task()->parent_group, kargv, options);
     p_xapi_free_argv(kargv);
     free(fpath);
     return (uint64_t)ret;
+}
+
+uint64_t do_xapi_RunArgs(char *path, char **argv)
+{
+    return spawn_from_user(path, argv, XPCS_VISITOR);
+}
+
+uint64_t do_xapi_SpawnInherited(char *path, char **argv)
+{
+    return spawn_from_user(path, argv, XPCS_INHERIT);
 }
 
 uint64_t do_xapi_MapMemory(uint64_t ptr, uint64_t size, uint32_t flags)

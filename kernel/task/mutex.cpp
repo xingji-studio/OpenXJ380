@@ -116,14 +116,7 @@ static bool mutex_owner_has_stopped_locked(tcb_t owner)
     TaskStatus status = __atomic_load_n(&owner->status, __ATOMIC_ACQUIRE);
     if (status != DEATH && status != OUT) return false;
 
-    size_t count = get_cpu_num();
-    if (count > MAX_CPU_NUM) count = MAX_CPU_NUM;
-    for (size_t i = 0; i < count; i++)
-    {
-        PROCESSOR_INFO *cpu = get_cpu(i);
-        if (cpu != NULL && __atomic_load_n(&cpu->current_task, __ATOMIC_ACQUIRE) == owner) return false;
-    }
-    return true;
+    return !scheduler_task_referenced(owner);
 }
 
 int mutex_lock_recoverable(mutex_t *mutex, bool *recovered)
@@ -138,15 +131,18 @@ int mutex_lock_recoverable(mutex_t *mutex, bool *recovered)
         spin_lock(&mutex->lock);
         if (mutex->state == MUTEX_LOCKED && mutex_owner_has_stopped_locked(mutex->owner))
         {
-            mutex->owner = NULL;
-            mutex->rcc = 0;
-            mutex->state = MUTEX_UNLOCKED;
+            // Transfer ownership atomically. Publishing UNLOCKED first would
+            // let a second waiter enter without learning that state recovery
+            // is required, before this recoverer can rebuild or poison it.
+            mutex->owner = get_current_task();
+            mutex->rcc = 1;
             abandoned = true;
             if (recovered != NULL) *recovered = true;
         }
         spin_unlock(&mutex->lock);
 
-        if (!abandoned)
+        if (abandoned) return 0;
+        else
         {
             scheduler_yield();
             cpu_relax();

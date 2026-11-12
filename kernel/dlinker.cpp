@@ -531,13 +531,13 @@ cp_module_t *get_module_raw(const char *module_name) {
 }
 
 void module_setup() {
-    vfs_node_t mr = vfs_open("/mod");
+    vfs_node_t mr = vfs_open("/system/mod");
     if (mr == NULL) {
-        write_serial_fmt("kmod: /mod not found\n");
+        write_serial_fmt("kmod: /system/mod not found\n");
         return;
     }
     if (mr->type != file_dir) {
-        write_serial_string("kmod: /mod is not a directory\n");
+        write_serial_string("kmod: /system/mod is not a directory\n");
         vfs_close(mr);
         return;
     }
@@ -550,13 +550,13 @@ void module_setup() {
         if (ch == NULL || ch->name == NULL) {
             continue;
         }
-        size_t path_len = strlen("/mod/") + strlen(ch->name) + 1;
+        size_t path_len = strlen("/system/mod/") + strlen(ch->name) + 1;
         char *buf = (char *)malloc(path_len);
         if (buf == NULL) {
             write_serial_fmt("kmod: no memory for %s\n", ch->name);
             continue;
         }
-        snprintf(buf, path_len, "/mod/%s", ch->name);
+        snprintf(buf, path_len, "/system/mod/%s", ch->name);
         bool exists = false;
         for (size_t j = 0; j < module_count; j++) {
             if (module_ls[j].is_use && strcmp(module_ls[j].raw_name, buf) == 0) {

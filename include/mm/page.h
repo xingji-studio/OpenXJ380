@@ -99,6 +99,11 @@ void page_table_clear(page_table_t *table);
  */
 void page_map_to(page_directory_t *directory, uint64_t addr, uint64_t frame, uint64_t flags);
 
+// Map a new low-half user page in an exclusively prepared address space.
+// Never overwrites an existing entry; leaves frame ownership with the caller
+// on failure, including intermediate page-table allocation failures.
+bool page_map_new_user_page(page_directory_t *directory, uint64_t addr, uint64_t frame, uint64_t flags);
+
 /**
  * 映射一组物理地址 (对应的虚拟地址用hhdm计算)
  * @param directory 页表

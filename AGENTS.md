@@ -68,6 +68,7 @@ XJ380/
 - User app link rules depend on the generated Ninja XAPI runtime objects under `out/xapi/`.
 
 ## ANTI-PATTERNS (THIS PROJECT)
+- OpenXJ380 is Apache-2.0 and is also consumed by the closed-source XJ380 parent. Review exact per-file licenses, provenance, build features, and transitive dependencies before importing or linking third-party code. New linked dependencies must preserve both projects' licensing goals; GPL implementations must not be linked into the kernel. A permissive wrapper or top-level license does not override copyleft source files. Host tools invoked as separate processes and existing explicit license exceptions require their own review; do not treat them as permission to link GPL implementations.
 - Do not push directly to `main`; create a separate branch, open a PR, and merge only after review.
 - Do not edit generated Mbed TLS files marked `DO NOT EDIT`; regenerate or update wrappers instead.
 - Do not use stb font parsing on untrusted fonts; `font/ttf/stb_ttf.h` explicitly has no security guarantee.

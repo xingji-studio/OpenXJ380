@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "relationship": "design-reference-only",
+  "review_date": "2026-10-31",
+  "repository": "https://github.com/gkostka/lwext4",
+  "candidate_revision": "58bcf89a121b72d4fb66334f1693d3b30e4cb9c5",
+  "copied_or_translated_implementation": false,
+  "retrieval": "Web-rendered source views only. HTTPS downloads failed certificate verification; pinned cache/blockdev views were unavailable. No complete upstream file bytes, file hashes or dependency-closure audit are claimed.",
+  "sources": [
+    {
+      "path": "src/ext4_bcache.c",
+      "url": "https://raw.githubusercontent.com/gkostka/lwext4/master/src/ext4_bcache.c",
+      "view_revision": "master",
+      "sha256": null,
+      "license": "BSD-3-Clause",
+      "reviewed_design": "LBA-keyed cache reuse, LRU replacement and range invalidation; native fixed arrays and bounded ranks are newly written."
+    },
+    {
+      "path": "src/ext4_blockdev.c",
+      "url": "https://raw.githubusercontent.com/gkostka/lwext4/master/src/ext4_blockdev.c",
+      "view_revision": "master",
+      "sha256": null,
+      "license": "BSD-3-Clause",
+      "reviewed_design": "Direct contiguous block-count I/O and distinguishing valid cached contents from failed fills; native callbacks, bounds and failure quarantine are newly written."
+    },
+    {
+      "path": "src/ext4_journal.c",
+      "url": "https://raw.githubusercontent.com/gkostka/lwext4/58bcf89a121b72d4fb66334f1693d3b30e4cb9c5/src/ext4_journal.c",
+      "view_revision": "58bcf89a121b72d4fb66334f1693d3b30e4cb9c5",
+      "sha256": null,
+      "license": "BSD-3-Clause",
+      "reviewed_design": "Commit/checkpoint lifetime separation. Native synchronous redo, six persistence barriers, recovery validation and failure quarantine are retained; no dirty-cache or asynchronous checkpoint implementation is imported."
+    }
+  ],
+  "excluded_implementations": [
+    "src/ext4_extent.c",
+    "src/ext4_extents.c",
+    "src/ext4_xattr.c"
+  ],
+  "notice": {
+    "path": "LWEXT4_BSD_NOTICE.txt",
+    "sha256": "072453b9cda2ee9cc4c16cf80652b7070fcff70259fc4e4ee5de17ba80af24d6"
+  }
+}

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdint.h>
+#include <user/permissions.h>
 
 struct RunfileSettings_Item
 {
@@ -20,5 +21,5 @@ bool init_user_runfile(const char *username);
 bool init_user_settings(const char *username);
 bool init_user_profile(const char *username);
 
-void runfile(char *path);
+void runfile(char *path, ProcessCredentialSource source = XPCS_SESSION);
 bool get_file_exname(char *name, char *exname);

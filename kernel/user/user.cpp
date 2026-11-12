@@ -1,10 +1,15 @@
 #include <input_method.h>
+#include <user/auth.h>
+#include <user/permissions.h>
+#include <user/special_permissions.h>
+#include <user/process_launch.h>
 #include "../build_settings.h"
 #include <ahci/ahci.h>
 #include <efi/boot.h>
 #include <efi/efi.h>
 #include <efi/fbc.h>
 #include <elf.h>
+#include <epf.h>
 #include <errno.h>
 #include <fs/fatfs/fatfs.h>
 #include <fs/partition.h>
@@ -12,6 +17,7 @@
 #include <fs/vfs/vfs.h>
 #include <krlibc.h>
 #include <mm/frame.h>
+#include <mm/uaccess.h>
 #include <pci/pci.h>
 #include <proto.hpp>
 #include <ps2/keyboard.h>
@@ -19,6 +25,7 @@
 #include <stdint.h>
 #include <syscall/syscall.h>
 #include <task/pcb.h>
+#include <task/process_preparation.h>
 #include <task/scheduler.h>
 #include <user/user.h>
 #include <user/runfile.h>
@@ -90,17 +97,11 @@ uint32_t user_gid(const UserInfo *user)
 UserInfo *task_effective_user()
 {
     tcb_t task = get_current_task();
+    if (task != NULL && task->task_level == TASK_APPLICATION_LEVEL && task->parent_group != NULL)
+        return &task->parent_group->permission_user;
     if (task != NULL && task->user_info != NULL) return task->user_info;
     if (current_user != NULL) return current_user;
     return &root_user;
-}
-
-extern bool no_interrupt;
-static void restore_runtime_state(uint64_t scheduler_depth, bool was_interrupt_enabled)
-{
-    scheduler_restore_depth(scheduler_depth);
-    if (was_interrupt_enabled && !no_interrupt) open_interrupt;
-    else close_interrupt;
 }
 
 static bool append_cmdline_char(char *cmdline, size_t cmdline_size, char **cursor, char ch)
@@ -145,115 +146,16 @@ static bool append_cmdline_arg(char *cmdline, size_t cmdline_size, char **cursor
     return true;
 }
 
-static bool user_registry_login_entry_valid(const UserInfo *user)
-{
-    if (user == NULL || user->name[0] == '\0') return false;
-    if (memchr(user->name, '\0', sizeof(user->name)) == NULL ||
-        memchr(user->password, '\0', sizeof(user->password)) == NULL) return false;
-    if (user->user_type == XUT_Root || user->user_type == XUT_System) return false;
-    if (user->user_type < XUT_Root || user->user_type > XUT_Custom) return false;
-    for (const char *p = user->name; *p != '\0'; p++)
-    {
-        if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
-              (*p >= '0' && *p <= '9') || *p == '_' || *p == '-' || *p == ' '))
-            return false;
-    }
-    return true;
-}
-
-static bool user_registry_needs_oobe(UserRegisterList *urf_data, size_t bytes_read)
-{
-    if (urf_data == NULL) return true;
-    if (bytes_read < sizeof(UserRegisterList)) return true;
-    if (urf_data->user_count <= 1 || urf_data->user_count > 128) return true;
-    for (int i = 1; i < urf_data->user_count; i++)
-    {
-        if (user_registry_login_entry_valid(&urf_data->uinf[i])) return false;
-    }
-    return true;
-}
-
-static bool user_registry_has_real_user(const UserRegisterList *registry)
-{
-    if (registry == NULL || registry->user_count <= 1 || registry->user_count > 128) return false;
-    for (int i = 1; i < registry->user_count; i++)
-    {
-        if (user_registry_login_entry_valid(&registry->uinf[i])) return true;
-    }
-    return false;
-}
-
-static bool user_registry_first_user_matches(const UserRegisterList *registry, const char *username,
-                                             const char *password)
-{
-    if (registry == NULL || username == NULL || password == NULL) return false;
-    if (registry->user_count <= 1 || registry->user_count > 128) return false;
-
-    for (int i = 1; i < registry->user_count; i++)
-    {
-        if (!user_registry_login_entry_valid(&registry->uinf[i])) continue;
-        return strcmp(username, registry->uinf[i].name) == 0 && strcmp(password, registry->uinf[i].password) == 0;
-    }
-    return false;
-}
-
-static bool load_user_registry(UserRegisterList *registry, size_t *bytes_read)
-{
-    if (registry == NULL) return false;
-    memset(registry, 0, sizeof(UserRegisterList));
-    if (bytes_read != NULL) *bytes_read = 0;
-
-    vfs_node_t node = vfs_open("/system/config/usereg.dat");
-    if (node == NULL) return false;
-
-    size_t read_size = vfs_read(node, registry, 0, sizeof(UserRegisterList));
-    vfs_close(node);
-    if (bytes_read != NULL) *bytes_read = read_size;
-    return read_size >= sizeof(int);
-}
-
-static bool write_first_user_registry(const char *username, const char *password)
-{
-    if (username == NULL || password == NULL) return false;
-
-    vfs_mkdir("/system");
-    vfs_mkdir("/system/config");
-
-    vfs_node_t file = vfs_open("/system/config/usereg.dat");
-    if (file == NULL)
-    {
-        if (vfs_mkfile("/system/config/usereg.dat") != EOK) return false;
-        file = vfs_open("/system/config/usereg.dat");
-    }
-    if (file == NULL) return false;
-
-    UserRegisterList registry;
-    memset(&registry, 0, sizeof(registry));
-    registry.user_count = 2;
-    strcpy(registry.uinf[0].name, "Root");
-    strcpy(registry.uinf[0].password, "");
-    registry.uinf[0].user_type = XUT_Root;
-    strncpy(registry.uinf[1].name, username, sizeof(registry.uinf[1].name) - 1);
-    strncpy(registry.uinf[1].password, password, sizeof(registry.uinf[1].password) - 1);
-    registry.uinf[1].user_type = XUT_Admin;
-
-    vfs_resize(file, 0);
-    size_t wrote = vfs_write(file, &registry, 0, sizeof(registry));
-    vfs_close(file);
-    return wrote == sizeof(registry);
-}
-
 static void set_current_user_from_info(UserInfo *info)
 {
     if (info == NULL) return;
     if (current_user == NULL) current_user = (UserInfo *)malloc(sizeof(UserInfo));
     if (current_user == NULL) return;
-    memset(current_user, 0, sizeof(UserInfo));
-    strcpy(current_user->name, info->name);
-    strcpy(current_user->password, info->password);
-    current_user->user_type = info->user_type;
-    current_user->envc      = 3;
-    current_user->envp      = current_user_envp;
+    UserInfo snapshot = *info;
+    memset(snapshot.password, 0, sizeof(snapshot.password));
+    snapshot.envc = 3;
+    snapshot.envp = current_user_envp;
+    permissions_session_publish(&snapshot);
 }
 
 bool user_session_is_ready()
@@ -284,132 +186,35 @@ void user_session_use_login()
 
 bool user_session_needs_oobe()
 {
-    UserRegisterList registry;
-    size_t           bytes_read = 0;
-    load_user_registry(&registry, &bytes_read);
-    return user_registry_needs_oobe(&registry, bytes_read);
+    return user_auth_oobe_state() == 1;
 }
 
 int user_session_list(UserInfo *out, int max_count)
 {
-    if (out == NULL || max_count < 0) return -EINVAL;
+    return user_auth_list(out, max_count);
+}
 
-    UserRegisterList registry;
-    size_t           bytes_read = 0;
-    load_user_registry(&registry, &bytes_read);
-    if (user_registry_needs_oobe(&registry, bytes_read)) return 0;
-
-    int copied = 0;
-    for (int i = 1; i < registry.user_count && i < 128; i++)
-    {
-        if (!user_registry_login_entry_valid(&registry.uinf[i])) continue;
-        if (copied >= max_count) break;
-        out[copied] = registry.uinf[i];
-        memset(out[copied].password, 0, sizeof(out[copied].password));
-        copied++;
-    }
-    return copied;
+static int activate_account(UserInfo *info)
+{
+    user_session_set_ready(false);
+    set_current_user_from_info(info);
+    if (current_user == NULL || !init_user_profile(current_user->name)) return -EIO;
+    (void)special_permissions_load_user(current_user->name);
+    return 0;
 }
 
 int user_session_login(const char *username, const char *password)
 {
-    if (username == NULL || password == NULL || username[0] == '\0') return -EINVAL;
-
-    static spin_t login_lock = SPIN_INIT;
-    static uint64_t retry_after_ns = 0;
-    static unsigned failed_attempts = 0;
-    spin_lock(&login_lock);
-    uint64_t now = nanoTime();
-    if (now < retry_after_ns) { spin_unlock(&login_lock); return -EAGAIN; }
-    spin_unlock(&login_lock);
-
-    UserRegisterList registry;
-    size_t           bytes_read = 0;
-    load_user_registry(&registry, &bytes_read);
-    if (user_registry_needs_oobe(&registry, bytes_read)) return -ENOENT;
-
-    for (int i = 1; i < registry.user_count && i < 128; i++)
-    {
-        if (!user_registry_login_entry_valid(&registry.uinf[i])) continue;
-        if (strcmp(username, registry.uinf[i].name) != 0) continue;
-        if (strcmp(password, registry.uinf[i].password) != 0)
-        {
-            spin_lock(&login_lock);
-            failed_attempts++;
-            uint64_t delay_seconds = 1ULL << min(failed_attempts, 5U);
-            retry_after_ns = now + delay_seconds * 1000000000ULL;
-            spin_unlock(&login_lock);
-            return -EACCES;
-        }
-
-        user_session_set_ready(false);
-        set_current_user_from_info(&registry.uinf[i]);
-        spin_lock(&login_lock);
-        failed_attempts = 0;
-        retry_after_ns = 0;
-        spin_unlock(&login_lock);
-        if (current_user == NULL || !init_user_profile(current_user->name)) return -EIO;
-        return 0;
-    }
-    spin_lock(&login_lock);
-    failed_attempts++;
-    retry_after_ns = now + (1ULL << min(failed_attempts, 5U)) * 1000000000ULL;
-    spin_unlock(&login_lock);
-    return -ENOENT;
+    UserInfo info = {};
+    int error = user_auth_login(username, password, &info);
+    return error ? error : activate_account(&info);
 }
 
 int user_session_create_first(const char *username, const char *password)
 {
-    if (username == NULL || username[0] == '\0' || password == NULL || password[0] == '\0') return -EINVAL;
-    user_session_set_ready(false);
-    for (const char *p = username; *p != '\0'; p++)
-    {
-        if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
-              (*p >= '0' && *p <= '9') || *p == '_' || *p == '-' || *p == ' '))
-            return -EINVAL;
-    }
-
-    UserRegisterList registry;
-    size_t           bytes_read = 0;
-    bool registry_loaded = load_user_registry(&registry, &bytes_read);
-    vfs_node_t existing_registry = vfs_open("/system/config/usereg.dat");
-    bool registry_exists = existing_registry != NULL;
-    if (existing_registry != NULL) vfs_close(existing_registry);
-    if (registry_exists && (!registry_loaded || bytes_read != sizeof(UserRegisterList) ||
-                            registry.user_count < 1 || registry.user_count > 128)) return -EIO;
-    if (!user_registry_needs_oobe(&registry, bytes_read))
-    {
-        if (user_registry_first_user_matches(&registry, username, password))
-        {
-            UserInfo *first_user = NULL;
-            for (int i = 1; i < registry.user_count && i < 128; i++)
-            {
-                if (user_registry_login_entry_valid(&registry.uinf[i]))
-                {
-                    first_user = &registry.uinf[i];
-                    break;
-                }
-            }
-            if (first_user != NULL)
-            {
-                set_current_user_from_info(first_user);
-                if (current_user == NULL || !init_user_profile(current_user->name)) return -EIO;
-                return 0;
-            }
-        }
-        return -EEXIST;
-    }
-
-    if (user_registry_has_real_user(&registry)) return -EEXIST;
-    if (!write_first_user_registry(username, password) || !init_user_profile(username)) return -EIO;
-
-    UserInfo info;
-    memset(&info, 0, sizeof(info));
-    strncpy(info.name, username, sizeof(info.name) - 1);
-    strncpy(info.password, password, sizeof(info.password) - 1);
-    info.user_type = XUT_Admin;
-    set_current_user_from_info(&info);
-    return 0;
+    UserInfo info = {};
+    int error = user_auth_create_first(username, password, &info);
+    return error ? error : activate_account(&info);
 }
 
 void init_user()
@@ -497,7 +302,7 @@ typedef struct loaded_user_elf
 static void free_file_image(uint8_t *buf, uint64_t size)
 {
     if (buf == NULL || size == 0) return;
-    free_frames((uint64_t)virt_to_phys((uint64_t)buf), (size + PAGE_SIZE - 1) / PAGE_SIZE);
+    free_frames((uint64_t)virt_to_phys((uint64_t)buf), size / PAGE_SIZE + (size % PAGE_SIZE != 0));
 }
 
 static int read_vfs_file(vfs_node_t file, uint8_t **out, uint64_t *out_size)
@@ -505,12 +310,26 @@ static int read_vfs_file(vfs_node_t file, uint8_t **out, uint64_t *out_size)
     if (file == NULL || out == NULL || out_size == NULL) return -EINVAL;
     uint64_t size = file->size;
     if (size == 0) return -ENOEXEC;
+    if (size > ~0ULL - (PAGE_SIZE - 1)) return -EFBIG;
+
+    // Identify EPF before allocating its complete file buffer, so an invalid
+    // oversized file cannot exhaust contiguous physical memory first.
+    if (size > EPF_MAX_FILE_SIZE)
+    {
+        uint8_t magic[4];
+        if (vfs_read(file, magic, 0, sizeof(magic)) != sizeof(magic)) return -EIO;
+        if (epf_has_magic(magic, sizeof(magic))) return -EFBIG;
+    }
 
     uint64_t pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
     uint64_t phys = alloc_frames(pages);
     if (phys == 0) return -ENOMEM;
     uint8_t *buf = (uint8_t *)phys_to_virt(phys);
-    if (buf == NULL) return -ENOMEM;
+    if (buf == NULL)
+    {
+        free_frames(phys, pages);
+        return -ENOMEM;
+    }
     memset(buf, 0, pages * PAGE_SIZE);
 
     size_t got = vfs_read(file, buf, 0, size);
@@ -535,26 +354,49 @@ static int find_elf_interpreter(uint8_t *buf, uint64_t file_size, char *interp, 
     if (buf == NULL || interp == NULL || interp_size == 0) return -EINVAL;
     interp[0] = '\0';
 
+    if (file_size < sizeof(Elf64_Ehdr)) return -ENOEXEC;
     Elf64_Ehdr *ehdr = (Elf64_Ehdr *)buf;
-    if (!elf_range_in_file(ehdr->e_phoff, (uint64_t)ehdr->e_phnum * ehdr->e_phentsize, file_size)) return -ENOEXEC;
+    if (ehdr->e_phentsize != sizeof(Elf64_Phdr) || ehdr->e_phnum == 0 || ehdr->e_phoff % 8 ||
+        !elf_range_in_file(ehdr->e_phoff, (uint64_t)ehdr->e_phnum * ehdr->e_phentsize, file_size)) return -ENOEXEC;
 
     Elf64_Phdr *phdrs = (Elf64_Phdr *)(buf + ehdr->e_phoff);
     for (int i = 0; i < ehdr->e_phnum; i++)
     {
         if (phdrs[i].p_type != PT_INTERP) continue;
+        if (interp[0] != '\0') return -ENOEXEC;
         if (phdrs[i].p_filesz == 0 || phdrs[i].p_filesz >= interp_size) return -ENAMETOOLONG;
         if (!elf_range_in_file(phdrs[i].p_offset, phdrs[i].p_filesz, file_size)) return -ENOEXEC;
+        if (buf[phdrs[i].p_offset + phdrs[i].p_filesz - 1] != '\0' || phdrs[i].p_filesz < 2 ||
+            memchr(buf + phdrs[i].p_offset, '\0', phdrs[i].p_filesz - 1) != NULL) return -ENOEXEC;
 
         memcpy(interp, buf + phdrs[i].p_offset, phdrs[i].p_filesz);
         interp[phdrs[i].p_filesz] = '\0';
-        return 0;
     }
 
     return 0;
 }
 
+static bool zero_user_elf_range(page_directory_t *directory, uint64_t address, uint64_t length)
+{
+    // The image is still private to its loader. Its mapped pages are stable,
+    // while the current thread keeps using its own process CR3 and stack.
+    // Clearing through the direct map permits a timer switch between pages.
+    for (uint64_t done = 0; done < length;)
+    {
+        uint64_t current = address + done;
+        uint64_t physical = translate_address(directory, current);
+        if (!physical) return false;
+        void *destination = phys_to_virt(physical);
+        if (!destination) return false;
+        uint64_t count = min(length - done, PAGE_SIZE - (current & (PAGE_SIZE - 1)));
+        memset(destination, 0, count);
+        done += count;
+    }
+    return true;
+}
+
 static int load_user_elf_image(uint8_t *buf, uint64_t file_size, pcb_t group, const char *name,
-                               uint64_t dyn_base, loaded_user_elf_t *out)
+                               uint64_t dyn_base, loaded_user_elf_t *out, bool native_image = false)
 {
     if (buf == NULL || group == NULL || out == NULL) return -EINVAL;
 
@@ -588,6 +430,10 @@ static int load_user_elf_image(uint8_t *buf, uint64_t file_size, pcb_t group, co
     }
 
     Elf64_Phdr *phdrs = (Elf64_Phdr *)(buf + ehdr->e_phoff);
+    if (native_image && (ehdr->e_ident[EI_CLASS] != ELFCLASS64 || ehdr->e_ident[EI_DATA] != ELFDATA2LSB ||
+        ehdr->e_ident[EI_VERSION] != EV_CURRENT || ehdr->e_version != EV_CURRENT ||
+        ehdr->e_machine != EM_X86_64 || ehdr->e_ehsize != sizeof(Elf64_Ehdr) || ehdr->e_phnum > 64))
+        return -ENOEXEC;
     uint64_t load_bias = ehdr->e_type == ET_DYN ? dyn_base : 0;
     uint64_t load_start = ~0ULL;
     uint64_t load_end = 0;
@@ -596,6 +442,13 @@ static int load_user_elf_image(uint8_t *buf, uint64_t file_size, pcb_t group, co
     for (int i = 0; i < ehdr->e_phnum; i++)
     {
         if (phdrs[i].p_type != PT_LOAD) continue;
+        if (native_image)
+        {
+            uint64_t alignment = phdrs[i].p_align;
+            if (!(phdrs[i].p_flags & PF_R) || (phdrs[i].p_flags & (PF_W | PF_X)) == (PF_W | PF_X) ||
+                (alignment > 1 && ((alignment & (alignment - 1)) || load_bias % alignment ||
+                 ((phdrs[i].p_vaddr - phdrs[i].p_offset) & (alignment - 1))))) return -ENOEXEC;
+        }
         if (phdrs[i].p_filesz > phdrs[i].p_memsz ||
             !elf_range_in_file(phdrs[i].p_offset, phdrs[i].p_filesz, file_size))
         {
@@ -631,9 +484,43 @@ static int load_user_elf_image(uint8_t *buf, uint64_t file_size, pcb_t group, co
         return -ENOEXEC;
     }
 
-    page_map_range_to_random(group->pagedir, load_start, load_end - load_start,
-                             PTE_PRESENT | PTE_WRITEABLE | PTE_USER);
-    memset((void *)load_start, 0, load_end - load_start);
+    // Native images are prepared privately. Keep ownership until all copies,
+    // permissions and the VMA reservation succeed, so a partial load rolls back.
+    struct NativeMapping
+    {
+        pcb_t process;
+        uint64_t start, end;
+        bool active, committed = false;
+        ~NativeMapping()
+        {
+            if (active && !committed && end > start) unmap_page_range(process->pagedir, start, end - start);
+        }
+    } mapping{group, load_start, load_start, native_image};
+    if (native_image)
+    {
+        if (load_end - load_start > (64ULL << 20) ||
+            vma_find_intersection(&group->vma_manager, load_start, load_end) != NULL) return -ENOEXEC;
+        for (uint64_t address = load_start; address < load_end; address += PAGE_SIZE)
+            if (translate_address(group->pagedir, address)) return -EEXIST;
+        for (uint64_t address = load_start; address < load_end; address += PAGE_SIZE)
+        {
+            uint64_t physical = alloc_frames(1);
+            if (!physical) return -ENOMEM;
+            if (!page_map_new_user_page(group->pagedir, address, physical,
+                                       PTE_PRESENT | PTE_WRITEABLE | PTE_USER | PTE_NO_EXECUTE | PTE_FRAME_ALLOCATED))
+            {
+                free_frames(physical, 1);
+                return -ENOMEM;
+            }
+            mapping.end = address + PAGE_SIZE;
+        }
+    }
+    else
+    {
+        page_map_range_to_random(group->pagedir, load_start, load_end - load_start,
+                                PTE_PRESENT | PTE_WRITEABLE | PTE_USER);
+    }
+    if (!zero_user_elf_range(group->pagedir, load_start, load_end - load_start)) return -ENOMEM;
 
     uint64_t phdr_addr = 0;
     for (int i = 0; i < ehdr->e_phnum; i++)
@@ -649,10 +536,13 @@ static int load_user_elf_image(uint8_t *buf, uint64_t file_size, pcb_t group, co
         if (phdrs[i].p_type != PT_LOAD) continue;
 
         uint64_t seg_addr = load_bias + phdrs[i].p_vaddr;
-        memcpy((void *)seg_addr, (void *)(buf + phdrs[i].p_offset), phdrs[i].p_filesz);
+        if (!copy_to_user_pagedir(group->pagedir, (void *)seg_addr, buf + phdrs[i].p_offset, phdrs[i].p_filesz))
+            return -ENOMEM;
         if (phdrs[i].p_memsz > phdrs[i].p_filesz)
         {
-            memset((void *)(seg_addr + phdrs[i].p_filesz), 0, phdrs[i].p_memsz - phdrs[i].p_filesz);
+            if (!zero_user_elf_range(group->pagedir, seg_addr + phdrs[i].p_filesz,
+                                      phdrs[i].p_memsz - phdrs[i].p_filesz))
+                return -ENOMEM;
         }
 
         if (phdr_addr == 0 && ehdr->e_phoff >= phdrs[i].p_offset &&
@@ -662,7 +552,43 @@ static int load_user_elf_image(uint8_t *buf, uint64_t file_size, pcb_t group, co
         }
     }
 
+    if (native_image)
+    {
+        uint64_t expected_phdr = 0;
+        uint64_t table_size = (uint64_t)ehdr->e_phnum * sizeof(Elf64_Phdr);
+        for (int i = 0; i < ehdr->e_phnum; ++i)
+        {
+            if (phdrs[i].p_type != PT_LOAD || !(phdrs[i].p_flags & PF_R) ||
+                ehdr->e_phoff < phdrs[i].p_offset) continue;
+            uint64_t offset = ehdr->e_phoff - phdrs[i].p_offset;
+            if (elf_range_in_file(offset, table_size, phdrs[i].p_filesz))
+                expected_phdr = load_bias + phdrs[i].p_vaddr + offset;
+        }
+        if (!phdr_addr || phdr_addr != expected_phdr) return -ENOEXEC;
+        // Code is executable only after copying has finished. Data and gaps
+        // stay NX; the user linker later seals RELRO and splits VMA permissions.
+        for (int i = 0; i < ehdr->e_phnum; ++i)
+        {
+            if (phdrs[i].p_type != PT_LOAD) continue;
+            uint64_t start = PADDING_DOWN(load_bias + phdrs[i].p_vaddr, PAGE_SIZE);
+            uint64_t end = PADDING_UP(load_bias + phdrs[i].p_vaddr + phdrs[i].p_memsz, PAGE_SIZE);
+            for (int j = 0; j < i; ++j)
+            {
+                if (phdrs[j].p_type != PT_LOAD) continue;
+                uint64_t other_start = PADDING_DOWN(load_bias + phdrs[j].p_vaddr, PAGE_SIZE);
+                uint64_t other_end = PADDING_UP(load_bias + phdrs[j].p_vaddr + phdrs[j].p_memsz, PAGE_SIZE);
+                if (start < other_end && other_start < end) return -ENOEXEC;
+            }
+            // Writable data includes relocation destinations until rtld seals RELRO.
+            uint64_t flags = PTE_PRESENT | PTE_USER | ((phdrs[i].p_flags & PF_W) ? PTE_WRITEABLE : 0) |
+                             ((phdrs[i].p_flags & PF_X) ? 0 : PTE_NO_EXECUTE);
+            for (uint64_t address = start; address < end; address += PAGE_SIZE)
+                if (!page_table_update_flags(group->pagedir, address, flags)) return -ENOMEM;
+        }
+    }
+
     vma_t *elf_vma = vma_alloc();
+    if (native_image && elf_vma == NULL) return -ENOMEM;
     if (elf_vma != NULL)
     {
         elf_vma->vm_start = load_start;
@@ -670,9 +596,16 @@ static int load_user_elf_image(uint8_t *buf, uint64_t file_size, pcb_t group, co
         elf_vma->vm_flags |= VMA_READ | VMA_WRITE | VMA_EXEC;
         elf_vma->vm_type = VMA_TYPE_ANON;
         elf_vma->vm_name = strdup(name != NULL ? name : "elf");
-        vma_insert(&group->vma_manager, elf_vma);
+        int inserted = vma_insert(&group->vma_manager, elf_vma);
+        if (native_image && (elf_vma->vm_name == NULL || inserted != 0))
+        {
+            if (inserted == 0) vma_remove(&group->vma_manager, elf_vma);
+            vma_free(elf_vma);
+            return -ENOMEM;
+        }
     }
 
+    mapping.committed = true;
     out->map_start = load_start;
     out->map_end = load_end;
     out->load_bias = load_bias;
@@ -706,17 +639,15 @@ uint64_t parse_elf_file(char *path, pcb_t group)
         return (uint64_t)ret;
     }
 
-    if (file_size < sizeof(Elf64_Ehdr))
+    if (file_size < 4)
     {
         free_file_image(buf, file_size);
         write_serial_fmt("Parse ELF/EPF file failed. Reason: Truncated header: %s.\n", path);
         return (uint64_t)-ENOEXEC;
     }
-    Elf64_Ehdr ehdr = *(Elf64_Ehdr *)buf;
-
     // 验证ELF/EPF魔数 (0x7F,'E','L','F') (0x24, 'E', 'P', 'F')
-    if ((*(uint32_t *)ehdr.e_ident != 0x464C457F)     // ELF
-        && (*(uint32_t *)ehdr.e_ident != 0x46504524)) // EPF
+    bool is_epf = epf_has_magic(buf, file_size);
+    if (memcmp(buf, "\177ELF", 4) != 0 && !is_epf)
     {
         pr_warn("Parse ELF/EPF file failed.\n");
         write_serial_fmt("Reason:   Bad Format path=%s size=%llu magic=%02x %02x %02x %02x.\n",
@@ -727,8 +658,40 @@ uint64_t parse_elf_file(char *path, pcb_t group)
                          file_size > 2 ? buf[2] : 0,
                          file_size > 3 ? buf[3] : 0);
         free_file_image(buf, file_size);
-        return NULL;
+        return (uint64_t)-ENOEXEC;
     }
+
+    // ELF/EPF 分流：EPF 使用自己的文件头、段表和 RVA 地址模型。
+    if (is_epf)
+    {
+        uint8_t *epf_interpreter = nullptr;
+        uint64_t epf_interpreter_size = 0;
+        int needs_interpreter = epf_get_interpreter(buf, file_size);
+        if (needs_interpreter > 0)
+        {
+            vfs_node_t interpreter_file = vfs_open(EPF_INTERPRETER_PATH);
+            if (!interpreter_file) ret = -ENOENT;
+            else
+            {
+                ret = read_vfs_file(interpreter_file, &epf_interpreter, &epf_interpreter_size);
+                vfs_close(interpreter_file);
+            }
+        }
+        else ret = needs_interpreter;
+        uint64_t entry = ret < 0 ? (uint64_t)ret :
+            load_user_epf_image(buf, file_size, group, epf_interpreter, epf_interpreter_size);
+        free_file_image(epf_interpreter, epf_interpreter_size);
+        free_file_image(buf, file_size);
+        if ((int64_t)entry < 0) write_serial_fmt("Cannot load EPF %s: ret=%d\n", path, (int)(int64_t)entry);
+        return entry;
+    }
+
+    if (file_size < sizeof(Elf64_Ehdr))
+    {
+        free_file_image(buf, file_size);
+        return (uint64_t)-ENOEXEC;
+    }
+    Elf64_Ehdr ehdr = *(Elf64_Ehdr *)buf;
 
     char interp_path[256];
     ret = find_elf_interpreter(buf, file_size, interp_path, sizeof(interp_path));
@@ -741,6 +704,9 @@ uint64_t parse_elf_file(char *path, pcb_t group)
 
     uint8_t *interp_buf = NULL;
     uint64_t interp_size = 0;
+    // A dedicated native interpreter uses the existing XAPI syscall ABI. Its
+    // own bootstrap validates the versioned XJ380 note in every loaded object.
+    bool native_image = strcmp(interp_path, "/system/lib/ld-xj380-x86_64.so.1") == 0;
     if (interp_path[0] != '\0')
     {
         vfs_node_t interp_file = vfs_open(interp_path);
@@ -760,28 +726,18 @@ uint64_t parse_elf_file(char *path, pcb_t group)
         }
     }
 
-    bool is_sti                = are_interrupts_enabled();
-    uint64_t scheduler_depth = scheduler_disable_depth();
-    if (!no_interrupt) close_interrupt;
-    disable_scheduler();
-
-    // Keep the saved CR3 on this stack. get_current_directory's scratch
-    // object can otherwise be overwritten by another CPU during ELF loading.
-    page_directory_t current_pagedir = {(page_table_t *)phys_to_virt(get_cr3())};
-    switch_page_directory(group->pagedir);
-
+    // The scheduler restores this loader's process CR3 after preemption, not
+    // the child's image. Map and populate the explicit target through HHDM;
+    // never borrow its CR3 across allocation, large copies or timer entries.
     loaded_user_elf_t main_elf;
     memset(&main_elf, 0, sizeof(main_elf));
-    ret = load_user_elf_image(buf, file_size, group, group->name, USER_DYN_MAIN_BASE, &main_elf);
+    ret = load_user_elf_image(buf, file_size, group, group->name, USER_DYN_MAIN_BASE, &main_elf, native_image);
     loaded_user_elf_t interp_elf;
     memset(&interp_elf, 0, sizeof(interp_elf));
     if (ret == 0 && interp_buf != NULL)
     {
-        ret = load_user_elf_image(interp_buf, interp_size, group, interp_path, USER_INTERP_BASE, &interp_elf);
+        ret = load_user_elf_image(interp_buf, interp_size, group, interp_path, USER_INTERP_BASE, &interp_elf, native_image);
     }
-
-    switch_page_directory(&current_pagedir); // 恢复页表
-    restore_runtime_state(scheduler_depth, is_sti);
 
     if (ret < 0)
     {
@@ -792,7 +748,7 @@ uint64_t parse_elf_file(char *path, pcb_t group)
         return (uint64_t)ret;
     }
 
-    group->linux_abi = interp_buf != NULL || ehdr.e_ident[EI_OSABI] == ELFOSABI_LINUX;
+    group->linux_abi = !native_image && (interp_buf != NULL || ehdr.e_ident[EI_OSABI] == ELFOSABI_LINUX);
     group->load_start = main_elf.map_start;
     group->aux_phdr = main_elf.phdr;
     group->aux_phent = main_elf.phent;
@@ -896,6 +852,18 @@ static void free_process_argv(char **argv)
 
 int create_user_process_from_file(char *path, pcb_t pcb, char *argv[])
 {
+    return create_user_process_with_options(path, pcb, argv, ProcessLaunchOptions{});
+}
+
+int create_user_process_with_options(char *path, pcb_t pcb, char *argv[], const ProcessLaunchOptions &options)
+{
+    // A picker result endpoint is owned by exactly one side, including every
+    // failed ELF/argument/thread setup path. Publish it before the first thread.
+    struct PendingWriter
+    {
+        vfs_node_t node;
+        ~PendingWriter() { if (node) vfs_close(node); }
+    } writer{options.result_writer};
     if (path == NULL)
     {
         write_serial_fmt("Create User Process Failed. Reason: Empty Path.\n");
@@ -915,19 +883,44 @@ int create_user_process_from_file(char *path, pcb_t pcb, char *argv[])
         write_serial_fmt("Create User Process Failed. Reason: Cannot Clone Page Directory.\n");
         return -ENOMEM;
     }
-    pcb_t             group         = create_process_group(process_name, pcb, new_directory, (char *)"");
+    struct PreparedImage
+    {
+        ProcessPreparation *ticket;
+        ~PreparedImage() { process_preparation_release(ticket); }
+    } prepared{NULL};
+    // Publish the child only after its construction ticket exists. Until its
+    // first thread is runnable it has no scheduler reference to stop a kill
+    // plus reaper from reclaiming the PCB/page tables under this loader.
+    pcb_t group = create_process_group_prepared(process_name, pcb, new_directory, (char *)"",
+                                                 options.credentials, &prepared.ticket);
     if (group == NULL)
     {
         free_page_directory(new_directory);
         write_serial_fmt("Create User Process Failed. Reason: Cannot Create Process Group.\n");
         return -ENOMEM;
     }
-    group->exe_path = strdup(path);
+    vfs_node_t executable_node = vfs_open(path);
+    char executable_directory[4096];
+    int directory_error = executable_node ?
+        permissions_executable_directory(executable_node, executable_directory, sizeof(executable_directory)) : -ENOENT;
+    group->exe_path = executable_node ? vfs_get_fullpath(executable_node) : NULL;
+    if (executable_node) vfs_close(executable_node);
+    if (directory_error < 0)
+    {
+        kill_proc_deferred(group, 0);
+        return directory_error;
+    }
+    permissions_process_exec(group, executable_directory);
     if (group->exe_path == NULL)
     {
         write_serial_fmt("Create User Process Failed. Reason: Cannot Copy Exec Path.\n");
-        kill_proc(group, 0, false);
+        kill_proc_deferred(group, 0);
         return -ENOMEM;
+    }
+    if (options.file_dialog && strcmp(group->exe_path, XJ380_FILE_DIALOG_PATH))
+    {
+        kill_proc_deferred(group, 0);
+        return -EACCES;
     }
 
     entry = (void *)parse_elf_file(path, group);
@@ -935,14 +928,14 @@ int create_user_process_from_file(char *path, pcb_t pcb, char *argv[])
     if (entry == NULL)
     {
         write_serial_fmt("Create User Process Failed. Reason: Cannot Open File.\n");
-        kill_proc(group, 0, false);
+        kill_proc_deferred(group, 0);
         return -ENOENT;
     }
     if ((int64_t)entry < 0)
     {
         write_serial_fmt("Create User Process Failed. Reason: Exec Format Error.\n");
         int ret = (int)(int64_t)entry;
-        kill_proc(group, 0, false);
+        kill_proc_deferred(group, 0);
         return ret;
     }
 
@@ -959,7 +952,7 @@ int create_user_process_from_file(char *path, pcb_t pcb, char *argv[])
             if (!append_cmdline_arg(cmdline, sizeof(cmdline), &cmdline_ptr, argv[i]))
             {
                 write_serial_fmt("Create User Process Failed. Reason: Command Line Too Long.\n");
-                kill_proc(group, 0, false);
+                kill_proc_deferred(group, 0);
                 return -E2BIG;
             }
             argc++;
@@ -970,7 +963,7 @@ int create_user_process_from_file(char *path, pcb_t pcb, char *argv[])
         if (!append_cmdline_arg(cmdline, sizeof(cmdline), &cmdline_ptr, path))
         {
             write_serial_fmt("Create User Process Failed. Reason: Command Line Too Long.\n");
-            kill_proc(group, 0, false);
+            kill_proc_deferred(group, 0);
             return -E2BIG;
         }
         argc++;
@@ -979,7 +972,7 @@ int create_user_process_from_file(char *path, pcb_t pcb, char *argv[])
     if (argc > 0 && thread_argv == NULL)
     {
         write_serial_fmt("Create User Process Failed. Reason: Cannot Copy Argv.\n");
-        kill_proc(group, 0, false);
+        kill_proc_deferred(group, 0);
         return -ENOMEM;
     }
 
@@ -993,7 +986,7 @@ int create_user_process_from_file(char *path, pcb_t pcb, char *argv[])
     {
         group->cmdline = old_cmdline;
         free_process_argv(thread_argv);
-        kill_proc(group, 0, false);
+        kill_proc_deferred(group, 0);
         return -ENOMEM;
     }
     if (old_cmdline != NULL) free(old_cmdline);
@@ -1001,7 +994,7 @@ int create_user_process_from_file(char *path, pcb_t pcb, char *argv[])
     if (argc > 0 && group->argv == NULL)
     {
         free_process_argv(thread_argv);
-        kill_proc(group, 0, false);
+        kill_proc_deferred(group, 0);
         return -ENOMEM;
     }
     group->argc = argc;
@@ -1009,19 +1002,44 @@ int create_user_process_from_file(char *path, pcb_t pcb, char *argv[])
     if (cwd == NULL)
     {
         free_process_argv(thread_argv);
-        kill_proc(group, 0, false);
+        kill_proc_deferred(group, 0);
         return -ENOMEM;
     }
     write_serial_fmt("CWD: %s\n", cwd);
     ime_process_loaded(group);
+    if (writer.node)
+    {
+        fd_file_handle *handle = (fd_file_handle *)calloc(1, sizeof(fd_file_handle));
+        if (!handle)
+        {
+            free(cwd);
+            free_process_argv(thread_argv);
+            kill_proc_deferred(group, 0);
+            return -ENOMEM;
+        }
+        handle->node = writer.node;
+        handle->fd = XJ380_FILE_DIALOG_RESULT_FD;
+        handle->flags = O_WRONLY | O_CLOEXEC;
+        if (queue_enqueue_id(group->file_open, handle, handle->fd) == (size_t)-1)
+        {
+            free(handle);
+            free(cwd);
+            free_process_argv(thread_argv);
+            kill_proc_deferred(group, 0);
+            return -ENOMEM;
+        }
+        writer.node = NULL; // The child's descriptor table now owns this end.
+    }
+    __atomic_store_n(&group->permission_file_dialog, options.file_dialog, __ATOMIC_RELEASE);
+    int pid = (int)group->pid;
     size_t tid = create_user_thread(entry, thread_argv, argc, process_name, group, cwd);
     if ((int64_t)tid < 0)
     {
-        kill_proc(group, 0, false);
+        kill_proc_deferred(group, 0);
         return (int)tid;
     }
 
-    return group->pid;
+    return pid;
 }
 
 int create_user_process_singleton_from_file(char *path, pcb_t pcb, char *argv[])
@@ -1037,6 +1055,9 @@ int create_user_process_singleton_from_file(char *path, pcb_t pcb, char *argv[])
 
 void create_user_thread_from_file(char *path, pcb_t pcb)
 {
+    ProcessPreparation *pin = process_preparation_acquire(pcb);
+    if (!pin) return;
+    ProcessPreparationGuard prepared(pin);
     char  thread_name[50];
     void *entry = (void *)parse_elf_file(path, pcb);
     if (entry == NULL || (int64_t)entry < 0) return;

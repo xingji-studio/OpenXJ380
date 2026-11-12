@@ -355,20 +355,27 @@ extern "C" void handle_page_fault(struct X64_REGS *frame, uint64_t error_code)
     if (current_task != NULL)
     {
         pcb_t current_proc = current_task->parent_group;
-        if (current_proc != NULL && current_proc->task_level == TASK_APPLICATION_LEVEL)
+        if (current_proc != NULL && current_proc->task_level == TASK_APPLICATION_LEVEL && !scheduler_depth &&
+            !(error_code & (0x1 | 0x8)) && faulting_address >= PAGE_SIZE &&
+            !check_user_overflow(faulting_address, 1))
         {
+            // The exception/FPU frame is already private to this stack. Lazy
+            // allocation may wait for another CPU's VM operation or allocate;
+            // it must not inherit this handler's temporary preemption disable.
+            scheduler_restore_depth(scheduler_depth);
+            if (!no_interrupt) open_interrupt;
+            mm_op_lock_acquire();
             errno_t status = lazy_tryalloc(current_proc, faulting_address);
-            if (status == 0)
+            bool mapped = status == 0 || (status == -1 && try_map_user_stack_fault(current_task, faulting_address));
+            mm_op_lock_release();
+            close_interrupt;
+            if (mapped)
             {
                 scheduler_restore_depth(scheduler_depth);
                 // The exception return restores the faulting context's IF.
                 return;
             }
-            if (try_map_user_stack_fault(current_task, faulting_address))
-            {
-                scheduler_restore_depth(scheduler_depth);
-                return;
-            }
+            disable_scheduler();
             goto err;
         }
     }
@@ -498,7 +505,7 @@ bool page_table_get_flags(page_directory_t *directory, uint64_t addr, uint64_t *
     if (!(pml4->entries[l4_index].value & PTE_PRESENT)) return false;
     if (pml4->entries[l4_index].value & PTE_HUGE)
     {
-        *out_flags = pml4->entries[l4_index].value & 0xFFF;
+        *out_flags = pml4->entries[l4_index].value & ~PTE_ADDR_MASK;
         return true;
     }
 
@@ -507,7 +514,7 @@ bool page_table_get_flags(page_directory_t *directory, uint64_t addr, uint64_t *
     if (!(pdpt->entries[l3_index].value & PTE_PRESENT)) return false;
     if (pdpt->entries[l3_index].value & PTE_HUGE)
     {
-        *out_flags = pdpt->entries[l3_index].value & 0xFFF;
+        *out_flags = pdpt->entries[l3_index].value & ~PTE_ADDR_MASK;
         return true;
     }
 
@@ -516,7 +523,7 @@ bool page_table_get_flags(page_directory_t *directory, uint64_t addr, uint64_t *
     if (!(pd->entries[l2_index].value & PTE_PRESENT)) return false;
     if (pd->entries[l2_index].value & PTE_HUGE)
     {
-        *out_flags = pd->entries[l2_index].value & 0xFFF;
+        *out_flags = pd->entries[l2_index].value & ~PTE_ADDR_MASK;
         return true;
     }
 
@@ -524,7 +531,7 @@ bool page_table_get_flags(page_directory_t *directory, uint64_t addr, uint64_t *
     if (pt == NULL) return false;
     if (!(pt->entries[l1_index].value & PTE_PRESENT)) return false;
 
-    *out_flags = pt->entries[l1_index].value & 0xFFF;
+    *out_flags = pt->entries[l1_index].value & ~PTE_ADDR_MASK;
     return true;
 }
 
@@ -697,7 +704,7 @@ static page_table_t *copy_page_table_recursive(page_table_t *source_table, int l
     return new_table;
 }
 
-static void free_page_table_recursive(page_table_t *table, int level)
+static void free_page_table_recursive(page_table_t *table, int level, bool failed_clone = false)
 {
     if (table == NULL) return;
     if (level <= 1)
@@ -705,7 +712,10 @@ static void free_page_table_recursive(page_table_t *table, int level)
         for (int i = 0; i < 512; i++)
         {
             uint64_t entry = table->entries[i].value;
-            if ((entry & PTE_PRESENT) && (entry & PTE_FRAME_ALLOCATED))
+            // A failed bootstrap clone owns only the ordinary pages it copied;
+            // a special leaf copied verbatim still belongs to its source.
+            if ((entry & PTE_PRESENT) && (entry & PTE_FRAME_ALLOCATED) &&
+                (!failed_clone || !(entry & PTE_HUGE)))
             {
                 free_frame(entry & PTE_ADDR_MASK);
                 table->entries[i].value = 0;
@@ -722,38 +732,106 @@ static void free_page_table_recursive(page_table_t *table, int level)
         if (entry & PTE_HUGE) continue;//竟然没有检查,还是保险点吧！！！！
 
         page_table_t *page_table_next = (page_table_t *)(phys_to_virt(table->entries[i].value & PTE_ADDR_MASK));
-        free_page_table_recursive(page_table_next, level - 1);
+        free_page_table_recursive(page_table_next, level - 1, failed_clone);
     }
     free_frame((uint64_t)virt_to_phys((uint64_t)table));
 }
 
+// Only the kernel's permanent bootstrap mappings may be read without the
+// legacy clone lock. The destination stays private until the caller publishes
+// the completed image. This deliberately does not alter fork's source contract.
+static page_table_t *copy_bootstrap_user_tables(page_table_t *source, int level)
+{
+    if (source == NULL) return NULL;
+    uint64_t frame = alloc_frames(1);
+    if (frame == 0) return NULL;
+    page_table_t *copy = (page_table_t *)phys_to_virt(frame);
+    page_table_clear(copy);
+
+    for (int i = 0; i < (level == 4 ? 256 : 512); ++i)
+    {
+        uint64_t entry = source->entries[i].value;
+        if (!(entry & PTE_PRESENT)) continue;
+        if (entry & PTE_HUGE)
+        {
+            copy->entries[i].value = entry;
+            continue;
+        }
+
+        uint64_t child;
+        if (level == 1)
+        {
+            child = alloc_frames(1);
+            if (child == 0)
+            {
+                free_page_table_recursive(copy, level, true);
+                return NULL;
+            }
+            memcpy(phys_to_virt(child), phys_to_virt(entry & PTE_ADDR_MASK), PAGE_SIZE);
+            copy->entries[i].value = child | (entry & ~PTE_ADDR_MASK) | PTE_FRAME_ALLOCATED;
+        }
+        else
+        {
+            page_table_t *table = copy_bootstrap_user_tables(
+                (page_table_t *)phys_to_virt(entry & PTE_ADDR_MASK), level - 1);
+            if (table == NULL)
+            {
+                free_page_table_recursive(copy, level, true);
+                return NULL;
+            }
+            child = (uint64_t)virt_to_phys((uint64_t)table);
+            copy->entries[i].value = child | (entry & ~PTE_ADDR_MASK);
+        }
+    }
+    return copy;
+}
+
 page_directory_t *clone_page_directory(page_directory_t *dir, bool all_copy)
 {
-    spin_lock(&page_lock);
+    // Kernel low-half bootstrap tables have a permanent lifetime and are not
+    // mutated after boot. Other sources still require the existing whole-copy
+    // protocol; an entry snapshot alone cannot pin a live process's child table.
+    bool bootstrap_copy = dir == &kernel_page_dir && !all_copy;
+    if (!bootstrap_copy) spin_lock(&page_lock);
     page_directory_t *new_directory = (page_directory_t *)(malloc(sizeof(page_directory_t)));
     if (new_directory == NULL)
     {
-        spin_unlock(&page_lock);
+        if (!bootstrap_copy) spin_unlock(&page_lock);
         return NULL;
     }
-    new_directory->table = copy_page_table_recursive(dir->table, 4, all_copy, false);
+    new_directory->table = bootstrap_copy ? copy_bootstrap_user_tables(dir->table, 4) :
+                                           copy_page_table_recursive(dir->table, 4, all_copy, false);
     if (new_directory->table == NULL)
     {
         free(new_directory);
-        spin_unlock(&page_lock);
+        if (!bootstrap_copy) spin_unlock(&page_lock);
         return NULL;
     }
-    if (!all_copy) memcpy((uint64_t *)new_directory->table + 256, (uint64_t *)dir->table + 256, PAGE_SIZE / 2);
-    spin_unlock(&page_lock);
+    if (!all_copy)
+    {
+        // This is a bounded root-entry snapshot, not a physical-page copy. All
+        // upper-half mappings retain their existing shared ownership.
+        if (bootstrap_copy) spin_lock(&page_lock);
+        memcpy((uint64_t *)new_directory->table + 256, (uint64_t *)dir->table + 256, PAGE_SIZE / 2);
+        if (bootstrap_copy) spin_unlock(&page_lock);
+    }
+    if (!bootstrap_copy) spin_unlock(&page_lock);
     return new_directory;
 }
 
 void free_page_directory(page_directory_t *dir)
 {
+    if (dir == NULL) return;
+    // The caller exclusively owns an unpublished directory, or has withdrawn
+    // its process and proved that no CPU/thread can still use the address space.
+    // Detach only metadata under the lock; recursive frame/heap reclamation
+    // must remain preemptible. This is not a concurrent-exec lifetime mechanism.
     spin_lock(&page_lock);
-    free_page_table_recursive(dir->table, 4);
-    free(dir);
+    page_table_t *table = dir->table;
+    dir->table = NULL;
     spin_unlock(&page_lock);
+    free_page_table_recursive(table, 4);
+    free(dir);
 }
 
 void unmap_page(page_directory_t *directory, uint64_t vaddr)
@@ -798,6 +876,71 @@ void unmap_page_range(page_directory_t *directory, uint64_t vaddr, uint64_t size
     {
         unmap_page(directory, va);
     }
+}
+
+bool page_map_new_user_page(page_directory_t *directory, uint64_t addr, uint64_t frame, uint64_t flags)
+{
+    if (directory == NULL || directory->table == NULL || (addr & (PAGE_SIZE - 1)) || addr < PAGE_SIZE ||
+        check_user_overflow(addr, PAGE_SIZE) || frame == 0 || (frame & ~PTE_ADDR_MASK) ||
+        (flags & (PTE_PRESENT | PTE_USER)) != (PTE_PRESENT | PTE_USER)) return false;
+
+    page_table_t *table = directory->table;
+    page_table_entry_t *created[3] = {};
+    uint32_t created_count = 0;
+    bool ready = true;
+    for (int shift = 39; shift >= 21; shift -= 9)
+    {
+        page_table_entry_t *entry = &table->entries[(addr >> shift) & ENTRY_MASK];
+        if (entry->value == 0)
+        {
+            uint64_t physical = alloc_frames(1);
+            if (!physical)
+            {
+                ready = false;
+                break;
+            }
+            page_table_t *next = (page_table_t *)phys_to_virt(physical);
+            if (next == NULL)
+            {
+                free_frames(physical, 1);
+                ready = false;
+                break;
+            }
+            page_table_clear(next);
+            entry->value = physical | PTE_PRESENT | PTE_WRITEABLE | PTE_USER;
+            created[created_count++] = entry;
+        }
+        // A huge page, supervisor path, or NX parent cannot implement the
+        // requested independent user-page permissions. Do not split or widen it.
+        if ((entry->value & (PTE_PRESENT | PTE_USER | PTE_WRITEABLE | PTE_HUGE | PTE_NO_EXECUTE)) !=
+            (PTE_PRESENT | PTE_USER | PTE_WRITEABLE))
+        {
+            ready = false;
+            break;
+        }
+        table = (page_table_t *)phys_to_virt(entry->value & PTE_ADDR_MASK);
+        if (table == NULL)
+        {
+            ready = false;
+            break;
+        }
+    }
+    if (ready && table->entries[(addr >> 12) & ENTRY_MASK].value == 0)
+    {
+        table->entries[(addr >> 12) & ENTRY_MASK].value = frame | flags;
+        flush_tlb(addr);
+        return true;
+    }
+    // Every newly created table is still empty on failure. Detach before free,
+    // in reverse order, without freeing the caller's data frame.
+    while (created_count)
+    {
+        page_table_entry_t *entry = created[--created_count];
+        uint64_t physical = entry->value & PTE_ADDR_MASK;
+        entry->value = 0;
+        free_frames(physical, 1);
+    }
+    return false;
 }
 
 void page_map_to(page_directory_t *directory, uint64_t addr, uint64_t frame, uint64_t flags)

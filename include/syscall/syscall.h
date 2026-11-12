@@ -356,7 +356,18 @@
 #define SYS_UMOUNT2 166
 
 #define SYS_GETTID 186
+#define SYS_SETXATTR 188
+#define SYS_LSETXATTR 189
+#define SYS_FSETXATTR 190
+#define SYS_GETXATTR 191
+#define SYS_LGETXATTR 192
+#define SYS_FGETXATTR 193
+#define SYS_LISTXATTR 194
+#define SYS_LLISTXATTR 195
 #define SYS_FLISTXATTR 196
+#define SYS_REMOVEXATTR 197
+#define SYS_LREMOVEXATTR 198
+#define SYS_FREMOVEXATTR 199
 #define SYS_TIME 201
 #define SYS_FUTEX 202
 #define SYS_SCHED_GETAFFINITY 204
@@ -760,7 +771,18 @@ sys_(mount, char *dev_name, char *dir_name, char *type, uint64_t flags, void *da
 sys_(pwrite, int fd, uint8_t *buffer, size_t size, int64_t offset);
 sys_(pread, int fd, uint8_t *buffer, size_t size, uint64_t offset);
 sys_(copy_file_range, int fd_in, uint64_t *off_in, int fd_out, uint64_t *off_out, size_t len, uint64_t flags);
+sys_(setxattr, const char *path, const char *name, const void *value, size_t size, int flags);
+sys_(lsetxattr, const char *path, const char *name, const void *value, size_t size, int flags);
+sys_(fsetxattr, int fd, const char *name, const void *value, size_t size, int flags);
+sys_(getxattr, const char *path, const char *name, void *value, size_t size);
+sys_(lgetxattr, const char *path, const char *name, void *value, size_t size);
+sys_(fgetxattr, int fd, const char *name, void *value, size_t size);
+sys_(listxattr, const char *path, char *list, size_t size);
+sys_(llistxattr, const char *path, char *list, size_t size);
 sys_(flistxattr, int fd, char *list, size_t size);
+sys_(removexattr, const char *path, const char *name);
+sys_(lremovexattr, const char *path, const char *name);
+sys_(fremovexattr, int fd, const char *name);
 sys_(openat);
 sys_(faccessat2);
 sys_(faccessat);

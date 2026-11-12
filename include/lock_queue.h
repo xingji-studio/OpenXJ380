@@ -45,6 +45,9 @@ size_t queue_enqueue_lowest(lock_queue *q, void *data);
  * @return 该节点的索引
  */
 size_t queue_enqueue_ref(lock_queue *q, void *data, lock_node **out_node);
+// Caller owns prepared storage on failure; queue owns it after success. No allocation/free.
+size_t queue_enqueue_preallocated(lock_queue *, void *, lock_node *, lock_node **, size_t *);
+bool queue_detach_preallocated(lock_queue *, lock_node *);
 
 /**
  * 入队操作(需手动解锁)

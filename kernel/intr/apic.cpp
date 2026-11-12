@@ -141,34 +141,109 @@ void init_IOApic()
  * @param MADT MADT表地址
  *
  */
+struct LapicClockSample
+{
+    uint64_t before, after;
+    uint32_t count;
+};
+
+static constexpr uint64_t LAPIC_CALIBRATION_WINDOW_NS = 10000000ULL;
+static constexpr uint64_t LAPIC_CALIBRATION_LIMIT_NS = 250000000ULL;
+static constexpr uint64_t LAPIC_TIMER_PERIOD_NS = 4000000ULL; // Preserve the existing 250Hz target.
+
+static bool sample_lapic_clock(LapicClockSample *sample)
+{
+    // The APIC read occurs somewhere inside this HPET bracket. Device/MMIO
+    // delays outside the bracket must not be counted as elapsed APIC ticks.
+    sample->before = nanoTime();
+    sample->count = lapic_read(LAPIC_REG_TIMER_CURCNT);
+    sample->after = nanoTime();
+    return sample->after >= sample->before &&
+           sample->after - sample->before <= LAPIC_CALIBRATION_LIMIT_NS;
+}
+
+static bool lapic_calibration_value(const LapicClockSample &start, const LapicClockSample &end,
+                                    uint32_t *initial, uint64_t *elapsed, uint64_t *uncertainty)
+{
+    if (start.after < start.before || end.after < end.before || end.before < start.after ||
+        end.after - start.before > LAPIC_CALIBRATION_LIMIT_NS || start.count == 0 || end.count == 0 ||
+        end.count >= start.count)
+        return false;
+    uint64_t start_width = start.after - start.before;
+    uint64_t end_width = end.after - end.before;
+    uint64_t start_mid = start.before + start_width / 2;
+    uint64_t end_mid = end.before + end_width / 2;
+    *elapsed = end_mid - start_mid;
+    *uncertainty = start_width + end_width;
+    // Bracket widths bound midpoint timing error to at most 5%. Reject a
+    // sample dominated by MMIO latency rather than guessing its frequency.
+    if (*elapsed < LAPIC_CALIBRATION_WINDOW_NS || *uncertainty > *elapsed / 10) return false;
+    uint64_t ticks = (uint64_t)start.count - end.count;
+    // u32 ticks * 4,000,000 fits in u64; no freestanding 128-bit division.
+    uint64_t value = (ticks * LAPIC_TIMER_PERIOD_NS + *elapsed / 2) / *elapsed;
+    if (value == 0 || value > 0xffffffffULL) return false;
+    *initial = (uint32_t)value;
+    return true;
+}
+
 void init_lApic()
 {
     lapic_write(LAPIC_REG_SPURIOUS, 0xff | 1 << 8);
     lapic_write(LAPIC_REG_TIMER, 32); // 32为 ioapic 时钟中断向量
     lapic_write(LAPIC_REG_TIMER_DIV, 11);
     lapic_write(LAPIC_REG_TIMER_INITCNT, ~((uint32_t)0));
-    uint64_t b = nanoTime();
-    uint64_t guard = 0;
-    for (;;)
+    uint64_t began = nanoTime();
+    uint32_t calibrated = 0;
+    uint64_t best_elapsed = 0, best_uncertainty = 0, best_error_ppm = ~0ULL;
+    bool stop = false;
+    for (unsigned attempt = 0; attempt < 3 && !stop; ++attempt)
     {
-        if (nanoTime() - b >= 1000000) break;
-        if (++guard >= 50000000ULL)
+        LapicClockSample start, end;
+        if (!sample_lapic_clock(&start) || start.after < began ||
+            start.after - began >= LAPIC_CALIBRATION_LIMIT_NS)
+            break;
+        bool waited = false;
+        for (unsigned poll = 0; poll < 100000; ++poll)
         {
-            write_serial_string("APIC timer calibration timeout, using fallback value.\n");
-            lapic_write(LAPIC_REG_TIMER, lapic_read(LAPIC_REG_TIMER) | 1 << 17);
-            lapic_write(LAPIC_REG_TIMER_INITCNT, 0x100000);
-            return;
+            uint64_t now = nanoTime();
+            if (now < start.after || now < began || now - began >= LAPIC_CALIBRATION_LIMIT_NS)
+            {
+                stop = true;
+                break;
+            }
+            if (now - start.after >= LAPIC_CALIBRATION_WINDOW_NS)
+            {
+                waited = true;
+                break;
+            }
+            asm volatile("pause" ::: "memory");
+        }
+        if (!waited || !sample_lapic_clock(&end) || end.after < began ||
+            end.after - began >= LAPIC_CALIBRATION_LIMIT_NS)
+            break;
+        uint32_t initial;
+        uint64_t elapsed, uncertainty;
+        if (!lapic_calibration_value(start, end, &initial, &elapsed, &uncertainty)) continue;
+        // All durations are bounded above by 250ms before multiplication.
+        uint64_t error_ppm = uncertainty * 1000000ULL / elapsed;
+        if (error_ppm < best_error_ppm)
+        {
+            calibrated = initial;
+            best_elapsed = elapsed;
+            best_uncertainty = uncertainty;
+            best_error_ppm = error_ppm;
         }
     }
-    uint64_t lapic_timer              = (~(uint32_t)0) - lapic_read(LAPIC_REG_TIMER_CURCNT);
-    uint64_t calibrated_timer_initial = (uint64_t)((uint64_t)(lapic_timer * 1000) / 250);
-    if (calibrated_timer_initial == 0)
+    if (calibrated == 0)
     {
-        write_serial_string("APIC timer calibration produced zero, using fallback value.\n");
-        calibrated_timer_initial = 0x100000;
+        calibrated = 0x100000;
+        write_serial_string("APIC timer calibration unavailable, using fallback initial=1048576.\n");
     }
     lapic_write(LAPIC_REG_TIMER, lapic_read(LAPIC_REG_TIMER) | 1 << 17);
-    lapic_write(LAPIC_REG_TIMER_INITCNT, calibrated_timer_initial);
+    lapic_write(LAPIC_REG_TIMER_INITCNT, calibrated);
+    write_serial_fmt("APIC timer: cpu=%llu initial=%u target_hz=250 measured_ns=%llu uncertainty_ns=%llu\n",
+                     (unsigned long long)lapic_id(), (unsigned)calibrated, (unsigned long long)best_elapsed,
+                     (unsigned long long)best_uncertainty);
 }
 
 /**

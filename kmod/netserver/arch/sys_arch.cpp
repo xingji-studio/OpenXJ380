@@ -218,7 +218,9 @@ u32_t sys_arch_sem_wait(sys_sem_t *sem, u32_t timeout)
         if (!valid || (timeout != 0 && elapsed(start) >= timeout)) {
             return SYS_ARCH_TIMEOUT;
         }
-        scheduler_yield();
+        // Empty blocking wait: the object guard and TCP/IP core lock
+        // are released before polling again; timeout==0 still means forever.
+        scheduler_sleep_ns(1000000ULL);
     }
 }
 
@@ -343,7 +345,9 @@ u32_t sys_arch_mbox_fetch(sys_mbox_t *mbox, void **message, u32_t timeout)
         if (timeout != 0 && elapsed(start) >= timeout) {
             return SYS_ARCH_TIMEOUT;
         }
-        scheduler_yield();
+        // Empty blocking wait: the object guard and TCP/IP core lock
+        // are released before polling again; timeout==0 still means forever.
+        scheduler_sleep_ns(1000000ULL);
     }
     return SYS_ARCH_TIMEOUT;
 }

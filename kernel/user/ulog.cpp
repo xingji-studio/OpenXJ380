@@ -22,8 +22,17 @@
 
 void write_ulog(char *str)
 {
+    // The logging service can append only to this fixed system log. It must
+    // continue to work when invoked on behalf of an application without SW.
+    tcb_t task = get_current_task();
+    if (task) ++task->ime_config_depth;
     vfs_node_t v = vfs_open("/system/oslog.log");
-    vfs_write(v, str, v->size, strlen(str) * sizeof(char));
+    if (v != NULL)
+    {
+        vfs_write(v, str, v->size, strlen(str));
+        vfs_close(v);
+    }
+    if (task) --task->ime_config_depth;
 }
 
 void ulog_err(char *err_type)

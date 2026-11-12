@@ -103,6 +103,30 @@ static bool hardware_random64(uint64_t *value)
     return false;
 }
 
+// Original checked hardware-entropy interface (Apache-2.0). Unlike the general
+// RNG API, this cannot silently fall back to timing/address-derived material.
+bool get_hardware_random_bytes(void *buffer, size_t length)
+{
+    if (!buffer || !length) return false;
+    uint8_t *bytes = static_cast<uint8_t *>(buffer);
+    size_t offset = 0;
+    while (offset < length)
+    {
+        uint64_t word = 0;
+        if (!hardware_random64(&word))
+        {
+            secure_zero(buffer, length);
+            return false;
+        }
+        size_t count = length - offset;
+        if (count > sizeof(word)) count = sizeof(word);
+        memcpy(bytes + offset, &word, count);
+        secure_zero(&word, sizeof(word));
+        offset += count;
+    }
+    return true;
+}
+
 static void reseed_locked(void)
 {
     uint64_t seed = nanoTime() ^ (uint64_t)(uintptr_t)&seed ^ (uint64_t)(uintptr_t)get_current_task();

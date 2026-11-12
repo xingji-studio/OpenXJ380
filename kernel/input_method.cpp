@@ -1,4 +1,5 @@
 #include "ime_internal.h"
+#include <user/process_launch.h>
 #include <errno.h>
 #include <fs/vfs/vfs.h>
 #include <ime_utf8.h>
@@ -144,14 +145,16 @@ void ime_process_loaded(pcb_t process)
     if (ime_settings_provider(process->exe_path)) process->ime_role = 3;
 }
 
-int ime_launch_manager(pcb_t parent, char **argv)
+int ime_launch_manager(pcb_t parent, char **argv, ProcessCredentialSource source)
 {
     tcb_t task = get_current_task();
     if (!task) return -ESRCH;
     const ImePlatform *platform = ime_platform();
     if (!platform) return -ENODEV;
     task->ime_launch_role = 2;
-    int result = create_user_process_from_file((char *)platform->manager, parent, argv);
+    ProcessLaunchOptions options;
+    options.credentials = source;
+    int result = create_user_process_with_options((char *)platform->manager, parent, argv, options);
     task->ime_launch_role = 0;
     return result;
 }

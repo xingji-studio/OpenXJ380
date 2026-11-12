@@ -31,6 +31,8 @@
 int    snprintf(char *buf, size_t size, const char *fmt, ...);
 // driver/serial/serial_port.cpp
 int    init_serial();
+bool   serial_runtime_start();
+void   serial_task_quiescent_exit(struct thread_control_block *task);
 void   write_serial(char a);
 void   write_serial_string(const char *str);
 void   write_serial_dec(unsigned long long dec);
@@ -188,6 +190,7 @@ void free_frame(uint64_t addr)
 }
 uint64_t alloc_frames(size_t count);
 uint64_t alloc_frames_dma32(size_t count);
+uint64_t alloc_frames_dma16(size_t count);
 
 // kernel/memory/hhdm.cpp
 void     init_hhdm();

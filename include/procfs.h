@@ -1,15 +1,21 @@
 #pragma once
+// SPDX-License-Identifier: Apache-2.0
 
 #define MAX_PID_NAME_LEN 32
 
 #include <task/pcb.h>
 #include <fs/vfs/vfs.h>
 
+struct ProcfsProcessContext;
+
 typedef struct proc_handle {
     char       name[64];
     char       content[256];
     vfs_node_t node;
     pcb_t      task;
+    // Process files retain this stable context, never a borrowed PCB. `task`
+    // remains a compatibility prefix and is NULL in persistent handles.
+    ProcfsProcessContext *process;
 } proc_handle_t;
 
 typedef struct procfs_self_handle {
@@ -19,4 +25,8 @@ typedef struct procfs_self_handle {
 void procfs_update_task_list();
 void procfs_on_new_task(pcb_t task);
 void procfs_on_exit_task(pcb_t task);
+// Before a quiescent terminal TCB is freed; FD tickets must be drained first.
+bool procfs_operation_thread_exit(tcb_t task);
+// Ordinary reaper task context, with no spin/backend locks held.
+void procfs_reap_retired();
 void procfs_setup();

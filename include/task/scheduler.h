@@ -2,6 +2,7 @@
 #include <stdint.h>
 
 typedef struct thread_control_block *tcb_t;
+typedef struct process_control_block *pcb_t;
 
 extern const uint64_t TIME_SLICE;
 extern const uint64_t MIN_SLICE;
@@ -24,6 +25,8 @@ extern const uint64_t MIN_SLICE;
  */
 void scheduler_start();
 void scheduler_stop();
+// Global boot/fatal gate only; an ordinary nested critical section leaves it open.
+bool scheduler_global_enabled();
 bool scheduler_is_enabled();
 // Save/restore only this CPU's nesting, preserving any enclosing section.
 // Restore before a non-returning user-mode handoff as well as error returns.
@@ -34,5 +37,11 @@ void scheduler_sleep_ns(uint64_t nano);
 void scheduler_wake_task(tcb_t task);
 void scheduler_tick();
 void scheduler_init_task(tcb_t task);
+
+// Terminal status plus absence from these references permits reclamation.
+// Includes a selected task and the previous interrupt's kernel-stack owner.
+// Never call while holding any CPU scheduler_queue lock.
+bool scheduler_task_referenced(tcb_t task);
+bool scheduler_process_referenced(pcb_t process);
 
 // tcb_t select_next_task_safe();

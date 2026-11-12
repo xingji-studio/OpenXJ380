@@ -91,17 +91,27 @@ Err_Code:
 	pushq	%r15
 
     cld
-    
-    movq ERRCODE(%rsp), %rsi    // 把错误码装进rsi，作为函数的第二个参数
-    movq FUNC(%rsp), %rdx
+
+    // C handlers may use SSE, including memset while satisfying a lazy #PF.
+    // Keep a private image for every entry, including nested kernel faults.
+    // R12's interrupted value is already in the unchanged X64_REGS frame.
+    movq %rsp, %r12
+    subq $512, %rsp
+    andq $-16, %rsp
+    fxsave64 (%rsp)
+
+    movq ERRCODE(%r12), %rsi    // 把错误码装进rsi，作为函数的第二个参数
+    movq FUNC(%r12), %rdx
     
     movq $0x10, %rdi    // 加载内核段的地址
     movq %rdi, %ds
     movq %rdi, %es
 
-    movq %rsp, %rdi // 把栈指针装入rdi，作为函数的第一个的参数
+    movq %r12, %rdi // 把原始寄存器帧装入rdi，作为函数的第一个参数
 
     callq *%rdx //调用服务程序 带*号表示调用的是绝对地址
+    fxrstor64 (%rsp)
+    movq %r12, %rsp
     jmp ret_from_exception
 
 
@@ -170,6 +180,14 @@ ENTRY(dev_not_avaliable)
     pushq %rax
     leaq c_device_not_avaliable(%rip), %rax    // 获取中断服务程序的地址
     xchgq %rax, (%rsp)  // 把FUNC的地址换入栈中
+    // Preserve the existing #NM recovery before the common FXSAVE can itself
+    // fault with CR0.TS set. The C handler repeats the same initialization.
+    pushq %rax
+    movq %cr0, %rax
+    andq $-13, %rax // clear CR0.EM and CR0.TS
+    orq $2, %rax   // set CR0.MP
+    movq %rax, %cr0
+    popq %rax
     jmp Err_Code
 
 // 8 #DF 双重错误
@@ -338,12 +356,25 @@ ENTRY(syscall_handler)
     pushq %r14
     pushq %r15
 
-    movq %rsp, %rdi
+    // This stack belongs to the syscall until it returns, even if it sleeps
+    // and the scheduler temporarily runs another task or nested IRQ handler.
+    movq %rsp, %r12
+    subq $512, %rsp
+    andq $-16, %rsp
+    fxsave64 (%rsp)
+
+    movq %r12, %rdi
     movq %gs:CPU_CURRENT_TASK, %rax
     movq THREAD_SYSCALL_USER_RSP(%rax), %rsi
     call c_syscall_handler
+    // Slow syscalls may enable IRQs after the entry image is complete. Mask
+    // them again before restoring user FPU state and touching return scratch.
+    cli
+    fxrstor64 (%rsp)
+    movq %r12, %rsp
 
 ENTRY(ret_from_syscall)
+    cli
     movq RIP(%rsp), %rcx
     movq RFLAGS(%rsp), %r11
     // Signal delivery and sigreturn may replace the saved user stack.

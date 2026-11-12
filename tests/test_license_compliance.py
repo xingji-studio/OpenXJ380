@@ -206,10 +206,11 @@ class LicenseComplianceTests(unittest.TestCase):
             fixture = Path(tmp)
             project = fixture / "project"
             stage = fixture / "stage"
+            modules = stage / "system/mod"
             (project / "out").mkdir(parents=True)
-            (stage / "mod").mkdir(parents=True)
+            modules.mkdir(parents=True)
             (project / "out/netserver.sys").write_bytes(b"current")
-            (stage / "mod/netserver.km").write_bytes(b"legacy")
+            (modules / "netserver.km").write_bytes(b"legacy")
 
             try:
                 ninja_build.ROOT = project
@@ -217,8 +218,8 @@ class LicenseComplianceTests(unittest.TestCase):
             finally:
                 ninja_build.ROOT = original_root
 
-            self.assertFalse((stage / "mod/netserver.km").exists())
-            self.assertEqual(b"current", (stage / "mod/netserver.sys").read_bytes())
+            self.assertFalse((modules / "netserver.km").exists())
+            self.assertEqual(b"current", (modules / "netserver.sys").read_bytes())
 
 
 if __name__ == "__main__":

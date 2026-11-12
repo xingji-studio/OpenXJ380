@@ -4,24 +4,7 @@
 
 #include "./settings.h"
 
-typedef enum
-{
-    XUT_Root,
-    XUT_System,
-    XUT_Admin,
-    XUT_Visitor,
-    XUT_Custom
-} UserType;
-
-typedef struct
-{
-    bool ReadFile;       // 读取普通文件
-    bool WriteFile;      // 写入普通文件
-    bool ChangeSettings; // 更改系统设置
-    bool VisitSysDir;    // 访问系统目录
-    bool ReadSysFile;    // 读取系统文件
-    bool WriteSysFile;   // 写入系统文件
-} UserPermisson;
+#include "permission_types.h"
 
 typedef struct
 {
@@ -31,9 +14,10 @@ typedef struct
     char          **envp;       // 环境变量指针
     size_t          envc;       // 环境变量数量
     int             fgproc;     // 前台进程
-    char            password[64];   // 用户密码
+    char            password[64]; // Reserved legacy ABI; zero in live sessions.
 } UserInfo;
 
+// Legacy disk ABI, read only during migration. New credentials use auth_store.h.
 typedef struct
 {
     int         user_count; // 用户数量

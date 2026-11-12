@@ -3,8 +3,35 @@
 #include <fs/vfs/vfs.h>
 #include <krlibc.h>
 #include <mutex.h>
+#include <proto.hpp>
 #include <syscall/xapi_user.h>
 #include <task/scheduler.h>
+
+extern bool no_interrupt;
+
+// Syscall entry saves the caller's register/FPU image with IF clear. This
+// service authorizes and copies through explicit page directories, then may
+// wait on recoverable mutexes and disk I/O. Keep that work preemptible without
+// opening the boot/fatal gate or an enclosing scheduler critical section.
+class UserStoreInterruptScope
+{
+    bool entry_interrupts_enabled;
+
+public:
+    UserStoreInterruptScope() : entry_interrupts_enabled(are_interrupts_enabled())
+    {
+        if (!no_interrupt && scheduler_is_enabled()) enable_intr();
+    }
+
+    ~UserStoreInterruptScope()
+    {
+        if (entry_interrupts_enabled && !no_interrupt) enable_intr();
+        else disable_intr();
+    }
+
+    UserStoreInterruptScope(const UserStoreInterruptScope &) = delete;
+    UserStoreInterruptScope &operator=(const UserStoreInterruptScope &) = delete;
+};
 
 // The service mutex is never held across this file's VFS work. A separate,
 // recoverable lock serializes clears, preference changes and delayed saves.
@@ -379,6 +406,7 @@ static int store_status(uint64_t address, XImeUserData &request)
 }
 int64_t ime_user_store_syscall(uint64_t address)
 {
+    UserStoreInterruptScope interrupts;
     XImeUserData request = {};
     if (!address || !copy_from_user_pagedir(xapi_current_pagedir(), &request, (void *)address, sizeof(request)))
         return -EFAULT;

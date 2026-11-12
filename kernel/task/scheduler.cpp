@@ -12,6 +12,7 @@
 extern lock_queue   *pcb_group_queue;
 extern XSK_SMP_INFO *xsi;
 extern bool          no_interrupt;
+extern "C" void serial_runtime_panic() __attribute__((weak));
 static volatile bool scheduler_boot_ready = false;
 volatile uint64_t    system_cpu_total_ticks = 0;
 volatile uint64_t    system_cpu_busy_ticks  = 0;
@@ -22,7 +23,6 @@ static constexpr uint64_t EEVDF_BASE_SLICE_NS  = TIME_SLICE * EEVDF_TICK_NS;
 static constexpr uint64_t EEVDF_MIN_SLICE_NS   = MIN_SLICE * EEVDF_TICK_NS;
 static constexpr uint64_t EEVDF_WAKEUP_CREDIT  = EEVDF_BASE_SLICE_NS;
 static constexpr uint64_t EEVDF_SLEEPER_CREDIT = EEVDF_BASE_SLICE_NS * 2;
-static constexpr uint64_t EEVDF_DEFAULT_WEIGHT = 1024ULL;
 static volatile uint64_t scheduler_disabled_diag_count = 0;
 #if CONFIG_KERNEL_DEBUG_SCHEDULER_FMANAGER_TIMER_LOG
 static volatile uint64_t scheduler_fmanager_diag_count = 0;
@@ -38,6 +38,111 @@ static_assert(__builtin_offsetof(PROCESSOR_INFO, scheduler_disable_depth) == 0x4
               "PROCESSOR_INFO.scheduler_disable_depth must follow syscall scratch fields");
 
 /*
+ * Queue removal alone does not prove that a TCB is unused: the timer may have
+ * selected it but not published current_task yet. Likewise, after publication
+ * the interrupt epilogue still uses the previous task's kernel stack until
+ * iretq. Keep both references outside PROCESSOR_INFO's assembly ABI. Each entry
+ * is protected by that CPU's scheduler_queue lock, including current_task
+ * publication. CPU array indices are deliberately independent of ACPI IDs.
+ */
+struct SchedulerReferences
+{
+    tcb_t selected;
+    tcb_t previous;
+};
+
+static SchedulerReferences scheduler_references[MAX_CPU_NUM];
+
+// Only this CPU's IRQ-masked timer path accesses its accounting anchor. Keep
+// it outside PROCESSOR_INFO/TCB: their layouts are consumed by entry assembly.
+// The pointer is compared with the pinned current task, never dereferenced
+// after a switch or treated as an additional reclamation reference.
+struct SchedulerRuntimeAccounting
+{
+    tcb_t task;
+    uint64_t sampled_at;
+    bool active;
+};
+
+static SchedulerRuntimeAccounting scheduler_runtime[MAX_CPU_NUM];
+
+static SchedulerReferences *references_for_cpu(PROCESSOR_INFO *cpu)
+{
+    size_t count = get_cpu_num();
+    if (count > MAX_CPU_NUM) count = MAX_CPU_NUM;
+    for (size_t i = 0; i < count; i++)
+    {
+        if (get_cpu(i) == cpu) return &scheduler_references[i];
+    }
+    return NULL;
+}
+
+static SchedulerRuntimeAccounting *runtime_for_cpu(PROCESSOR_INFO *cpu)
+{
+    if (cpu == NULL) return NULL;
+    SchedulerReferences *references = references_for_cpu(cpu);
+    return references != NULL ? &scheduler_runtime[references - scheduler_references] : NULL;
+}
+
+static bool scheduler_referenced(tcb_t task, pcb_t process)
+{
+    size_t count = get_cpu_num();
+    if (count > MAX_CPU_NUM) count = MAX_CPU_NUM;
+    for (size_t i = 0; i < count; i++)
+    {
+        PROCESSOR_INFO *cpu = get_cpu(i);
+        if (cpu == NULL) continue;
+        lock_queue *queue = cpu->scheduler_queue;
+        if (queue != NULL) spin_lock(&queue->lock);
+        tcb_t references[] = {__atomic_load_n(&cpu->current_task, __ATOMIC_ACQUIRE),
+                              scheduler_references[i].selected, scheduler_references[i].previous};
+        bool found = false;
+        for (tcb_t reference : references)
+        {
+            if (reference != NULL && (task != NULL ? reference == task : reference->parent_group == process))
+                found = true;
+        }
+        if (queue != NULL) spin_unlock(&queue->lock);
+        if (found) return true;
+    }
+    return false;
+}
+
+bool scheduler_task_referenced(tcb_t task)
+{
+    return task != NULL && scheduler_referenced(task, NULL);
+}
+
+bool scheduler_process_referenced(pcb_t process)
+{
+    return process != NULL && scheduler_referenced(NULL, process);
+}
+
+static void scheduler_interrupt_enter(PROCESSOR_INFO *cpu)
+{
+    if (cpu == NULL || cpu->scheduler_queue == NULL) return;
+    SchedulerReferences *references = references_for_cpu(cpu);
+    if (references == NULL) return;
+    spin_lock(&cpu->scheduler_queue->lock);
+    // A subsequent interrupt proves the previous iretq and stack handoff ran.
+    references->previous = NULL;
+    spin_unlock(&cpu->scheduler_queue->lock);
+}
+
+static void scheduler_publish_task(PROCESSOR_INFO *cpu, tcb_t previous, tcb_t next)
+{
+    SchedulerReferences *references = references_for_cpu(cpu);
+    spin_lock(&cpu->scheduler_queue->lock);
+    if (references != NULL)
+    {
+        if (previous != next) references->previous = previous;
+        references->selected = NULL;
+    }
+    __atomic_store_n(&cpu->current_task, next, __ATOMIC_RELEASE);
+    spin_unlock(&cpu->scheduler_queue->lock);
+}
+
+/*
  * Keep boot/fatal state separate from runtime preemption state. A shared
  * boolean let one CPU's critical section disable scheduling on every CPU, and
  * a stray enable from an unrelated path could then make it globally runnable.
@@ -50,6 +155,14 @@ void scheduler_start()
 void scheduler_stop()
 {
     __atomic_store_n(&scheduler_boot_ready, false, __ATOMIC_RELEASE);
+    // The serial hook only publishes an atomic emergency flag. It must never
+    // wait for a worker or acquire a lock, including before its first dispatch.
+    if (serial_runtime_panic != nullptr) serial_runtime_panic();
+}
+
+bool scheduler_global_enabled()
+{
+    return __atomic_load_n(&scheduler_boot_ready, __ATOMIC_ACQUIRE);
 }
 
 bool scheduler_is_enabled()
@@ -108,6 +221,7 @@ __attribute__((naked)) void save_registers()
 {
     __asm__ volatile(".intel_syntax noprefix\n\t"
                      "cli\n\t"
+                     "cld\n\t"
                      "push 0\n\t" // 对齐
                      "push 0\n\t" // 对齐
                      "push r15\n\t"
@@ -129,8 +243,16 @@ __attribute__((naked)) void save_registers()
                      "push rax\n\t"
                      "mov rax, ds\n\t"
                      "push rax\n\t"
-                     "mov rdi, rsp\n\t"
-                     "call timer_handle\n\t"
+                     // Preserve SIMD before any C scheduler code runs. Keep
+                     // the original registers_t layout and align the call.
+                     "mov r12, rsp\n\t"
+                     "sub rsp, 512\n\t"
+                     "and rsp, -16\n\t"
+                     "fxsave64 [rsp]\n\t"
+                     "mov rdi, r12\n\t"
+                     "mov rsi, rsp\n\t"
+                     "call timer_handle_fpu\n\t"
+                     "fxrstor64 [rsp]\n\t"
                      "mov rsp, rax\n\t"
                      "pop rax\n\t"
                      "mov ds, rax\n\t"
@@ -182,9 +304,6 @@ void change_proccess(registers_t *reg, tcb_t current_task0, tcb_t target)
         __asm__ __volatile__("movq %0, %%fs\n\t" ::"r"(fs_selector));
     }
     write_fsbase(target->fs_base);
-
-    save_fpu_context(&current_task0->fpu_context);
-    restore_fpu_context(&target->fpu_context);
 
     current_task0->context0.r15    = reg->r15;
     current_task0->context0.r14    = reg->r14;
@@ -243,7 +362,8 @@ static inline bool is_task_schedulable(tcb_t task, tcb_t current)
     if (task->task_level == TASK_IDLE_LEVEL) return false;
     if (task->parent_group == NULL) return false;
     if (task->parent_group->status == DEATH || task->parent_group->status == FUTEX ||
-        task->parent_group->status == OUT || task->parent_group->status == WAIT) {
+        task->parent_group->status == OUT || task->parent_group->status == WAIT ||
+        task->parent_group->status == ZOMBIE) {
         return false;
     }
     return true;
@@ -255,7 +375,8 @@ static inline bool is_current_task_runnable(tcb_t task)
     if (task->status != RUNNING && task->status != START && task->status != CREATE) return false;
     if (task->parent_group == NULL) return false;
     if (task->parent_group->status == DEATH || task->parent_group->status == FUTEX ||
-        task->parent_group->status == OUT || task->parent_group->status == WAIT) {
+        task->parent_group->status == OUT || task->parent_group->status == WAIT ||
+        task->parent_group->status == ZOMBIE) {
         return false;
     }
     return true;
@@ -267,6 +388,11 @@ static inline uint64_t task_sched_slice(tcb_t task)
     return task->eevdf_slice;
 }
 
+static inline uint64_t deadline_after_runtime(uint64_t vruntime, uint64_t slice)
+{
+    return vruntime > ~0ULL - slice ? ~0ULL : vruntime + slice;
+}
+
 static inline void apply_eevdf_wakeup_credit(tcb_t task, uint64_t base_vruntime)
 {
     if (task == NULL || task->task_level == TASK_IDLE_LEVEL) return;
@@ -276,27 +402,35 @@ static inline void apply_eevdf_wakeup_credit(tcb_t task, uint64_t base_vruntime)
     if (credit > EEVDF_SLEEPER_CREDIT) credit = EEVDF_SLEEPER_CREDIT;
 
     uint64_t placed_vruntime = base_vruntime > credit ? base_vruntime - credit : 0;
-    if (task->eevdf_vruntime > placed_vruntime) {
+    // Bound the lag carried by a stale sleeper. Waking must never rewind CPU
+    // time already consumed, including a short burst that ended before a tick.
+    if (task->eevdf_vruntime < placed_vruntime) {
         task->eevdf_vruntime = placed_vruntime;
     }
-    task->eevdf_deadline = task->eevdf_vruntime + task_sched_slice(task);
+    task->eevdf_deadline = deadline_after_runtime(task->eevdf_vruntime, task_sched_slice(task));
 }
 
 static inline bool wake_sleeping_task(tcb_t task, uint64_t now, uint64_t base_vruntime)
 {
+    // Both callers already own this task's CPU queue lock. A remote kill
+    // does not need that lock, so expiry must still preserve terminal state.
     if (task == NULL) return false;
-    if (task->status == WAIT && task->wakeup_time != 0 && now >= task->wakeup_time) {
+    if (__atomic_load_n(&task->status, __ATOMIC_ACQUIRE) == WAIT && task->wakeup_time != 0 &&
+        now >= task->wakeup_time) {
         task->wakeup_time = 0;
-        task->status = START;
         apply_eevdf_wakeup_credit(task, base_vruntime);
-        return true;
+        TaskStatus waiting = WAIT;
+        return __atomic_compare_exchange_n(&task->status, &waiting, START, false, __ATOMIC_RELEASE,
+                                             __ATOMIC_RELAXED);
     }
     return false;
 }
 
 static inline uint64_t vruntime_delta(uint64_t runtime_ns)
 {
-    return (runtime_ns * EEVDF_DEFAULT_WEIGHT) / EEVDF_DEFAULT_WEIGHT;
+    // Every current task class has the same weight. Avoid overflowing a
+    // multiply followed by division by that same weight.
+    return runtime_ns;
 }
 
 static inline bool deadline_before(tcb_t left, tcb_t right)
@@ -310,12 +444,36 @@ static inline bool deadline_before(tcb_t left, tcb_t right)
 static void charge_current_eevdf_runtime(tcb_t current, uint64_t runtime_ns)
 {
     if (current == NULL || current->task_level == TASK_IDLE_LEVEL) return;
-    if (current->status != RUNNING) return;
     if (runtime_ns == 0) return;
 
-    current->eevdf_vruntime += vruntime_delta(runtime_ns);
+    uint64_t delta = vruntime_delta(runtime_ns);
+    current->eevdf_vruntime = current->eevdf_vruntime > ~0ULL - delta ? ~0ULL : current->eevdf_vruntime + delta;
     uint64_t slice = task_sched_slice(current);
-    current->eevdf_deadline = current->eevdf_vruntime + slice;
+    current->eevdf_deadline = deadline_after_runtime(current->eevdf_vruntime, slice);
+}
+
+static void account_current_eevdf_runtime(PROCESSOR_INFO *cpu, tcb_t current, uint64_t now)
+{
+    SchedulerRuntimeAccounting *accounting = runtime_for_cpu(cpu);
+    if (accounting == NULL || cpu->scheduler_queue == NULL) return;
+    if (!accounting->active || accounting->task != current)
+    {
+        accounting->task = current;
+        accounting->sampled_at = now;
+        accounting->active = true;
+        return;
+    }
+    // Samples are taken before acquiring the queue lock. A clock anomaly or
+    // older sample must not move the anchor backward and double-bill an interval.
+    if (now <= accounting->sampled_at) return;
+    uint64_t elapsed = now - accounting->sampled_at;
+    accounting->sampled_at = now;
+    spin_lock(&cpu->scheduler_queue->lock);
+    // A blocker publishes WAIT before int32, but still executes until this
+    // handoff. Charge that burst too. The queue lock serializes remote wake's
+    // placement against this update; status/CAS and terminal state are untouched.
+    charge_current_eevdf_runtime(current, elapsed);
+    spin_unlock(&cpu->scheduler_queue->lock);
 }
 
 static uint64_t queue_average_vruntime(lock_queue *queue, tcb_t current, uint64_t now, tcb_t *fallback, tcb_t *idle)
@@ -330,7 +488,8 @@ static uint64_t queue_average_vruntime(lock_queue *queue, tcb_t current, uint64_
         tcb_t candidate = (tcb_t)node->data;
         uint64_t wake_base = current != NULL ? current->eevdf_vruntime : candidate->eevdf_vruntime;
         wake_sleeping_task(candidate, now, wake_base);
-        if (candidate != current && candidate != NULL && candidate->task_level == TASK_IDLE_LEVEL && idle != NULL) {
+        if (candidate != current && candidate != NULL && candidate->task_level == TASK_IDLE_LEVEL && idle != NULL &&
+            is_current_task_runnable(candidate)) {
             *idle = candidate;
         }
         if (candidate == current) {
@@ -357,7 +516,7 @@ static void init_task_eevdf_entity(tcb_t task, uint64_t base_vruntime, uint64_t 
     uint64_t slice = task_sched_slice(task);
     task->eevdf_slice = slice;
     task->eevdf_vruntime = base_vruntime > EEVDF_WAKEUP_CREDIT ? base_vruntime - EEVDF_WAKEUP_CREDIT : 0;
-    task->eevdf_deadline = task->eevdf_vruntime + slice;
+    task->eevdf_deadline = deadline_after_runtime(task->eevdf_vruntime, slice);
     task->eevdf_last_start = now;
 }
 
@@ -373,28 +532,42 @@ static void mark_task_dispatched(tcb_t task, uint64_t now)
         task->eevdf_slice = EEVDF_BASE_SLICE_NS;
     }
     if (task->eevdf_deadline == 0) {
-        task->eevdf_deadline = task->eevdf_vruntime + task_sched_slice(task);
+        task->eevdf_deadline = deadline_after_runtime(task->eevdf_vruntime, task_sched_slice(task));
     }
     task->eevdf_last_start = now;
 }
 
-tcb_t select_next_task_safe()
+static void begin_eevdf_runtime(PROCESSOR_INFO *cpu, tcb_t task, uint64_t now)
 {
-    struct PROCESSOR_INFO *cpu = get_current_cpu();
+    SchedulerRuntimeAccounting *accounting = runtime_for_cpu(cpu);
+    if (accounting == NULL || cpu->scheduler_queue == NULL) return;
+    if (accounting->active && now < accounting->sampled_at) now = accounting->sampled_at;
+    accounting->task = task;
+    accounting->sampled_at = now;
+    accounting->active = true;
+    spin_lock(&cpu->scheduler_queue->lock);
+    mark_task_dispatched(task, now);
+    spin_unlock(&cpu->scheduler_queue->lock);
+}
+
+static tcb_t select_next_task_safe_at(PROCESSOR_INFO *cpu, uint64_t now)
+{
     if (cpu == NULL) return NULL;
     lock_queue *queue = cpu->scheduler_queue;
     if (queue == NULL) return NULL;
+    SchedulerReferences *references = references_for_cpu(cpu);
+    if (references == NULL) return NULL;
 
     spin_lock(&queue->lock);
 
     if (queue->size == 0 || queue->head == NULL)
     {
+        references->selected = NULL;
         spin_unlock(&queue->lock);
         return NULL;
     }
     
-    tcb_t current = get_current_task();
-    uint64_t now = nanoTime();
+    tcb_t current = __atomic_load_n(&cpu->current_task, __ATOMIC_ACQUIRE);
     wake_sleeping_task(current, now, current != NULL ? current->eevdf_vruntime : 0);
 
     tcb_t fallback = NULL;
@@ -421,9 +594,17 @@ tcb_t select_next_task_safe()
     if (best == NULL) best = fallback;
 
     tcb_t result = best != NULL ? best : (is_current_task_runnable(current) ? current : idle);
-    if (result != NULL) mark_task_dispatched(result, now);
+    references->selected = result;
     spin_unlock(&queue->lock);
     return result;
+}
+
+tcb_t select_next_task_safe()
+{
+    PROCESSOR_INFO *cpu = get_current_cpu();
+    // Read the clock before taking a scheduler queue's IRQ-saving spin lock.
+    uint64_t now = nanoTime();
+    return select_next_task_safe_at(cpu, now);
 }
 
 tcb_t select_next_task()
@@ -447,10 +628,16 @@ extern "C" registers_t *timer_handle(registers_t *reg)
 {
     // send_eoi();
     PROCESSOR_INFO *cpu = get_current_cpu();
+    scheduler_interrupt_enter(cpu);
     const bool boot_ready = __atomic_load_n(&scheduler_boot_ready, __ATOMIC_ACQUIRE);
     const uint64_t disable_depth =
         cpu != NULL ? __atomic_load_n(&cpu->scheduler_disable_depth, __ATOMIC_ACQUIRE) : 0;
     if (!boot_ready || cpu == NULL || disable_depth != 0) {
+        if (!boot_ready)
+        {
+            SchedulerRuntimeAccounting *accounting = runtime_for_cpu(cpu);
+            if (accounting != NULL) accounting->active = false;
+        }
         /*
          * A task may be enqueued while the local CPU is inside a nested
          * critical section. Keep this diagnostic rate limited: it is only
@@ -480,6 +667,8 @@ extern "C" registers_t *timer_handle(registers_t *reg)
         return reg;
     }
 
+    uint64_t now = nanoTime();
+    account_current_eevdf_runtime(cpu, current, now);
     __atomic_fetch_add(&system_cpu_total_ticks, 1ULL, __ATOMIC_RELAXED);
     if (current->status == RUNNING && current->task_level != TASK_IDLE_LEVEL) {
         __atomic_fetch_add(&system_cpu_busy_ticks, 1ULL, __ATOMIC_RELAXED);
@@ -488,7 +677,6 @@ extern "C" registers_t *timer_handle(registers_t *reg)
 
     if (likely(current->status == RUNNING && current->task_level != TASK_IDLE_LEVEL)) {
         cpu->scheduler_ticks++;
-        charge_current_eevdf_runtime(current, EEVDF_TICK_NS);
         if (cpu->scheduler_ticks < TIME_SLICE) {
             send_eoi();
             return reg;
@@ -497,7 +685,8 @@ extern "C" registers_t *timer_handle(registers_t *reg)
         cpu->scheduler_ticks = 0;
     }
 
-    tcb_t best = select_next_task();
+    tcb_t best = select_next_task_safe_at(cpu, now);
+    if (best == NULL && is_current_task_runnable(current)) best = current;
 #if CONFIG_KERNEL_DEBUG_SCHEDULER_FMANAGER_TIMER_LOG
     if ((current != NULL && strcmp(current->name, "fmanager") == 0) ||
         (best != NULL && strcmp(best->name, "fmanager") == 0))
@@ -527,6 +716,15 @@ extern "C" registers_t *timer_handle(registers_t *reg)
     }
 #endif
     if (best == NULL || best == current) {
+        if (cpu->scheduler_queue != NULL) scheduler_publish_task(cpu, current, current);
+        cpu->scheduler_ticks = 0;
+        send_eoi();
+        return reg;
+    }
+
+    if (!is_current_task_runnable(best))
+    {
+        scheduler_publish_task(cpu, current, current);
         cpu->scheduler_ticks = 0;
         send_eoi();
         return reg;
@@ -535,37 +733,67 @@ extern "C" registers_t *timer_handle(registers_t *reg)
     // 记录当前线程运行时最新的 FSBASE，避免调度后丢失用户态 TLS 环境。
     current->fs_base = read_fsbase();
 
-    // 任务寻父处理
-    if (best->parent_group && 
-        (best->parent_group->parent_task == NULL || 
-         best->parent_group->parent_task->status == DEATH || 
-         best->parent_group->parent_task->status == OUT)) {
-        best->parent_group->parent_task = kernel_group;
-    }
+    // Process collection reparents children under the process/child-list
+    // locks. The timer must not dereference an unpinned parent PCB or change
+    // parent_task independently of those lists.
 
     // 正式切换
     if (cpu->current_task != best) {
         // 更新任务状态
-        if (current->status == RUNNING) { 
-            current->status = START; 
-        }
-        if (best->status == START || best->status == CREATE) { 
-            best->status = RUNNING; 
+        TaskStatus old_status = RUNNING;
+        __atomic_compare_exchange_n(&current->status, &old_status, START, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+        old_status = START;
+        if (!__atomic_compare_exchange_n(&best->status, &old_status, RUNNING, false, __ATOMIC_ACQ_REL,
+                                         __ATOMIC_ACQUIRE))
+        {
+            old_status = CREATE;
+            __atomic_compare_exchange_n(&best->status, &old_status, RUNNING, false, __ATOMIC_ACQ_REL,
+                                         __ATOMIC_ACQUIRE);
         }
         
         // 只有上下文有效的任务才切换
         if (best->context0.rip != 0) {
             cpu->scheduler_ticks = 0;
             change_proccess(reg, current, best);
-            cpu->current_task = best;
+            // Charge selection/context-switch work to the old stack owner
+            // before starting the next task's interval. Neither clock read is
+            // inside a queue lock, and the next dispatch excludes sleeping time.
+            uint64_t handoff = nanoTime();
+            account_current_eevdf_runtime(cpu, current, handoff);
+            scheduler_publish_task(cpu, current, best);
+            begin_eevdf_runtime(cpu, best, handoff);
         } else {
             // 如果上下文无效，不切换并恢复状态
-            current->status = RUNNING;
+            old_status = START;
+            __atomic_compare_exchange_n(&current->status, &old_status, RUNNING, false, __ATOMIC_ACQ_REL,
+                                         __ATOMIC_ACQUIRE);
             cpu->scheduler_ticks = 0;
+            scheduler_publish_task(cpu, current, current);
         }
     }
     send_eoi();
     return reg;
+}
+
+extern "C" registers_t *timer_handle_fpu(registers_t *reg, fpu_context_t *entry_fpu)
+{
+    // The assembly entry captured these registers before any C code could
+    // change them. The current/selected/previous scheduler references pin both
+    // tasks until the interrupt epilogue has finished using the old stack.
+    PROCESSOR_INFO *cpu = get_current_cpu();
+    tcb_t entry_task = cpu != NULL ? __atomic_load_n(&cpu->current_task, __ATOMIC_ACQUIRE) : NULL;
+    if (entry_task != NULL) memcpy(&entry_task->fpu_context, entry_fpu, sizeof(*entry_fpu));
+
+    registers_t *result = timer_handle(reg);
+
+    tcb_t selected_task = cpu != NULL ? __atomic_load_n(&cpu->current_task, __ATOMIC_ACQUIRE) : NULL;
+    // A declined switch must restore the exact entry image, including during
+    // boot or a nested scheduler-disabled section, rather than a stale TCB.
+    if (selected_task != NULL && selected_task != entry_task)
+        memcpy(entry_fpu, &selected_task->fpu_context, sizeof(*entry_fpu));
+    // Restore in assembly after all C code, not in change_proccess: later C
+    // helpers may use SSE and would otherwise corrupt the selected context.
+    return result;
 }
 
 void scheduler_yield()
@@ -595,29 +823,77 @@ void scheduler_sleep_ns(uint64_t nano)
     uint64_t wakeup_time = now + nano;
     if (wakeup_time < now) wakeup_time = (uint64_t)-1;
 
-    current->wakeup_time = wakeup_time;
-    current->status = WAIT;
+    PROCESSOR_INFO *cpu = get_current_cpu();
+    lock_queue *queue = cpu != NULL ? cpu->scheduler_queue : NULL;
+    if (queue == NULL) {
+        scheduler_yield();
+        return;
+    }
+
+    // Serialize deadline/state publication with expiry and remote wakeup.
+    // Otherwise an IRQ that observed an older WAIT can clear this new
+    // deadline before the current thread publishes its next WAIT state.
+    spin_lock(&queue->lock);
+    TaskStatus expected = __atomic_load_n(&current->status, __ATOMIC_ACQUIRE);
+    bool sleeping = false;
+    if (expected == RUNNING || expected == START) {
+        current->wakeup_time = wakeup_time;
+        sleeping = __atomic_compare_exchange_n(&current->status, &expected, WAIT, false, __ATOMIC_RELEASE,
+                                                __ATOMIC_RELAXED);
+    }
+    spin_unlock(&queue->lock);
+    if (!sleeping) {
+        scheduler_yield();
+        return;
+    }
     do {
         scheduler_yield();
-    } while (current->status == WAIT);
+    } while (__atomic_load_n(&current->status, __ATOMIC_ACQUIRE) == WAIT);
 
-    if (current->status == START) current->status = RUNNING;
+    expected = START;
+    __atomic_compare_exchange_n(&current->status, &expected, RUNNING, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
 }
 EXPORT_SYMBOL(scheduler_sleep_ns);
 
+static uint64_t wakeup_base_vruntime_locked(PROCESSOR_INFO *cpu)
+{
+    // Each run queue has its own vruntime origin. A remote interrupt must not
+    // place a sleeper against the calling CPU's unrelated current task.
+    tcb_t current = __atomic_load_n(&cpu->current_task, __ATOMIC_ACQUIRE);
+    if (current != NULL && current->task_level != TASK_IDLE_LEVEL && is_current_task_runnable(current))
+        return current->eevdf_vruntime;
+    uint64_t minimum = ~0ULL;
+    for (lock_node *node = cpu->scheduler_queue->head; node != NULL; node = node->next)
+    {
+        tcb_t candidate = (tcb_t)node->data;
+        if (candidate != NULL && candidate->task_level != TASK_IDLE_LEVEL && is_current_task_runnable(candidate) &&
+            candidate->eevdf_vruntime < minimum)
+            minimum = candidate->eevdf_vruntime;
+    }
+    return minimum == ~0ULL ? 0 : minimum;
+}
+
 void scheduler_wake_task(tcb_t task)
 {
-    if (task == NULL || task->status != WAIT) return;
+    if (task == NULL || __atomic_load_n(&task->status, __ATOMIC_ACQUIRE) != WAIT) return;
+    // Live published tasks do not migrate. cpu_id is their queue-array index;
+    // remove_task's fallback correction happens only after terminal state.
+    if (task->cpu_id >= get_cpu_num()) return;
+    PROCESSOR_INFO *cpu = get_cpu(task->cpu_id);
+    lock_queue *queue = cpu != NULL ? cpu->scheduler_queue : NULL;
+    if (queue == NULL) return;
 
-    uint64_t base_vruntime = 0;
-    tcb_t current = get_current_task();
-    if (current != NULL && current->task_level != TASK_IDLE_LEVEL) {
-        base_vruntime = current->eevdf_vruntime;
+    spin_lock(&queue->lock);
+    // The initial fast check may refer to an earlier sleep. Recheck while
+    // owning the same queue lock used to publish a new deadline and WAIT.
+    if (__atomic_load_n(&task->status, __ATOMIC_ACQUIRE) == WAIT) {
+        task->wakeup_time = 0;
+        apply_eevdf_wakeup_credit(task, wakeup_base_vruntime_locked(cpu));
+        // A concurrent kill must remain terminal even during preparation.
+        TaskStatus waiting = WAIT;
+        __atomic_compare_exchange_n(&task->status, &waiting, START, false, __ATOMIC_RELEASE, __ATOMIC_RELAXED);
     }
-
-    task->wakeup_time = 0;
-    task->status = START;
-    apply_eevdf_wakeup_credit(task, base_vruntime);
+    spin_unlock(&queue->lock);
 }
 EXPORT_SYMBOL(scheduler_wake_task);
 
@@ -658,7 +934,7 @@ static size_t scheduler_cpu_index(PROCESSOR_INFO *cpu)
     return (size_t)-1;
 }
 
-size_t add_task(tcb_t new_task)
+static size_t add_task_impl(tcb_t new_task, lock_node *prepared)
 {
     if (new_task == NULL) return -1;
 	    
@@ -726,8 +1002,16 @@ size_t add_task(tcb_t new_task)
     spin_unlock(&min_cpu->scheduler_queue->lock);
     init_task_eevdf_entity(new_task, base_vruntime, now);
     new_task->cpu_id      = min_cpu_index;
-    new_task->queue_index = queue_enqueue_ref(min_cpu->scheduler_queue, new_task, &new_task->sched_node);
-    if (strcmp(new_task->name, "fmanager") == 0)
+    size_t queue_index;
+    if (prepared)
+        queue_index = queue_enqueue_preallocated(min_cpu->scheduler_queue, new_task, prepared,
+                                                 &new_task->sched_node, &new_task->queue_index);
+    else
+        new_task->queue_index = queue_index =
+            queue_enqueue_ref(min_cpu->scheduler_queue, new_task, &new_task->sched_node);
+    // A prepared worker can finish immediately after queue publication.
+    // Never inspect its TCB again once another CPU can execute it.
+    if (!prepared && strcmp(new_task->name, "fmanager") == 0)
     {
         write_serial_fmt("[sched-debug] enqueue fmanager task=%p tid=%llu cpu=%llu lapic=%llu queue=%llu "
                          "status=%u rip=%llx rsp=%llx depth=%llu\n",
@@ -745,7 +1029,18 @@ size_t add_task(tcb_t new_task)
     // debug_sched_queue(min_cpu->scheduler_queue);
     
     spin_unlock(&scheduler_lock);
-    return new_task->queue_index;
+    return queue_index;
+}
+
+size_t add_task(tcb_t new_task)
+{
+    return add_task_impl(new_task, NULL);
+}
+
+size_t add_task_preallocated(tcb_t new_task, lock_node *prepared)
+{
+    if (!prepared) return (size_t)-1;
+    return add_task_impl(new_task, prepared);
 }
 
 void remove_task(tcb_t task)

@@ -412,6 +412,36 @@ ret:
 
 EXPORT_SYMBOL(alloc_frames_dma32);
 
+// ISA DMA is restricted to the low 16 MiB zone. Normal and DMA32 memory
+// must never be silently substituted. Account the pages exactly as above.
+uint64_t alloc_frames_dma16(size_t count)
+{
+    if (count == 0) return 0;
+
+    size_t   required_pages = count_to_block_pages(count);
+    uint64_t addr           = 0;
+
+    if (zones[ZONE_DMA] && zone_has_memory(zones[ZONE_DMA]))
+    {
+        addr = buddy_alloc_zone(zones[ZONE_DMA], count);
+        if (addr != 0) goto ret;
+    }
+
+ret:
+    if (addr == 0) return 0;
+
+    bitmap_set_range(&using_regions, addr / PAGE_SIZE, addr / PAGE_SIZE + required_pages, true);
+    for (uint64_t a = addr; a < addr + required_pages * PAGE_SIZE; a += PAGE_SIZE)
+    {
+        page_t *p = get_page(a);
+        page_ref(p);
+    }
+
+    return addr;
+}
+
+EXPORT_SYMBOL(alloc_frames_dma16);
+
 void free_frames_dma32(uint64_t addr, size_t count)
 {
     free_frames(addr, count);

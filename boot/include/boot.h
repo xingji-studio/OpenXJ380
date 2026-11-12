@@ -3,6 +3,8 @@
 #define _BOOT_H_
 #include <efi.h>
 #include <memory.h>
+#include "../../include/efi/root_binding.h"
+#include "../../include/efi/installer_handoff.h"
 
 #define MAX_CPU_NUM 256
 
@@ -14,6 +16,8 @@
 #define BOOT_FLAG_LAST_KNOWN_GOOD  (1ULL << 5)
 #define BOOT_FLAG_SHOW_PROGRESS    (1ULL << 6)
 #define BOOT_FLAG_INSTALLER        (1ULL << 7)
+#define BOOT_FLAG_BOUND_ROOT       (1ULL << 8)
+#define BOOT_FLAG_INSTALLER_HANDOFF (1ULL << 9)
 
 typedef struct
 {
@@ -36,6 +40,13 @@ typedef struct
     UINT64 installer_root_pak_size;
     UINT64 system_payload_pak;
     UINT64 system_payload_pak_size;
+    // The legacy prefix ends here. root_binding requires BOOT_FLAG_BOUND_ROOT.
+    XJ_ROOT_BINDING root_binding;
+    // Read this versioned tail only with BOOT_FLAG_INSTALLER_HANDOFF.
+    XJ_INSTALLER_HANDOFF installer_handoff;
 } BOOT_CONFIG;
+
+#define BOOT_CONFIG_LEGACY_BYTES __builtin_offsetof(BOOT_CONFIG, root_binding)
+#define BOOT_CONFIG_INSTALLER_HANDOFF_OFFSET __builtin_offsetof(BOOT_CONFIG, installer_handoff)
 
 #endif
