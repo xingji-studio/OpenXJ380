@@ -529,8 +529,8 @@ def main() -> None:
     args = parser.parse_args()
 
     installer_fs = os.environ.get("INSTALLER_FS", "ext4")
-    if installer_fs not in ("fat32", "ext4"):
-        parser.error("INSTALLER_FS must be fat32 or ext4")
+    if installer_fs != "ext4":
+        parser.error("INSTALLER_FS must be ext4")
     # No newly linked third-party filesystem implementation is approved.
     subprocess.run([sys.executable, str(ROOT / "tools/check_ext4_sources.py"), "--root", str(ROOT)],
                    check=True, stdout=subprocess.DEVNULL)

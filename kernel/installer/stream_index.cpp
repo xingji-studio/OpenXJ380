@@ -32,7 +32,7 @@ int stream_index_validate(const uint8_t *data, xjpak2::Size bytes, uint64_t volu
     uint64_t fat = le64(data + 56), fat_bytes = le64(data + 64), extents = le64(data + 72);
     if (!total || total > 0xffffffffULL || !count || count > StreamExtentMaximum || ext4 != 128 ||
         ext4_bytes < 64 || ext4_bytes > bytes - 128 || fat != ext4 + ext4_bytes ||
-        fat_bytes < 64 || fat_bytes > bytes - fat || extents != fat + fat_bytes ||
+        (fat_bytes && fat_bytes < 64) || fat_bytes > bytes - fat || extents != fat + fat_bytes ||
         count > (bytes - extents) / 24 || count * 24 != bytes - extents) return -22;
     uint64_t logical = 0, previous_end = 0;
     for (uint64_t i = 0; i < count; ++i)
@@ -46,7 +46,7 @@ int stream_index_validate(const uint8_t *data, xjpak2::Size bytes, uint64_t volu
         previous_end = physical + length;
     }
     if (logical != total) return -22;
-    output = {{data + ext4, xjpak2::Size(ext4_bytes)}, {data + fat, xjpak2::Size(fat_bytes)},
+    output = {{data + ext4, xjpak2::Size(ext4_bytes)}, {fat_bytes ? data + fat : nullptr, xjpak2::Size(fat_bytes)},
               {data + extents, xjpak2::Size(count * 24)}, total, count};
     return 0;
 }

@@ -34,9 +34,9 @@ BOOT_CONFIG saved_config;
 BootPackageProof package_proof;
 TableWorkspace table_workspace;
 uint64_t arena_budget;
-xjpak2::Record *root_records, *system_records, *fat32_records;
-xjpak2::Plan root_plan, system_plan, fat32_plan;
-XJ_INSTALLER_PACKAGE_SPAN ext4_span, fat32_span;
+xjpak2::Record *root_records, *system_records;
+xjpak2::Plan root_plan, system_plan;
+XJ_INSTALLER_PACKAGE_SPAN ext4_span;
 BlockExtent source_extent;
 SourceLifetime retained_source;
 xjinstaller::StreamIndex source_index;
@@ -241,8 +241,6 @@ int session_packages_prepare()
             source_read_context.index = &source_index;
             source_reader = {read_stream_source, &source_read_context, source_index.data_bytes};
             ext4_span = {whole.physical + uint64_t(source_index.ext4.data - data), source_index.ext4.size, 0};
-            fat32_span = {whole.physical + uint64_t(source_index.fat32.data - data), source_index.fat32.size, 0};
-            result = validate_package(fat32_span, false, budget, &fat32_records, fat32_plan, &source_reader);
         }
     }
     else if (result >= 0 && package_proof.profile == XJ_INSTALLER_PROFILE_DUAL)
@@ -253,11 +251,9 @@ int session_packages_prepare()
         if (!xj_installer_split_payloads(data, whole.bytes, &payloads)) result = -22;
         else
         {
-            // These subspans are covered by the already proven, page-exclusive
-            // parent span. They never acquire an independent frame lifetime.
+            // Older dual media can supply its ext4 package. The subspan stays
+            // covered by the proven parent span and shares its frame lifetime.
             ext4_span = {whole.physical + uint64_t(payloads.ext4 - data), payloads.ext4_bytes, 0};
-            fat32_span = {whole.physical + uint64_t(payloads.fat32 - data), payloads.fat32_bytes, 0};
-            result = validate_package(fat32_span, true, budget, &fat32_records, fat32_plan);
         }
     }
     if (result >= 0)
@@ -269,9 +265,6 @@ int session_packages_prepare()
     {
         free(root_records);
         free(system_records);
-        free(fat32_records);
-        fat32_records = nullptr;
-        fat32_plan = {};
         root_records = system_records = nullptr;
         root_plan = {};
         system_plan = {};
@@ -353,12 +346,6 @@ bool session_job_view(JobSessionView *output)
     output->source_extent = source_extent;
     output->package = reinterpret_cast<const void *>(direct_map_base + ext4_span.physical);
     output->package_bytes = ext4_span.bytes;
-    if (package_proof.profile == XJ_INSTALLER_PROFILE_DUAL ||
-        package_proof.profile == XJ_INSTALLER_PROFILE_STREAM_INDEX)
-    {
-        output->fat32_package = reinterpret_cast<const void *>(direct_map_base + fat32_span.physical);
-        output->fat32_package_bytes = fat32_span.bytes;
-    }
     output->source_reader = source_reader;
     output->ready = __atomic_load_n(&native_admission, __ATOMIC_ACQUIRE) == 1 &&
                     (package_proof.profile == XJ_INSTALLER_PROFILE_EXT4_PAK2 ||

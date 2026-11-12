@@ -289,8 +289,7 @@ int jobs_queue(JobHandle target_handle, const JobRequest *request, JobHandle *ou
     if (error) return error;
     if (snapshot.mode != XJ380_INSTALLER_MODE_FRESH || snapshot.language != session.language ||
         snapshot.components != session.components) return -EOPNOTSUPP;
-    if (snapshot.filesystem != 1 && snapshot.filesystem != 2) return -EOPNOTSUPP;
-    if (snapshot.filesystem == 1 && (!session.fat32_package || !session.fat32_package_bytes)) return -EOPNOTSUPP;
+    if (snapshot.filesystem != 2) return -EOPNOTSUPP;
     Target *target;
     Job *job = nullptr;
     {
@@ -450,8 +449,7 @@ int jobs_run(JobHandle handle)
     options.source_reader = job->session.source_reader;
     if (!error)
         error = installer_build_ext4_disk(job->target.node, job->source_pin, &options,
-            options.filesystem == 1 ? job->session.fat32_package : job->session.package,
-            options.filesystem == 1 ? job->session.fat32_package_bytes : job->session.package_bytes, &status);
+            job->session.package, job->session.package_bytes, &status);
     if (!error && (!status.complete || !status.activation_durable || status.io_failed || status.quarantined))
     {
         error = -EIO;

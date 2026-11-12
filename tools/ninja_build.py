@@ -366,18 +366,16 @@ def vdisk(*, complete: bool, filesystem: str | None = None, image_path: Path | N
 
 def installer_system_stage(*, filesystem: str | None = None) -> None:
     filesystem = env("INSTALLER_FS", "ext4") if filesystem is None else filesystem
-    if filesystem not in ("fat32", "ext4"):
-        raise SystemExit("INSTALLER_FS must be fat32 or ext4")
+    if filesystem != "ext4":
+        raise SystemExit("INSTALLER_FS must be ext4")
     installer_prepare()
     root = Path(env("INSTALLER_SYSTEM_ROOT", f"/tmp/xj380-installer-{os.getuid()}/system-root"))
     reset_dir(root)
     stage_full_system(root, include_linux_compat=True, filesystem=filesystem)
     command = ["python3", env("MAKE_PAK", "tools/make_pak.py"), str(root),
                env("INSTALLER_SYSTEM_PAK", "out/system-payload.pak")]
-    # PAK2 retains the links and metadata preserved by the ext4 staging profile.
-    # Keep the legacy two-positional-argument PAK1 invocation for FAT media.
-    if filesystem == "ext4":
-        command += ["--format", "pak2"]
+    # PAK2 retains ext4 links and metadata without duplicating linked files.
+    command += ["--format", "pak2"]
     run(command)
 
 
@@ -705,7 +703,7 @@ def main() -> None:
     parser.add_argument("command")
     parser.add_argument("--fs", choices=("fat32", "ext4"), help="filesystem for vdisk/complete (or VDISK_FS)")
     parser.add_argument("--image", type=Path, help="output for vdisk/complete (or VDISK_IMAGE)")
-    parser.add_argument("--installer-fs", choices=("fat32", "ext4"),
+    parser.add_argument("--installer-fs", choices=("ext4",),
                         help="filesystem for installer-system-stage (or INSTALLER_FS)")
     args = parser.parse_args()
     if (args.fs or args.image) and args.command not in ("vdisk", "complete"):

@@ -354,7 +354,6 @@ uint64_t do_xapi_InstallerNative(uint64_t operation, uint64_t request_address, u
             view.profile == XJ_INSTALLER_PROFILE_STREAM_INDEX)
         {
             response.flags |= XJ_INST_NATIVE_INFO_EXT4;
-            if (view.fat32_package && view.fat32_package_bytes) response.flags |= XJ_INST_NATIVE_INFO_FAT32;
             if (view.ready && view.components == XJ_INST_NATIVE_COMPONENTS_FULL &&
                 view.language == XJ_INST_NATIVE_LANGUAGE_PACKAGE && !session_validate_job_view(view))
                 response.flags |= XJ_INST_NATIVE_INFO_READY;
@@ -382,8 +381,7 @@ uint64_t do_xapi_InstallerNative(uint64_t operation, uint64_t request_address, u
         if (error) return uint64_t(error);
         auto &input = request.submit;
         if (input.reserved) return uint64_t(-EINVAL);
-        if ((input.filesystem != XJ_INST_NATIVE_FILESYSTEM_EXT4 &&
-             input.filesystem != XJ_INST_NATIVE_FILESYSTEM_FAT32) || input.mode != XJ_INST_NATIVE_MODE_FRESH ||
+        if (input.filesystem != XJ_INST_NATIVE_FILESYSTEM_EXT4 || input.mode != XJ_INST_NATIVE_MODE_FRESH ||
             input.language != XJ_INST_NATIVE_LANGUAGE_PACKAGE ||
             input.components != XJ_INST_NATIVE_COMPONENTS_FULL) return uint64_t(-EOPNOTSUPP);
         if (!input.target_handle || input.session_epoch != view.epoch) return uint64_t(-ESTALE);
