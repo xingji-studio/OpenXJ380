@@ -9,6 +9,9 @@ typedef __UINT64_TYPE__ XJ_ROOT_U64;
 
 #define XJ_ROOT_BINDING_SIZE 96U
 #define XJ_ROOT_BINDING_VERSION 1U
+#define XJ_ROOT_BINDING_FAT32_VERSION 2U
+#define XJ_ROOT_FILESYSTEM_FAT32 1U
+#define XJ_ROOT_FILESYSTEM_EXT4 2U
 #define XJ_ROOT_BINDING_DISK_GUID_OFFSET 16U
 #define XJ_ROOT_BINDING_ROOT_GUID_OFFSET 32U
 #define XJ_ROOT_BINDING_ESP_GUID_OFFSET 48U
@@ -76,6 +79,19 @@ static inline XJ_ROOT_U64 xj_root_binding_kernel_bytes(const XJ_ROOT_BINDING *bi
     return xj_root_binding_le64(binding->bytes + XJ_ROOT_BINDING_KERNEL_BYTES_OFFSET);
 }
 
+// Version 1 keeps the original ext4 UUID. Version 2 uses a FAT32 volume ID
+// followed by twelve zero bytes, preserving the 96-byte boot-config ABI.
+static inline XJ_ROOT_U32 xj_root_binding_filesystem(const XJ_ROOT_BINDING *binding)
+{
+    return xj_root_binding_le32(binding->bytes + 8) == XJ_ROOT_BINDING_FAT32_VERSION ?
+        XJ_ROOT_FILESYSTEM_FAT32 : XJ_ROOT_FILESYSTEM_EXT4;
+}
+
+static inline XJ_ROOT_U32 xj_root_binding_fat32_id(const XJ_ROOT_BINDING *binding)
+{
+    return xj_root_binding_le32(binding->bytes + 64);
+}
+
 static inline XJ_ROOT_U32 xj_root_binding_kernel_crc32c(const XJ_ROOT_BINDING *binding)
 {
     return xj_root_binding_le32(binding->bytes + XJ_ROOT_BINDING_KERNEL_CRC32C_OFFSET);
@@ -87,10 +103,16 @@ static inline int xj_root_binding_valid(const XJ_ROOT_BINDING *binding)
     if (!binding) return 0;
     for (unsigned i = 0; i < sizeof(magic); ++i)
         if (binding->bytes[i] != magic[i]) return 0;
-    if (xj_root_binding_le32(binding->bytes + 8) != XJ_ROOT_BINDING_VERSION ||
+    const XJ_ROOT_U32 version = xj_root_binding_le32(binding->bytes + 8);
+    if ((version != XJ_ROOT_BINDING_VERSION && version != XJ_ROOT_BINDING_FAT32_VERSION) ||
         xj_root_binding_le32(binding->bytes + 12) != XJ_ROOT_BINDING_SIZE ||
         xj_root_binding_kernel_bytes(binding) == 0)
         return 0;
+    if (version == XJ_ROOT_BINDING_FAT32_VERSION)
+    {
+        if (!xj_root_binding_fat32_id(binding)) return 0;
+        for (unsigned i = 68; i < 80; ++i) if (binding->bytes[i]) return 0;
+    }
     return xj_root_binding_crc32c(binding->bytes, XJ_ROOT_BINDING_DESCRIPTOR_CRC32C_OFFSET) ==
            xj_root_binding_le32(binding->bytes + XJ_ROOT_BINDING_DESCRIPTOR_CRC32C_OFFSET);
 }

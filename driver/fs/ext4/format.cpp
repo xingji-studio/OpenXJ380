@@ -374,13 +374,20 @@ int plan_format(const Ext4FormatDevice &device, const FormatOptions &options, Fo
 }
 
 int format(const Ext4FormatDevice &device, const FormatOptions &options, FormatWorkspace &work,
-           FormatGeometry &geometry, const FormatStorage *external)
+           FormatGeometry &geometry, const FormatStorage *external, const FormatProgress *progress)
 {
     int error = plan_format(device, options, work, geometry, external);
     LayoutStorage storage;
     if (!error) error = arena(geometry, external, storage);
     if (!error && !storage.locations) storage.descriptors = work.descriptors;
     if (error) return error;
+    const uint64_t total = uint64_t(geometry.groups) * kTable + geometry.journal_blocks;
+    uint64_t completed = 0;
+    auto report = [&]()
+    {
+        if (progress && progress->update) progress->update(progress->context, completed, total);
+    };
+    report();
     // Reject a backend that cannot flush before any destructive write. This
     // runs after the complete zero-I/O plan, so invalid arguments stay inert.
     if (!device.flush(device.context)) return -EIO;
@@ -434,6 +441,8 @@ int format(const Ext4FormatDevice &device, const FormatOptions &options, FormatW
         uint8_t encoded[4]; le32(encoded, group);
         checksum = crc(crc(seed, encoded, 4), descriptor, 64);
         le16(descriptor + 0x1e, uint16_t(checksum));
+        completed += kTable;
+        report();
     }
     directory(work.block, 2, 2, true, seed);
     if (!store(device, geometry.root_block, work.block)) return -EIO;
@@ -450,6 +459,8 @@ int format(const Ext4FormatDevice &device, const FormatOptions &options, FormatW
     {
         if (!store(device, geometry.journal_first + index, work.block)) return -EIO;
         if (!index) zero(work.block, kBlock);
+        ++completed;
+        if (!(index % 32)) report();
     }
     for (uint32_t group = 0; group < geometry.groups; ++group)
     {
@@ -472,6 +483,7 @@ int format(const Ext4FormatDevice &device, const FormatOptions &options, FormatW
     zero(work.block, kBlock); copy(work.block + 1024, work.super, 1024);
     geometry.primary_attempted = true;
     if (!store(device, 0, work.block) || !device.flush(device.context)) return -EIO;
+    report();
     return 0;
 }
 

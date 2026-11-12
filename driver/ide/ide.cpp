@@ -84,11 +84,14 @@ static int ide_packet_read(uint16_t base, uint8_t select, uint8_t packet_bytes,
         if ((inb(base + 2) & 3) != 2) return -1; // Data-in, never data-out.
         size_t phase_bytes = (size_t)inb(base + 4) | ((size_t)inb(base + 5) << 8);
         if (!phase_bytes || phase_bytes > bytes - transferred) return -1;
-        for (size_t i = 0; i < phase_bytes; i += 2)
+        // String I/O transfers this already validated data-in phase without
+        // a separate virtual-machine I/O exit for every 16-bit word.
+        size_t whole_words = phase_bytes / 2;
+        if (whole_words) insw(base, buffer + transferred, whole_words);
+        if (phase_bytes & 1)
         {
             uint16_t word = inw(base);
-            buffer[transferred + i] = (uint8_t)word;
-            if (i + 1 < phase_bytes) buffer[transferred + i + 1] = (uint8_t)(word >> 8);
+            buffer[transferred + phase_bytes - 1] = (uint8_t)word;
         }
         transferred += phase_bytes;
         ide_delay_400ns(base);
@@ -231,21 +234,36 @@ int ide_read(int drive, uint8_t *buffer, size_t size, size_t lba) {
     uint16_t base = ide_devices[drive].is_primary ? IDE_PRIMARY_DATA_PORT : IDE_SECONDARY_DATA_PORT;
     uint8_t drive_select = ide_devices[drive].is_master ? IDE_DEVICE_MASTER : IDE_DEVICE_SLAVE;
 
-    for (size_t sector_index = 0; sector_index < size; sector_index++) {
-        uint64_t current_lba = lba + sector_index;
-        if (ide_devices[drive].device_type == IDE_DEVICE_ATAPI)
+    if (ide_devices[drive].device_type == IDE_DEVICE_ATAPI)
+    {
+        size_t block_bytes = ide_devices[drive].sector_size;
+        if (!block_bytes || block_bytes > 65534) return -1;
+        // ATAPI's byte-count register is 16-bit. Keep each READ(12) below
+        // that limit and retain the per-phase status and exact-byte checks.
+        size_t maximum_blocks = 65534 / block_bytes;
+        for (size_t sector_index = 0; sector_index < size;)
         {
-            uint8_t command[16] = {0xa8}; // SCSI READ(12), one optical block.
+            size_t blocks = size - sector_index;
+            if (blocks > maximum_blocks) blocks = maximum_blocks;
+            uint64_t current_lba = lba + sector_index;
+            uint8_t command[16] = {0xa8}; // SCSI READ(12), bounded optical blocks.
             command[2] = (uint8_t)(current_lba >> 24);
             command[3] = (uint8_t)(current_lba >> 16);
             command[4] = (uint8_t)(current_lba >> 8);
             command[5] = (uint8_t)current_lba;
-            command[9] = 1;
+            command[6] = (uint8_t)(blocks >> 24);
+            command[7] = (uint8_t)(blocks >> 16);
+            command[8] = (uint8_t)(blocks >> 8);
+            command[9] = (uint8_t)blocks;
             if (ide_packet_read(base, drive_select, ide_devices[drive].packet_bytes, command,
-                                buffer + sector_index * ide_devices[drive].sector_size,
-                                ide_devices[drive].sector_size)) return -1;
-            continue;
+                                buffer + sector_index * block_bytes, blocks * block_bytes)) return -1;
+            sector_index += blocks;
         }
+        return 0;
+    }
+
+    for (size_t sector_index = 0; sector_index < size; sector_index++) {
+        uint64_t current_lba = lba + sector_index;
         if (current_lba > 0x0fffffffULL) return -1;
 
         // 等待就绪

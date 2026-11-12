@@ -11,6 +11,8 @@ namespace installer
 // this object. A published or quarantined lifetime remains reserved to reboot.
 // Unpublished retain/release is boot-serialized. After publication metadata is
 // immutable; cross-thread validation and atomic quarantine are permitted.
+// The explicit read_only_stream mode requires real unwritable media and keeps
+// an exclusion lease that permits bounded trusted source reads from workers.
 struct SourceLifetime
 {
     XJ_INSTALLER_SOURCE identity;
@@ -19,9 +21,10 @@ struct SourceLifetime
     const void *owner;
     uint64_t owner_tid;
     unsigned state;
+    bool read_only_stream;
 };
 
-int retain_source(const XJ_INSTALLER_SOURCE &, SourceLifetime *);
+int retain_source(const XJ_INSTALLER_SOURCE &, SourceLifetime *, bool read_only_stream = false);
 // Cross-thread metadata/lifetime reauthentication; never transfers I/O rights.
 int validate_source(const SourceLifetime &);
 // Publish only source retention. This does not make an installer session Ready.

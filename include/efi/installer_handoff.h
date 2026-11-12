@@ -30,8 +30,12 @@ typedef __UINT64_TYPE__ XJ_IH_U64;
 #define XJ_INSTALLER_VOLUME_CD 3U
 #define XJ_INSTALLER_FORMAT_PAK1 1U
 #define XJ_INSTALLER_FORMAT_PAK2 2U
+#define XJ_INSTALLER_FORMAT_DUAL 3U
+#define XJ_INSTALLER_FORMAT_STREAM_INDEX 4U
 #define XJ_INSTALLER_PROFILE_FAT32_PAK1 1U
 #define XJ_INSTALLER_PROFILE_EXT4_PAK2 2U
+#define XJ_INSTALLER_PROFILE_DUAL 3U
+#define XJ_INSTALLER_PROFILE_STREAM_INDEX 4U
 
 typedef struct XJ_INSTALLER_PCI_LOCATION
 {
@@ -298,7 +302,9 @@ static inline int xj_installer_handoff_valid(const XJ_INSTALLER_HANDOFF *handoff
         !handoff->loader_image_physical || !handoff->loader_image_bytes ||
         handoff->loader_image_physical > (~(XJ_IH_U64)0) - handoff->loader_image_bytes ||
         (handoff->system_profile != XJ_INSTALLER_PROFILE_FAT32_PAK1 &&
-         handoff->system_profile != XJ_INSTALLER_PROFILE_EXT4_PAK2) ||
+         handoff->system_profile != XJ_INSTALLER_PROFILE_EXT4_PAK2 &&
+         handoff->system_profile != XJ_INSTALLER_PROFILE_DUAL &&
+         handoff->system_profile != XJ_INSTALLER_PROFILE_STREAM_INDEX) ||
         !xj_installer_bytes_zero(handoff->reserved, sizeof(handoff->reserved)) ||
         !xj_installer_package_span_valid(&handoff->root) ||
         !xj_installer_package_span_valid(&handoff->system) ||

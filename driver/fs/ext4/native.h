@@ -46,7 +46,8 @@ public:
     void reset();
     int mount(Reader reader, void *context, uint64_t bytes);
     int read_inode(uint32_t number, Inode &inode) const;
-    int read(const Inode &inode, uint64_t offset, void *output, Size length, Size &completed) const;
+    int read(const Inode &inode, uint64_t offset, void *output, Size length, Size &completed,
+             unsigned maximum_transfer_blocks = 1) const;
     // Visitor: zero continues; positive stops successfully; negative is returned.
     int list_directory(const Inode &inode, DirectoryVisitor visitor, void *context) const;
     int lookup(const Inode &directory, const char *name, Inode &inode) const;

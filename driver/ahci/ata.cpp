@@ -92,7 +92,10 @@ static void sata_submit_safe(struct hba_device *dev, struct blkio_req *io_req)
         io_req->status = ahci_fail_port(port, -EIO);
         return;
     }
-    delay_us_hp(50);
+    // ahci_send_command waits for CI/SACT completion, settled BSY/DRQ and final
+    // error status under the original deadline. The fence and exact PRDBC
+    // check above complete the DMA handoff; no fixed post-completion wait is
+    // needed. FLUSH CACHE remains a separate command and durability boundary.
     io_req->status = 0;
 }
 

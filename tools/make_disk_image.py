@@ -89,14 +89,25 @@ def parse_root_binding(data: bytes) -> dict:
         raise ValueError("root binding must contain exactly 96 bytes")
     magic, version, size, disk, root, esp, filesystem, kernel_size, kernel_crc, checksum = struct.unpack(
         "<8sII16s16s16s16sQII", data)
-    if magic != b"XJROOT01" or version != 1 or size != ROOT_BINDING_SIZE or crc32c(data[:92]) != checksum:
+    if magic != b"XJROOT01" or version not in (1, 2) or size != ROOT_BINDING_SIZE or crc32c(data[:92]) != checksum:
         raise ValueError("invalid root binding header/checksum")
     result = {"disk_guid": uuid.UUID(bytes_le=disk), "root_guid": uuid.UUID(bytes_le=root),
               "esp_guid": uuid.UUID(bytes_le=esp), "filesystem_uuid": uuid.UUID(bytes=filesystem),
               "kernel_size": kernel_size, "kernel_crc32c": kernel_crc}
     # Reuse the field-level checks without assuming UUID generation versions.
-    root_binding(result["disk_guid"], result["root_guid"], result["esp_guid"], result["filesystem_uuid"],
-                 kernel_size, kernel_crc)
+    if version == 1:
+        root_binding(result["disk_guid"], result["root_guid"], result["esp_guid"], result["filesystem_uuid"],
+                     kernel_size, kernel_crc)
+    else:
+        volume_id, = struct.unpack_from("<I", filesystem)
+        if not volume_id or any(filesystem[4:]) or not kernel_size:
+            raise ValueError("invalid FAT32 binding identity")
+        identities = (result["disk_guid"], result["root_guid"], result["esp_guid"])
+        if len(set(identities)) != 3 or any(not identity.int for identity in identities):
+            raise ValueError("invalid FAT32 binding GPT identities")
+        result["volume_id"] = volume_id
+        result["filesystem_uuid"] = None
+    result["filesystem"] = "ext4" if version == 1 else "fat32"
     return result
 
 
@@ -270,7 +281,8 @@ def verify_gpt(path: Path, layout: list, identities: dict) -> None:
                 raise ValueError("unexpected GPT partition count")
             for entry, (name, first, last, kind) in zip(active, layout):
                 identity = identities["esp" if kind == "ef00" else "root"]
-                expected_type = ESP_TYPE_GUID if kind == "ef00" else ROOT_TYPE_GUID
+                expected_type = (ESP_TYPE_GUID if kind == "ef00" else
+                                 uuid.UUID("ebd0a0a2-b9e5-4433-87c0-68b6b72699c7") if kind == "0700" else ROOT_TYPE_GUID)
                 if entry[:16] != expected_type.bytes_le or entry[16:32] != identity.bytes_le or \
                         struct.unpack_from("<QQ", entry, 32) != (first, last):
                     raise ValueError(f"GPT partition identity/range mismatch: {name}")

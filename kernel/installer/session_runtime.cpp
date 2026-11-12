@@ -7,6 +7,9 @@
 #include <installer/context.h>
 #include <installer/source_lifetime.h>
 #include <installer/jobs.h>
+#include <installer/payloads.h>
+#include <installer/stream_index.h>
+#include <installer/source_reader.h>
 #include <installer_mode.h>
 #include <installer_protocol.h>
 #include <task/pcb.h>
@@ -31,10 +34,14 @@ BOOT_CONFIG saved_config;
 BootPackageProof package_proof;
 TableWorkspace table_workspace;
 uint64_t arena_budget;
-xjpak2::Record *root_records, *system_records;
-xjpak2::Plan root_plan, system_plan;
+xjpak2::Record *root_records, *system_records, *fat32_records;
+xjpak2::Plan root_plan, system_plan, fat32_plan;
+XJ_INSTALLER_PACKAGE_SPAN ext4_span, fat32_span;
 BlockExtent source_extent;
 SourceLifetime retained_source;
+xjinstaller::StreamIndex source_index;
+xjpak2::DataReader source_reader;
+SourceReadContext source_read_context;
 
 struct TableContext
 {
@@ -101,7 +108,8 @@ int refuse(int error)
 }
 
 int validate_package(const XJ_INSTALLER_PACKAGE_SPAN &span, bool legacy,
-                     uint64_t &remaining_budget, xjpak2::Record **records, xjpak2::Plan &plan)
+                     uint64_t &remaining_budget, xjpak2::Record **records, xjpak2::Plan &plan,
+                     const xjpak2::DataReader *reader = nullptr)
 {
     xjpak2::Limits limits;
     if (legacy)
@@ -119,7 +127,8 @@ int validate_package(const XJ_INSTALLER_PACKAGE_SPAN &span, bool legacy,
     if (needed > remaining_budget) return -12;
     *records = needed ? static_cast<xjpak2::Record *>(malloc(needed)) : nullptr;
     if (needed && !*records) return -12;
-    result = xjpak2::validate(bytes, span.bytes, limits, {*records, header.record_count}, plan);
+    result = reader ? xjpak2::validate_indexed(bytes, span.bytes, limits, {*records, header.record_count}, plan, *reader) :
+                      xjpak2::validate(bytes, span.bytes, limits, {*records, header.record_count}, plan);
     if (result < 0)
     {
         free(*records);
@@ -129,6 +138,8 @@ int validate_package(const XJ_INSTALLER_PACKAGE_SPAN &span, bool legacy,
     remaining_budget -= needed;
     return 0;
 }
+
+
 } // namespace
 
 int session_boot_prepare(const BOOT_CONFIG &config, const void *original_config)
@@ -217,14 +228,50 @@ int session_packages_prepare()
     // Boot-thread only; no state/registry lock may cover allocation or parsing.
     uint64_t budget = arena_budget;
     int result = validate_package(saved_config.installer_handoff.root, true, budget, &root_records, root_plan);
+    ext4_span = saved_config.installer_handoff.system;
+    if (result >= 0 && package_proof.profile == XJ_INSTALLER_PROFILE_STREAM_INDEX)
+    {
+        const auto &whole = saved_config.installer_handoff.system;
+        const auto *data = reinterpret_cast<const uint8_t *>(direct_map_base + whole.physical);
+        result = xjinstaller::stream_index_validate(data, whole.bytes,
+                    saved_config.installer_handoff.source.volume_bytes, source_index);
+        if (!result)
+        {
+            source_read_context.source = &retained_source;
+            source_read_context.index = &source_index;
+            source_reader = {read_stream_source, &source_read_context, source_index.data_bytes};
+            ext4_span = {whole.physical + uint64_t(source_index.ext4.data - data), source_index.ext4.size, 0};
+            fat32_span = {whole.physical + uint64_t(source_index.fat32.data - data), source_index.fat32.size, 0};
+            result = validate_package(fat32_span, false, budget, &fat32_records, fat32_plan, &source_reader);
+        }
+    }
+    else if (result >= 0 && package_proof.profile == XJ_INSTALLER_PROFILE_DUAL)
+    {
+        const auto &whole = saved_config.installer_handoff.system;
+        const auto *data = reinterpret_cast<const uint8_t *>(direct_map_base + whole.physical);
+        xj_installer_payloads payloads;
+        if (!xj_installer_split_payloads(data, whole.bytes, &payloads)) result = -22;
+        else
+        {
+            // These subspans are covered by the already proven, page-exclusive
+            // parent span. They never acquire an independent frame lifetime.
+            ext4_span = {whole.physical + uint64_t(payloads.ext4 - data), payloads.ext4_bytes, 0};
+            fat32_span = {whole.physical + uint64_t(payloads.fat32 - data), payloads.fat32_bytes, 0};
+            result = validate_package(fat32_span, true, budget, &fat32_records, fat32_plan);
+        }
+    }
     if (result >= 0)
-        result = validate_package(saved_config.installer_handoff.system,
+        result = validate_package(ext4_span,
                                    package_proof.profile == XJ_INSTALLER_PROFILE_FAT32_PAK1,
-                                   budget, &system_records, system_plan);
+                                   budget, &system_records, system_plan,
+                                   source_reader.read ? &source_reader : nullptr);
     if (result < 0)
     {
         free(root_records);
         free(system_records);
+        free(fat32_records);
+        fat32_records = nullptr;
+        fat32_plan = {};
         root_records = system_records = nullptr;
         root_plan = {};
         system_plan = {};
@@ -244,7 +291,9 @@ bool session_snapshot(SessionSnapshot *output)
     output->profile = package_proof.profile;
     output->ready = observed == source_retained &&
                     __atomic_load_n(&native_admission, __ATOMIC_ACQUIRE) == 1 &&
-                    package_proof.profile == XJ_INSTALLER_PROFILE_EXT4_PAK2 &&
+                    (package_proof.profile == XJ_INSTALLER_PROFILE_EXT4_PAK2 ||
+                     package_proof.profile == XJ_INSTALLER_PROFILE_DUAL ||
+                     package_proof.profile == XJ_INSTALLER_PROFILE_STREAM_INDEX) &&
                     installer_root_is_tmpfs_ready() && validate_source(retained_source) == 0;
     return true;
 }
@@ -255,7 +304,8 @@ int session_source_prepare()
     // Boot-owned storage survives caller exit. The exclusive source lease
     // prevents deletion/re-registration and excludes every physical alias.
     // Other worker TCBs may validate it but never borrow its I/O authority.
-    int result = retain_source(saved_config.installer_handoff.source, &retained_source);
+    int result = retain_source(saved_config.installer_handoff.source, &retained_source,
+                               package_proof.profile == XJ_INSTALLER_PROFILE_STREAM_INDEX);
     if (result < 0) return refuse(result);
     result = publish_source(&retained_source);
     if (result < 0)
@@ -301,10 +351,19 @@ bool session_job_view(JobSessionView *output)
     output->language = uint32_t(-1);
     output->source = source_node(retained_source);
     output->source_extent = source_extent;
-    output->package = reinterpret_cast<const void *>(direct_map_base + saved_config.installer_handoff.system.physical);
-    output->package_bytes = saved_config.installer_handoff.system.bytes;
+    output->package = reinterpret_cast<const void *>(direct_map_base + ext4_span.physical);
+    output->package_bytes = ext4_span.bytes;
+    if (package_proof.profile == XJ_INSTALLER_PROFILE_DUAL ||
+        package_proof.profile == XJ_INSTALLER_PROFILE_STREAM_INDEX)
+    {
+        output->fat32_package = reinterpret_cast<const void *>(direct_map_base + fat32_span.physical);
+        output->fat32_package_bytes = fat32_span.bytes;
+    }
+    output->source_reader = source_reader;
     output->ready = __atomic_load_n(&native_admission, __ATOMIC_ACQUIRE) == 1 &&
-                    package_proof.profile == XJ_INSTALLER_PROFILE_EXT4_PAK2 &&
+                    (package_proof.profile == XJ_INSTALLER_PROFILE_EXT4_PAK2 ||
+                     package_proof.profile == XJ_INSTALLER_PROFILE_DUAL ||
+                     package_proof.profile == XJ_INSTALLER_PROFILE_STREAM_INDEX) &&
                     installer_root_is_tmpfs_ready();
     return output->source != nullptr;
 }
@@ -338,6 +397,9 @@ int session_validate_job_view(const JobSessionView &view)
         view.components != current.components || view.language != current.language ||
         view.source != current.source || view.package != current.package ||
         view.package_bytes != current.package_bytes ||
+        view.fat32_package != current.fat32_package || view.fat32_package_bytes != current.fat32_package_bytes ||
+        view.source_reader.read != current.source_reader.read || view.source_reader.context != current.source_reader.context ||
+        view.source_reader.bytes != current.source_reader.bytes ||
         view.source_extent.device != current.source_extent.device ||
         view.source_extent.physical_device != current.source_extent.physical_device ||
         view.source_extent.generation != current.source_extent.generation ||

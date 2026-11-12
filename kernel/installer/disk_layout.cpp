@@ -17,6 +17,15 @@ constexpr uint8_t EspType[16] = {
     0x28, 0x73, 0x2a, 0xc1, 0x1f, 0xf8, 0xd2, 0x11,
     0xba, 0x4b, 0x00, 0xa0, 0xc9, 0x3e, 0xc9, 0x3b
 };
+constexpr uint8_t FatRootType[16] = {
+    0xa2, 0xa0, 0xd0, 0xeb, 0xe5, 0xb9, 0x33, 0x44,
+    0x87, 0xc0, 0x68, 0xb6, 0xb7, 0x26, 0x99, 0xc7
+};
+
+const uint8_t *root_type(const DiskLayout &layout)
+{
+    return layout.filesystem == 1 ? FatRootType : RootType;
+}
 
 uint32_t get32(const uint8_t *p)
 {
@@ -99,6 +108,7 @@ bool valid_layout(const DiskLayout &layout)
     if (layout.esp_first_lba > layout.esp_last_lba ||
         layout.esp_last_lba - layout.esp_first_lba >= uint64_t(-1) / DiskSectorBytes) return false;
     DiskLayoutOptions options;
+    options.filesystem = layout.filesystem;
     options.disk_bytes = layout.disk_bytes;
     options.esp_bytes = (layout.esp_last_lba - layout.esp_first_lba + 1) * DiskSectorBytes;
     copy(options.identities.disk, layout.identities.disk, 16);
@@ -202,14 +212,19 @@ int disk_layout_plan(const DiskLayoutOptions &options, DiskLayout &layout)
 {
     if (!valid_range(&options, sizeof(options)) || !valid_range(&layout, sizeof(layout)) ||
         overlaps(&options, sizeof(options), &layout, sizeof(layout))) return Invalid;
-    if (options.disk_bytes % DiskMiB || options.esp_bytes % DiskMiB ||
+    if ((options.filesystem != 1 && options.filesystem != 2) ||
+        options.disk_bytes % DiskMiB || options.esp_bytes % DiskMiB ||
         options.disk_bytes < 98 * DiskMiB || options.esp_bytes < 64 * DiskMiB ||
         options.esp_bytes > options.disk_bytes - 2 * DiskMiB ||
         options.disk_bytes - 2 * DiskMiB - options.esp_bytes < 32 * DiskMiB ||
         !valid_identities(options.identities)) return Invalid;
+    const uint64_t root_bytes = options.disk_bytes - 2 * DiskMiB - options.esp_bytes;
+    if (options.filesystem == 1 && (root_bytes < 64 * DiskMiB || root_bytes / 512 >= 0x100000000ULL))
+        return Invalid;
     uint64_t total = options.disk_bytes / DiskSectorBytes;
     uint64_t esp_first = total - SectorsPerMiB - options.esp_bytes / DiskSectorBytes;
     layout.disk_bytes = options.disk_bytes;
+    layout.filesystem = options.filesystem;
     layout.total_sectors = total;
     layout.primary_entries_lba = 2;
     layout.backup_entries_lba = total - 1 - TableSectors;
@@ -231,7 +246,7 @@ int disk_layout_build(const DiskLayout &layout, DiskLayoutWorkspace &workspace)
         overlaps(&layout, sizeof(layout), &workspace, sizeof(workspace)) || !valid_layout(layout)) return Invalid;
     make_mbr(layout, workspace.mbr);
     zero(workspace.entries, DiskTableBytes);
-    make_entry(workspace.entries, RootType, layout.identities.root, layout.root_first_lba,
+    make_entry(workspace.entries, root_type(layout), layout.identities.root, layout.root_first_lba,
                layout.root_last_lba, "XJ380");
     make_entry(workspace.entries + DiskEntryBytes, EspType, layout.identities.esp, layout.esp_first_lba,
                layout.esp_last_lba, "ESP");
@@ -258,7 +273,7 @@ int disk_layout_validate(const DiskLayout &layout, const DiskLayoutReadback &rea
     }
     const uint8_t *entries = readback.primary_entries.data;
     if (!check_mbr(layout, readback.mbr.data) || !equal(entries, readback.backup_entries.data, DiskTableBytes) ||
-        !check_entry(entries, RootType, layout.identities.root, layout.root_first_lba, layout.root_last_lba, "XJ380") ||
+        !check_entry(entries, root_type(layout), layout.identities.root, layout.root_first_lba, layout.root_last_lba, "XJ380") ||
         !check_entry(entries + DiskEntryBytes, EspType, layout.identities.esp, layout.esp_first_lba,
                      layout.esp_last_lba, "ESP") ||
         !zeros(entries + 2 * DiskEntryBytes, DiskTableBytes - 2 * DiskEntryBytes))

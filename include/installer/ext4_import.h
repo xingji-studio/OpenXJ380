@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Trusted fresh native-ext4 importer; no pathname/VFS or archive dependency.
 #include <installer/package.h>
+#include <installer/progress.h>
 
 namespace xjext4 {
 struct WriteDevice;
@@ -87,18 +88,25 @@ struct Ext4ImportWorkspace
     uint8_t uuid[16];
     uint8_t super[1024];
     uint8_t scratch[4096];
+    uint8_t source_buffer[131072];
     char name[256];
     char attribute_name[256];
     bool used;
     bool stopped;
+    ProgressObserver progress;
+    xjpak2::DataReader source;
 };
 
-// Pure memory preparation: PAK2 only, complete package, default user.* policy.
+// Pure memory preparation: PAK2 only, complete package or indexed metadata,
+// default user.* policy. An optional reader expands indexed regular payloads;
+// preparation validates metadata and source bounds without source I/O. Its
+// context must remain pinned through success, or reboot after writer failure.
 // Records and ordinal maps are supplied by the caller. Native factory
 // lost+found inode 11 is retained; an explicit /lost+found must be a DIRECTORY
 // and reuses it. Symlink user xattrs are rejected before any target operation.
 int ext4_import_prepare(const uint8_t *, Size, const xjpak2::Limits &,
-                        Ext4ImportWorkspace &, Ext4ImportRequirements &);
+                        Ext4ImportWorkspace &, Ext4ImportRequirements &,
+                        const xjpak2::DataReader *source = nullptr);
 
 // Conservative fresh-volume upper budget, not a reservation or space guarantee.
 // The native formatter's free blocks and inodes-11 may be supplied before format.
@@ -106,6 +114,8 @@ int ext4_import_check_budget(const Ext4ImportRequirements &, uint32_t block_size
                              uint64_t free_blocks, uint32_t free_inodes);
 
 // Caller retains an exclusive pinned offline device and immutable package.
+// Indexed callers must check every source CRC before destructive target I/O.
+// Copying rechecks each streamed file CRC to detect a later source change.
 // Requires a freshly formatted native 4KiB/256-byte-inode profile; no recovery,
 // repair, component selection, existing-tree overwrite or boot publication.
 // Revalidates package/maps and fresh target before WS's first flush/write, and
@@ -115,6 +125,7 @@ int ext4_import_check_budget(const Ext4ImportRequirements &, uint32_t block_size
 // Success alone closes the writer. Partial committed trees are not rolled back.
 int ext4_import_apply_fresh(const xjext4::WriteDevice &, uint64_t operation_seconds,
                             Ext4ImportWorkspace &, Ext4ImportStatus &,
-                            const xjext4::WriteStorage *storage = nullptr);
+                            const xjext4::WriteStorage *storage = nullptr,
+                            const ProgressObserver *progress = nullptr);
 
 } // namespace xjinstaller

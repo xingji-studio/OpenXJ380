@@ -19,7 +19,7 @@ struct JournalTransaction
     void *context;
     bool (*read)(void *context, unsigned index, void *output);
     // Optional indexed lookup for a large recovery overlay. Mutable commits
-    // contain at most sixteen images and may leave this callback null.
+    // contain at most 64 images and may leave this callback null.
     bool (*find)(void *context, uint64_t block, unsigned &index);
 };
 
@@ -71,6 +71,10 @@ struct JournalDevice
     // contiguous physical blocks. Zero/one retains the original single-block
     // contract. A failed multi-block write may have persisted any subset.
     uint32_t maximum_transfer_blocks;
+    // Zero keeps the ordinary sixteen-image contract. Fresh 4 KiB importers
+    // may opt into 64 images with caller-owned workspace. Recovery always
+    // accepts complete supported on-disk transactions, independent of this cap.
+    uint32_t maximum_updates;
 };
 
 struct BlockUpdate
@@ -83,6 +87,7 @@ class Journal
 {
 public:
     static constexpr unsigned kMaximumUpdates = 16;
+    static constexpr unsigned kExtendedUpdates = 64;
     // Caller storage permits 32768 journal blocks; the allocator-free fallback
     // supports 4096 mapping blocks and sixteen recovery after-images.
     int open(const JournalDevice &device);

@@ -274,6 +274,10 @@ int Journal::open(const JournalDevice &device)
     if (device.mapped_blocks > kMaximumJournalBlocks || (!device.workspace && device.mapped_blocks > 4096))
         return -EOPNOTSUPP;
     device_ = device;
+    if (!device_.maximum_updates) device_.maximum_updates = kMaximumUpdates;
+    if (device_.maximum_updates != kMaximumUpdates &&
+        (device_.maximum_updates != kExtendedUpdates || !device_.workspace || device_.block_size != 4096))
+        return -EINVAL;
     mapping_ = device.workspace ? device.workspace->mapping : mapping_small_;
     mapping_index_ = device.workspace ? device.workspace->mapping_index : mapping_index_small_;
     mapping_index_mask_ = device.workspace ? JournalWorkspace::kIndexSlots - 1 : 8191;
@@ -318,7 +322,7 @@ int Journal::open(const JournalDevice &device)
     first_ = big32(super_ + 0x14);
     start_ = big32(super_ + 0x1c);
     sequence_ = big32(super_ + 0x18);
-    if (!first_ || first_ >= maximum_ || maximum_ - first_ < kMaximumUpdates + 2 ||
+    if (!first_ || first_ >= maximum_ || maximum_ - first_ < device_.maximum_updates + 2 ||
         (start_ && (start_ < first_ || start_ >= maximum_))) return -EUCLEAN;
     wide_ = (incompatible & 2) != 0;
     checksum_seed_ = crc32c(0xffffffffU, device_.uuid, 16);
@@ -346,7 +350,7 @@ int Journal::commit(const BlockUpdate *updates, unsigned count)
     if (!ready_) return -EINVAL;
     if (failed_) return -EIO;
     if (start_) return -EBUSY;
-    if (!updates || !count || count > kMaximumUpdates) return -EINVAL;
+    if (!updates || !count || count > device_.maximum_updates) return -EINVAL;
     for (unsigned index = 0; index < count; ++index)
     {
         if (!updates[index].bytes || !valid_target(updates[index].block) ||
@@ -359,7 +363,8 @@ int Journal::commit(const BlockUpdate *updates, unsigned count)
             return -EOPNOTSUPP;
     if (device_.validate_transaction)
     {
-        uint64_t targets[kMaximumUpdates];
+        uint64_t small_targets[kMaximumUpdates];
+        uint64_t *targets = device_.workspace ? device_.workspace->targets : small_targets;
         for (unsigned index = 0; index < count; ++index) targets[index] = updates[index].block;
         CommitImages images = {updates, count, device_.block_size};
         JournalTransaction transaction = {targets, count, device_.block_size, &images, read_commit_image, nullptr};

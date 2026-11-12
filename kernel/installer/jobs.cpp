@@ -89,14 +89,17 @@ bool same_session(const JobSessionView &a, const JobSessionView &b)
     return a.ready && b.ready && a.epoch == b.epoch && a.components == b.components &&
            a.profile == b.profile && a.language == b.language && a.source == b.source &&
            same_extent(a.source_extent, b.source_extent) && a.package == b.package &&
-           a.package_bytes == b.package_bytes;
+           a.package_bytes == b.package_bytes && a.fat32_package == b.fat32_package &&
+           a.fat32_package_bytes == b.fat32_package_bytes && a.source_reader.read == b.source_reader.read &&
+           a.source_reader.context == b.source_reader.context && a.source_reader.bytes == b.source_reader.bytes;
 }
 
 int current_session(JobSessionView *output)
 {
     *output = {};
     if (!session_job_view(output) || !output->ready || !output->epoch) return -ENODEV;
-    if (output->profile != XJ_INSTALLER_PROFILE_EXT4_PAK2 ||
+    if ((output->profile != XJ_INSTALLER_PROFILE_EXT4_PAK2 && output->profile != XJ_INSTALLER_PROFILE_DUAL &&
+         output->profile != XJ_INSTALLER_PROFILE_STREAM_INDEX) ||
         output->components != XJ380_INSTALLER_COMPONENT_ALL) return -EOPNOTSUPP;
     if (!output->source || !output->package || !output->package_bytes) return -EINVAL;
     return session_validate_job_view(*output);
@@ -286,6 +289,8 @@ int jobs_queue(JobHandle target_handle, const JobRequest *request, JobHandle *ou
     if (error) return error;
     if (snapshot.mode != XJ380_INSTALLER_MODE_FRESH || snapshot.language != session.language ||
         snapshot.components != session.components) return -EOPNOTSUPP;
+    if (snapshot.filesystem != 1 && snapshot.filesystem != 2) return -EOPNOTSUPP;
+    if (snapshot.filesystem == 1 && (!session.fat32_package || !session.fat32_package_bytes)) return -EOPNOTSUPP;
     Target *target;
     Job *job = nullptr;
     {
@@ -431,9 +436,22 @@ int jobs_run(JobHandle handle)
     if (!error && !same_session(job->session, current)) error = -ESTALE;
     if (!error) error = validate_target(job->target, current);
     xjinstaller::FactoryStatus status = {};
+    auto progress_update = [](void *opaque, const xjinstaller::InstallProgress &progress)
+    {
+        auto *job = static_cast<Job *>(opaque);
+        RegistryLock lock;
+        if (job->internal == InternalState::Published && job->snapshot.state == JobState::Running &&
+            xjinstaller::progress_permille(progress) >= xjinstaller::progress_permille(job->snapshot.progress))
+            job->snapshot.progress = progress;
+    };
+    xjinstaller::FactoryOptions options = job->request.factory;
+    options.filesystem = job->request.filesystem;
+    options.progress = {progress_update, job};
+    options.source_reader = job->session.source_reader;
     if (!error)
-        error = installer_build_ext4_disk(job->target.node, job->source_pin, &job->request.factory,
-                                          job->session.package, job->session.package_bytes, &status);
+        error = installer_build_ext4_disk(job->target.node, job->source_pin, &options,
+            options.filesystem == 1 ? job->session.fat32_package : job->session.package,
+            options.filesystem == 1 ? job->session.fat32_package_bytes : job->session.package_bytes, &status);
     if (!error && (!status.complete || !status.activation_durable || status.io_failed || status.quarantined))
     {
         error = -EIO;

@@ -34,8 +34,8 @@ See [the package contract](INSTALLER_PACKAGES.md).
 
 ## Writable feature and durability boundaries
 
-- Writable sessions share a 32-entry clean read cache for home blocks and
-  journal images in caller-owned workspace storage (128 KiB data maximum).
+- Writable sessions share a 128-entry clean read cache for home blocks and
+  journal images in caller-owned workspace storage (512 KiB data maximum).
   Overlay after-images take priority; every attempted write invalidates its
   affected cache blocks first. A cold read failure also blocks subsequent warm
   cache reads and mutations. Large/cross-block reads retain direct backend I/O;
@@ -68,7 +68,7 @@ See [the package contract](INSTALLER_PACKAGES.md).
   superblock flags select signedness. Unknown selectors or conflicting flags
   are refused before writes.
   Symlink text is limited to one filesystem block minus its terminating NUL.
-- Each complete journal transaction contains at most 16 block after-images,
+- Ordinary complete journal transactions contain at most 16 block after-images,
   including data, inode tables, bitmaps, group descriptors and the superblock.
   Large writes may return a committed prefix; they are not atomic as a whole.
   Namespace operations commit once or fail before device writes when metadata
@@ -81,6 +81,11 @@ See [the package contract](INSTALLER_PACKAGES.md).
   supported zero-link orphan deletion before publication; explicit read-only
   mount refuses pending orphans. Malformed chains and still-named zero-link
   victims are refused before recovery writes.
+  The fresh 4 KiB installer explicitly opts into 64 after-images and 128 KiB
+  data chunks using caller-owned heap workspace. Ordinary mutation admission
+  remains at 16 images; native recovery accepts the larger supported records.
+  Both profiles retain the same six commit flush barriers. Linux and native
+  recovery tests cover 17-, 33- and 64-image commits, including escaped data.
 - Growth may create sparse holes. Partial-block shrink/extension clears stale
   tail bytes; newly allocated blocks are initialized before publication.
 - An open file survives unlink or rename replacement with its inode identity and
@@ -206,6 +211,25 @@ writer start retains the complete lifetime without close/retry or clearing
 RECOVER; backend failure stops all further I/O. Successful completion alone
 closes the writer and releases resources. Existing-target repair and keep-users
 remain separate policies.
+
+Fresh import applies all EAs before one final owner/mode/mtime transaction per
+canonical inode, restoring parent times after descendants. Ownership-only
+updates still clear privilege bits; an explicit combined mode is applied last.
+Each transaction retains the complete after-state guard. Clean before-image
+reads use the invalidating cache. A successful guarded checkpoint refreshes and
+checks every final group descriptor while reusing immutable sorted ownership
+ranges and the pinned journal mapping. Journal inode identity and block-map
+bytes remain checked; the guard forbids changing journal index/data blocks and
+proves they remain allocated. Initial open and recovery rebuild and check the
+full layout and every journal mapping.
+
+Independent final package readback remains uncached by the writer and checks
+every byte, name, inode identity, attribute and allocation checksum/counter.
+It may gather up to 32 physically adjacent mapped blocks (128 KiB), validating
+each mapping and splitting at holes, unwritten extents, gaps and EOF. Ordinary
+VFS readers retain their single-block contract. Bounded format/import/readback
+callbacks publish real work progress; allocation and full namespace census
+must finish before verification progress reaches completion.
 
 Formatter parameter/layout validation precedes I/O. A real flush preflight precedes
 the first destructive write. The formatter invalidates primary/new-profile

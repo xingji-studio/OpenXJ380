@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Original read-only fresh native-ext4 package readback; no archive dependency.
 #include <installer/package.h>
+#include <installer/progress.h>
 
 namespace xjext4 { class Volume; }
 
@@ -44,11 +45,13 @@ struct Ext4VerifyWorkspace
     xjpak2::Plan plan;
     Ext4VerifyDevice io;
     Ext4VerifyStatus status;
-    uint8_t uuid[16], super[1024], scratch[4096], descriptor[64];
+    uint8_t uuid[16], super[1024], scratch[131072], descriptor[64];
+    uint8_t expected[131072];
     char name[256], path[4096];
     uint32_t current_directory, current_inode, current_parent, current_record;
     uint32_t dot_entries, xattr_entries;
     bool missing_lost_found, lost_found_seen, used, stopped;
+    ProgressObserver progress;
 };
 
 // Revalidates complete PAK2 and independently rebuilds ordinal/parent maps
@@ -61,8 +64,13 @@ struct Ext4VerifyWorkspace
 // ownership audit. The caller owns device exclusivity/generation and real-flush
 // policy; this API has no write/flush callback and publishes no boot metadata.
 // One-shot after target reads start; first backend failure stops all reads.
+// The optional indexed source remains pinned for the complete call. Expected
+// bytes use a bounded buffer; target bytes must also match the index CRC. The
+// first source error stops both source and target callbacks, without cleanup I/O.
 int ext4_verify_package(const uint8_t *package, Size package_bytes, const xjpak2::Limits &,
                          const Ext4VerifyDevice &, const uint8_t expected_uuid[16],
-                         Ext4VerifyWorkspace &, Ext4VerifyStatus *status = nullptr);
+                         Ext4VerifyWorkspace &, Ext4VerifyStatus *status = nullptr,
+                         const ProgressObserver *progress = nullptr,
+                         const xjpak2::DataReader *source = nullptr);
 
 } // namespace xjinstaller

@@ -7,11 +7,12 @@ typedef __UINT32_TYPE__ xj_inst_native_u32;
 typedef __UINT64_TYPE__ xj_inst_native_u64;
 typedef __INT64_TYPE__ xj_inst_native_i64;
 
-#define XJ_INST_NATIVE_VERSION 1U
+#define XJ_INST_NATIVE_VERSION 2U
 #define XJ_INST_NATIVE_SYSCALL 128956723895689229ULL
 #define XJ_INST_NATIVE_MAX_TARGETS 32U
 #define XJ_INST_NATIVE_NAME_BYTES 64U
 #define XJ_INST_NATIVE_FILESYSTEM_EXT4 2U
+#define XJ_INST_NATIVE_FILESYSTEM_FAT32 1U
 #define XJ_INST_NATIVE_MODE_FRESH 0U
 #define XJ_INST_NATIVE_LANGUAGE_PACKAGE 0xffffffffU
 #define XJ_INST_NATIVE_COMPONENTS_FULL 15ULL
@@ -27,6 +28,7 @@ typedef __INT64_TYPE__ xj_inst_native_i64;
 #define XJ_INST_NATIVE_INFO_SESSION 1ULL
 #define XJ_INST_NATIVE_INFO_READY 2ULL
 #define XJ_INST_NATIVE_INFO_EXT4 4ULL
+#define XJ_INST_NATIVE_INFO_FAT32 8ULL
 #define XJ_INST_NATIVE_TARGET_WRITABLE 1U
 #define XJ_INST_NATIVE_TARGET_FLUSH 2U
 #define XJ_INST_NATIVE_LIST_CAPACITY_REACHED 1U
@@ -42,6 +44,20 @@ typedef __INT64_TYPE__ xj_inst_native_i64;
 #define XJ_INST_NATIVE_JOB_IO_FAILED 4ULL
 #define XJ_INST_NATIVE_JOB_ACTIVATION_ATTEMPTED 8ULL
 #define XJ_INST_NATIVE_JOB_ACTIVATION_DURABLE 16ULL
+
+#define XJ_INST_NATIVE_STAGE_NONE 0U
+#define XJ_INST_NATIVE_STAGE_PREFLIGHT 1U
+#define XJ_INST_NATIVE_STAGE_PARTITIONING 2U
+#define XJ_INST_NATIVE_STAGE_FORMATTING 3U
+#define XJ_INST_NATIVE_STAGE_DIRECTORIES 4U
+#define XJ_INST_NATIVE_STAGE_COPYING 5U
+#define XJ_INST_NATIVE_STAGE_LINKS 6U
+#define XJ_INST_NATIVE_STAGE_METADATA 7U
+#define XJ_INST_NATIVE_STAGE_BUILDING_ESP 8U
+#define XJ_INST_NATIVE_STAGE_VERIFYING_ROOT 9U
+#define XJ_INST_NATIVE_STAGE_VERIFYING_ESP 10U
+#define XJ_INST_NATIVE_STAGE_ACTIVATING 11U
+#define XJ_INST_NATIVE_STAGE_COMPLETE 12U
 
 typedef struct xj_inst_native_header
 {
@@ -98,6 +114,8 @@ typedef struct xj_inst_native_job
     xj_inst_native_u32 state, phase;
     xj_inst_native_i64 error;
     xj_inst_native_u64 flags, read_bytes, written_bytes, package_records, package_data_bytes;
+    xj_inst_native_u64 completed_units, total_units;
+    xj_inst_native_u32 progress_stage, progress_permille;
 } xj_inst_native_job;
 
 static inline void xj_inst_native_initialize(void *object, __SIZE_TYPE__ bytes)

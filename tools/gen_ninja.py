@@ -729,7 +729,8 @@ def main() -> None:
     kernel_objs += auth_crypto_objects(n)
     n.build("out/BOOTX64.efi", "boot", ["boot/bootx64.c", "boot/bootlib.c"],
             implicit=find_files("boot/include", (".h",)) +
-                     [Path("include/efi/root_binding.h"), Path("include/efi/installer_handoff.h")])
+                     [Path("include/efi/root_binding.h"), Path("include/efi/installer_handoff.h"),
+                      Path("include/installer/payloads.h")])
     n.build("font/hankaku.o", "objcopy_bin", "font/hankaku.bin", variables={"bin_input": "./font/hankaku.bin"})
     n.build("out/kernel.krl", "kernel_link", kernel_objs + [Path("font/hankaku.o"), Path("liballoc-x86_64.a")], implicit=["linker.ld"])
     compliance_bundle = Path("out/compliance/third-party/MANIFEST.json")

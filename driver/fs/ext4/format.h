@@ -53,6 +53,12 @@ struct FormatGroupLocation
     uint32_t block_bitmap, inode_bitmap, inode_table;
 };
 
+struct FormatProgress
+{
+    void (*update)(void *, uint64_t completed, uint64_t total);
+    void *context;
+};
+
 // Caller-owned heap storage (537600 bytes), never a kernel/interrupt stack.
 // No host/kernel allocator or third-party archive is needed.
 // allocated remains scratch storage for existing factory callers. Geometry
@@ -91,6 +97,6 @@ int plan_format(const Ext4FormatDevice &, const FormatOptions &, FormatWorkspace
 // This initializes the new profile's metadata, not every historic filesystem
 // signature or unallocated data block. It is not a secure erase.
 int format(const Ext4FormatDevice &, const FormatOptions &, FormatWorkspace &, FormatGeometry &,
-           const FormatStorage *storage = nullptr);
+           const FormatStorage *storage = nullptr, const FormatProgress *progress = nullptr);
 
 } // namespace xjext4

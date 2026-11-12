@@ -6,6 +6,7 @@
 #include "krlibc.h"
 #include <efi/boot.h>
 #include <fs/ext4/ext4.h>
+#include <installer/fat32.h>
 #include <ioctl.h>
 #include <dlinker.h>
 #include <block_access.h>
@@ -810,7 +811,8 @@ static int partition_select_bound_root(const XJ_ROOT_BINDING &binding, size_t &r
     if (!xj_root_binding_valid(&binding) || !partition_guid_present(xj_root_binding_disk_guid(&binding)) ||
         !partition_guid_present(xj_root_binding_root_guid(&binding)) ||
         !partition_guid_present(xj_root_binding_esp_guid(&binding)) ||
-        !partition_guid_present(xj_root_binding_ext4_uuid(&binding))) return -EINVAL;
+        (xj_root_binding_filesystem(&binding) == XJ_ROOT_FILESYSTEM_EXT4 &&
+         !partition_guid_present(xj_root_binding_ext4_uuid(&binding)))) return -EINVAL;
     if (!partition_inventory_complete) return -EUCLEAN;
     size_t disk_id = 0, disk_matches = 0, root_matches = 0, esp_matches = 0, esp_index = 0;
     for (size_t i = 0; i < 256; ++i)
@@ -843,11 +845,14 @@ static int partition_select_bound_root(const XJ_ROOT_BINDING &binding, size_t &r
                                            0x8e, 0x79, 0x3d, 0x69, 0xd8, 0x47, 0x7d, 0xe4};
     static const uint8_t esp_type[16] = {0x28, 0x73, 0x2a, 0xc1, 0x1f, 0xf8, 0xd2, 0x11,
                                          0xba, 0x4b, 0x00, 0xa0, 0xc9, 0x3e, 0xc9, 0x3b};
+    static const uint8_t fat_type[16] = {0xa2, 0xa0, 0xd0, 0xeb, 0xe5, 0xb9, 0x33, 0x44,
+                                        0x87, 0xc0, 0x68, 0xb6, 0xb7, 0x26, 0x99, 0xc7};
+    const uint8_t *root_type = xj_root_binding_filesystem(&binding) == XJ_ROOT_FILESYSTEM_FAT32 ? fat_type : linux_type;
     const partition_t &root = partitions[root_index], &esp = partitions[esp_index];
     if (root_index == esp_index || root.vdisk_id != disk_id || esp.vdisk_id != disk_id ||
         memcmp(root.disk_guid, xj_root_binding_disk_guid(&binding), 16) ||
         memcmp(esp.disk_guid, xj_root_binding_disk_guid(&binding), 16) ||
-        memcmp(root.partition_type_guid, linux_type, 16) || memcmp(esp.partition_type_guid, esp_type, 16))
+        memcmp(root.partition_type_guid, root_type, 16) || memcmp(esp.partition_type_guid, esp_type, 16))
         return -EUCLEAN;
     return 0;
 }
@@ -864,7 +869,8 @@ static int partition_mount_bound_root(const XJ_ROOT_BINDING &binding)
     if (length < 0 || size_t(length) >= sizeof(path)) return -ENAMETOOLONG;
     // The adapter verifies UUID and kernel contents against the initial clean
     // or recovered overlay before its first flush/RECOVER/replay home write.
-    return ext4fs_mount_bound_root(path, &binding);
+    return xj_root_binding_filesystem(&binding) == XJ_ROOT_FILESYSTEM_FAT32 ?
+        fatfs_mount_bound_root(path, &binding) : ext4fs_mount_bound_root(path, &binding);
 }
 
 [[noreturn]] static void root_mount_halt()
@@ -879,10 +885,11 @@ void mount_root()
         int error = partition_mount_bound_root(EFI_BC->root_binding);
         if (!error)
         {
-            pr_info("Mount bound ext4 root OK\n");
+            pr_info("Mount bound %s root OK\n", xj_root_binding_filesystem(&EFI_BC->root_binding) ==
+                    XJ_ROOT_FILESYSTEM_FAT32 ? "FAT32" : "ext4");
             return;
         }
-        pr_warn("Bound ext4 root refused: %d (no legacy fallback)\n", error);
+        pr_warn("Bound root refused: %d (no legacy fallback)\n", error);
         root_mount_halt();
     }
     for (uint64_t i = 0; i < partition_num; i++)
