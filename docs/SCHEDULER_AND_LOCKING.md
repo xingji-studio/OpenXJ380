@@ -31,6 +31,26 @@ in `kernel/task/scheduler.cpp` are intentional ABI checks. New per-CPU state
 belongs after those assembly fields unless every assembly offset is reviewed
 and updated together.
 
+Each AP must restore the BSP's MTRR/PAT snapshot and clear CR0.CD/NW before
+LAPIC calibration or runnable task publication. INIT leaves the AP's caches
+disabled; the trampoline and FPU setup do not enable them. `mtrr_save()` records
+the exact BSP default memory type, enable bits and optional fixed/PAT state.
+`mtrr_restore()` runs only during AP startup with IRQs disabled, flushes cache
+and TLB state (including global translations), restores supported memory-type
+MSRs, and enables caching while preserving other CR0/CR4 bits. Do not use it as
+a live runtime MTRR reconfiguration API.
+
+`tests/test_cpu_cache_init.py` checks the production restore sequence against
+traced register adapters. `python3 tests/run_cpu_cache_qemu.py` checks actual
+CR0 on all four CPUs after application startup; `--accel kvm` uses normal KVM
+device permissions. The runner changes only a temporary image. TCG checks
+architectural state but does not establish real cache-performance gains. KVM
+handling of guest cache controls also varies by host/backend configuration;
+do not infer a measured speedup solely from register values. See the
+[Intel SDM](https://cdrdv2-public.intel.com/868137/325462-089-sdm-vol-1-2abcd-3abcd-4.pdf)
+cache-control/MTRR sections and the
+[KVM memory-type policy](https://github.com/torvalds/linux/blob/v6.8/arch/x86/kvm/vmx/vmx.c#L7109).
+
 Terminal status alone does not make a task or process reclaimable. The timer
 publishes its selected task under the CPU queue lock before releasing that
 lock. When it publishes a new `current_task`, it retains the previous stack
@@ -118,6 +138,22 @@ blocking mutex while holding a spin lock. Never do blocking work with scheduler
 preemption disabled. If a protected operation needs a large copy or allocation,
 capture/pin the required state, release the spin lock, do the work, then
 validate the generation/lifetime before publishing the result.
+
+Mmap address selection and VMA publication, munmap VMA/lazy/PTE teardown, brk
+and mprotect use the same preemptible memory-operation mutex. Range search reads
+the mutable VMA list and cursor, so it belongs inside that scope as well as
+insertion/removal. Descriptor acquisition precedes the mutex, and all errors
+release it before FD-operation destruction. Never replace this blocking scope
+with a spin lock: VMA allocation, lazy metadata and frame reclamation may allocate
+or free memory. Concurrent TLS callback mappings and joins exercise this boundary.
+The gate lives with lazy allocation and is recursive, covering reservation
+lookup/split/merge/removal as well. User-copy or VFS work can fault from an
+existing memory-operation scope. A not-present user fault may wait/allocate
+only with inherited preemption depth zero; restore that depth before the slow
+path and close IRQs before exception return. Its private exception/FPU frame
+must remain intact across scheduling. Initialize a new frame through HHDM
+before publishing a present user PTE, and recheck pages another CPU already
+faulted in. Protection faults must not enter this allocation path.
 
 ## Runtime serial transport
 
@@ -272,6 +308,21 @@ message nodes under the queue lock and frees detached nodes after unlocking.
 code must not read or write the message afterward. Queue enqueue routines copy
 the node index before unlocking because a consumer may remove and free the node
 immediately.
+
+CLONE_THREAD creation uses the same preparation transaction as native user
+threads. The caller's register frame and CLONE_SETTLS base are copied into the
+private draft; user TID stores occur outside the publication lock and are
+withdrawn on failure. A user-supplied clone stack is never owned by the kernel
+thread draft. Preserve the selector-zero rule for an explicit user FS base.
+
+Clearing a child TID is a user TLS/stack reclamation boundary. `kill_thread()`
+marks terminal state only. The reaper clears TIDs after scheduler references
+show quiescence, including workers in otherwise live processes. Its scan links
+a preallocated preparation ticket under create-thread/process-list/preparation
+locks, drops those locks, checks CPU references, then performs user-memory I/O.
+Collection and exec must keep respecting that ticket. Individual kernel TCBs
+retain the existing process-collection lifetime; a cleared TID does not mean a
+raw TCB pointer is free to reclaim or retain outside its own lifetime protocol.
 
 Known limitation: simultaneous `execve()` from multiple threads in one process
 and stale threads still entering user mode after another thread commits exec

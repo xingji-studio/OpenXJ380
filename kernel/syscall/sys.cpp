@@ -1532,8 +1532,10 @@ sys_(arch_prctl, uint64_t code, uint64_t addr)
     switch (code)
     {
     case ARCH_SET_FS:
+        if (addr != 0 && check_user_overflow(addr, 1)) return SYSCALL_FAULT_(EINVAL);
+        // A selector reload must not replace a native EPF thread's FS base.
+        thread->fs = 0;
         thread->fs_base = addr;
-        if (thread->parent_group != NULL && thread->parent_group->linux_abi && addr != 0) thread->fs = 0;
         write_fsbase(thread->fs_base);
         break;
     case ARCH_GET_FS: return thread->fs_base;
@@ -1850,18 +1852,6 @@ sys_(readv, int fd, struct iovec *iov, int iovcnt0)
     free(kiov);
     return total;
 }
-static mutex_t mm_op_lock = {SPIN_INIT, MUTEX_UNLOCKED, NULL, NULL, 0, false};
-
-static void mm_op_lock_acquire()
-{
-    mutex_lock(&mm_op_lock);
-}
-
-static void mm_op_lock_release()
-{
-    mutex_unlock(&mm_op_lock);
-}
-
 static bool mapped_page_intersects(page_directory_t *pagedir, uint64_t start, uint64_t length)
 {
     if (pagedir == NULL || length == 0) return true;
@@ -2141,27 +2131,9 @@ sys_(mmap, uint64_t addr, size_t length, uint64_t prot, uint64_t flags, int fd,
         start_addr = addr;
         if (check_user_overflow(start_addr, aligned_len)) return SYSCALL_FAULT_(EINVAL);
         end_addr = start_addr + aligned_len;
-    } else {
-        if (process->mmap_start < USER_MMAP_START || process->mmap_start >= USER_BRK_START)
-            process->mmap_start = USER_MMAP_START;
-        uint64_t search_start = addr ? addr : process->mmap_start;
-        if (addr) {
-            start_addr = addr;
-            if (start_addr < USER_MMAP_START || start_addr >= USER_BRK_START ||
-                aligned_len > USER_BRK_START - start_addr) {
-                return SYSCALL_FAULT_(ENOMEM);
-            }
-            end_addr = start_addr + aligned_len;
-            if (!user_range_available(process, start_addr, aligned_len)) {
-                return SYSCALL_FAULT_(ENOMEM);
-            }
-        } else {
-            start_addr = find_user_mmap_range(process, search_start, aligned_len);
-            if (start_addr == 0 && search_start != USER_MMAP_START)
-                start_addr = find_user_mmap_range(process, USER_MMAP_START, aligned_len);
-            if (start_addr == 0) return SYSCALL_FAULT_(ENOMEM);
-            end_addr = start_addr + aligned_len;
-        }
+    } else if (addr) {
+        if (addr < USER_MMAP_START || addr >= USER_BRK_START || aligned_len > USER_BRK_START - addr)
+            return SYSCALL_FAULT_(ENOMEM);
     }
 
     FdOperation mapping_descriptor;
@@ -2175,6 +2147,30 @@ sys_(mmap, uint64_t addr, size_t length, uint64_t prot, uint64_t flags, int fd,
     }
 
     mm_op_lock_acquire();
+
+    // Choosing an address reads the mutable VMA list and mmap cursor. Keep
+    // selection and publication in one preemptible memory-operation scope.
+    if (!(flags & MAP_FIXED)) {
+        if (process->mmap_start < USER_MMAP_START || process->mmap_start >= USER_BRK_START)
+            process->mmap_start = USER_MMAP_START;
+        uint64_t search_start = addr ? addr : process->mmap_start;
+        if (addr) {
+            start_addr = addr;
+            if (!user_range_available(process, start_addr, aligned_len)) {
+                mm_op_lock_release();
+                return SYSCALL_FAULT_(ENOMEM);
+            }
+        } else {
+            start_addr = find_user_mmap_range(process, search_start, aligned_len);
+            if (!start_addr && search_start != USER_MMAP_START)
+                start_addr = find_user_mmap_range(process, USER_MMAP_START, aligned_len);
+            if (!start_addr) {
+                mm_op_lock_release();
+                return SYSCALL_FAULT_(ENOMEM);
+            }
+        }
+        end_addr = start_addr + aligned_len;
+    }
 
     vma_t *vma = vma_alloc();
     if (!vma) {
@@ -2231,13 +2227,7 @@ sys_(mmap, uint64_t addr, size_t length, uint64_t prot, uint64_t flags, int fd,
         return ret;
     }
 
-    uint64_t pt_flags = PTE_USER | PTE_PRESENT | PTE_WRITEABLE;
-
-    if (prot != PROT_NONE) {
-        if (prot & PROT_READ) pt_flags |= PTE_PRESENT;
-        if (prot & PROT_WRITE) pt_flags |= PTE_WRITEABLE;
-        if (!(prot & PROT_EXEC)) pt_flags |= PTE_NO_EXECUTE;
-    }
+    uint64_t pt_flags = prot_to_pte_flags(prot);
 
     if (!lazy_infoalloc(process, start_addr, aligned_len, pt_flags, flags)) {
         vma_unmap_range(mgr, start_addr, end_addr);
@@ -2336,10 +2326,17 @@ sys_(munmap, uint64_t addr, size_t size) {
     uint64_t end   = addr + size;
 
     vma_manager_t *mgr = &get_current_task()->parent_group->vma_manager;
-    if (vma_unmap_range(mgr, start, end) != 0) return SYSCALL_FAULT_(ENOMEM);
+    // munmap must share mmap/mprotect/brk's gate: worker TLS teardown can
+    // remove/free list nodes while another CPU selects or publishes a VMA.
+    mm_op_lock_acquire();
+    if (vma_unmap_range(mgr, start, end) != 0) {
+        mm_op_lock_release();
+        return SYSCALL_FAULT_(ENOMEM);
+    }
 
     unmap_virtual_page(get_current_task()->parent_group, addr, size);
     unmap_page_range(get_current_directory(), addr, size);
+    mm_op_lock_release();
     return 0;
 }
 

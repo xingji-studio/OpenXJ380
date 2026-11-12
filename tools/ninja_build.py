@@ -191,7 +191,39 @@ def stage_linux_compat(root: Path) -> None:
         raise SystemExit(1)
 
 
+def copy_epf_rtld(root: Path) -> None:
+    mkdir(root / "system/lib/epf")
+    mkdir(root / "apps/epf-dynamic-demo")
+    cp(ROOT / "out/ld-epf-x86_64.epf", root / "system/lib/ld-epf-x86_64.epf")
+    cp(ROOT / "out/libepf-demo.eps", root / "system/lib/epf/libepf-demo.eps")
+    for name in ("libepf-runtime.eps", "libepf-tls.eps", "libepf-tls-ie.eps", "libepf-cxx-tls.eps"):
+        cp(ROOT / "out" / name, root / "system/lib/epf" / name)
+    cp(ROOT / "out/epf-tls-demo.epf", root / "apps/epf-dynamic-demo/epf-tls-demo.epf")
+    cp(ROOT / "out/epf-cxx-tls-demo.epf", root / "apps/epf-dynamic-demo/epf-cxx-tls-demo.epf")
+    mkdir(root / "system/include")
+    cp(ROOT / "include/epf_runtime.h", root / "system/include/epf_runtime.h")
+    cp(ROOT / "out/epf-dynamic-demo.epf", root / "apps/epf-dynamic-demo/epf-dynamic-demo.epf")
+    cp(ROOT / "docs/EPF.md", root / "apps/epf-dynamic-demo/README.md")
+
+
+def copy_native_rtld(root: Path) -> None:
+    mkdir(root / "system/lib")
+    for name in ("ld-xj380-x86_64.so.1", "libnative-demo.so.1", "libxapi.so.1",
+                 "libnative-runtime.so.1", "libnative-tls.so.1", "libnative-tls-ie.so.1", "libnative-cxx-tls.so.1"):
+        cp(ROOT / "out" / name, root / "system/lib" / name)
+    mkdir(root / "apps/native-dynamic-demo")
+    cp(ROOT / "out/native-dynamic-demo.elf", root / "apps/native-dynamic-demo/native-dynamic-demo.elf")
+    for name in ("native-tls-demo.elf", "native-cxx-tls-demo.elf"):
+        cp(ROOT / "out" / name, root / "apps/native-dynamic-demo" / name)
+    mkdir(root / "system/include")
+    cp(ROOT / "include/native_runtime.h", root / "system/include/native_runtime.h")
+    cp(ROOT / "out/xapi-shared-demo.elf", root / "apps/native-dynamic-demo/xapi-shared-demo.elf")
+    cp(ROOT / "docs/ELF_DYNAMIC_LINKING.md", root / "apps/native-dynamic-demo/README.md")
+
+
 def copy_system_apps(root: Path) -> None:
+    copy_native_rtld(root)
+    copy_epf_rtld(root)
     system = root / "apps/system/shell"
     mkdir(system)
     cp(ROOT / "out/shell.elf", system / "shell.elf")
@@ -209,6 +241,7 @@ def copy_common_assets(root: Path) -> None:
     cp(ROOT / "driver/fs/ext4/SOURCE.json", ext4_notices)
     cp(ROOT / "driver/fs/ext4/REFERENCES.json", ext4_notices)
     cp(ROOT / "driver/fs/ext4/LWEXT4_BSD_NOTICE.txt", ext4_notices)
+    cp(ROOT / "resources/licenses/es1371.txt", root / "system/licenses/es1371.txt")
 
 
 def copy_modules(root: Path) -> None:
@@ -321,8 +354,10 @@ def vdisk(*, complete: bool, filesystem: str | None = None, image_path: Path | N
     stage_full_system(vdisk_root, include_linux_compat=complete, filesystem=filesystem)
     command = [sys.executable, str(ROOT / "tools/make_disk_image.py"),
                "--root", str(vdisk_root), "--image", str(image), "--fs", filesystem,
-               "--size-mib", env("VDISK_SIZE_MIB", "3072"), "--esp-mib", env("VDISK_ESP_MIB", "64"),
                "--sudo", env("VDISK_SUDO", "")]
+    for variable, option in (("VDISK_SIZE_MIB", "--size-mib"), ("VDISK_ESP_MIB", "--esp-mib")):
+        if variable in os.environ:
+            command += [option, os.environ[variable]]
     if filesystem == "fat32" and os.environ.get("VDISK_FAT_MIB"):
         command += ["--fat-mib", os.environ["VDISK_FAT_MIB"]]
     run(command)

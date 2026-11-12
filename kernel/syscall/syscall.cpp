@@ -440,6 +440,7 @@ extern "C" uint64_t c_syscall_handler(struct X64_REGS *regs, uint64_t user_rsp)
     case SYS_EXIT: sys_exit(regs->rdi, 0, 0, 0, 0, 0, regs); break;
     case SYS_EXIT_GROUP: sys_exit_group(regs->rdi, 0, 0, 0, 0, 0, regs); break;
     case SYS_TGKILL: regs->rax = (uint64_t)sys_tgkill(regs->rdi, regs->rsi, regs->rdx, 0, 0, 0, regs); break;
+    case SYS_SCHED_YIELD: regs->rax = (uint64_t)sys_yield(0, 0, 0, 0, 0, 0, regs); break;
     case SYS_GETPID: regs->rax = get_current_task()->parent_group->pid; break;
     case SYS_GETTID: regs->rax = get_current_task()->tid; break;
     case SYS_TIME: regs->rax = (uint64_t)sys_time((int64_t *)regs->rdi, 0, 0, 0, 0, 0, regs); break;

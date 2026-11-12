@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import shlex
 import shutil
+import stat
 import struct
 import subprocess
 import tempfile
@@ -101,6 +102,76 @@ def parse_root_binding(data: bytes) -> dict:
 
 def journal_size_mib(root_mib: int) -> int:
     return min(32, max(4, root_mib // 64))
+
+
+def round_up(value: int, unit: int) -> int:
+    return (value + unit - 1) // unit * unit
+
+
+class StagedUsage:
+    """Logical content and allocation sizes, independent of host sparse files."""
+
+    def __init__(self) -> None:
+        self.content_bytes = 0
+        self.inodes = 0
+        self.allocations: list[int] = []
+
+    def allocated_bytes(self, unit: int) -> int:
+        return sum(round_up(size, unit) for size in self.allocations)
+
+
+def staged_usage(root: Path, filesystem: str) -> StagedUsage:
+    usage = StagedUsage()
+    seen: set[tuple[int, int]] = set()
+
+    def visit(path: Path, ancestors: set[tuple[int, int]]) -> None:
+        # FAT's staging profile materializes links; mcopy also follows any
+        # remaining links. Ext4 imports links and preserves hard-linked inodes.
+        info = path.stat() if filesystem == "fat32" else path.lstat()
+        identity = (info.st_dev, info.st_ino)
+        if stat.S_ISDIR(info.st_mode):
+            if identity in ancestors:
+                raise ValueError(f"directory link cycle in staged system: {path}")
+            children = sorted(path.iterdir())
+            if filesystem == "fat32":
+                # Include short and UTF-16 long-name entries, dot entries and
+                # the end marker. Count LFNs conservatively even for 8.3 names.
+                slots = 3 + sum(1 + (len(child.name.encode("utf-16-le")) // 2 + 12) // 13
+                                for child in children)
+                directory_bytes = slots * 32
+            else:
+                # Ext4 dirents cannot cross blocks; each metadata_csum block
+                # reserves a 12-byte checksum tail in addition to dot entries.
+                blocks, used = 1, 24
+                for child in children:
+                    length = round_up(8 + len(os.fsencode(child.name)), 4)
+                    if used + length > 4096 - 12:
+                        blocks, used = blocks + 1, 0
+                    used += length
+                directory_bytes = blocks * 4096
+            usage.inodes += 1
+            usage.allocations.append(directory_bytes)
+            for child in children:
+                visit(child, ancestors | {identity})
+            return
+        if filesystem == "ext4" and identity in seen:
+            return
+        seen.add(identity)
+        usage.inodes += 1
+        if stat.S_ISREG(info.st_mode):
+            if filesystem == "fat32" and info.st_size > 0xffffffff:
+                raise ValueError(f"file exceeds the FAT32 4 GiB limit: {path}")
+            usage.content_bytes += info.st_size
+            usage.allocations.append(info.st_size)
+        elif stat.S_ISLNK(info.st_mode):
+            usage.content_bytes += info.st_size
+            if info.st_size >= 60:
+                usage.allocations.append(info.st_size + 1)
+        elif filesystem == "fat32":
+            raise ValueError(f"unsupported file type in FAT32 staged system: {path}")
+
+    visit(root, set())
+    return usage
 
 
 def positive_integer(value: str) -> int:
@@ -285,13 +356,93 @@ def require_staged_file(root: Path, name: str) -> None:
         raise ValueError(f"staged system is missing {name}")
 
 
-def build_image(root: Path, image: Path, *, filesystem: str = "fat32", size_mib: int = 3072,
-                esp_mib: int = 64, fat_mib: int | None = None, sudo: str = "") -> None:
+def format_ext4(partition: Path, size_mib: int, filesystem_uuid: uuid.UUID,
+                sudo: list[str], *, root: Path | None = None, inodes: int | None = None) -> None:
+    command = ["mke2fs", "-q", "-F", "-t", "ext4", "-b", "4096", "-I", "256", "-L", "XJ380",
+               "-U", str(filesystem_uuid), "-J", f"size={journal_size_mib(size_mib)}",
+               "-O", EXT4_FEATURES, "-E", "lazy_itable_init=0,lazy_journal_init=0,root_owner=0:0"]
+    if inodes is not None:
+        command += ["-N", str(inodes)]
+    if root is not None:
+        command += ["-d", str(root)]
+    run([*command, str(partition)], sudo)
+
+
+def prepare_partition(partition: Path, usage: StagedUsage, *, filesystem: str,
+                      size_mib: int | None, filesystem_uuid: uuid.UUID, sudo: list[str]) -> tuple[int, int | None]:
+    """Format a bounded partition, growing automatic sizes using actual metadata.
+
+    Probing the formatter avoids depending on host FAT cluster-size and ext4
+    inode-table defaults. The final ext4 import uses the same geometry. Manual
+    sizes are never enlarged, and only automatic sizes reserve 20% of content.
+    """
+    automatic = size_mib is None
+    minimum = 64 if filesystem == "fat32" else 32
+    capacity = size_mib
+    if automatic:
+        capacity = max(minimum, round_up((usage.content_bytes * 6 + 4) // 5, MIB) // MIB)
+    if capacity < minimum:
+        raise ValueError(f"{filesystem} partition must be at least {minimum} MiB")
+    inodes = None
+    while True:
+        if filesystem == "ext4" and capacity * MIB > NATIVE_MAX_ROOT_BYTES:
+            raise ValueError("ext4 root exceeds the reviewed 1 TiB host-image profile")
+        create_file(partition, capacity * MIB)
+        if filesystem == "fat32":
+            run(["mkfs.vfat", "-F", "32", "-S", "512", "-n", "XJ380BOOT", str(partition)], sudo)
+            verify_fat32(partition)
+            with partition.open("rb") as stream:
+                boot = stream.read(512)
+            unit = boot[13] * SECTOR_SIZE
+            metadata = struct.unpack_from("<H", boot, 14)[0] + boot[16] * struct.unpack_from("<I", boot, 36)[0]
+            available = (struct.unpack_from("<I", boot, 32)[0] - metadata) // boot[13] * unit
+        else:
+            format_ext4(partition, capacity, filesystem_uuid, sudo, inodes=inodes)
+            verify_ext4(partition, filesystem_uuid, journal_size_mib(capacity))
+            with partition.open("rb") as stream:
+                stream.seek(1024)
+                superblock = stream.read(1024)
+            u32 = lambda offset: struct.unpack_from("<I", superblock, offset)[0]
+            unit = 4096
+            free = u32(12) | (u32(0x158) << 32)
+            reserved = u32(8) | (u32(0x154) << 32)
+            available = max(0, free - reserved) * unit
+            needed_inodes = usage.inodes + ((usage.inodes + 4) // 5 if automatic else 0)
+            if u32(16) < needed_inodes:
+                requested = needed_inodes + 16  # Reserved inodes and lost+found.
+                if inodes == requested:
+                    raise ValueError("ext4 partition has too few inodes for staged contents")
+                # The native profile admits at most 32768 inodes per group.
+                minimum_capacity = ((requested + 32767) // 32768 - 1) * 128 + 1
+                if not automatic and capacity < minimum_capacity:
+                    raise ValueError("ext4 partition is too small for the required inode tables")
+                capacity = max(capacity, minimum_capacity)
+                inodes = requested
+                continue
+        needed = usage.allocated_bytes(unit)
+        if automatic:
+            needed += round_up((usage.content_bytes + 4) // 5, unit)
+        if needed <= available:
+            return capacity, inodes
+        if not automatic:
+            raise ValueError(f"{filesystem} partition ({capacity} MiB) is too small for staged contents "
+                             f"({needed} allocation bytes, {available} available)")
+        capacity += round_up(needed - available, MIB) // MIB
+
+
+def build_image(root: Path, image: Path, *, filesystem: str = "fat32", size_mib: int | None = None,
+                esp_mib: int | None = None, fat_mib: int | None = None, sudo: str = "") -> None:
     root = root.resolve()
     if image.is_symlink():
         raise ValueError(f"output must be a regular image file: {image}")
     image = image.parent.resolve() / image.name
-    layout = partition_layout(filesystem, size_mib, esp_mib, fat_mib)
+    automatic = size_mib is None
+    if filesystem not in ("fat32", "ext4"):
+        raise ValueError(f"unsupported filesystem: {filesystem}")
+    if not automatic:
+        partition_layout(filesystem, size_mib, 64 if esp_mib is None else esp_mib, fat_mib)
+    elif filesystem == "ext4" and esp_mib is not None and esp_mib < 64:
+        raise ValueError("FAT32 EFI partition must be at least 64 MiB")
     if not root.is_dir():
         raise ValueError(f"staged system directory does not exist: {root}")
     if image.is_symlink() or (image.exists() and not image.is_file()):
@@ -302,8 +453,7 @@ def build_image(root: Path, image: Path, *, filesystem: str = "fat32", size_mib:
         require_staged_file(root, name)
     if filesystem == "ext4":
         require_staged_file(root, "config/README.md")
-        if (layout[0][2] - layout[0][1] + 1) * SECTOR_SIZE > NATIVE_MAX_ROOT_BYTES:
-            raise ValueError("ext4 root exceeds the reviewed 1 TiB host-image profile")
+    usage = staged_usage(root, filesystem)
     required = ["sgdisk", "mkfs.vfat", "mcopy"]
     if filesystem == "ext4":
         required += ["mke2fs", "e2fsck", "debugfs"]
@@ -316,18 +466,9 @@ def build_image(root: Path, image: Path, *, filesystem: str = "fat32", size_mib:
     # population, and filesystem check succeeds. A failure preserves old images.
     with tempfile.TemporaryDirectory(prefix=f".{image.name}-", dir=image.parent) as directory:
         work = Path(directory)
-        disk = work / "disk.img"
-        create_file(disk, size_mib * MIB)
         identities = {name: uuid.uuid4() for name in ("disk", "root", "esp", "filesystem")}
         if len(set(identities.values())) != 4 or any(not value.int for value in identities.values()):
             raise ValueError("image identities must be distinct and nonzero")
-        command = ["sgdisk", "--clear", f"--disk-guid={identities['disk']}"]
-        for index, (name, first, last, kind) in enumerate(layout, 1):
-            identity = identities["esp" if kind == "ef00" else "root"]
-            command += [f"--new={index}:{first}:{last}", f"--typecode={index}:{kind}",
-                        f"--change-name={index}:{name}", f"--partition-guid={index}:{identity}"]
-        run([*command, str(disk)], sudo_command)
-
         boot_root = root
         if filesystem == "ext4":
             boot_root = work / "esp-root"
@@ -341,14 +482,40 @@ def build_image(root: Path, image: Path, *, filesystem: str = "fat32", size_mib:
             descriptor = boot_root / ROOT_BINDING_PATH
             descriptor.parent.mkdir(parents=True, exist_ok=True)
             descriptor.write_bytes(binding)
+        # Size the actual EFI snapshot separately: ext4 duplicates the boot
+        # files here, whereas FAT32 puts the complete system in this partition.
+        esp_usage = staged_usage(boot_root, "fat32") if filesystem == "ext4" else usage
+        if filesystem == "fat32":
+            requested_fat = fat_mib if fat_mib is not None else (None if automatic else size_mib - 2)
+        else:
+            requested_fat = esp_mib if esp_mib is not None else (None if automatic else 64)
+        actual_fat, _ = prepare_partition(
+            work / "esp.img", esp_usage, filesystem="fat32", size_mib=requested_fat,
+            filesystem_uuid=identities["filesystem"], sudo=sudo_command)
+        root_inodes = None
+        if filesystem == "ext4":
+            actual_root, root_inodes = prepare_partition(
+                work / "root.img", usage, filesystem="ext4", size_mib=None if automatic else size_mib - actual_fat - 2,
+                filesystem_uuid=identities["filesystem"], sudo=sudo_command)
+            if automatic:
+                size_mib = actual_root + actual_fat + 2
+        elif automatic:
+            size_mib = actual_fat + 2
+        layout = partition_layout(filesystem, size_mib, actual_fat, fat_mib)
+        disk = work / "disk.img"
+        create_file(disk, size_mib * MIB)
+        command = ["sgdisk", "--clear", f"--disk-guid={identities['disk']}"]
+        for index, (name, first, last, kind) in enumerate(layout, 1):
+            identity = identities["esp" if kind == "ef00" else "root"]
+            command += [f"--new={index}:{first}:{last}", f"--typecode={index}:{kind}",
+                        f"--change-name={index}:{name}", f"--partition-guid={index}:{identity}"]
+        run([*command, str(disk)], sudo_command)
+
+        if filesystem == "ext4":
             first, last = layout[0][1:3]
             partition = work / "root.img"
-            create_file(partition, (last - first + 1) * SECTOR_SIZE)
-            journal_mib = journal_size_mib((last - first + 1) * SECTOR_SIZE // MIB)
-            run(["mke2fs", "-q", "-F", "-t", "ext4", "-b", "4096", "-I", "256", "-L", "XJ380",
-                 "-U", str(identities["filesystem"]), "-J", f"size={journal_mib}",
-                 "-O", EXT4_FEATURES, "-E", "lazy_itable_init=0,lazy_journal_init=0,root_owner=0:0",
-                 "-d", str(root), str(partition)], sudo_command)
+            journal_mib = journal_size_mib(actual_root)
+            format_ext4(partition, actual_root, identities["filesystem"], sudo_command, root=root, inodes=root_inodes)
             run(["e2fsck", "-fn", str(partition)], sudo_command)
             verify_ext4(partition, identities["filesystem"], journal_mib)
             # Verify what mkfs actually imported, rather than rereading a staged
@@ -362,9 +529,6 @@ def build_image(root: Path, image: Path, *, filesystem: str = "fat32", size_mib:
 
         first, last = layout[-1][1:3]
         partition = work / "esp.img"
-        create_file(partition, (last - first + 1) * SECTOR_SIZE)
-        run(["mkfs.vfat", "-F", "32", "-S", "512", "-n", "XJ380BOOT", str(partition)], sudo_command)
-        verify_fat32(partition)
         entries = [str(entry) for entry in sorted(boot_root.iterdir())]
         run(["mcopy", "-o", "-s", "-i", str(partition), *entries, "::"])
         if filesystem == "ext4":
@@ -382,6 +546,8 @@ def build_image(root: Path, image: Path, *, filesystem: str = "fat32", size_mib:
             os.fsync(stream.fileno())
         os.replace(disk, image)
 
+    mode = "automatic" if automatic else "explicit"
+    print(f"Staged content: {usage.content_bytes} bytes; capacity: {mode}", flush=True)
     print(f"Created {image} ({filesystem}, {size_mib} MiB)", flush=True)
     for index, (name, first, last, _) in enumerate(layout, 1):
         print(f"  Partition {index}: {name}, {(last - first + 1) * SECTOR_SIZE // MIB} MiB", flush=True)
@@ -392,15 +558,17 @@ def main() -> None:
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--image", type=Path, required=True)
     parser.add_argument("--fs", choices=("fat32", "ext4"), default="fat32")
-    parser.add_argument("--size-mib", type=positive_integer, default=3072)
-    parser.add_argument("--esp-mib", type=positive_integer, default=64)
+    parser.add_argument("--size-mib", type=positive_integer,
+                        help="total capacity in MiB (default: content + 20%%, filesystem overhead and alignment)")
+    parser.add_argument("--esp-mib", type=positive_integer,
+                        help="ext4 EFI partition capacity in MiB (default: automatic, at least 64)")
     parser.add_argument("--fat-mib", type=positive_integer)
     parser.add_argument("--sudo", default="")
     args = parser.parse_args()
     try:
         build_image(args.root, args.image, filesystem=args.fs, size_mib=args.size_mib,
                     esp_mib=args.esp_mib, fat_mib=args.fat_mib, sudo=args.sudo)
-    except (ValueError, subprocess.CalledProcessError) as error:
+    except (OSError, ValueError, subprocess.CalledProcessError) as error:
         parser.exit(1, f"image build failed: {error}\n")
 
 

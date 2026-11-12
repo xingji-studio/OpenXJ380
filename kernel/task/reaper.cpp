@@ -54,6 +54,7 @@ void reaper_thread()
         block_access_reap_abandoned();
         installer::jobs_reap_abandoned();
         process_reap_wait_claims();
+        reap_quiesced_thread_tids();
         reap_quiesced_file_descriptors();
         fd_reap_abandoned_operations();
         procfs_reap_retired();

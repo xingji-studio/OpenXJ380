@@ -9,6 +9,7 @@
 #include <efi/efi.h>
 #include <efi/fbc.h>
 #include <elf.h>
+#include <epf.h>
 #include <errno.h>
 #include <fs/fatfs/fatfs.h>
 #include <fs/partition.h>
@@ -301,7 +302,7 @@ typedef struct loaded_user_elf
 static void free_file_image(uint8_t *buf, uint64_t size)
 {
     if (buf == NULL || size == 0) return;
-    free_frames((uint64_t)virt_to_phys((uint64_t)buf), (size + PAGE_SIZE - 1) / PAGE_SIZE);
+    free_frames((uint64_t)virt_to_phys((uint64_t)buf), size / PAGE_SIZE + (size % PAGE_SIZE != 0));
 }
 
 static int read_vfs_file(vfs_node_t file, uint8_t **out, uint64_t *out_size)
@@ -309,12 +310,26 @@ static int read_vfs_file(vfs_node_t file, uint8_t **out, uint64_t *out_size)
     if (file == NULL || out == NULL || out_size == NULL) return -EINVAL;
     uint64_t size = file->size;
     if (size == 0) return -ENOEXEC;
+    if (size > ~0ULL - (PAGE_SIZE - 1)) return -EFBIG;
+
+    // Identify EPF before allocating its complete file buffer, so an invalid
+    // oversized file cannot exhaust contiguous physical memory first.
+    if (size > EPF_MAX_FILE_SIZE)
+    {
+        uint8_t magic[4];
+        if (vfs_read(file, magic, 0, sizeof(magic)) != sizeof(magic)) return -EIO;
+        if (epf_has_magic(magic, sizeof(magic))) return -EFBIG;
+    }
 
     uint64_t pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
     uint64_t phys = alloc_frames(pages);
     if (phys == 0) return -ENOMEM;
     uint8_t *buf = (uint8_t *)phys_to_virt(phys);
-    if (buf == NULL) return -ENOMEM;
+    if (buf == NULL)
+    {
+        free_frames(phys, pages);
+        return -ENOMEM;
+    }
     memset(buf, 0, pages * PAGE_SIZE);
 
     size_t got = vfs_read(file, buf, 0, size);
@@ -339,19 +354,23 @@ static int find_elf_interpreter(uint8_t *buf, uint64_t file_size, char *interp, 
     if (buf == NULL || interp == NULL || interp_size == 0) return -EINVAL;
     interp[0] = '\0';
 
+    if (file_size < sizeof(Elf64_Ehdr)) return -ENOEXEC;
     Elf64_Ehdr *ehdr = (Elf64_Ehdr *)buf;
-    if (!elf_range_in_file(ehdr->e_phoff, (uint64_t)ehdr->e_phnum * ehdr->e_phentsize, file_size)) return -ENOEXEC;
+    if (ehdr->e_phentsize != sizeof(Elf64_Phdr) || ehdr->e_phnum == 0 || ehdr->e_phoff % 8 ||
+        !elf_range_in_file(ehdr->e_phoff, (uint64_t)ehdr->e_phnum * ehdr->e_phentsize, file_size)) return -ENOEXEC;
 
     Elf64_Phdr *phdrs = (Elf64_Phdr *)(buf + ehdr->e_phoff);
     for (int i = 0; i < ehdr->e_phnum; i++)
     {
         if (phdrs[i].p_type != PT_INTERP) continue;
+        if (interp[0] != '\0') return -ENOEXEC;
         if (phdrs[i].p_filesz == 0 || phdrs[i].p_filesz >= interp_size) return -ENAMETOOLONG;
         if (!elf_range_in_file(phdrs[i].p_offset, phdrs[i].p_filesz, file_size)) return -ENOEXEC;
+        if (buf[phdrs[i].p_offset + phdrs[i].p_filesz - 1] != '\0' || phdrs[i].p_filesz < 2 ||
+            memchr(buf + phdrs[i].p_offset, '\0', phdrs[i].p_filesz - 1) != NULL) return -ENOEXEC;
 
         memcpy(interp, buf + phdrs[i].p_offset, phdrs[i].p_filesz);
         interp[phdrs[i].p_filesz] = '\0';
-        return 0;
     }
 
     return 0;
@@ -377,7 +396,7 @@ static bool zero_user_elf_range(page_directory_t *directory, uint64_t address, u
 }
 
 static int load_user_elf_image(uint8_t *buf, uint64_t file_size, pcb_t group, const char *name,
-                               uint64_t dyn_base, loaded_user_elf_t *out)
+                               uint64_t dyn_base, loaded_user_elf_t *out, bool native_image = false)
 {
     if (buf == NULL || group == NULL || out == NULL) return -EINVAL;
 
@@ -411,6 +430,10 @@ static int load_user_elf_image(uint8_t *buf, uint64_t file_size, pcb_t group, co
     }
 
     Elf64_Phdr *phdrs = (Elf64_Phdr *)(buf + ehdr->e_phoff);
+    if (native_image && (ehdr->e_ident[EI_CLASS] != ELFCLASS64 || ehdr->e_ident[EI_DATA] != ELFDATA2LSB ||
+        ehdr->e_ident[EI_VERSION] != EV_CURRENT || ehdr->e_version != EV_CURRENT ||
+        ehdr->e_machine != EM_X86_64 || ehdr->e_ehsize != sizeof(Elf64_Ehdr) || ehdr->e_phnum > 64))
+        return -ENOEXEC;
     uint64_t load_bias = ehdr->e_type == ET_DYN ? dyn_base : 0;
     uint64_t load_start = ~0ULL;
     uint64_t load_end = 0;
@@ -419,6 +442,13 @@ static int load_user_elf_image(uint8_t *buf, uint64_t file_size, pcb_t group, co
     for (int i = 0; i < ehdr->e_phnum; i++)
     {
         if (phdrs[i].p_type != PT_LOAD) continue;
+        if (native_image)
+        {
+            uint64_t alignment = phdrs[i].p_align;
+            if (!(phdrs[i].p_flags & PF_R) || (phdrs[i].p_flags & (PF_W | PF_X)) == (PF_W | PF_X) ||
+                (alignment > 1 && ((alignment & (alignment - 1)) || load_bias % alignment ||
+                 ((phdrs[i].p_vaddr - phdrs[i].p_offset) & (alignment - 1))))) return -ENOEXEC;
+        }
         if (phdrs[i].p_filesz > phdrs[i].p_memsz ||
             !elf_range_in_file(phdrs[i].p_offset, phdrs[i].p_filesz, file_size))
         {
@@ -454,8 +484,42 @@ static int load_user_elf_image(uint8_t *buf, uint64_t file_size, pcb_t group, co
         return -ENOEXEC;
     }
 
-    page_map_range_to_random(group->pagedir, load_start, load_end - load_start,
-                             PTE_PRESENT | PTE_WRITEABLE | PTE_USER);
+    // Native images are prepared privately. Keep ownership until all copies,
+    // permissions and the VMA reservation succeed, so a partial load rolls back.
+    struct NativeMapping
+    {
+        pcb_t process;
+        uint64_t start, end;
+        bool active, committed = false;
+        ~NativeMapping()
+        {
+            if (active && !committed && end > start) unmap_page_range(process->pagedir, start, end - start);
+        }
+    } mapping{group, load_start, load_start, native_image};
+    if (native_image)
+    {
+        if (load_end - load_start > (64ULL << 20) ||
+            vma_find_intersection(&group->vma_manager, load_start, load_end) != NULL) return -ENOEXEC;
+        for (uint64_t address = load_start; address < load_end; address += PAGE_SIZE)
+            if (translate_address(group->pagedir, address)) return -EEXIST;
+        for (uint64_t address = load_start; address < load_end; address += PAGE_SIZE)
+        {
+            uint64_t physical = alloc_frames(1);
+            if (!physical) return -ENOMEM;
+            if (!page_map_new_user_page(group->pagedir, address, physical,
+                                       PTE_PRESENT | PTE_WRITEABLE | PTE_USER | PTE_NO_EXECUTE | PTE_FRAME_ALLOCATED))
+            {
+                free_frames(physical, 1);
+                return -ENOMEM;
+            }
+            mapping.end = address + PAGE_SIZE;
+        }
+    }
+    else
+    {
+        page_map_range_to_random(group->pagedir, load_start, load_end - load_start,
+                                PTE_PRESENT | PTE_WRITEABLE | PTE_USER);
+    }
     if (!zero_user_elf_range(group->pagedir, load_start, load_end - load_start)) return -ENOMEM;
 
     uint64_t phdr_addr = 0;
@@ -488,7 +552,43 @@ static int load_user_elf_image(uint8_t *buf, uint64_t file_size, pcb_t group, co
         }
     }
 
+    if (native_image)
+    {
+        uint64_t expected_phdr = 0;
+        uint64_t table_size = (uint64_t)ehdr->e_phnum * sizeof(Elf64_Phdr);
+        for (int i = 0; i < ehdr->e_phnum; ++i)
+        {
+            if (phdrs[i].p_type != PT_LOAD || !(phdrs[i].p_flags & PF_R) ||
+                ehdr->e_phoff < phdrs[i].p_offset) continue;
+            uint64_t offset = ehdr->e_phoff - phdrs[i].p_offset;
+            if (elf_range_in_file(offset, table_size, phdrs[i].p_filesz))
+                expected_phdr = load_bias + phdrs[i].p_vaddr + offset;
+        }
+        if (!phdr_addr || phdr_addr != expected_phdr) return -ENOEXEC;
+        // Code is executable only after copying has finished. Data and gaps
+        // stay NX; the user linker later seals RELRO and splits VMA permissions.
+        for (int i = 0; i < ehdr->e_phnum; ++i)
+        {
+            if (phdrs[i].p_type != PT_LOAD) continue;
+            uint64_t start = PADDING_DOWN(load_bias + phdrs[i].p_vaddr, PAGE_SIZE);
+            uint64_t end = PADDING_UP(load_bias + phdrs[i].p_vaddr + phdrs[i].p_memsz, PAGE_SIZE);
+            for (int j = 0; j < i; ++j)
+            {
+                if (phdrs[j].p_type != PT_LOAD) continue;
+                uint64_t other_start = PADDING_DOWN(load_bias + phdrs[j].p_vaddr, PAGE_SIZE);
+                uint64_t other_end = PADDING_UP(load_bias + phdrs[j].p_vaddr + phdrs[j].p_memsz, PAGE_SIZE);
+                if (start < other_end && other_start < end) return -ENOEXEC;
+            }
+            // Writable data includes relocation destinations until rtld seals RELRO.
+            uint64_t flags = PTE_PRESENT | PTE_USER | ((phdrs[i].p_flags & PF_W) ? PTE_WRITEABLE : 0) |
+                             ((phdrs[i].p_flags & PF_X) ? 0 : PTE_NO_EXECUTE);
+            for (uint64_t address = start; address < end; address += PAGE_SIZE)
+                if (!page_table_update_flags(group->pagedir, address, flags)) return -ENOMEM;
+        }
+    }
+
     vma_t *elf_vma = vma_alloc();
+    if (native_image && elf_vma == NULL) return -ENOMEM;
     if (elf_vma != NULL)
     {
         elf_vma->vm_start = load_start;
@@ -496,9 +596,16 @@ static int load_user_elf_image(uint8_t *buf, uint64_t file_size, pcb_t group, co
         elf_vma->vm_flags |= VMA_READ | VMA_WRITE | VMA_EXEC;
         elf_vma->vm_type = VMA_TYPE_ANON;
         elf_vma->vm_name = strdup(name != NULL ? name : "elf");
-        vma_insert(&group->vma_manager, elf_vma);
+        int inserted = vma_insert(&group->vma_manager, elf_vma);
+        if (native_image && (elf_vma->vm_name == NULL || inserted != 0))
+        {
+            if (inserted == 0) vma_remove(&group->vma_manager, elf_vma);
+            vma_free(elf_vma);
+            return -ENOMEM;
+        }
     }
 
+    mapping.committed = true;
     out->map_start = load_start;
     out->map_end = load_end;
     out->load_bias = load_bias;
@@ -532,17 +639,15 @@ uint64_t parse_elf_file(char *path, pcb_t group)
         return (uint64_t)ret;
     }
 
-    if (file_size < sizeof(Elf64_Ehdr))
+    if (file_size < 4)
     {
         free_file_image(buf, file_size);
         write_serial_fmt("Parse ELF/EPF file failed. Reason: Truncated header: %s.\n", path);
         return (uint64_t)-ENOEXEC;
     }
-    Elf64_Ehdr ehdr = *(Elf64_Ehdr *)buf;
-
     // 验证ELF/EPF魔数 (0x7F,'E','L','F') (0x24, 'E', 'P', 'F')
-    if ((*(uint32_t *)ehdr.e_ident != 0x464C457F)     // ELF
-        && (*(uint32_t *)ehdr.e_ident != 0x46504524)) // EPF
+    bool is_epf = epf_has_magic(buf, file_size);
+    if (memcmp(buf, "\177ELF", 4) != 0 && !is_epf)
     {
         pr_warn("Parse ELF/EPF file failed.\n");
         write_serial_fmt("Reason:   Bad Format path=%s size=%llu magic=%02x %02x %02x %02x.\n",
@@ -553,8 +658,40 @@ uint64_t parse_elf_file(char *path, pcb_t group)
                          file_size > 2 ? buf[2] : 0,
                          file_size > 3 ? buf[3] : 0);
         free_file_image(buf, file_size);
-        return NULL;
+        return (uint64_t)-ENOEXEC;
     }
+
+    // ELF/EPF 分流：EPF 使用自己的文件头、段表和 RVA 地址模型。
+    if (is_epf)
+    {
+        uint8_t *epf_interpreter = nullptr;
+        uint64_t epf_interpreter_size = 0;
+        int needs_interpreter = epf_get_interpreter(buf, file_size);
+        if (needs_interpreter > 0)
+        {
+            vfs_node_t interpreter_file = vfs_open(EPF_INTERPRETER_PATH);
+            if (!interpreter_file) ret = -ENOENT;
+            else
+            {
+                ret = read_vfs_file(interpreter_file, &epf_interpreter, &epf_interpreter_size);
+                vfs_close(interpreter_file);
+            }
+        }
+        else ret = needs_interpreter;
+        uint64_t entry = ret < 0 ? (uint64_t)ret :
+            load_user_epf_image(buf, file_size, group, epf_interpreter, epf_interpreter_size);
+        free_file_image(epf_interpreter, epf_interpreter_size);
+        free_file_image(buf, file_size);
+        if ((int64_t)entry < 0) write_serial_fmt("Cannot load EPF %s: ret=%d\n", path, (int)(int64_t)entry);
+        return entry;
+    }
+
+    if (file_size < sizeof(Elf64_Ehdr))
+    {
+        free_file_image(buf, file_size);
+        return (uint64_t)-ENOEXEC;
+    }
+    Elf64_Ehdr ehdr = *(Elf64_Ehdr *)buf;
 
     char interp_path[256];
     ret = find_elf_interpreter(buf, file_size, interp_path, sizeof(interp_path));
@@ -567,6 +704,9 @@ uint64_t parse_elf_file(char *path, pcb_t group)
 
     uint8_t *interp_buf = NULL;
     uint64_t interp_size = 0;
+    // A dedicated native interpreter uses the existing XAPI syscall ABI. Its
+    // own bootstrap validates the versioned XJ380 note in every loaded object.
+    bool native_image = strcmp(interp_path, "/system/lib/ld-xj380-x86_64.so.1") == 0;
     if (interp_path[0] != '\0')
     {
         vfs_node_t interp_file = vfs_open(interp_path);
@@ -591,12 +731,12 @@ uint64_t parse_elf_file(char *path, pcb_t group)
     // never borrow its CR3 across allocation, large copies or timer entries.
     loaded_user_elf_t main_elf;
     memset(&main_elf, 0, sizeof(main_elf));
-    ret = load_user_elf_image(buf, file_size, group, group->name, USER_DYN_MAIN_BASE, &main_elf);
+    ret = load_user_elf_image(buf, file_size, group, group->name, USER_DYN_MAIN_BASE, &main_elf, native_image);
     loaded_user_elf_t interp_elf;
     memset(&interp_elf, 0, sizeof(interp_elf));
     if (ret == 0 && interp_buf != NULL)
     {
-        ret = load_user_elf_image(interp_buf, interp_size, group, interp_path, USER_INTERP_BASE, &interp_elf);
+        ret = load_user_elf_image(interp_buf, interp_size, group, interp_path, USER_INTERP_BASE, &interp_elf, native_image);
     }
 
     if (ret < 0)
@@ -608,7 +748,7 @@ uint64_t parse_elf_file(char *path, pcb_t group)
         return (uint64_t)ret;
     }
 
-    group->linux_abi = interp_buf != NULL || ehdr.e_ident[EI_OSABI] == ELFOSABI_LINUX;
+    group->linux_abi = !native_image && (interp_buf != NULL || ehdr.e_ident[EI_OSABI] == ELFOSABI_LINUX);
     group->load_start = main_elf.map_start;
     group->aux_phdr = main_elf.phdr;
     group->aux_phent = main_elf.phent;

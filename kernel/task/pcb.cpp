@@ -956,6 +956,54 @@ static void clear_child_tid_if_requested(tcb_t task)
     task->tid_directory = NULL;
 }
 
+// A live process may join a finished worker long before process collection.
+// Pin its PCB/directory under the existing preparation registry, then perform
+// the user-memory store only after dropping every spin lock and checking CPU
+// references. Marking DEATH alone is not a TLS/stack reclamation boundary.
+void reap_quiesced_thread_tids()
+{
+    if (!pcb_group_queue || scheduler_disable_depth()) return;
+    auto *pin = static_cast<ProcessPreparation *>(calloc(1, sizeof(ProcessPreparation)));
+    if (!pin) return;
+    tcb_t target = NULL, owner = get_current_task();
+    if (!owner) { free(pin); return; }
+    spin_lock(&create_thread_lock);
+    spin_lock(&pcb_group_queue->lock);
+    for (lock_node *entry = pcb_group_queue->head; entry && !target; entry = entry->next)
+    {
+        pcb_t process = static_cast<pcb_t>(entry->data);
+        if (!process || !process->pagedir || !process->thread_queue || process->status == DEATH ||
+            process->status == OUT || process->status == ZOMBIE ||
+            __atomic_load_n(&process->fd_cleanup_state, __ATOMIC_ACQUIRE) != 0) continue;
+        spin_lock(&preparation_lock);
+        bool busy = false;
+        for (ProcessPreparation *existing = process_preparations; existing; existing = existing->next)
+            if (existing->process == process) { busy = true; break; }
+        if (!busy && __atomic_load_n(&process->fd_cleanup_state, __ATOMIC_ACQUIRE) == 0)
+        {
+            spin_lock(&process->thread_queue->lock);
+            for (lock_node *node = process->thread_queue->head; node; node = node->next)
+            {
+                tcb_t task = static_cast<tcb_t>(node->data);
+                if (!task || (task->status != DEATH && task->status != OUT) || !task->clear_child_tid ||
+                    task->tid_directory != process->pagedir) continue;
+                target = task;
+                pin->process = process; pin->directory = process->pagedir;
+                pin->owner = owner; pin->owner_tid = owner->tid; pin->depth = 1;
+                pin->next = process_preparations; process_preparations = pin;
+                break;
+            }
+            spin_unlock(&process->thread_queue->lock);
+        }
+        spin_unlock(&preparation_lock);
+    }
+    spin_unlock(&pcb_group_queue->lock);
+    spin_unlock(&create_thread_lock);
+    if (!target) { free(pin); return; }
+    if (!scheduler_task_referenced(target)) clear_child_tid_if_requested(target);
+    process_preparation_release(pin);
+}
+
 static void free_user_stack_mapping(tcb_t task)
 {
     if (task == NULL || task->parent_group == NULL || task->parent_group->pagedir == NULL ||
@@ -976,7 +1024,6 @@ void kill_thread(tcb_t task)
         write_serial_fmt("Cannot stop kernel thread.");
         return;
     }
-    clear_child_tid_if_requested(task);
     __atomic_store_n(&task->status, DEATH, __ATOMIC_RELEASE);
     // kill_thread0(task); 瑕佺敤鐨勮В鎺?浣嗗彲鑳借鍔犻攣
 }
@@ -1163,7 +1210,8 @@ static uint64_t build_user_stack(tcb_t task, uint64_t sp, uint64_t entry_point, 
     char **envp = task->parent_group->envp ? task->parent_group->envp : current_user->envp;
 
     uint64_t tmp_stack = sp;
-    tmp_stack          = push_slice(task, tmp_stack, (const uint8_t *)task->name, strlen(task->name) + 1);
+    const char *executable = task->parent_group->exe_path ? task->parent_group->exe_path : task->name;
+    tmp_stack          = push_slice(task, tmp_stack, (const uint8_t *)executable, strlen(executable) + 1);
     ok                 = tmp_stack != 0;
     uint64_t aux_execfn = tmp_stack;
     static const char platform[] = "x86_64";
@@ -1208,8 +1256,6 @@ static uint64_t build_user_stack(tcb_t task, uint64_t sp, uint64_t entry_point, 
         ok             = tmp_stack != 0;
         argvps[argv_i] = tmp_stack;
     }
-    if (ok && argv_i > 0) aux_execfn = argvps[0];
-
     uint8_t aux_random[16];
     fill_aux_random(aux_random, task, sp);
     if (ok) tmp_stack = push_slice(task, tmp_stack, aux_random, sizeof(aux_random));
@@ -1727,163 +1773,84 @@ static constexpr uint64_t CLONE_PARENT_SETTID_FLAG  = 0x00100000;
 static constexpr uint64_t CLONE_CHILD_CLEARTID_FLAG = 0x00200000;
 static constexpr uint64_t CLONE_CHILD_SETTID_FLAG   = 0x01000000;
 
+// Clone state is private to the preparing caller. No pointers to its register
+// frame survive publication, and the preparation ticket pins the directory.
+struct ThreadCloneState
+{
+    X64_REGS registers;
+    uint64_t flags, stack, tls;
+    int *parent_tid, *child_tid;
+};
+
+static size_t
+prepare_application_thread(void *entry, void *arguments, int argc, char *name,
+                            pcb_t process, char *cwd, bool message, uint64_t argument,
+                            const ThreadCloneState *clone);
+
+static void prepare_clone_context(tcb_t task, const ThreadCloneState *clone, tcb_t creator)
+{
+    task->context0.rip    = clone->registers.rcx;
+    task->context0.rflags = clone->registers.r11;
+    task->context0.cs     = clone->registers.cs;
+    task->context0.ss     = clone->registers.ss;
+    task->context0.es     = clone->registers.es;
+    task->context0.ds     = clone->registers.ds;
+    task->context0.rax    = 0;//子进程返回零
+    task->context0.rdi    = clone->registers.rdi;
+    task->context0.rsi    = clone->registers.rsi;
+    task->context0.rdx    = clone->registers.rdx;
+    task->context0.r9     = clone->registers.r9;
+    task->context0.r8     = clone->registers.r8;
+    task->context0.r10    = clone->registers.r10;
+    task->context0.r11    = clone->registers.r11;
+    task->context0.r12    = clone->registers.r12;
+    task->context0.r13    = clone->registers.r13;
+    task->context0.r14    = clone->registers.r14;
+    task->context0.r15    = clone->registers.r15;
+    task->context0.rbx    = clone->registers.rbx;
+    task->context0.rbp    = clone->registers.rbp;
+    task->context0.rsp    = clone->stack != 0 ? clone->stack : clone->registers.rsp;
+    task->context0.rcx    = clone->registers.rcx;
+
+    task->user_stack = clone->stack ? clone->stack : creator->user_stack;
+    task->user_stack_top = clone->stack ? clone->stack : creator->user_stack_top;
+    task->fs = (clone->flags & CLONE_SETTLS_FLAG) ? 0 : creator->fs;
+    task->fs_base = (clone->flags & CLONE_SETTLS_FLAG) ? clone->tls : creator->fs_base;
+    memcpy(task->actions, creator->actions, sizeof(task->actions));
+    task->blocked = creator->blocked;
+}
+
 uint64_t thread_clone(struct X64_REGS *reg, uint64_t flags, uint64_t stack, int *parent_tid, int *child_tid,
                       uint64_t tls)
 {
     if (reg == NULL) return SYSCALL_FAULT_(EINVAL);
-
     if ((flags & CLONE_THREAD_FLAG) == 0)
         return process_fork(reg, (flags & CLONE_VFORK_FLAG) != 0, stack, flags, parent_tid, child_tid);
-
     const uint64_t required = CLONE_VM_FLAG | CLONE_FS_FLAG | CLONE_FILES_FLAG | CLONE_SIGHAND_FLAG;
     if ((flags & required) != required) return SYSCALL_FAULT_(EINVAL);
-
-    bool is_sti                = are_interrupts_enabled();
-    uint64_t scheduler_depth = scheduler_disable_depth();
-    tcb_t parent_task          = get_current_task();
-    if (parent_task == NULL || parent_task->parent_group == NULL || parent_task->parent_group->pagedir == NULL)
+    tcb_t creator = get_current_task();
+    if (!creator || !creator->parent_group || !creator->parent_group->pagedir) return SYSCALL_FAULT_(EFAULT);
+    if (scheduler_disable_depth()) return SYSCALL_FAULT_(EWOULDBLOCK);
+    if (((flags & CLONE_PARENT_SETTID_FLAG) && !parent_tid) ||
+        ((flags & (CLONE_CHILD_SETTID_FLAG | CLONE_CHILD_CLEARTID_FLAG)) && !child_tid))
         return SYSCALL_FAULT_(EFAULT);
-    uint64_t parent_fs_base = read_fsbase();
-    if (parent_fs_base != 0 || parent_task->fs_base == 0)
-        parent_task->fs_base = parent_fs_base;
-
-    pcb_t process = parent_task->parent_group;
-    page_directory_t *pagedir = process->pagedir;
-
-    if ((flags & CLONE_PARENT_SETTID_FLAG) && parent_tid == NULL) return SYSCALL_FAULT_(EFAULT);
-    if ((flags & (CLONE_CHILD_SETTID_FLAG | CLONE_CHILD_CLEARTID_FLAG)) && child_tid == NULL)
-        return SYSCALL_FAULT_(EFAULT);
-
-    close_interrupt;
-    disable_scheduler();
-
-    spin_lock(&create_thread_lock);
-
-    tcb_t new_task = alloc_zeroed_tcb();
-    if (new_task == NULL)
+    if ((stack && check_user_overflow(stack, 1)) ||
+        ((flags & CLONE_SETTLS_FLAG) && tls && check_user_overflow(tls, 1))) return SYSCALL_FAULT_(EINVAL);
+    creator->fs_base = read_fsbase();
+    ThreadCloneState clone = {*reg, flags, stack, tls, parent_tid, child_tid};
+    bool was_interrupt_enabled = are_interrupts_enabled();
+    if (!no_interrupt) open_interrupt;
+    char *cwd = strdup(creator->str_cwd ? creator->str_cwd : "/");
+    if (!cwd)
     {
-        spin_unlock(&create_thread_lock);
-        restore_runtime_state(scheduler_depth, is_sti);
+        restore_runtime_state(0, was_interrupt_enabled);
         return SYSCALL_FAULT_(ENOMEM);
     }
-
-    new_task->task_level = TASK_APPLICATION_LEVEL;
-    new_task->cpu_id     = get_current_cpu()->processor_id;
-    new_task->status     = START;
-    new_task->parent_group = process;
-    strncpy(new_task->name, parent_task->name, sizeof(new_task->name) - 1);
-
-    uint64_t kernel_stack_phys = alloc_frames(KERNEL_STACK_SIZE / PAGE_SIZE);
-    if (kernel_stack_phys == 0)
-    {
-        free(new_task);
-        spin_unlock(&create_thread_lock);
-        restore_runtime_state(scheduler_depth, is_sti);
-        return SYSCALL_FAULT_(ENOMEM);
-    }
-    uint64_t syscall_stack_phys = alloc_frames(KERNEL_STACK_SIZE / PAGE_SIZE);
-    if (syscall_stack_phys == 0)
-    {
-        free_frames(kernel_stack_phys, KERNEL_STACK_SIZE / PAGE_SIZE);
-        free(new_task);
-        spin_unlock(&create_thread_lock);
-        restore_runtime_state(scheduler_depth, is_sti);
-        return SYSCALL_FAULT_(ENOMEM);
-    }
-
-    new_task->kernel_stack  = (uint64_t)phys_to_virt(kernel_stack_phys) + KERNEL_STACK_SIZE;
-    new_task->syscall_stack = (uint64_t)phys_to_virt(syscall_stack_phys) + KERNEL_STACK_SIZE;
-    new_task->main          = parent_task->main;
-    new_task->user_stack    = stack != 0 ? stack : parent_task->user_stack;
-    new_task->user_stack_top = stack != 0 ? stack : parent_task->user_stack_top;
-
-    new_task->context0.rip    = reg->rcx;
-    new_task->context0.rflags = reg->r11;
-    new_task->context0.cs     = reg->cs;
-    new_task->context0.ss     = reg->ss;
-    new_task->context0.es     = reg->es;
-    new_task->context0.ds     = reg->ds;
-    new_task->context0.rax    = 0;//子进程返回零
-    new_task->context0.rdi    = reg->rdi;
-    new_task->context0.rsi    = reg->rsi;
-    new_task->context0.rdx    = reg->rdx;
-    new_task->context0.r9     = reg->r9;
-    new_task->context0.r8     = reg->r8;
-    new_task->context0.r10    = reg->r10;
-    new_task->context0.r11    = reg->r11;
-    new_task->context0.r12    = reg->r12;
-    new_task->context0.r13    = reg->r13;
-    new_task->context0.r14    = reg->r14;
-    new_task->context0.r15    = reg->r15;
-    new_task->context0.rbx    = reg->rbx;
-    new_task->context0.rbp    = reg->rbp;
-    new_task->context0.rsp    = stack != 0 ? stack : reg->rsp;
-    new_task->context0.rcx    = reg->rcx;
-
-    memcpy(new_task->fpu_context.fxsave_area, parent_task->fpu_context.fxsave_area, 512);
-    memcpy(new_task->actions, parent_task->actions, sizeof(new_task->actions));
-    new_task->blocked = parent_task->blocked;
-    new_task->signal  = 0;
-    new_task->fs      = parent_task->fs;
-    new_task->fs_base = (flags & CLONE_SETTLS_FLAG) ? tls : parent_task->fs_base;
-
-    new_task->cwd = parent_task->cwd;
-    if (new_task->cwd != NULL) new_task->cwd->refcount++;
-    new_task->str_cwd = parent_task->str_cwd != NULL ? strdup(parent_task->str_cwd) : NULL;
-    new_task->user_info = parent_task->user_info;
-    new_task->winnum = 0;
-    new_task->hasfscr = false;
-    new_task->window_count = 0;
-    new_task->tid = alloc_tid();
-    int tid = (int)new_task->tid;
-    if ((flags & CLONE_PARENT_SETTID_FLAG) && !copy_to_user_pagedir(pagedir, parent_tid, &tid, sizeof(tid)))
-    {
-        if (new_task->cwd != NULL) vfs_close(new_task->cwd);
-        free(new_task->str_cwd);
-        free_frames(syscall_stack_phys, KERNEL_STACK_SIZE / PAGE_SIZE);
-        free_frames(kernel_stack_phys, KERNEL_STACK_SIZE / PAGE_SIZE);
-        free(new_task);
-        spin_unlock(&create_thread_lock);
-        restore_runtime_state(scheduler_depth, is_sti);
-        return SYSCALL_FAULT_(EFAULT);
-    }
-    if ((flags & CLONE_CHILD_SETTID_FLAG) && !copy_to_user_pagedir(pagedir, child_tid, &tid, sizeof(tid)))
-    {
-        if (new_task->cwd != NULL) vfs_close(new_task->cwd);
-        free(new_task->str_cwd);
-        free_frames(syscall_stack_phys, KERNEL_STACK_SIZE / PAGE_SIZE);
-        free_frames(kernel_stack_phys, KERNEL_STACK_SIZE / PAGE_SIZE);
-        free(new_task);
-        spin_unlock(&create_thread_lock);
-        restore_runtime_state(scheduler_depth, is_sti);
-        return SYSCALL_FAULT_(EFAULT);
-    }
-    if (flags & CLONE_CHILD_CLEARTID_FLAG)
-    {
-        new_task->clear_child_tid = (uint64_t)child_tid;
-        new_task->tid_directory   = pagedir;
-    }
-
-    new_task->group_index = queue_enqueue(process->thread_queue, new_task);
-    if (new_task->group_index == (size_t)-1)
-    {
-        if (new_task->cwd != NULL) vfs_close(new_task->cwd);
-        free(new_task->str_cwd);
-        free_frames(syscall_stack_phys, KERNEL_STACK_SIZE / PAGE_SIZE);
-        free_frames(kernel_stack_phys, KERNEL_STACK_SIZE / PAGE_SIZE);
-        free(new_task);
-        spin_unlock(&create_thread_lock);
-        restore_runtime_state(scheduler_depth, is_sti);
-        return SYSCALL_FAULT_(ENOMEM);
-    }
-
-    add_task(new_task);
-    spin_unlock(&create_thread_lock);
-    restore_runtime_state(scheduler_depth, is_sti);
-    return new_task->tid;
+    uint64_t result = prepare_application_thread((void *)reg->rcx, NULL, 0, creator->name,
+                                                  creator->parent_group, cwd, false, 0, &clone);
+    restore_runtime_state(0, was_interrupt_enabled);
+    return result;
 }
-
-
 
 uint64_t process_execve(char *path, char **argv, char **envp)
 {
@@ -2902,7 +2869,8 @@ static void cleanup_thread_draft(ProcessPreparation *pin)
 }
 
 static size_t prepare_application_thread(void *entry, void *arguments, int argc, char *name,
-                                         pcb_t process, char *cwd, bool message, uint64_t argument)
+                                         pcb_t process, char *cwd, bool message, uint64_t argument,
+                                         const ThreadCloneState *clone = nullptr)
 {
     bool was_interrupt_enabled = are_interrupts_enabled();
     uint64_t scheduler_depth = scheduler_disable_depth();
@@ -2955,7 +2923,7 @@ static size_t prepare_application_thread(void *entry, void *arguments, int argc,
         if (!stack) error = -ENOMEM;
         else task->syscall_stack = (uint64_t)phys_to_virt(stack) + KERNEL_STACK_SIZE;
     }
-    if (!error)
+    if (!error && !clone)
     {
         task->user_stack = page_reserve_process_user_range(process, BIG_USER_STACK);
         if (!task->user_stack) error = -ENOMEM;
@@ -2994,10 +2962,32 @@ static size_t prepare_application_thread(void *entry, void *arguments, int argc,
             task->fs_base = creator->fs_base;
         }
         else if (message) task->fs_base = reinterpret_cast<uint64_t>(task);
+        if (clone) prepare_clone_context(task, clone, creator);
         save_fpu_context(&task->fpu_context);
         tid = alloc_tid();
         task->tid = tid;
         if (tid == size_t(-1)) error = -EOVERFLOW;
+    }
+    bool wrote_parent_tid = false, wrote_child_tid = false;
+    if (!error && clone)
+    {
+        if (tid > 0x7fffffff) error = -EOVERFLOW;
+        int value = (int)tid;
+        if (!error && (clone->flags & CLONE_PARENT_SETTID_FLAG))
+        {
+            wrote_parent_tid = copy_to_user_pagedir(pin->directory, clone->parent_tid, &value, sizeof(value));
+            if (!wrote_parent_tid) error = -EFAULT;
+        }
+        if (!error && (clone->flags & CLONE_CHILD_SETTID_FLAG))
+        {
+            wrote_child_tid = copy_to_user_pagedir(pin->directory, clone->child_tid, &value, sizeof(value));
+            if (!wrote_child_tid) error = -EFAULT;
+        }
+        if (!error && (clone->flags & CLONE_CHILD_CLEARTID_FLAG))
+        {
+            task->clear_child_tid = (uint64_t)clone->child_tid;
+            task->tid_directory = pin->directory;
+        }
     }
     if (!error)
     {
@@ -3041,8 +3031,17 @@ static size_t prepare_application_thread(void *entry, void *arguments, int argc,
         }
         spin_unlock(&create_thread_lock);
     }
-    if (error) cleanup_thread_draft(pin);
-    else if (!message) procfs_on_new_task(process);
+    if (error)
+    {
+        if (clone)
+        {
+            int zero = 0;
+            if (wrote_parent_tid) copy_to_user_pagedir(pin->directory, clone->parent_tid, &zero, sizeof(zero));
+            if (wrote_child_tid) copy_to_user_pagedir(pin->directory, clone->child_tid, &zero, sizeof(zero));
+        }
+        cleanup_thread_draft(pin);
+    }
+    else if (!message && !clone) procfs_on_new_task(process);
     process_preparation_release(pin);
     restore_runtime_state(scheduler_depth, was_interrupt_enabled);
     return error ? size_t(error) : tid;

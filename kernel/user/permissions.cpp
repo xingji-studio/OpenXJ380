@@ -635,7 +635,9 @@ static bool shared_resource_path(const char *path)
 
 static bool public_read_path(const char *path)
 {
-    return shared_resource_path(path) || under(path, "/etc");
+    // Native interpreters and shared libraries are readable system runtime
+    // files. Their writes still require the ordinary protected-system policy.
+    return shared_resource_path(path) || under(path, "/system/lib") || under(path, "/etc");
 }
 
 static bool system_path(const char *path)
@@ -687,7 +689,7 @@ static bool path_access(const char *path, bool directory, int operation, uint8_t
     // when the application has broad NV/CS file permissions.
     if (write && network_store_path(path, directory && operation == IME_FILE_REMOVE)) return false;
 
-    // Every application can read shared assets and /etc configuration, including
+    // Every application can read shared assets, runtime libraries and /etc configuration, including
     // Custom with no file permissions. Resolved VFS operations and preflight use
     // the same rule; writes and deletion still use the ordinary policy.
     if (!write && public_read_path(path)) return true;

@@ -104,6 +104,10 @@ extern "C" void apu_entry(uint64_t cpu_id, uint64_t tr)
 
     init_cpu();
 
+    // AP reset/INIT disables caches and does not inherit the BSP's memory
+    // types. Restore both before LAPIC calibration or running kernel/user work.
+    mtrr_restore();
+
     info->gdt_entries_t[0] = 0x0000000000000000U;
     info->gdt_entries_t[1] = 0x00a09a0000000000U;
     info->gdt_entries_t[2] = 0x00c0920000000000U;

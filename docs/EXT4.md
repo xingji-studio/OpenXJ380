@@ -413,8 +413,14 @@ VDISK_IMAGE=out/XJ380-ext4.img ninja -f build.ninja justrun
 python3 tools/ninja_build.py vdisk --fs ext4 --image out/XJ380-ext4.img
 ```
 
-`VDISK_SIZE_MIB` sets total disk size; `VDISK_ESP_MIB` sets the ESP size (at least
-64 MiB). Both product and provider wrappers use the same reviewed host formatter.
+With `VDISK_SIZE_MIB` unset, the formatter sizes the final staged content with
+20% extra content space, filesystem metadata/allocation overhead and MiB alignment.
+Repackaging smaller content also reduces the RAW image's logical size. Ext4 root
+and EFI contents are sized separately; the ESP is at least 64 MiB. `VDISK_SIZE_MIB`
+overrides total disk size; `VDISK_ESP_MIB` overrides ESP size (at least 64 MiB).
+An explicit total size defaults to a 64 MiB ESP. Explicit capacities are never
+enlarged, and insufficient capacity fails without replacing the previous image.
+Both product and provider wrappers use the same reviewed host formatter.
 Ext4 staging preserves symlinks; FAT32 staging retains its existing flattening.
 The host needs standalone `sgdisk`, `mke2fs`, `e2fsck`, `debugfs`, `mkfs.vfat` and
 mtools. No implementation library from these tools enters the kernel.
