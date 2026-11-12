@@ -190,6 +190,7 @@ void free_frame(uint64_t addr)
 }
 uint64_t alloc_frames(size_t count);
 uint64_t alloc_frames_dma32(size_t count);
+uint64_t alloc_frames_dma16(size_t count);
 
 // kernel/memory/hhdm.cpp
 void     init_hhdm();

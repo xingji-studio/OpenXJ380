@@ -34,6 +34,7 @@
 #include <ps2/mouse.h>
 #include <rtc.h>
 #include <sb16.h>
+#include <audio_backend.h>
 #include <syscall/signal.h>
 #include <syscall/pxapi.h>
 #include <syscall/syscall.h>
@@ -614,11 +615,9 @@ extern "C" void KernelMain(const FrameBufferConfig &fbc, EFI_SYSTEM_TABLE &Syste
 
     // disable_intr();
 #if !OPENXJ380_INPUT_OUTPUT_DISABLED
-    // HDA 驱动现在会在初始化阶段自行完成注册，这里只需要启动探测即可。
-    hda_init();
-    hda_regist();
+    // Probe one shared audio output: HDA, ICH AC97, ES1371, then ISA SB16.
+    audio_backend_init();
 #endif
-    // sb16_init();
 
     keyboard_init();
     mouse_init();

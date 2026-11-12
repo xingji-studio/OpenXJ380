@@ -176,6 +176,7 @@ uint8_t hda_pin_complex_type(uint32_t codec, uint32_t node) {
 
 uint16_t hda_get_connection_list_entry(uint32_t codec, uint32_t node, uint32_t index) {
     uint32_t cll        = hda_verb(codec, node, 0xf00, 0xe);
+    if (cll == 0xffffffff || index >= (cll & 0x7f)) return 0;
     bool     long_entry = (cll & 0x80) != 0;
     write_serial_fmt("cll: %08x and long_entry: %d\n", cll, long_entry);
     if (!long_entry) {
@@ -245,6 +246,7 @@ void hda_init_audio_mixer(uint32_t codec, uint32_t node) {
         hda_pin_output_amp_cap = amp_cap;
     }
     uint16_t n    = hda_get_connection_list_entry(codec, node, 0);
+    if (!n) return;
     uint8_t  type = hda_node_type(codec, n);
     if (type == HDA_WIDGET_AUDIO_OUTPUT) {
         write_serial_fmt("(%08x) : node %d is Audio Output\n", type, n);
@@ -270,6 +272,7 @@ void hda_init_audio_selector(uint32_t codec, uint32_t node) {
         hda_pin_output_amp_cap = amp_cap;
     }
     uint16_t n    = hda_get_connection_list_entry(codec, node, 0);
+    if (!n) return;
     uint8_t  type = hda_node_type(codec, n);
     if (type == HDA_WIDGET_AUDIO_OUTPUT) {
         write_serial_fmt("(%08x) : node %d is Audio Output\n", type, n);
@@ -420,6 +423,7 @@ void hda_init_output_pin(uint32_t codec, uint32_t node) {
     }
     hda_verb(codec, node, 0x701, 0);
     uint16_t n    = hda_get_connection_list_entry(codec, node, 0);
+    if (!n) return;
     uint8_t  type = hda_node_type(codec, n);
     if (type == HDA_WIDGET_AUDIO_OUTPUT) {
         write_serial_fmt("(%08x) : node %d is Audio Output\n", type, n);
@@ -431,6 +435,18 @@ void hda_init_output_pin(uint32_t codec, uint32_t node) {
         write_serial_fmt("(%08x) : node %d is Audio Selector\n", type, n);
         hda_init_audio_selector(codec, n);
     }
+}
+
+// A codec may expose unused pin widgets with a zero default configuration.
+// They look like Line Out, but have no output path. Never let one replace a
+// usable pin or follow its empty connection list to the codec root (node 0).
+static bool hda_output_pin_usable(uint32_t codec, uint32_t node)
+{
+    uint32_t capability = hda_verb(codec, node, 0xf00, 0x0c);
+    uint32_t config = hda_verb(codec, node, 0xf1c, 0);
+    uint32_t connections = hda_verb(codec, node, 0xf00, 0x0e);
+    return capability != 0xffffffff && config != 0xffffffff && connections != 0xffffffff &&
+           (capability & (1U << 4)) && ((config >> 30) & 3) != 1 && (connections & 0x7f);
 }
 
 void hda_init_afg(uint32_t codec, uint32_t node) {
@@ -461,11 +477,12 @@ void hda_init_afg(uint32_t codec, uint32_t node) {
         }
         if (type == HDA_WIDGET_PIN_COMPLEX) {
             write_serial_fmt("(%08x) : node %d is Pin Complex\n", type, i);
+            if (!hda_output_pin_usable(codec, i)) continue;
             uint8_t pin_type = hda_pin_complex_type(codec, i);
             write_serial_fmt("(%08x) : pin type is %d\n", pin_type, i);
             if (pin_type == HDA_PIN_COMPLEX_LINE_OUT) {
                 write_serial_fmt("(%08x) : node %d is Line Out\n", pin_type, i);
-                pin_output = i;
+                if (!pin_output) pin_output = i;
             } else if (pin_type == HDA_PIN_COMPLEX_SPEAKER) {
                 write_serial_fmt("(%08x) : node %d is Speaker\n", pin_type, i);
                 if (pin_speaker == 0) pin_speaker = i;
@@ -483,20 +500,20 @@ void hda_init_afg(uint32_t codec, uint32_t node) {
             } else if (pin_type == HDA_PIN_COMPLEX_CD) {
 
                 write_serial_fmt("(%08x) : node %d is CD\n", pin_type, i);
-                pin_output = i;
+                if (!pin_output) pin_output = i;
             } else if (pin_type == HDA_PIN_COMPLEX_SPDIF_OUT) {
                 write_serial_fmt("(%08x) : node %d is SPDIF Out\n", pin_type, i);
-                pin_output = i;
+                if (!pin_output) pin_output = i;
             } else if (pin_type == HDA_PIN_COMPLEX_DIG_OUT) {
                 write_serial_fmt("(%08x) : node %d is Digital Out\n", pin_type, i);
-                pin_output = i;
+                if (!pin_output) pin_output = i;
             } else if (pin_type == HDA_PIN_COMPLEX_MODEM_LINE_SIDE) {
                 write_serial_fmt("(%08x) : node %d is Modem Line Side\n", pin_type, i);
-                pin_output = i;
+                if (!pin_output) pin_output = i;
             } else if (pin_type == HDA_PIN_COMPLEX_MODEM_HANDSET_SIDE) {
                 write_serial_fmt("(%08x) : node %d is Modem Handset Side\n", pin_type, i);
 
-                pin_output = i;
+                if (!pin_output) pin_output = i;
             }
         }
     }
@@ -672,7 +689,6 @@ void hda_init() {
         if (device == NULL) device = pci_find_vid_did(0x1002, 0x4383);
         if (device == NULL) device = pci_find_vid_did(0x8086, 0x293e);
         if (device == NULL) device = pci_find_class(0x040300);
-        if (device == NULL) device = pci_find_class(0x040100);
         if (device == NULL) {
             write_serial_fmt("Cannot find a High Definition Audio controller.\n");
             return;
@@ -913,7 +929,10 @@ static void hda_audio_interrupt()
         return;
     }
     const uint64_t now = nanoTime();
-    const uint32_t position = mem_get32(hda_output_base + 4);
+    uint32_t position = mem_get32(hda_output_base + 4);
+    // VMware can expose CBL at the exact end of its cyclic buffer before
+    // reporting zero. Both denote the same wrap boundary, counted once.
+    if (position == HDA_BUF_SIZE * HDA_AUDIO_PERIODS) position = 0;
     const uint64_t poll_elapsed = now - audio_poll_time;
     const uint64_t ring_ns = (uint64_t)HDA_BUF_SIZE * HDA_AUDIO_PERIODS * 1000000000ULL / (48000U * 4U);
     audio_poll_time = now;

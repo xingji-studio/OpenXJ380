@@ -241,6 +241,7 @@ def copy_common_assets(root: Path) -> None:
     cp(ROOT / "driver/fs/ext4/SOURCE.json", ext4_notices)
     cp(ROOT / "driver/fs/ext4/REFERENCES.json", ext4_notices)
     cp(ROOT / "driver/fs/ext4/LWEXT4_BSD_NOTICE.txt", ext4_notices)
+    cp(ROOT / "resources/licenses/es1371.txt", root / "system/licenses/es1371.txt")
 
 
 def copy_modules(root: Path) -> None:
