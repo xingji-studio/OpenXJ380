@@ -78,21 +78,27 @@ static bool valid_hardware(const BlockSourceHardware &h)
     if (h.transport == XJ_INSTALLER_SOURCE_NVME)
         return (h.controller->class_code >> 8) == 0x0108 && h.nvme_namespace &&
                h.nvme_namespace != 0xffffffffU && !h.sata_port && !h.sata_multiplier && !h.lun &&
-               !h.ide_channel && !h.ide_unit;
+               !h.ide_channel && !h.ide_unit && !h.sata_direct_zero;
     if (h.transport == XJ_INSTALLER_SOURCE_IDE)
         return (h.controller->class_code >> 8) == 0x0101 && h.ide_channel <= 1 && h.ide_unit <= 1 &&
                !h.sata_port && !h.sata_multiplier && !h.lun && !h.nvme_namespace &&
-               xj_installer_bytes_zero(h.nvme_eui64, sizeof(h.nvme_eui64));
+               xj_installer_bytes_zero(h.nvme_eui64, sizeof(h.nvme_eui64)) && !h.sata_direct_zero;
     return false;
 }
 
 static bool same_hardware(const BlockSourceHardware &h, const XJ_INSTALLER_SOURCE &s)
 {
     const XJ_INSTALLER_PCI_LOCATION &leaf = s.pci[s.pci_count - 1];
+    // Do not globally normalize multiplier zero: on a PMP-capable controller
+    // it could name a different physical device. The driver's CAP observation
+    // is independent of the firmware path and is mandatory for this alias.
+    bool multiplier_matches = h.sata_multiplier == s.sata_multiplier ||
+        (h.transport == XJ_INSTALLER_SOURCE_AHCI && h.sata_multiplier == 0xffff &&
+         !s.sata_multiplier && h.sata_direct_zero);
     return h.controller && h.controller->segment == leaf.segment && h.controller->bus == leaf.bus &&
            h.controller->slot == leaf.device && h.controller->func == leaf.function &&
            h.transport == s.transport && h.sata_port == s.sata_port &&
-           h.sata_multiplier == s.sata_multiplier && h.lun == s.lun && h.ide_channel == s.ide_channel &&
+           multiplier_matches && h.lun == s.lun && h.ide_channel == s.ide_channel &&
            h.ide_unit == s.ide_unit && h.nvme_namespace == s.nvme_namespace;
 }
 

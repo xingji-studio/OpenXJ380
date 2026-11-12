@@ -17,6 +17,9 @@ struct BlockSourceHardware
     uint8_t ide_channel, ide_unit;
     uint32_t nvme_namespace;
     uint8_t nvme_eui64[8];
+    // Trusted AHCI CAP.SPM was clear. Only then may a firmware path's legacy
+    // multiplier value zero identify the driver's direct HBA port (0xffff).
+    bool sata_direct_zero;
 };
 
 // Trusted built-in drivers call after whole-device registration, using the

@@ -365,7 +365,7 @@ def vdisk(*, complete: bool, filesystem: str | None = None, image_path: Path | N
 
 
 def installer_system_stage(*, filesystem: str | None = None) -> None:
-    filesystem = env("INSTALLER_FS", "fat32") if filesystem is None else filesystem
+    filesystem = env("INSTALLER_FS", "ext4") if filesystem is None else filesystem
     if filesystem not in ("fat32", "ext4"):
         raise SystemExit("INSTALLER_FS must be fat32 or ext4")
     installer_prepare()
