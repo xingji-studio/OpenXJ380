@@ -335,11 +335,11 @@ The UI owns every request on its main TCB. Original-caller Admin admission,
 strict effective user-page permissions and same-owner release apply. Worker
 arguments remain kernel-owned. Public disk/partition GUIDs and filesystem UUIDs
 prefer CPUID-gated RDSEED/RDRAND with bounded retries. If unavailable, the
-identifier-only interface uses the existing ChaCha20 software PRNG, diversifying
-its key with wall/HPET time, CPUID-gated TSC and an atomic request sequence that
-refuses to wrap. These timing inputs are not claimed as cryptographic entropy;
+identifier-only interface diversifies a key from the existing ChaCha20 software
+PRNG with wall/HPET time and CPUID-gated TSC. A non-wrapping atomic request
+sequence supplies a per-request nonce. These timing inputs are not claimed as cryptographic entropy;
 keys, authentication and ASLR retain the strict hardware-only interface.
-Nonzero/distinct/version checks remain mandatory before target I/O. The serial
+Nonzero/distinct validation and UUID version/variant formatting precede target I/O. The serial
 line `installer: identity random source=hardware` or `software` records which
 path supplied the identifiers without logging their seed material.
 

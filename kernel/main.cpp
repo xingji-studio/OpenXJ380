@@ -779,9 +779,11 @@ extern "C" void KernelMain(const FrameBufferConfig &fbc, EFI_SYSTEM_TABLE &Syste
     // create_user_thread((void *)utsk, NULL, (char *)"test_task2", ugp);
 
 
+    // Publish runtime IRQ policy before any CPU can dispatch a worker. A
+    // pending timer can preempt immediately after STI, before the next store.
+    no_interrupt = false;
     scheduler_start();
     open_interrupt;
-    no_interrupt = false;
 
     // no_interrupt = true;
     // close_interrupt;
