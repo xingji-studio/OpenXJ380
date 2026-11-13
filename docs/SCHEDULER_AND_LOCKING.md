@@ -20,6 +20,13 @@ counter. They solve different problems:
   already started may use it to detect fatal shutdown; a nonzero local depth
   must never be mistaken for system-wide shutdown.
 
+At the final boot handoff, clear `no_interrupt` before `scheduler_start()`,
+then enable BSP interrupts. Opening the global gate can dispatch workers on
+an AP, and a pending BSP timer can preempt immediately after `sti`. If the
+boot IRQ policy is still set, thread creation can leave a worker's IF cleared
+when restoring its caller state. Changing the policy later does not repair
+that worker's saved flags. Both product and provider startup use this order.
+
 Never use `enable_scheduler()` to start the system scheduler. Never replace a
 save/restore pair with a naked enable: the caller may have entered with a
 nonzero depth. A function that changes the depth must restore its entry value

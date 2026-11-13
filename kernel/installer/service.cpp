@@ -11,6 +11,7 @@
 #include <errno.h>
 #include <krlibc.h>
 #include <mm/uaccess.h>
+#include <proto.hpp>
 #include <rng.h>
 #include <rtc.h>
 #include <task/kernel_worker.h>
@@ -162,7 +163,8 @@ int fresh_options(xjinstaller::FactoryOptions *options)
     for (unsigned attempt = 0; attempt < 8; ++attempt)
     {
         uint8_t identities[64];
-        if (!get_hardware_random_bytes(identities, sizeof(identities))) return -EOPNOTSUPP;
+        bool hardware_random = false;
+        if (!get_identifier_random_bytes(identities, sizeof(identities), &hardware_random)) return -EIO;
         if (!nonzero(identities) || !nonzero(identities + 16) || !nonzero(identities + 32) ||
             !nonzero(identities + 48)) continue;
         bool distinct = true;
@@ -193,6 +195,7 @@ int fresh_options(xjinstaller::FactoryOptions *options)
         options->time_seconds = realtime_ns() / 1000000000ULL;
         options->journal_mib = 6;
         options->esp_bytes = 64ULL << 20;
+        write_serial_fmt("installer: identity random source=%s\n", hardware_random ? "hardware" : "software");
         return 0;
     }
     return -EIO;

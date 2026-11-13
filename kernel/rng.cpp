@@ -3,6 +3,7 @@
 #include <cpu/lock.h>
 #include <krlibc.h>
 #include <proto.hpp>
+#include <rtc.h>
 #include <task/pcb.h>
 
 static spin_t rng_lock = SPIN_INIT;
@@ -73,31 +74,46 @@ static uint64_t splitmix64(uint64_t *state)
     return z ^ (z >> 31);
 }
 
+// Keep optional instructions behind the current CPU's CPUID checks below.
+static bool try_rdseed64(uint64_t *value)
+{
+    unsigned char ok;
+    __asm__ volatile("rdseed %0; setc %1" : "=r"(*value), "=qm"(ok)::"cc");
+    return ok != 0;
+}
+
+static bool try_rdrand64(uint64_t *value)
+{
+    unsigned char ok;
+    __asm__ volatile("rdrand %0; setc %1" : "=r"(*value), "=qm"(ok)::"cc");
+    return ok != 0;
+}
+
 static bool hardware_random64(uint64_t *value)
 {
     uint32_t eax, ebx, ecx, edx;
     asm_cpuid(0, 0, &eax, &ebx, &ecx, &edx);
-    if (eax >= 7)
+    const uint32_t maximum_leaf = eax;
+    if (maximum_leaf >= 7)
     {
         asm_cpuid(7, 0, &eax, &ebx, &ecx, &edx);
         if ((ebx & (1U << 18)) != 0)
         {
             for (unsigned i = 0; i < 10; ++i)
             {
-                unsigned char ok;
-                __asm__ volatile("rdseed %0; setc %1" : "=r"(*value), "=qm"(ok)::"cc");
-                if (ok) return true;
+                if (try_rdseed64(value)) return true;
             }
         }
     }
-    asm_cpuid(1, 0, &eax, &ebx, &ecx, &edx);
-    if ((ecx & (1U << 30)) != 0)
+    if (maximum_leaf >= 1)
     {
-        for (unsigned i = 0; i < 10; ++i)
+        asm_cpuid(1, 0, &eax, &ebx, &ecx, &edx);
+        if ((ecx & (1U << 30)) != 0)
         {
-            unsigned char ok;
-            __asm__ volatile("rdrand %0; setc %1" : "=r"(*value), "=qm"(ok)::"cc");
-            if (ok) return true;
+            for (unsigned i = 0; i < 10; ++i)
+            {
+                if (try_rdrand64(value)) return true;
+            }
         }
     }
     return false;
@@ -171,4 +187,85 @@ void get_random_bytes(void *buffer, size_t length)
         memset(block, 0, sizeof(block));
     }
     spin_unlock(&rng_lock);
+}
+
+static uint64_t identifier_sequence;
+
+static uint64_t read_identifier_tsc()
+{
+    uint32_t low, high;
+    __asm__ volatile("rdtsc" : "=a"(low), "=d"(high));
+    return (uint64_t(high) << 32) | low;
+}
+
+static uint64_t identifier_timestamp()
+{
+    uint32_t eax, ebx, ecx, edx;
+    asm_cpuid(0, 0, &eax, &ebx, &ecx, &edx);
+    if (eax < 1) return 0;
+    asm_cpuid(1, 0, &eax, &ebx, &ecx, &edx);
+    return (edx & (1U << 4)) ? read_identifier_tsc() : 0;
+}
+
+bool get_identifier_random_bytes(void *buffer, size_t length, bool *used_hardware)
+{
+    if (used_hardware) *used_hardware = false;
+    if (!buffer || !length) return false;
+    if (get_hardware_random_bytes(buffer, length))
+    {
+        if (used_hardware) *used_hardware = true;
+        return true;
+    }
+
+    // Public disk identifiers need a compatibility path on older CPUs. This
+    // does not turn timing/address-derived material into cryptographic entropy:
+    // keys, authentication and ASLR must retain the hardware-only interface.
+    uint64_t sequence = __atomic_load_n(&identifier_sequence, __ATOMIC_RELAXED);
+    do
+    {
+        if (sequence == __UINT64_MAX__)
+        {
+            secure_zero(buffer, length);
+            return false;
+        }
+    } while (!__atomic_compare_exchange_n(&identifier_sequence, &sequence, sequence + 1, false,
+                                          __ATOMIC_RELAXED, __ATOMIC_RELAXED));
+    ++sequence;
+
+    // Read clocks outside RNG locks. Wall time differentiates cold starts;
+    // HPET/TSC add execution timing and the sequence separates simultaneous
+    // requests even when clocks are unavailable or unchanged.
+    uint64_t timing[3] = {realtime_ns(), nanoTime(), identifier_timestamp()};
+    uint32_t key[8];
+    get_random_bytes(key, sizeof(key));
+    for (unsigned i = 0; i < 3; ++i)
+    {
+        key[2 * i] ^= uint32_t(timing[i]);
+        key[2 * i + 1] ^= uint32_t(timing[i] >> 32);
+    }
+    uint32_t nonce[3] = {uint32_t(sequence), uint32_t(sequence >> 32), 0x584a4944U}; // "XJID" domain.
+    uint8_t block[64];
+    uint8_t *output = static_cast<uint8_t *>(buffer);
+    uint64_t counter = 0;
+    size_t offset = 0;
+    bool complete = true;
+    while (offset < length)
+    {
+        if (counter > __UINT32_MAX__)
+        {
+            complete = false;
+            break;
+        }
+        rng_chacha20_block(key, uint32_t(counter++), nonce, block);
+        size_t count = length - offset;
+        if (count > sizeof(block)) count = sizeof(block);
+        memcpy(output + offset, block, count);
+        offset += count;
+    }
+    secure_zero(key, sizeof(key));
+    secure_zero(timing, sizeof(timing));
+    secure_zero(nonce, sizeof(nonce));
+    secure_zero(block, sizeof(block));
+    if (!complete) secure_zero(buffer, length);
+    return complete;
 }

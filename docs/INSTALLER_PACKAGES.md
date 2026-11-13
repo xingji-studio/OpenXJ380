@@ -333,8 +333,15 @@ The version 1 native ABI copies fixed-width requests and replies; it exposes
 opaque handles and display metadata, never kernel pointers or raw target IDs.
 The UI owns every request on its main TCB. Original-caller Admin admission,
 strict effective user-page permissions and same-owner release apply. Worker
-arguments remain kernel-owned. Checked hardware-only entropy supplies new
-identities; entropy failure issues no target I/O.
+arguments remain kernel-owned. Public disk/partition GUIDs and filesystem UUIDs
+prefer CPUID-gated RDSEED/RDRAND with bounded retries. If unavailable, the
+identifier-only interface diversifies a key from the existing ChaCha20 software
+PRNG with wall/HPET time and CPUID-gated TSC. A non-wrapping atomic request
+sequence supplies a per-request nonce. These timing inputs are not claimed as cryptographic entropy;
+keys, authentication and ASLR retain the strict hardware-only interface.
+Nonzero/distinct validation and UUID version/variant formatting precede target I/O. The serial
+line `installer: identity random source=hardware` or `software` records which
+path supplied the identifiers without logging their seed material.
 
 A private RAM-tree builder copies the validated PAK1 root, verifies its contents
 and required installer executable/config guide, then seals it without mounting
