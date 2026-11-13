@@ -442,7 +442,7 @@ def prepare_partition(partition: Path, usage: StagedUsage, *, filesystem: str,
         capacity += round_up(needed - available, MIB) // MIB
 
 
-def build_image(root: Path, image: Path, *, filesystem: str = "fat32", size_mib: int | None = None,
+def build_image(root: Path, image: Path, *, filesystem: str = "ext4", size_mib: int | None = None,
                 esp_mib: int | None = None, fat_mib: int | None = None, sudo: str = "") -> None:
     root = root.resolve()
     if image.is_symlink():
@@ -569,7 +569,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--image", type=Path, required=True)
-    parser.add_argument("--fs", choices=("fat32", "ext4"), default="fat32")
+    parser.add_argument("--fs", type=str.lower, choices=("fat32", "ext4"), default="ext4",
+                        help="system filesystem (default: ext4 with FAT32 ESP)")
     parser.add_argument("--size-mib", type=positive_integer,
                         help="total capacity in MiB (default: content + 20%%, filesystem overhead and alignment)")
     parser.add_argument("--esp-mib", type=positive_integer,

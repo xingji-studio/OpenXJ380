@@ -117,11 +117,21 @@ ninja -f build.ninja clean       # 删除构建产物
 ninja -f build.ninja vdisk
 ```
 
-该命令生成 `XJ380.img`，并将内核、模块、命令行示例程序和资源按系统目录布局写入镜像。镜像制作通常需要写入分区和文件系统的权限；默认配置下，运行 QEMU 时也可能使用 `sudo`。
+该命令默认生成 ext4 系统根分区＋FAT32 EFI 引导分区的 `XJ380.img`，并将内核、模块、命令行示例程序和资源按系统目录布局写入镜像。默认配置下，运行 QEMU 时可能使用 `sudo`。
+
+需要全 FAT32 镜像时，在执行打包时设置 `VDISK_FS=FAT32`：
+
+```bash
+VDISK_FS=FAT32 ninja -f build.ninja vdisk
+```
+
+`vdisk`、`complete` 及依赖镜像打包的运行、VMDK 目标采用相同默认值。`VDISK_FS` 大小写不敏感，
+兼容 `fat32`、`ext4`，非法值会报错。直接运行 `python3 tools/ninja_build.py vdisk` 时默认值相同，
+显式 `--fs FAT32` 或 `--fs ext4` 优先于环境变量。
 
 默认容量按最终暂存内容的逻辑大小增加 20% 余量，并计入文件系统开销、最小容量和 MiB 对齐；
 减少内容后重新打包，RAW 镜像也会缩小。`VDISK_SIZE_MIB` 可显式指定整盘容量（MiB），
-`VDISK_FAT_MIB` 可指定 FAT32 分区容量，`VDISK_ESP_MIB` 可指定 ext4 镜像的 EFI 分区容量。
+`VDISK_FAT_MIB` 可指定全 FAT32 模式的分区容量，`VDISK_ESP_MIB` 可指定 ext4 镜像的 EFI 分区容量（至少 64 MiB）。
 显式容量不足时打包失败并保留原镜像。
 
 使用 QEMU 启动并在需要时自动创建镜像：

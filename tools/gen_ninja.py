@@ -787,6 +787,7 @@ def main() -> None:
     phony(n, "kmods", kmod_targets)
 
     n.comment("IMAGE AND UTILITY TARGETS - delegate staging/run helpers to tools/ninja_build.py")
+    n.comment("VDISK_FS is read at packaging time: ext4 root + FAT32 ESP by default; FAT32 selects all-FAT32.")
     # Image creation, QEMU launch, formatting, and graph reporting stay in the
     # helper script because they are imperative workflows rather than compile
     # edges.  Ninja still tracks their visible target names here.

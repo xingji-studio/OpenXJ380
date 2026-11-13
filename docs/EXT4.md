@@ -10,9 +10,9 @@ a volume needing recovery is refused in that mode.
 
 This remains a supported subset, not a complete ext4 implementation. System-root
 mounting uses the explicit boot binding described below; ordinary application/data
-mount APIs still refuse the system root. The public image builder accepts `VDISK_FS=ext4` or `--fs ext4` for
-an explicitly bound writable root and FAT32 ESP. FAT32 remains the default image
-format. A trusted kernel factory API now builds a fresh ext4 root and FAT32 ESP
+mount APIs still refuse the system root. The public image builder defaults to
+an explicitly bound writable ext4 root and FAT32 ESP. `VDISK_FS=FAT32` selects
+an all-FAT32 image instead. A trusted kernel factory API now builds a fresh ext4 root and FAT32 ESP
 on a whole disk. The versioned native graphical installer supports fresh,
 full-package ext4 installation with a FAT32 ESP. Legacy copy/repair entrypoints
 remain refused; repair, keep-users and in-place update are not enabled.
@@ -383,7 +383,7 @@ loader, the same kernel bytes at `/system/kernel.krl`, and a 96-byte descriptor
 at `/EFI/XJ380/root.bin`. The formatter leaves the source stage unchanged,
 formats/checks temporary partitions with independent host tools, reads back both
 kernel copies and the descriptor, then atomically replaces the requested image.
-The default FAT32 build remains separate.
+The explicitly selected all-FAT32 build remains separate.
 
 `XJROOT01` version one records a disk GUID, root-partition GUID, ESP GUID, ext4
 filesystem UUID, kernel length and standard CRC32C, plus a descriptor CRC32C over
@@ -431,11 +431,21 @@ including its ESP and alignment space. Its journal is selected between 4 and
 32 MiB, within the native 32768-logical-block journal limit. The normal public image commands are:
 
 ```sh
-VDISK_FS=ext4 VDISK_IMAGE=out/XJ380-ext4.img ninja -f build.ninja vdisk
+ninja -f build.ninja vdisk
+VDISK_IMAGE=out/XJ380-ext4.img ninja -f build.ninja vdisk
 VDISK_IMAGE=out/XJ380-ext4.img ninja -f build.ninja justrun
 # Equivalent direct packaging of already-built artifacts:
-python3 tools/ninja_build.py vdisk --fs ext4 --image out/XJ380-ext4.img
+python3 tools/ninja_build.py vdisk --image out/XJ380-ext4.img
+# Explicit all-FAT32 compatibility image:
+VDISK_FS=FAT32 VDISK_IMAGE=out/XJ380-fat32.img ninja -f build.ninja vdisk
 ```
+
+`vdisk`, `complete`, and their dependent run/VMDK targets default to ext4 with a
+FAT32 ESP. Both wrappers resolve `VDISK_FS` at packaging time, so it can be changed
+without regenerating Ninja first. Values are case-insensitive (`fat32` and `ext4`
+remain accepted); invalid values fail before staging. An explicit `--fs` takes
+priority over `VDISK_FS`. The standalone formatter also defaults to ext4 with a
+FAT32 ESP and accepts `--fs FAT32` for an all-FAT32 image.
 
 With `VDISK_SIZE_MIB` unset, the formatter sizes the final staged content with
 20% extra content space, filesystem metadata/allocation overhead and MiB alignment.

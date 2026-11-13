@@ -293,7 +293,7 @@ def fix_links(root: Path) -> None:
     )
 
 
-def stage_full_system(root: Path, *, include_linux_compat: bool, filesystem: str = "fat32") -> None:
+def stage_full_system(root: Path, *, include_linux_compat: bool, filesystem: str = "ext4") -> None:
     if filesystem not in ("fat32", "ext4"):
         raise ValueError("filesystem must be fat32 or ext4")
     stage_base(root)
@@ -342,10 +342,16 @@ def installer_prepare() -> None:
     prepare()
 
 
-def vdisk(*, complete: bool, filesystem: str | None = None, image_path: Path | None = None) -> None:
-    filesystem = filesystem or env("VDISK_FS", "fat32")
+def vdisk_filesystem(filesystem: str | None = None) -> str:
+    """Resolve the system filesystem at packaging time, after any CLI override."""
+    filesystem = (env("VDISK_FS", "ext4") if filesystem is None else filesystem).lower()
     if filesystem not in ("fat32", "ext4"):
         raise SystemExit("VDISK_FS must be fat32 or ext4")
+    return filesystem
+
+
+def vdisk(*, complete: bool, filesystem: str | None = None, image_path: Path | None = None) -> None:
+    filesystem = vdisk_filesystem(filesystem)
     image = ROOT / (image_path or Path(env("VDISK_IMAGE", "XJ380.img")))
     vdisk_root = Path(env("VDISK_ROOT", f"/tmp/xj380-vdisk-{os.getuid()}/XJ380"))
     if image.resolve().is_relative_to(vdisk_root.resolve()):
@@ -609,6 +615,7 @@ def check_required_tool(
 
 
 def check_tools() -> None:
+    filesystem = vdisk_filesystem()
     missing: list[tuple[str, str, str]] = []
     prefix = env("COMPILER_PREFIX", "")
     print("XJ380 Ninja 构建工具检查")
@@ -640,7 +647,7 @@ def check_tools() -> None:
     check_required_tool(missing, "sgdisk", ["sgdisk"], "创建 GPT/EFI 分区", "sudo apt install gdisk")
     check_required_tool(missing, "mkfs.vfat", ["mkfs.vfat"], "格式化 FAT32 EFI 分区",
                         "sudo apt install dosfstools")
-    if env("VDISK_FS", "fat32") == "ext4":
+    if filesystem == "ext4":
         check_required_tool(missing, "mke2fs", ["mke2fs"], "创建并填充 ext4 系统分区", "sudo apt install e2fsprogs")
         check_required_tool(missing, "e2fsck", ["e2fsck"], "校验 ext4 系统分区", "sudo apt install e2fsprogs")
         check_required_tool(missing, "debugfs", ["debugfs"], "核对 ext4 根分区内核与引导绑定", "sudo apt install e2fsprogs")
@@ -701,7 +708,8 @@ def graph() -> None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("command")
-    parser.add_argument("--fs", choices=("fat32", "ext4"), help="filesystem for vdisk/complete (or VDISK_FS)")
+    parser.add_argument("--fs", type=str.lower, choices=("fat32", "ext4"),
+                        help="system filesystem for vdisk/complete (or VDISK_FS; default: ext4 with FAT32 ESP)")
     parser.add_argument("--image", type=Path, help="output for vdisk/complete (or VDISK_IMAGE)")
     parser.add_argument("--installer-fs", choices=("ext4",),
                         help="filesystem for installer-system-stage (or INSTALLER_FS)")
