@@ -60,8 +60,9 @@ int permissions_file_error();
 void permissions_clear_file_error();
 void permissions_set_file_error(int error);
 
-// Only authenticated login/profile services may construct this scope. It
-// authorizes fixed profile paths, never arbitrary symlink targets or raw disks.
+// Trusted profile services and the read-only pre-login language query may
+// construct this scope. It authorizes fixed profile paths, never arbitrary
+// symlink targets or raw disks. No application receives the underlying files.
 class PermissionProfileScope
 {
     tcb_t task;
