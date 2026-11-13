@@ -56,6 +56,7 @@ int cleanup_unpublished(SourceLifetime &source, int failure)
         source.lease = 0;
     }
     source.identity = {};
+    source.read_only_stream = false;
     source.owner = nullptr;
     source.owner_tid = 0;
     __atomic_store_n(&source.state, empty, __ATOMIC_RELEASE);
@@ -63,7 +64,7 @@ int cleanup_unpublished(SourceLifetime &source, int failure)
 }
 } // namespace
 
-int retain_source(const XJ_INSTALLER_SOURCE &identity, SourceLifetime *source)
+int retain_source(const XJ_INSTALLER_SOURCE &identity, SourceLifetime *source, bool read_only_stream)
 {
     if (!source) return -EINVAL;
     tcb_t task = get_current_task();
@@ -74,12 +75,15 @@ int retain_source(const XJ_INSTALLER_SOURCE &identity, SourceLifetime *source)
     if (!__atomic_compare_exchange_n(&source->state, &expected, retaining, false,
                                       __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return -EBUSY;
     source->identity = identity;
+    source->read_only_stream = read_only_stream;
+    if (read_only_stream && !(identity.flags & XJ_INSTALLER_SOURCE_READ_ONLY))
+        return cleanup_unpublished(*source, -EOPNOTSUPP);
     source->owner = task;
     source->owner_tid = task->tid;
     BlockExtent expected_extent = {};
     int result = block_source_match(source->identity, &expected_extent);
     if (result) return cleanup_unpublished(*source, result);
-    result = block_access_claim(expected_extent, true, &source->lease);
+    result = block_access_claim(expected_extent, !read_only_stream, &source->lease);
     if (result) return cleanup_unpublished(*source, result);
     result = devfs_retain_block(expected_extent.device, expected_extent.generation, &source->reference);
     if (result)
@@ -100,8 +104,10 @@ int retain_source(const XJ_INSTALLER_SOURCE &identity, SourceLifetime *source)
     if (!result) result = block_access_resolve_node(source->reference.node, &from_node);
     if (!result && (!same_extent(matched, expected_extent) || !same_extent(from_node, expected_extent) ||
                     source->reference.bytes != identity.physical_bytes ||
-                    source->reference.sector_size != identity.physical_block_size)) result = -ESTALE;
-    if (!result) result = block_access_validate_retained_exclusive(source->lease, expected_extent);
+                    source->reference.sector_size != identity.physical_block_size ||
+                    (read_only_stream && source->reference.writable))) result = -ESTALE;
+    if (!result) result = read_only_stream ? block_access_validate_retained_shared(source->lease, expected_extent) :
+                                           block_access_validate_retained_exclusive(source->lease, expected_extent);
     if (result) return cleanup_unpublished(*source, result);
     __atomic_store_n(&source->state, retained, __ATOMIC_RELEASE);
     return 0;
@@ -113,7 +119,10 @@ int validate_source(const SourceLifetime &source)
     if (state == quarantined) return -EIO;
     if ((state != retained && state != published) || source.reference.quarantined ||
         !source.reference.node || !source.lease) return -ENODEV;
-    int result = block_access_validate_retained_exclusive(source.lease, source.reference.extent);
+    if (source.read_only_stream && (!(source.identity.flags & XJ_INSTALLER_SOURCE_READ_ONLY) ||
+                                  source.reference.writable)) return -EOPNOTSUPP;
+    int result = source.read_only_stream ? block_access_validate_retained_shared(source.lease, source.reference.extent) :
+                                         block_access_validate_retained_exclusive(source.lease, source.reference.extent);
     if (result) return result;
     BlockExtent matched = {}, from_node = {};
     result = block_source_match(source.identity, &matched);

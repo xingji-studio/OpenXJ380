@@ -29,7 +29,7 @@ jobs:
     timeout-minutes: 60
     env:
       VDISK_SIZE_MIB: 512
-      VDISK_FAT_MIB: 510
+      VDISK_ESP_MIB: 64
 
     steps:
       - name: Check out sources
@@ -45,6 +45,7 @@ jobs:
             bzip2 \
             clang \
             dosfstools \
+            e2fsprogs \
             g++ \
             gcc \
             gcc-mingw-w64-x86-64 \
@@ -73,12 +74,7 @@ jobs:
         run: |
           test -s XJ380.img
           sgdisk --verify XJ380.img
-          mdir -i XJ380.img@@1048576 ::/EFI/BOOT/BOOTX64.efi
-          mdir -i XJ380.img@@1048576 ::/system/kernel.krl
-          mdir -i XJ380.img@@1048576 ::/apps/system/shell/shell.elf
-          mdir -i XJ380.img@@1048576 ::/system/mod/e1000.sys
-          mdir -i XJ380.img@@1048576 ::/system/mod/netserver.sys
-          mdir -i XJ380.img@@1048576 ::/system/licenses/third-party/MANIFEST.json
+          python3 tools/verify_disk_image.py XJ380.img
           sha256sum XJ380.img > XJ380.img.sha256
           ninja -f build.ninja size
 

@@ -35,6 +35,15 @@ struct Span
     Size size;
 };
 
+// Exact bounded reads from a pinned immutable installation source. The callback
+// returns zero or a negative errno; it never exposes a user-supplied pointer.
+struct DataReader
+{
+    int (*read)(void *, uint64_t, void *, Size) = nullptr;
+    void *context = nullptr;
+    uint64_t bytes = 0;
+};
+
 // These upper bounds are a supported format profile, not a target capacity
 // reservation. Each caller must lower them to its actual RAM/filesystem budget.
 struct Limits
@@ -70,6 +79,9 @@ struct Record
     uint32_t mode, uid, gid, mtime_nsec;
     int64_t mtime_seconds;
     uint16_t xattr_count;
+    uint64_t payload_offset = 0;
+    uint32_t payload_crc32c = 0;
+    bool payload_external = false;
 };
 
 struct Workspace
@@ -84,6 +96,7 @@ struct Plan
     uint64_t inode_count = 0, data_bytes = 0;
     bool legacy_v1 = false;
     bool validated = false;
+    DataReader reader = {};
 };
 
 // Cheap header/count/declared-budget validation for bounded arena allocation.
@@ -99,6 +112,14 @@ int inspect_header(const uint8_t *package, Size bytes, const Limits &, HeaderInf
 // be modified. Validation does not establish destination lifetime/exclusivity,
 // free-space reservation, authentication or atomic installation.
 int validate(const uint8_t *package, Size bytes, const Limits &, Workspace, Plan &);
+// Metadata uses the same fully validated PAK2 namespace/link/attribute grammar.
+// Each regular payload is a 24-byte {offset, length, CRC32C, reserved-zero}
+// descriptor into reader. Real file/data budgets are checked after expansion;
+// no source I/O occurs here. The factory checks complete data CRCs before its
+// first target operation, and consumers recheck CRCs while copying/readback.
+int validate_indexed(const uint8_t *, Size, const Limits &, Workspace, Plan &, const DataReader &);
+int read_payload(const Plan &, const Record &, uint64_t offset, void *, Size);
+uint32_t crc32c_update(uint32_t unfinalized_state, const uint8_t *, Size);
 uint32_t crc32c(const uint8_t *, Size);
 
 } // namespace xjpak2

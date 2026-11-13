@@ -12,6 +12,8 @@
 #include <device.h>
 #include <fs/fatfs/private.h>
 #include <installer/esp.h>
+#include <installer/fat32.h>
+#include <efi/root_binding.h>
 #include <task/scheduler.h>
 #include <ioctl.h>
 #include <user/permissions.h>
@@ -1158,6 +1160,46 @@ void fatfs_init() {
     if (fatfs_id == VFS_STATUS_FAILED) { write_serial_fmt("Failed to register fat filesystem\n"); }
 }
 
+// Validate the selected bound FAT32 root before any user process can write it.
+// A failure is fatal to this boot; the caller never falls back to another root.
+int fatfs_mount_bound_root(const char *source, const XJ_ROOT_BINDING *binding)
+{
+    if (!source || !binding || !xj_root_binding_valid(binding) ||
+        xj_root_binding_filesystem(binding) != XJ_ROOT_FILESYSTEM_FAT32) return -EINVAL;
+    vfs_node_t device = vfs_open(source);
+    if (!device) return -ENODEV;
+    auto *buffer = static_cast<uint8_t *>(malloc(65536));
+    if (!buffer) { vfs_close(device); return -ENOMEM; }
+    int error = 0;
+    if (vfs_read(device, buffer, 0, 512) != 512) error = -EIO;
+    if (!error && (buffer[510] != 0x55 || buffer[511] != 0xaa ||
+        memcmp(buffer + 82, "FAT32   ", 8) ||
+        xj_root_binding_le32(buffer + 67) != xj_root_binding_fat32_id(binding))) error = -EUCLEAN;
+    if (!error) error = vfs_mount(source, rootdir);
+    if (!error)
+    {
+        vfs_node_t kernel = vfs_open("/system/kernel.krl");
+        if (!kernel || kernel->size != xj_root_binding_kernel_bytes(binding)) error = -EUCLEAN;
+        uint32_t crc = 0xffffffffU;
+        for (uint64_t at = 0; !error && at < kernel->size;)
+        {
+            size_t count = kernel->size - at > 65536 ? 65536 : size_t(kernel->size - at);
+            if (vfs_read(kernel, buffer, at, count) != count) { error = -EIO; break; }
+            for (size_t i = 0; i < count; ++i)
+            {
+                crc ^= buffer[i];
+                for (unsigned bit = 0; bit < 8; ++bit) crc = (crc >> 1) ^ ((0U - (crc & 1U)) & 0x82f63b78U);
+            }
+            at += count;
+        }
+        if (!error && ~crc != xj_root_binding_le32(binding->bytes + 88)) error = -EUCLEAN;
+        if (kernel && vfs_close(kernel)) error = -EIO;
+    }
+    free(buffer);
+    if (vfs_close(device)) error = -EIO;
+    return error;
+}
+
 // Original Apache-2.0 private factory ESP session. No valid root binding is
 // written here: the coordinator must validate and activate the closed volume.
 namespace {
@@ -1167,6 +1209,13 @@ struct EspContext
     BlockAccessWindow window;
     xjinstaller::EspPayload payload;
     xjinstaller::EspBuildStatus status;
+    const xjpak2::Plan *root_plan;
+    xjinstaller::ProgressObserver observer;
+    uint8_t *seen;
+    uint64_t data_total;
+    uint64_t format_done, format_total;
+    bool formatting;
+    bool verifying;
     FATFS filesystem;
     FIL file;
     DIR directory;
@@ -1176,7 +1225,12 @@ struct EspContext
     bool scratch_used[4];
     alignas(16) uint8_t scratch[4][32768];
     uint8_t mkfs_work[65536], stream[65536], placeholder[96];
-    char path[64];
+    char path[520], name[512], directory_name[512];
+    // Private root construction repeatedly scans dense FAT directories. Keep
+    // a bounded, write-through sector cache; a fresh verifier gets a separately
+    // zeroed context, so no writer bytes can satisfy independent readback.
+    uint64_t root_cache_tags[2048];
+    uint8_t root_cache[2048][512];
 };
 
 static EspContext *esp_contexts[10];
@@ -1255,7 +1309,8 @@ static int esp_file(EspContext *context, const char *name, const void *source, s
 {
     esp_path(context, name);
     memset(&context->file, 0, sizeof(context->file));
-    if (esp_fresult(context, f_open(&context->file, context->path, write ? FA_CREATE_ALWAYS | FA_WRITE : FA_READ)))
+    if (esp_fresult(context, f_open(&context->file, context->path,
+                                   write ? (context->root_plan ? FA_CREATE_NEW : FA_CREATE_ALWAYS) | FA_WRITE : FA_READ)))
         return context->error;
     if (!write && f_size(&context->file) != bytes) return esp_stop(context, -EIO);
     size_t done = 0;
@@ -1282,6 +1337,10 @@ static int esp_file(EspContext *context, const char *name, const void *source, s
             context->status.verified_bytes += count;
         }
         done += count;
+        if (context->root_plan)
+            xjinstaller::report_progress(context->observer,
+                write ? xjinstaller::InstallStage::Copying : xjinstaller::InstallStage::VerifyingRoot,
+                write ? context->status.written_bytes : context->status.verified_bytes, context->data_total);
     }
     if (write && esp_fresult(context, f_sync(&context->file))) return context->error;
     return esp_fresult(context, f_close(&context->file));
@@ -1332,9 +1391,49 @@ static int esp_io(unsigned drive, void *buffer, uint64_t sector, unsigned count,
     if (bytes / 512 != count) return esp_stop(context, -EOVERFLOW);
     uint64_t offset = context->window.offset + sector * 512;
     context->status.io_started = true;
+    bool cached_root = context->root_plan && !context->formatting;
+    if (cached_root && !write && count <= 2048)
+    {
+        bool hit = true;
+        for (unsigned i = 0; i < count; ++i)
+            if (context->root_cache_tags[(sector + i) & 2047] != sector + i + 1) { hit = false; break; }
+        if (hit)
+        {
+            for (unsigned i = 0; i < count; ++i)
+                memcpy(static_cast<uint8_t *>(buffer) + size_t(i) * 512,
+                       context->root_cache[(sector + i) & 2047], 512);
+            return 0;
+        }
+    }
     size_t actual = write ? vfs_write(context->window.node, buffer, offset, bytes) :
                             vfs_read(context->window.node, buffer, offset, bytes);
     if (actual != bytes) return esp_stop(context, -EIO, true);
+    if (context->root_plan)
+    {
+        // Publish only after the complete backend request succeeds. Writes
+        // never become deferred work; any short I/O poisons before reuse.
+        for (unsigned i = 0; i < count; ++i)
+        {
+            memcpy(context->root_cache[(sector + i) & 2047],
+                   static_cast<const uint8_t *>(buffer) + size_t(i) * 512, 512);
+            context->root_cache_tags[(sector + i) & 2047] = sector + i + 1;
+        }
+    }
+    if (write && context->root_plan && context->formatting)
+    {
+        // The first formatter write is its BPB. Derive the exact FAT/root
+        // initialization work from that generated BPB, not volume capacity.
+        if (!sector && bytes >= 512)
+        {
+            const auto *bpb = static_cast<const uint8_t *>(buffer);
+            uint32_t fat_sectors = uint32_t(bpb[36]) | uint32_t(bpb[37]) << 8 |
+                                   uint32_t(bpb[38]) << 16 | uint32_t(bpb[39]) << 24;
+            context->format_total = (4ULL + uint64_t(bpb[16]) * fat_sectors + bpb[13]) * 512;
+        }
+        context->format_done += bytes;
+        xjinstaller::report_progress(context->observer, xjinstaller::InstallStage::Formatting,
+                                     context->format_done, context->format_total);
+    }
     return 0;
 }
 
@@ -1392,14 +1491,216 @@ bool fatfs_esp_memfree(void *buffer)
     return false;
 }
 
-int fatfs_build_esp_window(const BlockAccessWindow *window, const xjinstaller::EspPayload *payload,
-                           xjinstaller::EspBuildStatus *status)
+static void fatfs_root_name(EspContext *context, const xjpak2::Span &path)
 {
-    if (!window || !payload) return -EINVAL;
+    memcpy(context->name, path.data, path.size);
+    context->name[path.size] = 0;
+}
+
+static const xjpak2::Record *fatfs_root_find(EspContext *context, const char *name, size_t *index)
+{
+    size_t begin = 0, end = context->root_plan->count, length = strlen(name);
+    while (begin < end)
+    {
+        size_t middle = begin + (end - begin) / 2;
+        const auto &record = context->root_plan->records[middle];
+        size_t common = length < record.path.size ? length : record.path.size;
+        // Match the package parser's unsigned-byte ordering for UTF-8 paths.
+        // The kernel memcmp currently orders signed chars, unlike hosted libc.
+        int order = 0;
+        for (size_t i = 0; i < common; ++i)
+        {
+            uint8_t value = uint8_t(name[i]);
+            if (value == record.path.data[i]) continue;
+            order = value < record.path.data[i] ? -1 : 1;
+            break;
+        }
+        if (!order) order = length < record.path.size ? -1 : length > record.path.size ? 1 : 0;
+        if (!order) { *index = middle; return &record; }
+        if (order < 0) end = middle;
+        else begin = middle + 1;
+    }
+    return nullptr;
+}
+
+static int fatfs_root_directory(EspContext *context, const char *name)
+{
+    esp_path(context, name);
+    if (esp_fresult(context, f_opendir(&context->directory, context->path))) return context->error;
+    const size_t prefix = strlen(name);
+    for (;;)
+    {
+        if (esp_fresult(context, f_readdir(&context->directory, &context->information))) return context->error;
+        if (!context->information.fname[0]) break;
+        // Do not recurse through on-disk names: only enumerate directories
+        // from the already validated manifest and match every returned child.
+        size_t child = strlen(context->information.fname);
+        size_t base = prefix == 1 ? 0 : prefix;
+        if (base + 1 + child >= sizeof(context->name)) return esp_stop(context, -ENAMETOOLONG);
+        memcpy(context->name, name, base);
+        context->name[base] = '/';
+        memcpy(context->name + base + 1, context->information.fname, child + 1);
+        size_t index = 0;
+        const auto *record = fatfs_root_find(context, context->name, &index);
+        if (!record || context->seen[index] ||
+            ((record->kind == xjpak2::Kind::Directory) != bool(context->information.fattrib & AM_DIR)) ||
+            (record->kind == xjpak2::Kind::Regular && context->information.fsize != record->payload.size))
+            return esp_stop(context, -EUCLEAN);
+        context->seen[index] = 1;
+    }
+    return esp_fresult(context, f_closedir(&context->directory));
+}
+
+static int fatfs_root_file(EspContext *context, const xjpak2::Record &record, bool write)
+{
+    if (!record.payload_external)
+        return esp_file(context, context->name, record.payload.data, record.payload.size, write);
+    esp_path(context, context->name);
+    memset(&context->file, 0, sizeof(context->file));
+    if (esp_fresult(context, f_open(&context->file, context->path, write ? FA_CREATE_NEW | FA_WRITE : FA_READ)))
+        return context->error;
+    if (!write && f_size(&context->file) != record.payload.size) return esp_stop(context, -EUCLEAN);
+    uint32_t source_crc = 0xffffffffU, target_crc = 0xffffffffU;
+    for (size_t done = 0; done < record.payload.size;)
+    {
+        unsigned count = unsigned(record.payload.size - done > sizeof(context->stream) ? sizeof(context->stream) :
+                                                                                       record.payload.size - done);
+        int error = xjpak2::read_payload(*context->root_plan, record, done, context->mkfs_work, count);
+        if (error) return esp_stop(context, error);
+        source_crc = xjpak2::crc32c_update(source_crc, context->mkfs_work, count);
+        unsigned actual = 0;
+        FRESULT result = write ? f_write(&context->file, context->mkfs_work, count, &actual) :
+                                 f_read(&context->file, context->stream, count, &actual);
+        if (write) context->status.written_bytes += actual;
+        else context->status.verified_bytes += actual;
+        if (esp_fresult(context, result) || actual != count) return esp_stop(context, -EIO);
+        if (!write)
+        {
+            if (memcmp(context->stream, context->mkfs_work, count)) return esp_stop(context, -EUCLEAN);
+            target_crc = xjpak2::crc32c_update(target_crc, context->stream, count);
+        }
+        done += count;
+        xjinstaller::report_progress(context->observer, write ? xjinstaller::InstallStage::Copying :
+                                                                xjinstaller::InstallStage::VerifyingRoot,
+             write ? context->status.written_bytes : context->status.verified_bytes, context->data_total);
+    }
+    if (~source_crc != record.payload_crc32c || (!write && ~target_crc != record.payload_crc32c))
+        return esp_stop(context, -EUCLEAN);
+    if (write && esp_fresult(context, f_sync(&context->file))) return context->error;
+    return esp_fresult(context, f_close(&context->file));
+}
+
+static int fatfs_root_contents(EspContext *context, uint32_t volume_id, bool verify)
+{
+    using namespace xjinstaller;
+    const auto &plan = *context->root_plan;
+    esp_path(context, "");
+    if (!verify)
+    {
+        if (fatfs_esp_disk_sync(context->drive)) return context->error;
+        context->mkfs.fmt = FM_FAT32 | FM_SFD;
+        context->mkfs.n_fat = 2;
+        context->mkfs.align = 1;
+        context->mkfs.au_size = fat32_cluster_bytes(context->window.bytes);
+        context->formatting = true;
+        report_progress(context->observer, InstallStage::Formatting, 0, 0);
+        if (esp_fresult(context, f_mkfs(context->path, &context->mkfs, context->mkfs_work,
+                                       sizeof(context->mkfs_work)))) return context->error;
+        context->formatting = false;
+        // Install a per-installation serial in both BPBs before mounting.
+        if (fatfs_esp_disk_read(context->drive, context->stream, 0, 1)) return context->error;
+        for (unsigned i = 0; i < 4; ++i) context->stream[67 + i] = uint8_t(volume_id >> (8 * i));
+        if (fatfs_esp_disk_write(context->drive, context->stream, 0, 1) ||
+            fatfs_esp_disk_write(context->drive, context->stream, 6, 1) ||
+            fatfs_esp_disk_sync(context->drive)) return context->error;
+    }
+    if (esp_fresult(context, f_mount(&context->filesystem, context->path, 1))) return context->error;
+    if (context->filesystem.fs_type != FS_FAT32 || context->filesystem.n_fats != 2 ||
+        fatfs_esp_disk_read(context->drive, context->stream, 0, 1)) return esp_stop(context, -EIO);
+    uint32_t serial = uint32_t(context->stream[67]) | uint32_t(context->stream[68]) << 8 |
+                      uint32_t(context->stream[69]) << 16 | uint32_t(context->stream[70]) << 24;
+    if (serial != volume_id) return esp_stop(context, -EUCLEAN);
+    if (verify)
+    {
+        if (fatfs_esp_disk_read(context->drive, context->mkfs_work, 6, 1)) return context->error;
+        if (memcmp(context->stream, context->mkfs_work, 512)) return esp_stop(context, -EUCLEAN);
+        // Read both FAT copies in bounded chunks before opening any files.
+        uint32_t fat = context->filesystem.fsize;
+        uint64_t first = context->filesystem.fatbase;
+        for (uint32_t sector = 0; sector < fat;)
+        {
+            unsigned count = fat - sector > 64 ? 64 : fat - sector;
+            if (fatfs_esp_disk_read(context->drive, context->stream, first + sector, count) ||
+                fatfs_esp_disk_read(context->drive, context->mkfs_work, first + fat + sector, count))
+                return context->error;
+            if (memcmp(context->stream, context->mkfs_work, count * 512)) return esp_stop(context, -EUCLEAN);
+            sector += count;
+        }
+    }
+    report_progress(context->observer, verify ? InstallStage::VerifyingRoot : InstallStage::Directories, 0,
+                     verify ? plan.data_bytes : plan.count);
+    for (size_t i = 0; i < plan.count; ++i)
+    {
+        const auto &record = plan.records[i];
+        if (record.path.size > 511) return esp_stop(context, -ENAMETOOLONG);
+        if (record.kind != xjpak2::Kind::Directory || record.path.size == 1) continue;
+        fatfs_root_name(context, record.path);
+        if (!verify)
+        {
+            esp_path(context, context->name);
+            if (esp_fresult(context, f_mkdir(context->path))) return context->error;
+            report_progress(context->observer, InstallStage::Directories, i + 1, plan.count);
+        }
+    }
+    for (size_t i = 0; i < plan.count; ++i)
+    {
+        const auto &record = plan.records[i];
+        if (record.kind != xjpak2::Kind::Regular) continue;
+        fatfs_root_name(context, record.path);
+        if (fatfs_root_file(context, record, !verify)) return context->error;
+    }
+    if (verify)
+    {
+        if (fatfs_root_directory(context, "/")) return context->error;
+        for (size_t i = 0; i < plan.count; ++i)
+        {
+            const auto &record = plan.records[i];
+            if (record.kind == xjpak2::Kind::Directory && record.path.size > 1)
+            {
+                // path is separate from name, which enumeration uses as scratch.
+                memcpy(context->path + 2, record.path.data, record.path.size);
+                context->path[2 + record.path.size] = 0;
+                char *directory = context->directory_name;
+                memcpy(directory, context->path + 2, record.path.size + 1);
+                if (fatfs_root_directory(context, directory)) return context->error;
+            }
+        }
+        for (size_t i = 0; i < plan.count; ++i)
+            if (plan.records[i].path.size != 1 && !context->seen[i]) return esp_stop(context, -EUCLEAN);
+    }
+    esp_path(context, "");
+    if (esp_fresult(context, f_unmount(context->path))) return context->error;
+    if (!verify && fatfs_esp_disk_sync(context->drive)) return context->error;
+    report_progress(context->observer, verify ? InstallStage::VerifyingRoot : InstallStage::Copying,
+                     plan.data_bytes, plan.data_bytes);
+    return 0;
+}
+
+static int fatfs_factory_window(const BlockAccessWindow *window, const xjinstaller::EspPayload *payload,
+                                const xjpak2::Plan *root_plan, uint32_t volume_id,
+                                xjinstaller::EspBuildStatus *status,
+                                const xjinstaller::ProgressObserver &observer, bool verify_only)
+{
+    if (!window || (!payload && !root_plan)) return -EINVAL;
     BlockAccessWindow selected = *window;
-    xjinstaller::EspPayload source = *payload;
+    xjinstaller::EspPayload source = payload ? *payload : xjinstaller::EspPayload{};
     xjinstaller::EspRequirements requirements;
-    int error = xjinstaller::esp_plan(selected.bytes, source, requirements);
+    int error = root_plan ?
+        (!root_plan->validated || (!root_plan->legacy_v1 && !root_plan->reader.read) ||
+         !root_plan->count || !root_plan->records ||
+         !volume_id || selected.bytes < 64ULL * 1048576 || selected.bytes % 512 ||
+         selected.bytes / 512 >= 0x100000000ULL ? -EINVAL : 0) :
+        xjinstaller::esp_plan(selected.bytes, source, requirements);
     if (error) return error;
     if (status && (!esp_span(status, sizeof(*status)) ||
                    esp_overlap(status, sizeof(*status), source.loader, source.loader_bytes) ||
@@ -1442,15 +1743,24 @@ int fatfs_build_esp_window(const BlockAccessWindow *window, const xjinstaller::E
     if (!context) { fatfs_unlock(); return -ENOMEM; }
     context->window = selected;
     context->payload = source;
+    context->root_plan = root_plan;
+    context->observer = observer;
+    context->verifying = verify_only;
+    context->data_total = root_plan ? root_plan->data_bytes : 0;
+    if (root_plan && verify_only)
+    {
+        context->seen = static_cast<uint8_t *>(calloc(root_plan->count, 1));
+        if (!context->seen) { free(context); fatfs_unlock(); return -ENOMEM; }
+    }
     context->status.phase = xjinstaller::EspBuildPhase::Preflight;
     context->drive = alloc_number();
     error = context->drive < 0 ? -ENOSPC : esp_validate(context);
-    if (error) { free(context); fatfs_unlock(); return error; }
+    if (error) { free(context->seen); free(context); fatfs_unlock(); return error; }
     vfs_child_lock();
     bool overflow = selected.node->refcount == uint32_t(-1);
     if (!overflow) ++selected.node->refcount;
     vfs_child_unlock();
-    if (overflow) { free(context); fatfs_unlock(); return -EOVERFLOW; }
+    if (overflow) { free(context->seen); free(context); fatfs_unlock(); return -EOVERFLOW; }
     // One heap block owns all FatFs objects, work buffers, and its bounded
     // allocator slabs. Publish it and the device pin before the first request.
     esp_contexts[context->drive] = context;
@@ -1461,6 +1771,13 @@ int fatfs_build_esp_window(const BlockAccessWindow *window, const xjinstaller::E
     context->status.phase = xjinstaller::EspBuildPhase::Published;
     do
     {
+        if (root_plan)
+        {
+            if (fatfs_root_contents(context, volume_id, verify_only)) break;
+            context->status.complete = true;
+            context->status.phase = xjinstaller::EspBuildPhase::Complete;
+            break;
+        }
         if (fatfs_esp_disk_sync(context->drive)) break;
         context->status.phase = xjinstaller::EspBuildPhase::InitialFlush;
         esp_path(context, "");
@@ -1521,6 +1838,27 @@ int fatfs_build_esp_window(const BlockAccessWindow *window, const xjinstaller::E
     drive_leases[context->drive] = 0;
     fatfs_unlock();
     vfs_close(selected.node);
+    free(context->seen);
     free(context);
     return 0;
+}
+
+int fatfs_build_esp_window(const BlockAccessWindow *window, const xjinstaller::EspPayload *payload,
+                           xjinstaller::EspBuildStatus *status)
+{
+    return fatfs_factory_window(window, payload, nullptr, 0, status, {}, false);
+}
+
+int xjinstaller::fatfs_build_root_window(const BlockAccessWindow *window, const xjpak2::Plan *plan,
+                                         uint32_t volume_id, EspBuildStatus *status,
+                                         const ProgressObserver &observer)
+{
+    return fatfs_factory_window(window, nullptr, plan, volume_id, status, observer, false);
+}
+
+int xjinstaller::fatfs_verify_root_window(const BlockAccessWindow *window, const xjpak2::Plan *plan,
+                                          uint32_t volume_id, EspBuildStatus *status,
+                                          const ProgressObserver &observer)
+{
+    return fatfs_factory_window(window, nullptr, plan, volume_id, status, observer, true);
 }

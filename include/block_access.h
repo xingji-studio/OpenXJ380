@@ -67,6 +67,9 @@ int block_access_validate_owned_exclusive(BlockAccessToken token, const BlockExt
 // to the caller nor transfers the original owner's token. The exact ordinary
 // whole-device exclusive lease and its nonterminal owner must still be live.
 int block_access_validate_retained_exclusive(BlockAccessToken token, const BlockExtent &whole);
+// Authenticates a retained nonexclusive whole-device exclusion. This does not
+// prove that media is read-only; source readers must check real device flags.
+int block_access_validate_retained_shared(BlockAccessToken token, const BlockExtent &whole);
 
 // expected_generation=0 is for current device-manager calls. Cached devfs
 // handles must pass their nonzero captured generation. Zero-byte I/O is valid.

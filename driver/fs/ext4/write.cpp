@@ -333,9 +333,9 @@ int WriteSession::add_metadata(uint64_t first, uint64_t count, uint32_t inode_gr
     return 0;
 }
 
-int WriteSession::build_layout()
+int WriteSession::build_layout(bool refresh)
 {
-    metadata_count_ = 0;
+    if (!refresh) metadata_count_ = 0;
     bitmap_group_ = 0xffffffffU;
     uint32_t size = volume_.block_size_;
     bool wide = (volume_.incompat_ & 0x80U) != 0;
@@ -347,6 +347,14 @@ int WriteSession::build_layout()
         int error = volume_.read_group(group, descriptor);
         if (error) return error;
         GroupLayout &layout = groups_[group];
+        // A successful guarded checkpoint can change counters/checksums and
+        // clear UNINIT flags, but never move metadata. Preserve the validated
+        // sorted ownership ranges; still read/check every final descriptor.
+        if (refresh && (layout.bitmap != descriptor_block(descriptor, 0, 0x20, wide) ||
+            layout.inode_bitmap != descriptor_block(descriptor, 4, 0x24, wide) ||
+            layout.inode_table != descriptor_block(descriptor, 8, 0x28, wide) ||
+            ((layout.flags ^ le16(descriptor + 0x12)) & ~3U) ||
+            (le16(descriptor + 0x12) & ~layout.flags & 3U))) return -EUCLEAN;
         layout.bitmap = descriptor_block(descriptor, 0, 0x20, wide);
         layout.inode_bitmap = descriptor_block(descriptor, 4, 0x24, wide);
         layout.inode_table = descriptor_block(descriptor, 8, 0x28, wide);
@@ -355,6 +363,7 @@ int WriteSession::build_layout()
         layout.free_inodes = le16(descriptor + 0xe) | (wide ? uint32_t(le16(descriptor + 0x2e)) << 16 : 0);
         layout.bitmap_checksum = le16(descriptor + 0x18) |
                                  (wide ? uint32_t(le16(descriptor + 0x38)) << 16 : 0);
+        if (refresh) continue;
         error = add_metadata(layout.bitmap, 1);
         if (!error) error = add_metadata(layout.inode_bitmap, 1);
         if (!error) error = add_metadata(layout.inode_table, table_blocks, group);
@@ -368,6 +377,7 @@ int WriteSession::build_layout()
             if (error) return error;
         }
     }
+    if (refresh) return 0;
     // Heapsort followed by adjacent validation makes overlap checking O(G log G)
     // even for a volume with thousands of allocation groups.
     auto sift = [&](Size start, Size count)
@@ -705,7 +715,7 @@ int WriteSession::validate_afterstate()
         uint8_t image_bytes[4096];
         if (!tx_image_read(update, image_bytes)) return -EIO;
         const uint8_t *image = image_bytes;
-        if (!device_.read(device_.context, physical * size, old, size)) return -EIO;
+        if (!read_home(physical * size, old, size)) return -EIO;
         if (physical == 1024 / size)
         {
             for (uint32_t i = 0; i < size; ++i)
@@ -879,10 +889,10 @@ int WriteSession::validate_afterstate()
     return 0;
 }
 
-int WriteSession::verify_recovered_layout()
+int WriteSession::verify_recovered_layout(bool checkpoint)
 {
     uint8_t recovered[1024];
-    if (!device_.read(device_.context, 1024, recovered, sizeof(recovered))) return -EIO;
+    if (!read_home(1024, recovered, sizeof(recovered))) return -EIO;
     for (Size i = 0; i < sizeof(recovered); ++i)
     {
         bool mutable_byte = (i >= 0xc && i < 0x14) || (i >= 0x30 && i < 0x34) || i == 0x274 ||
@@ -909,9 +919,15 @@ int WriteSession::verify_recovered_layout()
         journal.xattr_block != journal_inode_.xattr_block) return -EUCLEAN;
     for (Size i = 0; i < sizeof(journal.block_map); ++i)
         if (journal.block_map[i] != journal_inode_.block_map[i]) return -EUCLEAN;
-    error = build_layout();
+    error = build_layout(checkpoint);
     if (error) return error;
     bitmap_group_ = 0xffffffffU;
+    // Open/recovery pins and validates every journal mapping. Normal commit
+    // policy protects inode 8, its index blocks and all journal data blocks,
+    // and checks that every protected block remains allocated in the complete
+    // after-state. The inode identity/map comparison above therefore proves
+    // the pinned mapping unchanged. Never use this shortcut during recovery.
+    if (checkpoint) return 0;
     verifying_journal_ = true;
     for (uint32_t logical = 0; logical < journal_blocks_; ++logical)
     {
@@ -932,7 +948,7 @@ int WriteSession::set_recovery(bool enabled)
     uint32_t size = volume_.block_size_;
     uint64_t offset = 1024 / size * uint64_t(size);
     uint8_t *block = workspace_->blocks[0];
-    if (!device_.read(device_.context, offset, block, size)) return stop(-EIO);
+    if (!read_home(offset, block, size)) return stop(-EIO);
     copy(block + 1024 % size, super_, sizeof(super_));
     workspace_->read_cache.invalidate(offset, size, size);
     if (!device_.write(device_.context, offset, block, size) || !device_.flush(device_.context)) return stop(-EIO);
@@ -941,12 +957,16 @@ int WriteSession::set_recovery(bool enabled)
 }
 
 int WriteSession::open(const WriteDevice &device, WriteWorkspace &workspace,
-                       InitialValidator validator, void *validator_context, const WriteStorage *storage)
+                       InitialValidator validator, void *validator_context, const WriteStorage *storage,
+                       unsigned maximum_updates)
 {
     // Open on a freshly zero-initialized session, or after successful close.
     // Reopening an active/failed object would silently abandon a dirty mount.
     if (active_ || failed_) return -EBUSY;
     if (!device.read || !device.write || !device.flush) return -EINVAL;
+    if (maximum_updates != Journal::kMaximumUpdates && maximum_updates != Journal::kExtendedUpdates)
+        return -EINVAL;
+    tx_capacity_ = maximum_updates;
     device_ = device;
     workspace_ = &workspace;
     workspace_->read_cache.reset();
@@ -984,6 +1004,7 @@ int WriteSession::open(const WriteDevice &device, WriteWorkspace &workspace,
     journal_device.context = this;
     journal_device.workspace = &workspace.journal;
     journal_device.maximum_transfer_blocks = Journal::kMaximumUpdates;
+    journal_device.maximum_updates = tx_capacity_;
     journal_device.read = journal_read;
     journal_device.write = journal_write;
     journal_device.flush = journal_flush;
@@ -1108,9 +1129,9 @@ int WriteSession::tx_edit(uint64_t block, uint8_t *&data, bool zero)
     if (index == tx_count_)
     {
         for (index = 0; index < tx_count_ && tx_blocks_[index] != ~uint64_t(0); ++index) {}
-        if (index == 16) return -E2BIG;
+        if (index == tx_capacity_) return -E2BIG;
         data = workspace_->blocks[index];
-        if (!zero && !device_.read(device_.context, block * volume_.block_size_, data, volume_.block_size_))
+        if (!zero && !read_home(block * volume_.block_size_, data, volume_.block_size_))
             return stop(-EIO);
         tx_blocks_[index] = block;
         if (index == tx_count_) ++tx_count_;
@@ -1531,12 +1552,12 @@ int WriteSession::tx_commit()
         tx_blocks_[count++] = tx_blocks_[i];
     }
     tx_count_ = count;
-    BlockUpdate updates[16];
+    BlockUpdate *updates = workspace_->updates;
     for (unsigned i = 0; i < count; ++i) updates[i] = {tx_blocks_[i], workspace_->blocks[i]};
     int error = journal_.commit(updates, count);
     tx_cancel();
     if (error) return stop(error);
-    error = verify_recovered_layout();
+    error = verify_recovered_layout(true);
     return error ? stop(error) : 0;
 }
 
@@ -1561,9 +1582,9 @@ int WriteSession::pwrite(uint32_t number, uint64_t offset, const void *data, Siz
         Size amount = length - completed;
         uint64_t count = (position % size + amount - 1) / size + 1;
         bool old_overwrite = position <= inode.size && amount <= inode.size - position;
-        if (!old_overwrite || count > 15)
+        if (!old_overwrite || count >= tx_capacity_)
         {
-            Size maximum = Size(8) * size - position % size;
+            Size maximum = Size(tx_capacity_ / 2) * size - position % size;
             if (amount > maximum) amount = maximum;
         }
         for (;;)

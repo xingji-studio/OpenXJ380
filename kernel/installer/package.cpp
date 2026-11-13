@@ -169,12 +169,16 @@ bool address_range(const void *pointer, Size bytes)
 
 } // namespace
 
-uint32_t crc32c(const uint8_t *bytes, Size size)
+uint32_t crc32c_update(uint32_t crc, const uint8_t *bytes, Size size)
 {
-    uint32_t crc = 0xffffffffU;
     for (Size i = 0; i < size; ++i)
         crc = crc_table.values[(crc ^ bytes[i]) & 255U] ^ (crc >> 8);
-    return ~crc;
+    return crc;
+}
+
+uint32_t crc32c(const uint8_t *bytes, Size size)
+{
+    return ~crc32c_update(0xffffffffU, bytes, size);
 }
 
 int inspect_header(const uint8_t *package, Size bytes, const Limits &limits, HeaderInfo &info)
@@ -339,6 +343,60 @@ int validate(const uint8_t *package, Size bytes, const Limits &limits, Workspace
     plan.data_bytes = data_total;
     plan.legacy_v1 = legacy;
     plan.validated = true;
+    return 0;
+}
+
+int validate_indexed(const uint8_t *package, Size bytes, const Limits &limits, Workspace workspace,
+                     Plan &plan, const DataReader &reader)
+{
+    plan = {};
+    if (!reader.read || reader.bytes > (8ULL << 30)) return Invalid;
+    Limits metadata = limits;
+    metadata.allow_v1 = false;
+    if (metadata.max_file_bytes < 24) metadata.max_file_bytes = 24;
+    // Descriptor bytes are bounded by the metadata package, independently of
+    // the real data budget checked below. No external data is allocated here.
+    metadata.max_data_bytes = metadata.max_bytes;
+    Plan checked;
+    int error = validate(package, bytes, metadata, workspace, checked);
+    if (error) return error;
+    uint64_t total = 0;
+    for (Size i = 0; i < checked.count; ++i)
+    {
+        Record &record = workspace.records[i];
+        if (record.kind != Kind::Regular) continue;
+        if (record.payload.size != 24 || u32(record.payload.data + 20)) return Invalid;
+        uint64_t offset = u64(record.payload.data), length = u64(record.payload.data + 8);
+        if (offset > reader.bytes || length > reader.bytes - offset) return Invalid;
+        if (length > limits.max_file_bytes || length > Size(-1) || length > limits.max_data_bytes ||
+            total > limits.max_data_bytes - length) return TooBig;
+        total += length;
+        record.payload_offset = offset;
+        record.payload_crc32c = u32(record.payload.data + 16);
+        record.payload_external = true;
+        record.payload = {nullptr, Size(length)};
+    }
+    checked.data_bytes = total;
+    checked.reader = reader;
+    plan = checked;
+    return 0;
+}
+
+int read_payload(const Plan &plan, const Record &record, uint64_t offset, void *output, Size bytes)
+{
+    if (!plan.validated || offset > record.payload.size || bytes > record.payload.size - offset ||
+        (bytes && !address_range(output, bytes))) return Invalid;
+    if (!bytes) return 0;
+    if (record.payload_external)
+    {
+        if (record.kind != Kind::Regular || !plan.reader.read || record.payload_offset > plan.reader.bytes ||
+            record.payload.size > plan.reader.bytes - record.payload_offset) return Invalid;
+        int error = plan.reader.read(plan.reader.context, record.payload_offset + offset, output, bytes);
+        return error > 0 ? Invalid : error;
+    }
+    if (!address_range(record.payload.data, record.payload.size)) return Invalid;
+    auto *destination = static_cast<uint8_t *>(output);
+    for (Size i = 0; i < bytes; ++i) destination[i] = record.payload.data[Size(offset) + i];
     return 0;
 }
 

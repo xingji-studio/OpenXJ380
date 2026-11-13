@@ -843,7 +843,7 @@ int WriteSession::validate_xattrs_afterstate(const Volume &after)
             if (physical < groups_[group].inode_table || physical - groups_[group].inode_table >= table_blocks)
                 continue;
             if (!tx_image_read(i, image) ||
-                !device_.read(device_.context, physical * size, old, size)) return -EIO;
+                !read_home(physical * size, old, size)) return -EIO;
             uint32_t first = uint32_t((physical - groups_[group].inode_table) * (size / volume_.inode_size_));
             for (uint32_t offset = 0; offset < size; offset += volume_.inode_size_)
             {
@@ -933,7 +933,7 @@ int WriteSession::validate_xattrs_afterstate(const Volume &after)
             uint32_t before_references = 0;
             if (before_allocated)
             {
-                if (!device_.read(device_.context, physical * size, old, size)) return -EIO;
+                if (!read_home(physical * size, old, size)) return -EIO;
                 Attributes parsed = {};
                 error = parse_block(old, size, volume_.checksum_seed_, physical, checksummed, parsed);
                 if (error) return error;

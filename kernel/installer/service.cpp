@@ -28,7 +28,7 @@ static_assert(sizeof(xj_inst_native_targets) == 2856, "native targets ABI");
 static_assert(sizeof(xj_inst_native_release_targets) == 288, "native target release ABI");
 static_assert(sizeof(xj_inst_native_submit) == 64, "native submit ABI");
 static_assert(sizeof(xj_inst_native_handle) == 40, "native handle ABI");
-static_assert(sizeof(xj_inst_native_job) == 96, "native job ABI");
+static_assert(sizeof(xj_inst_native_job) == 120, "native job ABI");
 
 enum class TicketState : unsigned { Free, Preparing, Dispatched, Running, Done, Quarantined };
 struct WorkerTicket
@@ -95,7 +95,9 @@ int live_session(JobSessionView *view, bool ready)
     *view = {};
     if (!session_job_view(view) || !view->epoch) return -ENODEV;
     if (!ready) return 0;
-    if (view->profile != XJ_INSTALLER_PROFILE_EXT4_PAK2) return -EOPNOTSUPP;
+    if (view->profile != XJ_INSTALLER_PROFILE_EXT4_PAK2 && view->profile != XJ_INSTALLER_PROFILE_DUAL &&
+        view->profile != XJ_INSTALLER_PROFILE_STREAM_INDEX)
+        return -EOPNOTSUPP;
     if (view->components != XJ_INST_NATIVE_COMPONENTS_FULL ||
         view->language != XJ_INST_NATIVE_LANGUAGE_PACKAGE) return -EOPNOTSUPP;
     if (!view->ready) return -ENODEV;
@@ -345,10 +347,11 @@ uint64_t do_xapi_InstallerNative(uint64_t operation, uint64_t request_address, u
         response.session_epoch = view.epoch;
         response.components = view.components;
         response.package_bytes = view.package_bytes;
-        response.filesystem = view.profile;
+        response.filesystem = XJ_INST_NATIVE_FILESYSTEM_EXT4;
         response.language = view.language;
         response.flags = XJ_INST_NATIVE_INFO_SESSION;
-        if (view.profile == XJ_INSTALLER_PROFILE_EXT4_PAK2)
+        if (view.profile == XJ_INSTALLER_PROFILE_EXT4_PAK2 || view.profile == XJ_INSTALLER_PROFILE_DUAL ||
+            view.profile == XJ_INSTALLER_PROFILE_STREAM_INDEX)
         {
             response.flags |= XJ_INST_NATIVE_INFO_EXT4;
             if (view.ready && view.components == XJ_INST_NATIVE_COMPONENTS_FULL &&
@@ -386,6 +389,7 @@ uint64_t do_xapi_InstallerNative(uint64_t operation, uint64_t request_address, u
         job_request.mode = input.mode;
         job_request.language = input.language;
         job_request.components = input.components;
+        job_request.filesystem = input.filesystem;
         error = fresh_options(&job_request.factory);
         if (error) return uint64_t(error);
         WorkerTicket *ticket = reserve_ticket();
@@ -449,5 +453,11 @@ uint64_t do_xapi_InstallerNative(uint64_t operation, uint64_t request_address, u
     response.written_bytes = snapshot.factory.written_bytes;
     response.package_records = snapshot.factory.package_records;
     response.package_data_bytes = snapshot.factory.package_data_bytes;
+    response.progress_stage = uint32_t(snapshot.progress.stage);
+    response.completed_units = snapshot.progress.completed;
+    response.total_units = snapshot.progress.total;
+    response.progress_permille = xjinstaller::progress_permille(snapshot.progress);
+    if (snapshot.state == JobState::Succeeded && snapshot.factory.activation_durable && !snapshot.error)
+        response.progress_permille = 1000;
     return write_response(directory, response_address, &response, sizeof(response)) ? 0 : uint64_t(-EFAULT);
 }

@@ -35,13 +35,15 @@ struct WriteStorage
 // place the large WriteSession or its workspace on a kernel/interrupt stack.
 struct WriteWorkspace
 {
-    uint8_t blocks[16][4096];
+    uint8_t blocks[Journal::kExtendedUpdates][4096];
+    BlockUpdate updates[Journal::kExtendedUpdates];
     JournalWorkspace journal;
     DirectoryIndexWorkspace directory;
     ReadCache read_cache;
 };
 
-// Bounded journaled mutations. Each transaction has at most sixteen complete
+// Bounded journaled mutations. Ordinary transactions have sixteen complete
+// after-images; a fresh 4 KiB importer may explicitly opt into sixty-four
 // after-images; a large pwrite may commit a prefix and report partial progress.
 // Mapping nodes, allocation metadata, file bytes and inode changes share the
 // same transaction. Caller-owned storage must remain in task/heap context.
@@ -57,7 +59,7 @@ public:
     // recovery view before any log/home write, then discarded after open.
     int open(const WriteDevice &device, WriteWorkspace &workspace,
              InitialValidator validator = nullptr, void *validator_context = nullptr,
-             const WriteStorage *storage = nullptr);
+             const WriteStorage *storage = nullptr, unsigned maximum_updates = Journal::kMaximumUpdates);
     int pwrite(uint32_t number, uint64_t offset, const void *data, Size length,
                uint64_t timestamp_seconds, Size &completed);
     int truncate(uint32_t number, uint64_t size, uint64_t timestamp_seconds);
@@ -143,7 +145,8 @@ private:
     uint32_t bitmap_group_;
     uint32_t first_inode_;
     bool verifying_journal_;
-    uint64_t tx_blocks_[16];
+    uint64_t tx_blocks_[Journal::kExtendedUpdates];
+    unsigned tx_capacity_;
     unsigned tx_count_;
     uint8_t inline_dirty_[128];
     uint8_t *tx_dirty_;
@@ -252,10 +255,10 @@ private:
     static bool bit_next(const Bitmap &, uint64_t first, uint64_t &found);
     const MetadataRange *metadata_range(uint64_t block) const;
     int check_writable_super();
-    int build_layout();
+    int build_layout(bool refresh = false);
     int add_metadata(uint64_t first, uint64_t count, uint32_t inode_group = 0xffffffffU);
     int check_inode_update(uint64_t block, uint32_t group, const void *after);
-    int verify_recovered_layout();
+    int verify_recovered_layout(bool checkpoint = false);
     int set_recovery(bool enabled);
     int check_target_block(uint64_t block, uint32_t inode_group = 0xffffffffU);
     int stop(int error);

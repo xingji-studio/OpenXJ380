@@ -321,6 +321,28 @@ int block_access_validate_retained_exclusive(BlockAccessToken token, const Block
     return 0;
 }
 
+int block_access_validate_retained_shared(BlockAccessToken token, const BlockExtent &whole)
+{
+    if (!token || !whole.bytes || whole.device != whole.physical_device || whole.start ||
+        whole.generation != whole.physical_generation) return -EINVAL;
+    Lock lock;
+    if (io_abandoned) return -EIO;
+    BlockExtent current;
+    if (!resolve(whole.device, whole.generation, current) || !exact(whole, current)) return -ENODEV;
+    const Access *retained = nullptr;
+    for (const Access &entry : leases)
+    {
+        if (entry.token && entry.poisoned && overlaps(entry.extent, current)) return -EIO;
+        if (entry.token == token) retained = &entry;
+    }
+    for (const Access &entry : tickets)
+        if (entry.token && entry.poisoned && overlaps(entry.extent, current)) return -EIO;
+    if (!retained || !exact(retained->extent, current)) return -EINVAL;
+    // This authenticates an exclusion lease only. Its caller must separately
+    // prove hardware read-only media before permitting cross-TCB source reads.
+    return !retained->exclusive && !retained->scan && !retained->owner ? 0 : -EPERM;
+}
+
 int block_access_io_begin(uint32_t device, uint64_t generation, uint64_t offset, uint64_t bytes,
                           BlockAccessToken *token)
 {

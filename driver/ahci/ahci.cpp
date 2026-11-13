@@ -720,6 +720,7 @@ void ahci_setup() {
         provenance.read_only = (hbadev->flags & HBA_DEV_FATAPI) != 0;
         provenance.sata_port = (uint16_t)i;
         provenance.sata_multiplier = 0xffff; // This driver addresses direct HBA ports only.
+        provenance.sata_direct_zero = (cap & (1U << 17)) == 0; // CAP.SPM: no port multiplier support.
         int source_status = block_source_register((uint32_t)id, provenance);
         if (source_status)
             write_serial_fmt("AHCI[%d] source provenance unavailable: %d\n", i, source_status);

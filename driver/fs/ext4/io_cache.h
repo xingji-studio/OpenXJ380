@@ -13,7 +13,12 @@ namespace xjext4 {
 // writeback, read-ahead, retained caller pointers or internal locking occurs.
 struct ReadCache
 {
-    static constexpr unsigned kEntries = 32;
+    // A fresh import can validate 64 after-images plus inode/bitmap/directory
+    // metadata. Keep those clean before-images resident through the complete
+    // guard instead of rereading them after each sweep. All storage is owned
+    // by the caller on the heap; invalidation and failure rules are unchanged.
+    static constexpr unsigned kEntries = 128;
+    static_assert(kEntries < 255, "LRU ranks must fit in uint8_t");
     uint8_t data[kEntries][4096];
     uint64_t blocks[kEntries];
     uint8_t rank[kEntries]; // Zero is invalid; valid ranks are exactly 1..N (MRU..LRU).

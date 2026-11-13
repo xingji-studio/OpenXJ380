@@ -6,6 +6,7 @@
 #include <installer/ext4_verify.h>
 #include <installer/esp.h>
 #include <installer/esp_verify.h>
+#include <installer/fat32.h>
 #include <fs/ext4/ext4.h>
 #include <device.h>
 #include <cpu/regio.h>
@@ -43,6 +44,10 @@ struct FactoryContext
     EspPublication publication;
     XJ_ROOT_BINDING binding;
     EspPayload payload;
+    const xjpak2::Record *loader_record, *kernel_record;
+    uint8_t *loader_storage, *kernel_storage;
+    uint8_t source_buffer[131072];
+    Fat32Name *fat_names;
     WindowReader root_reader, esp_reader;
     bool published, pinned;
 };
@@ -190,12 +195,16 @@ int preflight(FactoryContext *context, const uint8_t *package, size_t bytes)
     layout_options.disk_bytes = context->whole.bytes;
     layout_options.esp_bytes = context->options.esp_bytes;
     layout_options.identities = context->options.identities;
+    layout_options.filesystem = context->options.filesystem;
     int error = disk_layout_plan(layout_options, context->layout);
     if (error) return error;
     xjpak2::Limits limits;
+    const bool fat32 = context->options.filesystem == 1;
+    if (fat32) { limits.max_path = 511; limits.max_file_bytes = 0xffffffffULL; }
     xjpak2::HeaderInfo header;
     error = xjpak2::inspect_header(package, bytes, limits, header);
-    if (error || header.legacy_v1) return error ? error : -EOPNOTSUPP;
+    const bool indexed = context->options.source_reader.read != nullptr;
+    if (error || header.legacy_v1 != (fat32 && !indexed)) return error ? error : -EOPNOTSUPP;
     if (header.record_count > size_t(-1) / sizeof(xjpak2::Record) ||
         header.record_count > size_t(-1) / sizeof(Ext4ImportEntry) ||
         header.record_count > size_t(-1) / sizeof(Ext4VerifyEntry)) return -E2BIG;
@@ -218,17 +227,44 @@ int preflight(FactoryContext *context, const uint8_t *package, size_t bytes)
     verify.volume = allocate<xjext4::Volume>();
     if (!plan.records || !plan.entries || !verify.entries || !verify.volume) return -ENOMEM;
     Ext4ImportRequirements requirements;
-    error = ext4_import_prepare(package, bytes, limits, plan, requirements);
+    if (fat32)
+    {
+        error = indexed ? xjpak2::validate_indexed(package, bytes, limits, {plan.records, plan.capacity},
+                                                   plan.plan, context->options.source_reader) :
+                          xjpak2::validate(package, bytes, limits, {plan.records, plan.capacity}, plan.plan);
+        context->fat_names = static_cast<Fat32Name *>(malloc(header.record_count * sizeof(Fat32Name)));
+        if (!error && !context->fat_names) error = -ENOMEM;
+        Fat32Requirements budget{};
+        const uint64_t root_bytes = (context->layout.root_last_lba - context->layout.root_first_lba + 1) * 512;
+        if (!error) error = fat32_check_plan(plan.plan, context->fat_names, header.record_count, root_bytes, budget);
+        if (!error && !xj_root_binding_le32(context->options.filesystem_uuid)) error = -EINVAL;
+    }
+    else error = ext4_import_prepare(package, bytes, limits, plan, requirements,
+                                     indexed ? &context->options.source_reader : nullptr);
     if (error) return error;
     const auto *kernel = required_file(plan.plan, "/system/kernel.krl");
-    const auto *loader = required_file(plan.plan, "/EFI/BOOT/BOOTX64.EFI");
+    const auto *loader = required_file(plan.plan, fat32 ? "/system/boot/BOOTX64.EFI" : "/EFI/BOOT/BOOTX64.EFI");
     if (!kernel || !loader || !required_file(plan.plan, "/config/README.md") ||
-        kernel->payload.size < 64 || memcmp(kernel->payload.data, "\x7f" "ELF", 4) ||
-        kernel->payload.data[4] != 2 || kernel->payload.data[5] != 1 ||
-        kernel->payload.data[18] != 62 || kernel->payload.data[19] ||
-        loader->payload.size < 64 || loader->payload.data[0] != 'M' || loader->payload.data[1] != 'Z')
+        kernel->payload.size < 64 || loader->payload.size < 64)
         return -ENOEXEC;
+    context->loader_record = loader;
+    context->kernel_record = kernel;
     context->payload = {loader->payload.data, loader->payload.size, kernel->payload.data, kernel->payload.size};
+    if (indexed)
+    {
+        // Only the small ESP payload is retained. Source file data uses one
+        // fixed buffer and is never copied wholesale into the kernel heap.
+        if (loader->payload.size > context->options.esp_bytes ||
+            kernel->payload.size > context->options.esp_bytes - loader->payload.size) return -ENOSPC;
+        context->loader_storage = static_cast<uint8_t *>(malloc(loader->payload.size));
+        context->kernel_storage = static_cast<uint8_t *>(malloc(kernel->payload.size));
+        if (!context->loader_storage || !context->kernel_storage) return -ENOMEM;
+        context->payload.loader = context->loader_storage;
+        context->payload.kernel = context->kernel_storage;
+    }
+    else if (memcmp(kernel->payload.data, "\x7f" "ELF", 4) || kernel->payload.data[4] != 2 ||
+             kernel->payload.data[5] != 1 || kernel->payload.data[18] != 62 || kernel->payload.data[19] ||
+             loader->payload.data[0] != 'M' || loader->payload.data[1] != 'Z') return -ENOEXEC;
     EspRequirements esp_requirements{};
     error = esp_plan(context->options.esp_bytes, context->payload, esp_requirements);
     if (error) return error;
@@ -240,28 +276,31 @@ int preflight(FactoryContext *context, const uint8_t *package, size_t bytes)
     context->root_reader = {context, context->layout.root_first_lba * 512,
                             (context->layout.root_last_lba - context->layout.root_first_lba + 1) * 512};
     context->esp_reader = {context, context->layout.esp_first_lba * 512, context->options.esp_bytes};
-    xjext4::FormatOptions format_options{};
-    memcpy(format_options.uuid, context->options.filesystem_uuid, 16);
-    format_options.time_seconds = context->options.time_seconds;
-    format_options.journal_mib = context->options.journal_mib;
-    memcpy(format_options.label, "XJ380", 5);
-    xjext4::Ext4FormatDevice device{nullptr, no_read, no_write, no_flush, context->root_reader.bytes};
-    error = xjext4::format_storage_size(device.bytes, context->format_storage.bytes);
-    if (!error && context->format_storage.bytes)
+    if (!fat32)
     {
-        context->format_storage.data = malloc(context->format_storage.bytes);
-        if (!context->format_storage.data) error = -ENOMEM;
+        xjext4::FormatOptions format_options{};
+        memcpy(format_options.uuid, context->options.filesystem_uuid, 16);
+        format_options.time_seconds = context->options.time_seconds;
+        format_options.journal_mib = context->options.journal_mib;
+        memcpy(format_options.label, "XJ380", 5);
+        xjext4::Ext4FormatDevice device{nullptr, no_read, no_write, no_flush, context->root_reader.bytes};
+        error = xjext4::format_storage_size(device.bytes, context->format_storage.bytes);
+        if (!error && context->format_storage.bytes)
+        {
+            context->format_storage.data = malloc(context->format_storage.bytes);
+            if (!context->format_storage.data) error = -ENOMEM;
+        }
+        if (!error) error = xjext4::plan_format(device, format_options, *context->format, context->geometry,
+                                              &context->format_storage);
+        // Pure admission check; actual builder storage is allocated before its
+        // first format request and stays with the quarantined build on failure.
+        size_t writer_bytes = 0;
+        if (!error) error = xjext4::WriteSession::storage_size_for(context->geometry.blocks,
+                             context->geometry.inodes, context->geometry.groups, writer_bytes);
+        if (!error) error = ext4_import_check_budget(requirements, 4096, context->geometry.free_blocks,
+                                                    context->geometry.inodes - 11);
+        if (error) return error;
     }
-    if (!error) error = xjext4::plan_format(device, format_options, *context->format, context->geometry,
-                                          &context->format_storage);
-    // Pure admission check; actual builder storage is allocated before its
-    // first format request and stays with the quarantined build on failure.
-    size_t writer_bytes = 0;
-    if (!error) error = xjext4::WriteSession::storage_size_for(context->geometry.blocks,
-                         context->geometry.inodes, context->geometry.groups, writer_bytes);
-    if (!error) error = ext4_import_check_budget(requirements, 4096, context->geometry.free_blocks,
-                                                context->geometry.inodes - 11);
-    if (error) return error;
     auto &binding = context->binding;
     memcpy(binding.bytes, "XJROOT01", 8);
     binding.bytes[8] = 1; binding.bytes[12] = XJ_ROOT_BINDING_SIZE;
@@ -269,8 +308,13 @@ int preflight(FactoryContext *context, const uint8_t *package, size_t bytes)
     memcpy(binding.bytes + 32, context->options.identities.root, 16);
     memcpy(binding.bytes + 48, context->options.identities.esp, 16);
     memcpy(binding.bytes + 64, context->options.filesystem_uuid, 16);
+    if (fat32)
+    {
+        binding.bytes[8] = XJ_ROOT_BINDING_FAT32_VERSION;
+        memset(binding.bytes + 68, 0, 12);
+    }
     uint64_t kernel_bytes = context->payload.kernel_bytes;
-    uint32_t kernel_crc = xj_root_binding_crc32c(context->payload.kernel, context->payload.kernel_bytes);
+    uint32_t kernel_crc = indexed ? 0 : xj_root_binding_crc32c(context->payload.kernel, context->payload.kernel_bytes);
     for (unsigned i = 0; i < 8; ++i) binding.bytes[80 + i] = uint8_t(kernel_bytes >> (8 * i));
     for (unsigned i = 0; i < 4; ++i) binding.bytes[88 + i] = uint8_t(kernel_crc >> (8 * i));
     uint32_t descriptor_crc = xj_root_binding_crc32c(binding.bytes, 92);
@@ -292,6 +336,8 @@ void free_context(FactoryContext *context)
     }
     if (context->esp_verify) { free(context->esp_verify->cluster_bits); free(context->esp_verify); }
     free(context->format_storage.data);
+    free(context->fat_names);
+    free(context->loader_storage); free(context->kernel_storage);
     free(context->format); free(context->backup_entries); free(context->readback); free(context->gpt);
     free(context);
 }
@@ -299,6 +345,45 @@ void free_context(FactoryContext *context)
 int execute(FactoryContext *context, const uint8_t *package, size_t bytes)
 {
     auto &status = context->status;
+    if (context->options.source_reader.read)
+    {
+        const auto &plan = context->preflight->plan;
+        uint64_t verified = 0;
+        report_progress(context->options.progress, InstallStage::Preflight, 0, plan.data_bytes);
+        // The full selected manifest/data is checked before target I/O. This
+        // runs only after context publication and pins, so worker death retains
+        // every source/target lifetime without leaving an untracked request.
+        for (size_t i = 0; i < plan.count; ++i)
+        {
+            const auto &record = plan.records[i];
+            if (!record.payload_external) continue;
+            uint32_t crc = 0xffffffffU;
+            for (size_t done = 0; done < record.payload.size;)
+            {
+                size_t amount = record.payload.size - done;
+                if (amount > sizeof(context->source_buffer)) amount = sizeof(context->source_buffer);
+                int error = xjpak2::read_payload(plan, record, done, context->source_buffer, amount);
+                if (error) return error;
+                crc = xjpak2::crc32c_update(crc, context->source_buffer, amount);
+                if (&record == context->kernel_record)
+                    memcpy(context->kernel_storage + done, context->source_buffer, amount);
+                if (&record == context->loader_record)
+                    memcpy(context->loader_storage + done, context->source_buffer, amount);
+                done += amount; verified += amount;
+                report_progress(context->options.progress, InstallStage::Preflight, verified, plan.data_bytes);
+            }
+            if (~crc != record.payload_crc32c) return -EUCLEAN;
+        }
+        const auto *kernel = context->kernel_storage;
+        const auto *loader = context->loader_storage;
+        if (memcmp(kernel, "\x7f" "ELF", 4) || kernel[4] != 2 || kernel[5] != 1 ||
+            kernel[18] != 62 || kernel[19] || loader[0] != 'M' || loader[1] != 'Z') return -ENOEXEC;
+        uint32_t crc = xj_root_binding_crc32c(context->payload.kernel, context->payload.kernel_bytes);
+        for (unsigned i = 0; i < 4; ++i) context->binding.bytes[88 + i] = uint8_t(crc >> (8 * i));
+        crc = xj_root_binding_crc32c(context->binding.bytes, 92);
+        for (unsigned i = 0; i < 4; ++i) context->binding.bytes[92 + i] = uint8_t(crc >> (8 * i));
+    }
+    report_progress(context->options.progress, InstallStage::Partitioning, 0, context->esp_reader.bytes);
     phase(context, FactoryPhase::InitialFlush);
     if (!flush(context)) return -EIO;
     const auto &layout = context->layout;
@@ -319,7 +404,11 @@ int execute(FactoryContext *context, const uint8_t *package, size_t bytes)
         memcmp(zeros, context->readback->mbr, 512) || memcmp(zeros, context->readback->primary_header, 512) ||
         memcmp(zeros, context->readback->backup_header, 512)) return -EIO;
     for (uint64_t offset = 0; offset < context->esp_reader.bytes; offset += 65536)
+    {
         if (!write(context, context->esp_reader.offset + offset, zeros, 65536)) return -EIO;
+        report_progress(context->options.progress, InstallStage::Partitioning, offset + 65536,
+                         context->esp_reader.bytes);
+    }
     if (!flush(context)) return -EIO;
     phase(context, FactoryPhase::EspInvalidated);
     if (!write(context, layout.backup_entries_lba * 512, gpt.entries, DiskTableBytes) ||
@@ -345,24 +434,50 @@ int execute(FactoryContext *context, const uint8_t *package, size_t bytes)
     memcpy(options.label, "XJ380", 5);
     options.time_seconds = context->options.time_seconds; options.journal_mib = context->options.journal_mib;
     ext4_build_status root_status{};
-    error = ext4fs_build_window(&root, &options, package, bytes, &root_status);
-    if (root_status.format.io_failed || root_status.import_io_failed) status.io_failed = true;
-    if (error || !root_status.import_complete || root_status.quarantined || root_status.import_io_failed ||
-        root_status.format.io_failed) return error ? error : -EIO;
+    if (context->options.filesystem == 1)
+    {
+        EspBuildStatus fat_status{};
+        error = fatfs_build_root_window(&root, &context->preflight->plan,
+                    xj_root_binding_fat32_id(&context->binding), &fat_status, context->options.progress);
+        if (fat_status.io_failed) status.io_failed = true;
+        if (error || !fat_status.complete || fat_status.quarantined) return error ? error : -EIO;
+    }
+    else
+    {
+        error = ext4fs_build_window(&root, &options, package, bytes, &root_status, &context->options.progress,
+                                    context->options.source_reader.read ? &context->options.source_reader : nullptr);
+        if (root_status.format.io_failed || root_status.import_io_failed) status.io_failed = true;
+        if (error || !root_status.import_complete || root_status.quarantined || root_status.import_io_failed ||
+            root_status.format.io_failed) return error ? error : -EIO;
+    }
     phase(context, FactoryPhase::RootBuilt);
     BlockAccessWindow esp{context->target, context->whole, context->lease,
                            context->esp_reader.offset, context->esp_reader.bytes};
     EspBuildStatus esp_status{};
+    report_progress(context->options.progress, InstallStage::BuildingEsp, 0, 1);
     error = fatfs_build_esp_window(&esp, &context->payload, &esp_status);
     if (esp_status.io_failed) status.io_failed = true;
     if (error || !esp_status.complete || esp_status.quarantined || esp_status.io_failed)
         return error ? error : -EIO;
     phase(context, FactoryPhase::EspBuilt);
+    report_progress(context->options.progress, InstallStage::BuildingEsp, 1, 1);
     Ext4VerifyDevice root_device{window_read, &context->root_reader, context->root_reader.bytes};
     Ext4VerifyStatus verify_status{};
     xjpak2::Limits limits;
-    error = ext4_verify_package(package, bytes, limits, root_device, context->options.filesystem_uuid,
-                                 *context->verify, &verify_status);
+    if (context->options.filesystem == 1)
+    {
+        EspBuildStatus fat_status{};
+        error = fatfs_verify_root_window(&root, &context->preflight->plan,
+                    xj_root_binding_fat32_id(&context->binding), &fat_status, context->options.progress);
+        if (fat_status.io_failed) status.io_failed = true;
+        if (error || !fat_status.complete || fat_status.quarantined) return error ? error : -EIO;
+        verify_status.complete = true;
+        verify_status.records_verified = status.package_records;
+        verify_status.data_bytes_verified = fat_status.verified_bytes;
+    }
+    else error = ext4_verify_package(package, bytes, limits, root_device, context->options.filesystem_uuid,
+                                 *context->verify, &verify_status, &context->options.progress,
+                                 context->options.source_reader.read ? &context->options.source_reader : nullptr);
     if (verify_status.io_failed) status.io_failed = true;
     if (error || !verify_status.complete || verify_status.io_failed ||
         verify_status.records_verified != status.package_records ||
@@ -371,6 +486,7 @@ int execute(FactoryContext *context, const uint8_t *package, size_t bytes)
     EspReadDevice esp_device{window_read, &context->esp_reader, context->esp_reader.bytes};
     EspExpectedFiles files{static_cast<const uint8_t *>(context->payload.loader), context->payload.loader_bytes,
                             static_cast<const uint8_t *>(context->payload.kernel), context->payload.kernel_bytes};
+    report_progress(context->options.progress, InstallStage::VerifyingEsp, 0, 1);
     error = esp_verify_prepare_publication(esp_device, files, context->binding,
                                             *context->esp_verify, context->publication);
     if (context->esp_verify->io_failed) status.io_failed = true;
@@ -378,16 +494,21 @@ int execute(FactoryContext *context, const uint8_t *package, size_t bytes)
     if (context->publication.sector_offset % 512 || context->publication.sector_offset > context->esp_reader.bytes ||
         512 > context->esp_reader.bytes - context->publication.sector_offset) return -EUCLEAN;
     phase(context, FactoryPhase::EspVerified);
+    report_progress(context->options.progress, InstallStage::VerifyingEsp, 1, 1);
+    report_progress(context->options.progress, InstallStage::Activating, 0, 3);
     // No filesystem writer/session remains. The proposed sector was read back
     // from an allocated fixed-size placeholder. Flush every prerequisite before
     // the first request capable of making the binding valid.
     if (!flush(context)) return -EIO;
+    report_progress(context->options.progress, InstallStage::Activating, 1, 3);
     phase(context, FactoryPhase::ActivationAttempted); status.activation_attempted = true;
     uint64_t activation = context->esp_reader.offset + context->publication.sector_offset;
     if (!write(context, activation, context->publication.sector, 512) || !flush(context)) return -EIO;
+    report_progress(context->options.progress, InstallStage::Activating, 2, 3);
     if (!read(context, activation, context->esp_verify->data, 512) ||
         memcmp(context->esp_verify->data, context->publication.sector, 512)) return -EIO;
     phase(context, FactoryPhase::ActivationDurable); status.activation_durable = true;
+    report_progress(context->options.progress, InstallStage::Activating, 3, 3);
     return 0;
 }
 
@@ -414,7 +535,9 @@ int installer_build_ext4_disk(vfs_node_t target, vfs_node_t source, const xjinst
     tcb_t task = get_current_task();
     if (!task || !scheduler_is_enabled() || !(get_rflags() & (1ULL << 9))) return refuse(-EWOULDBLOCK);
     if (task->ime_storage_depth) return refuse(-EBUSY);
-    int availability = ext4fs_factory_ready();
+    if (snapshot.filesystem != 1 && snapshot.filesystem != 2) return refuse(-EINVAL);
+    report_progress(snapshot.progress, InstallStage::Preflight, 0, 1);
+    int availability = snapshot.filesystem == 2 ? ext4fs_factory_ready() : 0;
     if (!availability) availability = fatfs_factory_ready();
     if (availability) return refuse(availability);
     if (!vfs_check_access(target, nullptr, IME_FILE_MOUNT) || !vfs_check_access(target, nullptr, IME_FILE_WRITE))

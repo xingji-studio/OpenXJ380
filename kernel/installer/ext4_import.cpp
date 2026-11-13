@@ -257,13 +257,7 @@ const char *filename(Ext4ImportWorkspace &work, const xjpak2::Record &record)
 int metadata(Ext4ImportWorkspace &work, Size index, uint64_t seconds)
 {
     const auto &record = work.plan.records[index];
-    xjext4::AttributeUpdate update = {};
-    update.mask = xjext4::kAttributeUid | xjext4::kAttributeGid;
-    update.uid = record.uid; update.gid = record.gid;
-    int error = work.writer->set_attributes(work.entries[index].inode, update, seconds);
-    update = {};
-    update.mask = xjext4::kAttributeMode; update.mode = uint16_t(record.mode);
-    if (!error) error = work.writer->set_attributes(work.entries[index].inode, update, seconds);
+    int error = 0;
     Size offset = 0;
     for (unsigned i = 0; !error && i < record.xattr_count; ++i)
     {
@@ -281,10 +275,13 @@ int metadata(Ext4ImportWorkspace &work, Size index, uint64_t seconds)
 } // namespace
 
 int ext4_import_prepare(const uint8_t *package, Size bytes, const xjpak2::Limits &requested,
-                        Ext4ImportWorkspace &work, Ext4ImportRequirements &requirements)
+                        Ext4ImportWorkspace &work, Ext4ImportRequirements &requirements,
+                        const xjpak2::DataReader *source)
 {
     if (work.used || work.stopped || work.status.io_failed)
         return work.status.error ? work.status.error : -EBUSY;
+    // Snapshot before rebuilding Plan: the caller may pass its saved reader.
+    xjpak2::DataReader source_snapshot = source ? *source : xjpak2::DataReader{};
     xjpak2::Limits limits = requested;
     limits.allow_v1 = limits.allow_trusted = limits.allow_security = false;
     if (limits.max_entries > 262144) limits.max_entries = 262144;
@@ -300,7 +297,9 @@ int ext4_import_prepare(const uint8_t *package, Size bytes, const xjpak2::Limits
     if (header.record_count > work.capacity || !regions_valid(package, bytes, work, header.record_count, false))
         return -EINVAL;
     work.status = {}; work.plan = {}; work.requirements = {}; requirements = {};
-    error = xjpak2::validate(package, bytes, limits, {work.records, work.capacity}, work.plan);
+    error = source ? xjpak2::validate_indexed(package, bytes, limits, {work.records, work.capacity}, work.plan,
+                                              source_snapshot) :
+                     xjpak2::validate(package, bytes, limits, {work.records, work.capacity}, work.plan);
     if (error) return error;
     auto lost_path = xjpak2::Span{reinterpret_cast<const uint8_t *>("/lost+found"), 11};
     Size lost = find(work.plan, lost_path, work.plan.count);
@@ -356,6 +355,7 @@ int ext4_import_prepare(const uint8_t *package, Size bytes, const xjpak2::Limits
         if (!add(needed.blocks, blocks)) return -EOVERFLOW;
     }
     work.package = package; work.package_bytes = bytes; work.limits = limits;
+    work.source = source_snapshot;
     work.requirements = needed; requirements = needed;
     work.status.prepared = true; work.status.phase = Ext4ImportPhase::Prepared;
     return 0;
@@ -371,7 +371,7 @@ int ext4_import_check_budget(const Ext4ImportRequirements &requirements, uint32_
 
 int ext4_import_apply_fresh(const xjext4::WriteDevice &device, uint64_t seconds,
                             Ext4ImportWorkspace &work, Ext4ImportStatus &status,
-                            const xjext4::WriteStorage *storage)
+                            const xjext4::WriteStorage *storage, const ProgressObserver *progress)
 {
     if (work.used || work.stopped || work.status.io_failed)
     {
@@ -381,10 +381,12 @@ int ext4_import_apply_fresh(const xjext4::WriteDevice &device, uint64_t seconds,
     if (!device.read || !device.write || !device.flush || !device.bytes || seconds > 0x37fffffffULL ||
         !work.status.prepared) return -EINVAL;
     Ext4ImportRequirements needed;
-    int error = ext4_import_prepare(work.package, work.package_bytes, work.limits, work, needed);
+    int error = ext4_import_prepare(work.package, work.package_bytes, work.limits, work, needed,
+                                     work.source.read ? &work.source : nullptr);
     if (error) return error;
     if (!regions_valid(work.package, work.package_bytes, work, work.plan.count, true, storage)) return -EINVAL;
     work.io = {device.read, device.write, device.flush, device.context, device.bytes};
+    work.progress = progress ? *progress : ProgressObserver{};
     work.used = true;
     work.status.phase = Ext4ImportPhase::Preflight;
     work.read_volume->reset();
@@ -396,14 +398,17 @@ int ext4_import_apply_fresh(const xjext4::WriteDevice &device, uint64_t seconds,
     work.status.phase = Ext4ImportPhase::Opening;
     work.status.writer_started = true;
     xjext4::WriteDevice wrapped = {read, write, flush, &work, device.bytes};
-    error = work.writer->open(wrapped, *work.writer_workspace, initial, &work, storage);
+    error = work.writer->open(wrapped, *work.writer_workspace, initial, &work, storage,
+                              xjext4::Journal::kExtendedUpdates);
     if (error) return finish(work, error, status);
     work.status.writer_open = true;
     work.entries[0].inode = 2;
     work.status.phase = Ext4ImportPhase::Directories;
+    report_progress(work.progress, InstallStage::Directories, 0, work.plan.count);
     for (Size i = 1; !error && i < work.plan.count; ++i)
     {
         const auto &record = work.records[i];
+        report_progress(work.progress, InstallStage::Directories, i, work.plan.count);
         if (record.kind != xjpak2::Kind::Directory) continue;
         work.status.last_record = uint32_t(i + 1);
         if (named(record.path, "/lost+found", 11)) { work.entries[i].inode = 11; continue; }
@@ -418,6 +423,7 @@ int ext4_import_apply_fresh(const xjext4::WriteDevice &device, uint64_t seconds,
     }
     if (error) return finish(work, error, status);
     work.status.phase = Ext4ImportPhase::RegularData;
+    report_progress(work.progress, InstallStage::Copying, 0, work.plan.data_bytes);
     for (Size i = 1; !error && i < work.plan.count; ++i)
     {
         const auto &record = work.records[i];
@@ -431,23 +437,44 @@ int ext4_import_apply_fresh(const xjext4::WriteDevice &device, uint64_t seconds,
             work.entries[i].inode = created.number;
             ++work.status.inodes_created; ++work.status.names_created;
         }
+        uint32_t source_crc = ~0U;
         for (Size offset = 0; !error && offset < record.payload.size;)
         {
             Size amount = record.payload.size - offset;
-            if (amount > 65536) amount = 65536;
+            if (amount > 131072) amount = 131072;
+            const uint8_t *payload = record.payload.data;
+            if (record.payload_external)
+            {
+                error = xjpak2::read_payload(work.plan, record, offset, work.source_buffer, amount);
+                if (error)
+                {
+                    work.status.io_failed = true;
+                    break; // Never submit target I/O after a failed source read.
+                }
+                payload = work.source_buffer;
+                source_crc = xjpak2::crc32c_update(source_crc, payload, amount);
+            }
+            else payload += offset;
             Size completed = 0;
-            error = work.writer->pwrite(created.number, offset, record.payload.data + offset, amount, seconds,
+            error = work.writer->pwrite(created.number, offset, payload, amount, seconds,
                                          completed);
             if (completed > amount) error = -EUCLEAN;
             else { offset += completed; work.status.data_bytes_committed += completed; }
+            report_progress(work.progress, InstallStage::Copying, work.status.data_bytes_committed,
+                            work.plan.data_bytes);
             if (!error && completed != amount) error = -EIO;
         }
+        // The source can change after factory admission; do not finalize an
+        // inode whose bytes no longer match the resident index.
+        if (!error && record.payload_external && ~source_crc != record.payload_crc32c) error = -EUCLEAN;
     }
     if (error) return finish(work, error, status);
     work.status.phase = Ext4ImportPhase::Symlinks;
+    report_progress(work.progress, InstallStage::Links, 0, work.plan.count * 2);
     for (Size i = 1; !error && i < work.plan.count; ++i)
     {
         const auto &record = work.records[i];
+        report_progress(work.progress, InstallStage::Links, i, work.plan.count * 2);
         if (record.kind != xjpak2::Kind::Symlink) continue;
         work.status.last_record = uint32_t(i + 1);
         copy(work.scratch, record.payload.data, record.payload.size); work.scratch[record.payload.size] = 0;
@@ -465,6 +492,7 @@ int ext4_import_apply_fresh(const xjext4::WriteDevice &device, uint64_t seconds,
     for (Size i = 1; !error && i < work.plan.count; ++i)
     {
         const auto &record = work.records[i];
+        report_progress(work.progress, InstallStage::Links, work.plan.count + i, work.plan.count * 2);
         if (record.kind != xjpak2::Kind::Hardlink) continue;
         work.status.last_record = uint32_t(i + 1);
         uint32_t target = work.entries[record.object_id - 1].inode;
@@ -475,11 +503,13 @@ int ext4_import_apply_fresh(const xjext4::WriteDevice &device, uint64_t seconds,
     }
     if (error) return finish(work, error, status);
     work.status.phase = Ext4ImportPhase::Metadata;
+    report_progress(work.progress, InstallStage::Metadata, 0, work.plan.count * 2);
     for (Size i = 0; !error && i < work.plan.count; ++i)
     {
         if (work.records[i].kind == xjpak2::Kind::Hardlink) continue;
         work.status.last_record = uint32_t(i + 1);
         error = metadata(work, i, seconds);
+        if (!error) report_progress(work.progress, InstallStage::Metadata, i + 1, work.plan.count * 2);
     }
     if (error) return finish(work, error, status);
     work.status.phase = Ext4ImportPhase::Times;
@@ -491,9 +521,16 @@ int ext4_import_apply_fresh(const xjext4::WriteDevice &device, uint64_t seconds,
         if (record.kind == xjpak2::Kind::Hardlink) continue;
         work.status.last_record = uint32_t(i + 1);
         xjext4::AttributeUpdate update = {};
-        update.mask = xjext4::kAttributeMtime;
+        // All namespace/data/EA changes precede this final inode transaction.
+        // Chown, the explicit final mode and mtime share the same six durable
+        // journal barriers; reverse order restores parent times last.
+        update.mask = xjext4::kAttributeUid | xjext4::kAttributeGid |
+                      xjext4::kAttributeMode | xjext4::kAttributeMtime;
+        update.uid = record.uid; update.gid = record.gid; update.mode = uint16_t(record.mode);
         update.mtime_seconds = record.mtime_seconds; update.mtime_nanoseconds = record.mtime_nsec;
         error = work.writer->set_attributes(work.entries[i].inode, update, seconds);
+        if (!error) report_progress(work.progress, InstallStage::Metadata,
+                                    work.plan.count * 2 - i, work.plan.count * 2);
     }
     if (error) return finish(work, error, status);
     work.status.phase = Ext4ImportPhase::Closing;

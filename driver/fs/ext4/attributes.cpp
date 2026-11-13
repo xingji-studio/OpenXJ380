@@ -44,7 +44,6 @@ int WriteSession::set_attributes(uint32_t number, const AttributeUpdate &update,
     if (!error)
     {
         uint16_t mode = read16(raw);
-        if (update.mask & kAttributeMode) mode = (mode & 0170000) | (update.mode & 07777);
         if (update.mask & kAttributeUid)
         {
             store16(raw + 2, uint16_t(update.uid));
@@ -57,6 +56,9 @@ int WriteSession::set_attributes(uint32_t number, const AttributeUpdate &update,
             store16(raw + 0x7a, uint16_t(update.gid >> 16));
             mode &= ~06000;
         }
+        // An ownership-only update clears privilege bits. A trusted combined
+        // update explicitly supplies the final mode, after changing ownership.
+        if (update.mask & kAttributeMode) mode = (mode & 0170000) | (update.mode & 07777);
         store16(raw, mode);
         if (update.mask & kAttributeAtime)
         {

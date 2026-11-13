@@ -528,9 +528,9 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    installer_fs = os.environ.get("INSTALLER_FS", "fat32")
-    if installer_fs not in ("fat32", "ext4"):
-        parser.error("INSTALLER_FS must be fat32 or ext4")
+    installer_fs = os.environ.get("INSTALLER_FS", "ext4")
+    if installer_fs != "ext4":
+        parser.error("INSTALLER_FS must be ext4")
     # No newly linked third-party filesystem implementation is approved.
     subprocess.run([sys.executable, str(ROOT / "tools/check_ext4_sources.py"), "--root", str(ROOT)],
                    check=True, stdout=subprocess.DEVNULL)
@@ -728,7 +728,9 @@ def main() -> None:
     kernel_objs = root_objects(n, nasm_files, asm_files, c_files, cpp_files)
     kernel_objs += auth_crypto_objects(n)
     n.build("out/BOOTX64.efi", "boot", ["boot/bootx64.c", "boot/bootlib.c"],
-            implicit=find_files("boot/include", (".h",)) + [Path("include/efi/root_binding.h")])
+            implicit=find_files("boot/include", (".h",)) +
+                     [Path("include/efi/root_binding.h"), Path("include/efi/installer_handoff.h"),
+                      Path("include/installer/payloads.h")])
     n.build("font/hankaku.o", "objcopy_bin", "font/hankaku.bin", variables={"bin_input": "./font/hankaku.bin"})
     n.build("out/kernel.krl", "kernel_link", kernel_objs + [Path("font/hankaku.o"), Path("liballoc-x86_64.a")], implicit=["linker.ld"])
     compliance_bundle = Path("out/compliance/third-party/MANIFEST.json")
@@ -785,6 +787,7 @@ def main() -> None:
     phony(n, "kmods", kmod_targets)
 
     n.comment("IMAGE AND UTILITY TARGETS - delegate staging/run helpers to tools/ninja_build.py")
+    n.comment("VDISK_FS is read at packaging time: ext4 root + FAT32 ESP by default; FAT32 selects all-FAT32.")
     # Image creation, QEMU launch, formatting, and graph reporting stay in the
     # helper script because they are imperative workflows rather than compile
     # edges.  Ninja still tracks their visible target names here.

@@ -31,6 +31,8 @@
 #define IDE_CMD_READ_SECTORS  0x20
 #define IDE_CMD_WRITE_SECTORS 0x30
 #define IDE_CMD_IDENTIFY      0xEC
+#define IDE_CMD_IDENTIFY_PACKET 0xA1
+#define IDE_CMD_PACKET        0xA0
 #define IDE_CMD_CACHE_FLUSH   0xE7
 
 // IDE 状态寄存器位
@@ -57,6 +59,7 @@ typedef struct ide_device {
     char     model[41];
     char     serial[21];
     int      drive_id;  // 注册后的设备 ID
+    uint8_t  packet_bytes; // ATAPI command packet length (12 or 16), zero for ATA.
 } ide_device_t;
 
 // 函数声明

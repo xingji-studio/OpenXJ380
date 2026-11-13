@@ -4,10 +4,12 @@
 #include <fs/vfs/vfs.h>
 #include <efi/root_binding.h>
 #include <block_access.h>
+#include <installer/progress.h>
 
 struct stat;
 struct statfs;
 struct timespec;
+namespace xjpak2 { struct DataReader; }
 
 // Advisory pure preflight for known factory blockers. No allocation/I/O/guard
 // or reservation: later acquisition still rechecks all ordinary gates. Reports
@@ -61,8 +63,12 @@ struct ext4_build_status
 // The caller must retain its kernel-owned package storage until success, or
 // until reboot after quarantine/abandonment. Partial installation is never boot
 // activation or a package-wide rollback. No cleanup I/O follows backend failure.
+// With an indexed source, the caller first verifies all source file CRCs and
+// pins its read context through completion or reboot after quarantine. The
+// builder revalidates metadata and checks each file CRC again while importing.
 int ext4fs_build_node(vfs_node_t device, const ext4_format_options *options,
-                      const void *package, size_t package_bytes, ext4_build_status *status = nullptr);
+                      const void *package, size_t package_bytes, ext4_build_status *status = nullptr,
+                      const xjpak2::DataReader *source = nullptr);
 
 // Synchronous same-TCB build inside an authenticated whole-device lease. The
 // caller retains the parent token/node/immutable package throughout completion
@@ -71,7 +77,9 @@ int ext4fs_build_node(vfs_node_t device, const ext4_format_options *options,
 // physical whole device. Only real 512-byte logical-sector devices are accepted
 // by this fresh-installer profile. This is a trusted API, not a user interface.
 int ext4fs_build_window(const BlockAccessWindow *window, const ext4_format_options *options,
-                        const void *package, size_t package_bytes, ext4_build_status *status = nullptr);
+                        const void *package, size_t package_bytes, ext4_build_status *status = nullptr,
+                        const xjinstaller::ProgressObserver *progress = nullptr,
+                        const xjpak2::DataReader *source = nullptr);
 
 void ext4fs_init();
 int ext4fs_mount_bound_root(const char *device, const XJ_ROOT_BINDING *binding);

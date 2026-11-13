@@ -10,9 +10,9 @@ a volume needing recovery is refused in that mode.
 
 This remains a supported subset, not a complete ext4 implementation. System-root
 mounting uses the explicit boot binding described below; ordinary application/data
-mount APIs still refuse the system root. The public image builder accepts `VDISK_FS=ext4` or `--fs ext4` for
-an explicitly bound writable root and FAT32 ESP. FAT32 remains the default image
-format. A trusted kernel factory API now builds a fresh ext4 root and FAT32 ESP
+mount APIs still refuse the system root. The public image builder defaults to
+an explicitly bound writable ext4 root and FAT32 ESP. `VDISK_FS=FAT32` selects
+an all-FAT32 image instead. A trusted kernel factory API now builds a fresh ext4 root and FAT32 ESP
 on a whole disk. The versioned native graphical installer supports fresh,
 full-package ext4 installation with a FAT32 ESP. Legacy copy/repair entrypoints
 remain refused; repair, keep-users and in-place update are not enabled.
@@ -34,8 +34,8 @@ See [the package contract](INSTALLER_PACKAGES.md).
 
 ## Writable feature and durability boundaries
 
-- Writable sessions share a 32-entry clean read cache for home blocks and
-  journal images in caller-owned workspace storage (128 KiB data maximum).
+- Writable sessions share a 128-entry clean read cache for home blocks and
+  journal images in caller-owned workspace storage (512 KiB data maximum).
   Overlay after-images take priority; every attempted write invalidates its
   affected cache blocks first. A cold read failure also blocks subsequent warm
   cache reads and mutations. Large/cross-block reads retain direct backend I/O;
@@ -68,7 +68,7 @@ See [the package contract](INSTALLER_PACKAGES.md).
   superblock flags select signedness. Unknown selectors or conflicting flags
   are refused before writes.
   Symlink text is limited to one filesystem block minus its terminating NUL.
-- Each complete journal transaction contains at most 16 block after-images,
+- Ordinary complete journal transactions contain at most 16 block after-images,
   including data, inode tables, bitmaps, group descriptors and the superblock.
   Large writes may return a committed prefix; they are not atomic as a whole.
   Namespace operations commit once or fail before device writes when metadata
@@ -81,6 +81,11 @@ See [the package contract](INSTALLER_PACKAGES.md).
   supported zero-link orphan deletion before publication; explicit read-only
   mount refuses pending orphans. Malformed chains and still-named zero-link
   victims are refused before recovery writes.
+  The fresh 4 KiB installer explicitly opts into 64 after-images and 128 KiB
+  data chunks using caller-owned heap workspace. Ordinary mutation admission
+  remains at 16 images; native recovery accepts the larger supported records.
+  Both profiles retain the same six commit flush barriers. Linux and native
+  recovery tests cover 17-, 33- and 64-image commits, including escaped data.
 - Growth may create sparse holes. Partial-block shrink/extension clears stale
   tail bytes; newly allocated blocks are initialized before publication.
 - An open file survives unlink or rename replacement with its inode identity and
@@ -206,6 +211,25 @@ writer start retains the complete lifetime without close/retry or clearing
 RECOVER; backend failure stops all further I/O. Successful completion alone
 closes the writer and releases resources. Existing-target repair and keep-users
 remain separate policies.
+
+Fresh import applies all EAs before one final owner/mode/mtime transaction per
+canonical inode, restoring parent times after descendants. Ownership-only
+updates still clear privilege bits; an explicit combined mode is applied last.
+Each transaction retains the complete after-state guard. Clean before-image
+reads use the invalidating cache. A successful guarded checkpoint refreshes and
+checks every final group descriptor while reusing immutable sorted ownership
+ranges and the pinned journal mapping. Journal inode identity and block-map
+bytes remain checked; the guard forbids changing journal index/data blocks and
+proves they remain allocated. Initial open and recovery rebuild and check the
+full layout and every journal mapping.
+
+Independent final package readback remains uncached by the writer and checks
+every byte, name, inode identity, attribute and allocation checksum/counter.
+It may gather up to 32 physically adjacent mapped blocks (128 KiB), validating
+each mapping and splitting at holes, unwritten extents, gaps and EOF. Ordinary
+VFS readers retain their single-block contract. Bounded format/import/readback
+callbacks publish real work progress; allocation and full namespace census
+must finish before verification progress reaches completion.
 
 Formatter parameter/layout validation precedes I/O. A real flush preflight precedes
 the first destructive write. The formatter invalidates primary/new-profile
@@ -359,7 +383,7 @@ loader, the same kernel bytes at `/system/kernel.krl`, and a 96-byte descriptor
 at `/EFI/XJ380/root.bin`. The formatter leaves the source stage unchanged,
 formats/checks temporary partitions with independent host tools, reads back both
 kernel copies and the descriptor, then atomically replaces the requested image.
-The default FAT32 build remains separate.
+The explicitly selected all-FAT32 build remains separate.
 
 `XJROOT01` version one records a disk GUID, root-partition GUID, ESP GUID, ext4
 filesystem UUID, kernel length and standard CRC32C, plus a descriptor CRC32C over
@@ -407,11 +431,21 @@ including its ESP and alignment space. Its journal is selected between 4 and
 32 MiB, within the native 32768-logical-block journal limit. The normal public image commands are:
 
 ```sh
-VDISK_FS=ext4 VDISK_IMAGE=out/XJ380-ext4.img ninja -f build.ninja vdisk
+ninja -f build.ninja vdisk
+VDISK_IMAGE=out/XJ380-ext4.img ninja -f build.ninja vdisk
 VDISK_IMAGE=out/XJ380-ext4.img ninja -f build.ninja justrun
 # Equivalent direct packaging of already-built artifacts:
-python3 tools/ninja_build.py vdisk --fs ext4 --image out/XJ380-ext4.img
+python3 tools/ninja_build.py vdisk --image out/XJ380-ext4.img
+# Explicit all-FAT32 compatibility image:
+VDISK_FS=FAT32 VDISK_IMAGE=out/XJ380-fat32.img ninja -f build.ninja vdisk
 ```
+
+`vdisk`, `complete`, and their dependent run/VMDK targets default to ext4 with a
+FAT32 ESP. Both wrappers resolve `VDISK_FS` at packaging time, so it can be changed
+without regenerating Ninja first. Values are case-insensitive (`fat32` and `ext4`
+remain accepted); invalid values fail before staging. An explicit `--fs` takes
+priority over `VDISK_FS`. The standalone formatter also defaults to ext4 with a
+FAT32 ESP and accepts `--fs FAT32` for an all-FAT32 image.
 
 With `VDISK_SIZE_MIB` unset, the formatter sizes the final staged content with
 20% extra content space, filesystem metadata/allocation overhead and MiB alignment.

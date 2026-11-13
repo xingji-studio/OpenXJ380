@@ -97,15 +97,44 @@ int ahci_send_command(struct hba_port *port, int slot, uint64_t timeout_ns)
         }
         asm volatile("pause");
     }
-    io_mfence();
-    int error = ahci_command_error(port);
-    if (!error && (port->regs[HBA_RPxTFD] & (HBA_PxTFD_BSY | HBA_PxTFD_DRQ))) error = -EIO;
-    if (!error && port->regs[HBA_RPxSACT]) error = -EIO;
-    if (error)
+    // Some virtual HBAs expose cleared PxCI before the final task-file update
+    // becomes observable. Keep ownership until BSY/DRQ settle as well. This
+    // waits for the original command under its original deadline; it never
+    // reissues it or treats an error/active NCQ tag as successful completion.
+    bool reported_pending = false;
+    for (;;)
     {
-        if (port->device) sata_read_error(port);
-        ahci_log_cmd_failure(port, slot, "invalid final completion state");
-        return ahci_fail_port(port, error);
+        io_mfence();
+        int error = ahci_command_error(port);
+        uint32_t tfd = port->regs[HBA_RPxTFD];
+        uint32_t active = port->regs[HBA_RPxSACT];
+        if (!error && active) error = -EIO;
+        if (error)
+        {
+            write_serial_fmt("AHCI: rejected final status slot=%d error=%d TFD=0x%x SACT=0x%x\n",
+                             slot, error, tfd, active);
+            if (port->device) sata_read_error(port);
+            ahci_log_cmd_failure(port, slot, "invalid final completion state");
+            return ahci_fail_port(port, error);
+        }
+        if (!(tfd & (HBA_PxTFD_BSY | HBA_PxTFD_DRQ))) break;
+        if (!reported_pending)
+        {
+            // Bound serial noise during large installations, while recording
+            // the actual sampled status rather than a later settled value.
+            static uint32_t reports;
+            if (__atomic_fetch_add(&reports, 1u, __ATOMIC_RELAXED) < 8)
+                write_serial_fmt("AHCI: waiting for final task-file slot=%d sampled TFD=0x%x\n", slot, tfd);
+            reported_pending = true;
+        }
+        if (deadline.expired(nanoTime(), timeout_ns))
+        {
+            io_mfence();
+            if (!(port->regs[HBA_RPxTFD] & (HBA_PxTFD_BSY | HBA_PxTFD_DRQ))) continue;
+            ahci_log_timeout(port, slot, "final task-file timeout", deadline, timeout_ns);
+            return ahci_fail_port(port, -ETIMEDOUT);
+        }
+        asm volatile("pause");
     }
     hba_clear_reg(port->regs[HBA_RPxIS]);
     return 0;

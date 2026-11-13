@@ -27,6 +27,7 @@ struct DiskLayoutOptions
     uint64_t disk_bytes;
     uint64_t esp_bytes = 64 * DiskMiB;
     DiskIdentities identities;
+    uint32_t filesystem = 2; // 1: FAT32 Basic Data, 2: ext4 Linux filesystem.
 };
 
 struct DiskLayout
@@ -42,6 +43,7 @@ struct DiskLayout
     uint64_t esp_first_lba;
     uint64_t esp_last_lba;
     DiskIdentities identities;
+    uint32_t filesystem = 2;
 };
 
 struct DiskLayoutWorkspace

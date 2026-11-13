@@ -1284,10 +1284,13 @@ struct BuildContext
 } // namespace
 
 static int build_offline(vfs_node_t device, const BlockAccessWindow *window, const ext4_format_options *options,
-                          const void *package, size_t package_bytes, ext4_build_status *status)
+                          const void *package, size_t package_bytes, ext4_build_status *status,
+                          const xjinstaller::ProgressObserver *progress = nullptr,
+                          const xjpak2::DataReader *source = nullptr)
 {
     ext4_format_options snapshot = {};
     if (options) snapshot = *options;
+    xjpak2::DataReader source_snapshot = source ? *source : xjpak2::DataReader{};
     // Do not clear a caller's output through the immutable package. All pointers
     // are trusted kernel spans; this API never validates user mappings.
     uintptr_t first = reinterpret_cast<uintptr_t>(package);
@@ -1352,7 +1355,7 @@ static int build_offline(vfs_node_t device, const BlockAccessWindow *window, con
     }
     xjinstaller::Ext4ImportRequirements requirements;
     error = xjinstaller::ext4_import_prepare(static_cast<const uint8_t *>(package), package_bytes, limits,
-                                            context->import, requirements);
+                                            context->import, requirements, source ? &source_snapshot : nullptr);
     if (!error) error = block_access_resolve_node(device, &context->format.extent);
     if (!error && (context->format.extent.bytes != device->size || !context->format.extent.bytes)) error = -EINVAL;
     if (!error) error = block_access_require_flush(context->format.extent);
@@ -1424,15 +1427,22 @@ static int build_offline(vfs_node_t device, const BlockAccessWindow *window, con
     // published before the formatter's first flush or destructive write.
     context->format.next = format_contexts;
     format_contexts = &context->format;
+    xjinstaller::ProgressObserver observer = progress ? *progress : xjinstaller::ProgressObserver{};
+    xjext4::FormatProgress format_progress = {
+        [](void *opaque, uint64_t done, uint64_t total)
+        {
+            xjinstaller::report_progress(*static_cast<xjinstaller::ProgressObserver *>(opaque),
+                                         xjinstaller::InstallStage::Formatting, done, total);
+        }, &observer};
     error = xjext4::format(io, native_options, *context->format.workspace, context->format.geometry,
-                              &context->format.storage);
+                              &context->format.storage, &format_progress);
     if (!error)
     {
         if (status) status->import_started = true;
         xjext4::WriteDevice writer_io = {format_read, format_write, format_flush, &context->format,
                                         context->format.io_bytes};
         error = xjinstaller::ext4_import_apply_fresh(writer_io, snapshot.time_seconds, context->import,
-                                                    context->import_status, &context->storage);
+                                                    context->import_status, &context->storage, &observer);
     }
     if (operation_has_failed()) format_fail_io(&context->format);
     if (status)
@@ -1462,20 +1472,22 @@ static int build_offline(vfs_node_t device, const BlockAccessWindow *window, con
 }
 
 int ext4fs_build_node(vfs_node_t device, const ext4_format_options *options,
-                      const void *package, size_t package_bytes, ext4_build_status *status)
+                      const void *package, size_t package_bytes, ext4_build_status *status,
+                      const xjpak2::DataReader *source)
 {
-    return build_offline(device, NULL, options, package, package_bytes, status);
+    return build_offline(device, NULL, options, package, package_bytes, status, nullptr, source);
 }
 
 int ext4fs_build_window(const BlockAccessWindow *window, const ext4_format_options *options,
-                        const void *package, size_t package_bytes, ext4_build_status *status)
+                        const void *package, size_t package_bytes, ext4_build_status *status,
+                        const xjinstaller::ProgressObserver *progress, const xjpak2::DataReader *source)
 {
     // Snapshot the trusted descriptor before a possibly overlapping status is
     // cleared. A borrowed descriptor never acquires/relinquishes the parent.
     BlockAccessWindow snapshot = {};
     if (window) snapshot = *window;
     return build_offline(window ? snapshot.node : NULL, window ? &snapshot : NULL, options,
-                          package, package_bytes, status);
+                          package, package_bytes, status, progress, source);
 }
 
 int ext4fs_mount_bound_root(const char *device, const XJ_ROOT_BINDING *binding)

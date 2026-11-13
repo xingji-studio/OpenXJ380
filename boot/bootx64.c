@@ -9,6 +9,7 @@
 #include <fbc.h>
 #include <msr.h>
 #include "memory.h"
+#include "../include/installer/payloads.h"
 
 #define NULL 0
 struct EFI_SYSTEM_TABLE                *ST;   // 系统表
@@ -807,17 +808,49 @@ static int boot_installer_media_bytes(const BOOT_INSTALLER_BLOCK_MEDIA *media, U
     return *bytes != 0;
 }
 
+// Firmware device paths can differ across hypervisors. Log complete bounded
+// nodes so a rejected identity remains diagnosable without weakening admission.
+static void boot_package_number(char *buffer, UINT64 value, unsigned base);
+
+static void boot_installer_log_path(const UINT8 *path)
+{
+    if (!path) return;
+    static const char digits[] = "0123456789ABCDEF";
+    write_serial_string("Installer source device path: ");
+    UINTN offset = 0;
+    while (offset <= XJ_INSTALLER_PATH_MAX - 4)
+    {
+        UINTN bytes = xj_installer_le16(path + offset + 2);
+        if (bytes < 4 || bytes > XJ_INSTALLER_PATH_MAX - offset) break;
+        for (UINTN i = 0; i < bytes; ++i)
+        {
+            UINT8 value = path[offset + i];
+            char text[3] = {digits[value >> 4], digits[value & 15], 0};
+            write_serial_string(text);
+        }
+        write_serial_string(" ");
+        if (path[offset] == 127) break;
+        offset += bytes;
+    }
+    write_serial_string("\n");
+}
+
 static void boot_installer_capture_source(XJ_INSTALLER_SOURCE *output)
 {
     XJ_INSTALLER_PATH_INFO parsed;
     XJ_INSTALLER_SOURCE source;
     UINT32 reason = XJ_INSTALLER_SOURCE_UNSUPPORTED;
+    const char *stage = "loaded-image";
+    const UINT8 *path = NULL;
+    EFI_STATUS status = EFI_SUCCESS;
     xmemset(output, 0, sizeof(*output));
     if (!LIP || !LIP->DeviceHandle) goto failure;
-    const UINT8 *path = NULL;
-    EFI_STATUS status = BS->OpenProtocol(LIP->DeviceHandle, &boot_installer_device_path_guid,
+    stage = "device-path-protocol";
+    status = BS->OpenProtocol(LIP->DeviceHandle, &boot_installer_device_path_guid,
                                          (void **)&path, IM, NULL, EFI_OPEN_PROTOCOL_GET_PROTOCOL);
     if (EFI_ERROR(status) || !path) goto failure;
+    boot_installer_log_path(path);
+    stage = "device-path-parse";
     reason = xj_installer_parse_device_path(path, XJ_INSTALLER_PATH_MAX, &parsed);
     if (reason != XJ_INSTALLER_SOURCE_SUPPORTED) goto failure;
     source = parsed.identity;
@@ -825,12 +858,14 @@ static void boot_installer_capture_source(XJ_INSTALLER_SOURCE *output)
     {
         EFI_HANDLE pci_handle = NULL;
         BOOT_INSTALLER_PCI_IO *pci = NULL;
+        stage = "pci-protocol";
         status = boot_installer_exact_protocol(&boot_installer_pci_io_guid, path, parsed.pci_end[i],
                                                &pci_handle, (void **)&pci);
         if (EFI_ERROR(status) || !pci || !pci->get_location || !pci->read_config)
         { reason = status == EFI_COMPROMISED_DATA ? XJ_INSTALLER_SOURCE_AMBIGUOUS :
                                                     XJ_INSTALLER_SOURCE_UNSUPPORTED; goto failure; }
         UINTN segment, bus, device, function;
+        stage = "pci-location";
         status = pci->get_location(pci, &segment, &bus, &device, &function);
         if (EFI_ERROR(status) || segment > 65535 || bus > 255 || device > 31 || function > 7 ||
             device != source.pci[i].device || function != source.pci[i].function)
@@ -838,6 +873,7 @@ static void boot_installer_capture_source(XJ_INSTALLER_SOURCE *output)
         source.pci[i].segment = (UINT16)segment;
         source.pci[i].bus = (UINT8)bus;
         UINT32 class_revision = 0;
+        stage = "pci-class";
         status = pci->read_config(pci, 2, 8, 1, &class_revision); // EfiPciIoWidthUint32.
         UINT32 class_code = class_revision >> 8;
         if (EFI_ERROR(status) ||
@@ -850,16 +886,19 @@ static void boot_installer_capture_source(XJ_INSTALLER_SOURCE *output)
     }
     EFI_HANDLE physical_handle = NULL, volume_handle = NULL;
     BOOT_INSTALLER_BLOCK_IO *physical = NULL, *volume = NULL;
+    stage = "physical-block-protocol";
     status = boot_installer_exact_protocol(&boot_installer_block_io_guid, path, parsed.physical_path_bytes,
                                            &physical_handle, (void **)&physical);
     if (EFI_ERROR(status) || !physical || !physical->media || physical->media->partition)
     { reason = status == EFI_COMPROMISED_DATA ? XJ_INSTALLER_SOURCE_AMBIGUOUS :
                                                 XJ_INSTALLER_SOURCE_UNSUPPORTED; goto failure; }
+    stage = "volume-block-protocol";
     status = boot_installer_exact_protocol(&boot_installer_block_io_guid, path, source.path_bytes - 4,
                                            &volume_handle, (void **)&volume);
     if (EFI_ERROR(status) || !volume || volume_handle != LIP->DeviceHandle || !volume->media)
     { reason = status == EFI_COMPROMISED_DATA ? XJ_INSTALLER_SOURCE_AMBIGUOUS :
                                                 XJ_INSTALLER_SOURCE_UNSUPPORTED; goto failure; }
+    stage = "block-geometry";
     if (!boot_installer_media_bytes(physical->media, &source.physical_bytes) ||
         !boot_installer_media_bytes(volume->media, &source.volume_bytes))
     { reason = XJ_INSTALLER_SOURCE_MALFORMED; goto failure; }
@@ -869,59 +908,268 @@ static void boot_installer_capture_source(XJ_INSTALLER_SOURCE *output)
     if (parsed.media_start > ~(UINT64)0 / source.physical_block_size)
     { reason = XJ_INSTALLER_SOURCE_MALFORMED; goto failure; }
     source.volume_offset = parsed.media_start * source.physical_block_size;
+    stage = "source-validation";
     if (!xj_installer_source_valid(&source))
     { reason = XJ_INSTALLER_SOURCE_MALFORMED; goto failure; }
     *output = source;
     return;
 failure:
     output->status = reason;
+    write_serial_string("Installer source rejected: stage=");
+    write_serial_string((char *)stage);
+    char number[32];
+    boot_package_number(number, reason, 10);
+    write_serial_string(" reason=");
+    write_serial_string(number);
+    boot_package_number(number, status, 16);
+    write_serial_string(" efi_status=");
+    write_serial_string(number);
+    write_serial_string("\n");
+}
+
+// Bound firmware requests even when a package is larger than 2 GiB. Package
+// ownership remains one page-exclusive span, as required by the kernel proof.
+#define BOOT_PACKAGE_READ_CHUNK (1024U * 1024U)
+// CreateAndMapNewPageTable shares PML4[0] with the kernel's PML4[256] alias.
+// Both reach the first 512 GiB, including firmware RAM above the PCI hole.
+#define BOOT_PACKAGE_ADDRESS_MAX ((1ULL << 39) - 1)
+
+typedef struct BOOT_PACKAGE_DIAGNOSTIC
+{
+    const char *code;
+    const char *message;
+    UINTN file_bytes;
+    UINTN read_bytes;
+    EFI_PHYSICAL_ADDRESS physical;
+} BOOT_PACKAGE_DIAGNOSTIC;
+
+static EFI_STATUS boot_package_error(BOOT_PACKAGE_DIAGNOSTIC *diagnostic, const char *code,
+                                     const char *message, EFI_STATUS status)
+{
+    diagnostic->code = code;
+    diagnostic->message = message;
+    return status;
+}
+
+// Some firmware rejects AllocateMaxAddress even when its map contains a
+// suitable conventional range above the PCI hole. Keep the package contiguous
+// and owned by EFI, trying the other standard page-allocation modes first.
+static void boot_package_memory_number(const char *label, UINT64 value)
+{
+    char number[32];
+    boot_package_number(number, value, 16);
+    write_serial_string((char *)label);
+    write_serial_string(number);
+}
+
+static EFI_STATUS boot_package_allocate_pages(UINTN pages, EFI_PHYSICAL_ADDRESS *address)
+{
+    *address = BOOT_PACKAGE_ADDRESS_MAX;
+    EFI_STATUS status = BS->AllocatePages(AllocateMaxAddress, EfiLoaderData, pages, address);
+    if (!EFI_ERROR(status)) return status;
+    boot_package_memory_number("Installer memory fallback: bytes=", pages * 4096);
+    boot_package_memory_number(" max_status=", status);
+    write_serial_string("\n");
+    *address = 0;
+    status = BS->AllocatePages(AllocateAnyPages, EfiLoaderData, pages, address);
+    if (!EFI_ERROR(status)) return status;
+    if (!BS->GetMemoryMap || !BS->AllocatePool || !BS->FreePool) return status;
+
+    UINTN bytes = 0, key = 0, stride = 0;
+    UINT32 version = 0;
+    EFI_STATUS mapped = BS->GetMemoryMap(&bytes, NULL, &key, &stride, &version);
+    if (mapped != EFI_BUFFER_TOO_SMALL || !bytes) return status;
+    // Pool allocation can itself split descriptors. Retry a growing map with
+    // bounded slack, and never allocate from an unvalidated firmware entry.
+    for (unsigned attempt = 0; attempt < 3 && bytes <= 1024U * 1024U; ++attempt)
+    {
+        UINTN capacity = bytes + 4096;
+        void *map = NULL;
+        mapped = BS->AllocatePool(EfiLoaderData, capacity, &map);
+        if (EFI_ERROR(mapped) || !map) return status;
+        bytes = capacity;
+        mapped = BS->GetMemoryMap(&bytes, map, &key, &stride, &version);
+        if (mapped == EFI_BUFFER_TOO_SMALL)
+        {
+            BS->FreePool(map);
+            continue;
+        }
+        if (EFI_ERROR(mapped) || bytes > capacity || stride < 40 || stride > 4096 ||
+            bytes % stride || version != 1)
+        {
+            BS->FreePool(map);
+            return status;
+        }
+        UINT64 total = 0, largest = 0;
+        for (unsigned pass = 0; pass < 3; ++pass)
+        {
+            for (UINTN at = 0; at < bytes; at += stride)
+            {
+                // UEFI's stride can be 40 bytes, unlike our aligned C type.
+                EFI_MEMORY_DESCRIPTOR entry;
+                xmemset(&entry, 0, sizeof(entry));
+                for (UINTN i = 0; i < 40; ++i) ((UINT8 *)&entry)[i] = ((UINT8 *)map)[at + i];
+                if (entry.Type != EfiConventionalMemory || !entry.PhysicalStart ||
+                    (entry.PhysicalStart & 4095) || entry.PhysicalStart > BOOT_PACKAGE_ADDRESS_MAX ||
+                    !entry.NumberOfPages || entry.NumberOfPages > (~(UINT64)0 - entry.PhysicalStart) / 4096)
+                    continue;
+                UINT64 available = (BOOT_PACKAGE_ADDRESS_MAX - entry.PhysicalStart + 1) / 4096;
+                if (available > entry.NumberOfPages) available = entry.NumberOfPages;
+                if (!pass)
+                {
+                    total += available;
+                    if (largest < available) largest = available;
+                    continue;
+                }
+                if (available < pages) continue;
+                EFI_PHYSICAL_ADDRESS candidate = entry.PhysicalStart + (available - pages) * 4096;
+                if ((candidate >= (1ULL << 32)) != (pass == 1)) continue;
+                boot_package_memory_number("Installer memory candidate: physical=", candidate);
+                boot_package_memory_number(" bytes=", pages * 4096);
+                write_serial_string("\n");
+                *address = candidate;
+                EFI_STATUS allocated = BS->AllocatePages(AllocateAddress, EfiLoaderData, pages, address);
+                if (!EFI_ERROR(allocated))
+                {
+                    BS->FreePool(map);
+                    return allocated;
+                }
+            }
+            if (!pass)
+            {
+                boot_package_memory_number("Installer memory map: conventional_bytes=", total * 4096);
+                boot_package_memory_number(" largest_bytes=", largest * 4096);
+                write_serial_string("\n");
+            }
+        }
+        BS->FreePool(map);
+        break;
+    }
+    return status;
 }
 
 // Page-exclusive bounded allocations permit later ownership validation and
 // freezing without changing protection on unrelated AllocatePool objects.
 static EFI_STATUS read_boot_package(struct EFI_FILE_PROTOCOL *root, CHAR16 *path, void **out_buffer,
-                                     UINTN *out_size, XJ_INSTALLER_PACKAGE_SPAN *span, UINT64 already_bytes)
+                                     UINTN *out_size, XJ_INSTALLER_PACKAGE_SPAN *span, UINT64 already_bytes,
+                                     BOOT_PACKAGE_DIAGNOSTIC *diagnostic)
 {
-    if (!root || !path || !out_buffer || !out_size || !span) return EFI_INVALID_PARAMETER;
+    if (!diagnostic) return EFI_INVALID_PARAMETER;
+    xmemset(diagnostic, 0, sizeof(*diagnostic));
+    if (!root || !path || !out_buffer || !out_size || !span)
+        return boot_package_error(diagnostic, "PACKAGE_INVALID_ARGUMENT", "Invalid loader argument.",
+                                  EFI_INVALID_PARAMETER);
     *out_buffer = NULL;
     *out_size = 0;
     xmemset(span, 0, sizeof(*span));
     struct EFI_FILE_PROTOCOL *file = NULL;
     EFI_STATUS status = open_boot_file(root, path, &file);
-    if (EFI_ERROR(status)) return status;
+    if (EFI_ERROR(status))
+        return boot_package_error(diagnostic, status == EFI_NOT_FOUND ? "PACKAGE_NOT_FOUND" : "PACKAGE_OPEN_FAILED",
+                                  "Could not open the installer package.", status);
     UINTN bytes = 0;
     status = boot_file_size(file, &bytes);
-    if (EFI_ERROR(status) || !bytes || bytes > XJ_INSTALLER_PACKAGE_MAX ||
-        already_bytes > XJ_INSTALLER_PACKAGES_MAX || bytes > XJ_INSTALLER_PACKAGES_MAX - already_bytes)
+    diagnostic->file_bytes = bytes;
+    if (EFI_ERROR(status))
     {
         file->Close(file);
-        return EFI_ERROR(status) ? status : EFI_OUT_OF_RESOURCES;
+        return boot_package_error(diagnostic, "PACKAGE_SIZE_FAILED", "Could not read the package size.", status);
+    }
+    UINT64 package_limit = XJ_INSTALLER_PACKAGE_MAX;
+    const char index_path[] = "\\installer\\system-index.pak";
+    UINTN index_at = 0;
+    while (index_path[index_at] && index_path[index_at] == path[index_at]) ++index_at;
+    if (!index_path[index_at] && !path[index_at]) package_limit = 64ULL << 20;
+    if (!bytes || bytes > package_limit || already_bytes > XJ_INSTALLER_PACKAGES_MAX ||
+        bytes > XJ_INSTALLER_PACKAGES_MAX - already_bytes)
+    {
+        file->Close(file);
+        return boot_package_error(diagnostic, !bytes ? "PACKAGE_EMPTY" :
+                                  (bytes > package_limit ? "PACKAGE_TOO_LARGE" : "PACKAGES_TOO_LARGE"),
+                                  "Package size is outside the loader limits.", EFI_BAD_BUFFER_SIZE);
     }
     UINTN pages = (bytes + 4095) / 4096;
-    EFI_PHYSICAL_ADDRESS address = 0xffffffffULL;
-    status = BS->AllocatePages(AllocateMaxAddress, EfiLoaderData, pages, &address);
-    if (EFI_ERROR(status)) { file->Close(file); return status; }
-    if (!address || (address & 4095) || address > 0x100000000ULL - pages * 4096)
+    EFI_PHYSICAL_ADDRESS address = 0;
+    status = boot_package_allocate_pages(pages, &address);
+    if (EFI_ERROR(status))
+    {
+        file->Close(file);
+        return boot_package_error(diagnostic, "PACKAGE_MEMORY_UNAVAILABLE",
+                                  "No usable contiguous RAM for the package. See the memory map in the serial log.", status);
+    }
+    if (!address || (address & 4095) || address > BOOT_PACKAGE_ADDRESS_MAX - (pages * 4096 - 1))
     {
         BS->FreePages(address, pages);
         file->Close(file);
-        return EFI_COMPROMISED_DATA;
+        return boot_package_error(diagnostic, "PACKAGE_BAD_ALLOCATION", "Firmware returned an invalid memory range.",
+                                  EFI_COMPROMISED_DATA);
     }
-    xmemset((void *)address, 0, pages * 4096);
-    UINTN read_bytes = bytes;
-    status = file->Read(file, &read_bytes, (void *)address);
+    // Successful reads initialize the entire file; only the last page's padding
+    // needs clearing. On any failed read, free the span without publishing it.
+    xmemset((void *)(address + bytes), 0, pages * 4096 - bytes);
+    while (diagnostic->read_bytes < bytes)
+    {
+        UINTN remaining = bytes - diagnostic->read_bytes;
+        UINTN requested = remaining < BOOT_PACKAGE_READ_CHUNK ? remaining : BOOT_PACKAGE_READ_CHUNK;
+        UINTN read_bytes = requested;
+        status = file->Read(file, &read_bytes, (void *)(address + diagnostic->read_bytes));
+        if (EFI_ERROR(status))
+        {
+            boot_package_error(diagnostic, "PACKAGE_READ_FAILED", "Firmware could not read the package.", status);
+            break;
+        }
+        if (read_bytes > requested)
+        {
+            status = boot_package_error(diagnostic, "PACKAGE_INVALID_READ", "Firmware returned an invalid read size.",
+                                        EFI_DEVICE_ERROR);
+            break;
+        }
+        diagnostic->read_bytes += read_bytes;
+        if (read_bytes != requested)
+        {
+            status = boot_package_error(diagnostic, "PACKAGE_TRUNCATED", "Package ended before its declared size.",
+                                        EFI_END_OF_FILE);
+            break;
+        }
+    }
     EFI_STATUS closed = file->Close(file);
-    if (EFI_ERROR(status) || read_bytes != bytes || EFI_ERROR(closed))
+    if (!EFI_ERROR(status) && EFI_ERROR(closed))
+        status = boot_package_error(diagnostic, "PACKAGE_CLOSE_FAILED", "Firmware could not close the package.", closed);
+    if (EFI_ERROR(status))
     {
         BS->FreePages(address, pages);
-        return EFI_ERROR(status) ? status : (EFI_ERROR(closed) ? closed : EFI_DEVICE_ERROR);
+        return status;
     }
     span->physical = address;
     span->bytes = bytes;
     span->pages = pages;
     *out_buffer = (void *)address;
     *out_size = bytes;
+    diagnostic->physical = address;
+    diagnostic->code = "OK";
+    diagnostic->message = "Installer package loaded.";
     return EFI_SUCCESS;
+}
+
+// Avoid the old bootlib formatters' stack-returned buffers and 32-bit decimal
+// truncation: package sizes and EFI_STATUS must retain all 64 bits.
+static void boot_package_number(char *buffer, UINT64 value, unsigned base)
+{
+    static const char digits[] = "0123456789ABCDEF";
+    char reversed[20];
+    unsigned count = 0;
+    do
+    {
+        reversed[count++] = digits[value % base];
+        value /= base;
+    } while (value);
+    if (base == 16)
+    {
+        *buffer++ = '0';
+        *buffer++ = 'x';
+    }
+    while (count) *buffer++ = reversed[--count];
+    *buffer = '\0';
 }
 
 static int boot_installer_package_magic(const void *buffer, UINTN bytes)
@@ -929,6 +1177,12 @@ static int boot_installer_package_magic(const void *buffer, UINTN bytes)
     static const UINT8 prefix[5] = {'X', 'J', 'P', 'A', 'K'};
     if (!buffer || bytes < 8) return 0;
     const UINT8 *p = (const UINT8 *)buffer;
+    const char stream_magic[] = "XJSTRM01";
+    int stream = 1;
+    for (unsigned i = 0; i < 8; ++i) if (p[i] != (unsigned char)stream_magic[i]) stream = 0;
+    if (stream) return XJ_INSTALLER_FORMAT_STREAM_INDEX;
+    xj_installer_payloads payloads;
+    if (xj_installer_split_payloads(buffer, bytes, &payloads)) return XJ_INSTALLER_FORMAT_DUAL;
     for (unsigned i = 0; i < 5; ++i) if (p[i] != prefix[i]) return 0;
     if (p[6] != '0' || p[7]) return 0;
     return p[5] == '1' ? XJ_INSTALLER_FORMAT_PAK1 :
@@ -1181,6 +1435,53 @@ char new_stack[STACK_SIZE]; // 你不配当主播！滚吧！* 哭 *
 typedef void (*__attribute__((sysv_abi)) Kernel)(const struct FrameBufferConfig *, struct EFI_SYSTEM_TABLE *,
                                                  BOOT_CONFIG *);
 
+// Keep full file sizes and the original firmware status in both diagnostics.
+// In particular, a size or allocation failure must never claim a missing file.
+static void boot_package_serial_number(UINT64 value, unsigned base)
+{
+    char number[32];
+    boot_package_number(number, value, base);
+    write_serial_string(number);
+}
+
+static void boot_package_report(const char *name, EFI_STATUS status, const BOOT_PACKAGE_DIAGNOSTIC *diagnostic)
+{
+    write_serial_string("Installer package ");
+    write_serial_string((char *)name);
+    write_serial_string(": ");
+    write_serial_string((char *)diagnostic->code);
+    write_serial_string(" bytes=");
+    boot_package_serial_number(diagnostic->file_bytes, 10);
+    write_serial_string(" read=");
+    boot_package_serial_number(diagnostic->read_bytes, 10);
+    write_serial_string(" physical=");
+    boot_package_serial_number(diagnostic->physical, 16);
+    write_serial_string(" status=");
+    boot_package_serial_number(status, 16);
+    write_serial_string("\n");
+    if (!EFI_ERROR(status)) return;
+
+    puts(L"\r\nInstaller package: ");
+    puts_ascii(name);
+    puts(L"\r\nError code: ");
+    puts_ascii(diagnostic->code);
+    puts(L"\r\n");
+    puts_ascii(diagnostic->message);
+    puts(L"\r\nFile bytes: ");
+    puts_dec(diagnostic->file_bytes);
+    puts(L"  Read bytes: ");
+    puts_dec(diagnostic->read_bytes);
+    puts(L"\r\nPackage limit: ");
+    puts_dec(XJ_INSTALLER_PACKAGE_MAX);
+    puts(L"  Combined limit: ");
+    puts_dec(XJ_INSTALLER_PACKAGES_MAX);
+    puts(L"\r\nEFI status: ");
+    char number[32];
+    boot_package_number(number, status, 16);
+    puts_ascii(number);
+    puts(L"\r\n");
+}
+
 EFI_STATUS efi_main(EFI_HANDLE ImageHandle, struct EFI_SYSTEM_TABLE *SystemTable)
 {
     write_serial_string("\n");
@@ -1258,22 +1559,32 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, struct EFI_SYSTEM_TABLE *SystemTable
             write_serial_string("Installer kernel found.\n");
             boot_status("Loading installer payloads");
 
+            BOOT_PACKAGE_DIAGNOSTIC package_diagnostic;
             status = read_boot_package(root, L"\\installer\\installer-root.pak", &installer_root_buffer,
-                                       &installer_root_size, &installer_handoff.root, 0);
+                                       &installer_root_size, &installer_handoff.root, 0, &package_diagnostic);
+            boot_package_report("installer-root.pak", status, &package_diagnostic);
             if (EFI_ERROR(status))
             {
-                puts(L"XJ380 installer payload is missing. Error code: INSTALLER_ROOT_NOT_FOUND");
-                write_serial_string("Installer root payload read failed. Stop.\n");
                 while (1)
                     ;
             }
 
-            status = read_boot_package(root, L"\\installer\\system-payload.pak", &system_payload_buffer,
-                                       &system_payload_size, &installer_handoff.system, installer_root_size);
+            const char *system_package_name = "system-index.pak";
+            status = read_boot_package(root, L"\\installer\\system-index.pak", &system_payload_buffer,
+                                       &system_payload_size, &installer_handoff.system, installer_root_size,
+                                       &package_diagnostic);
+            // Older single-profile media keeps the resident compatibility ABI.
+            // A present but damaged stream index never falls back to its data.
+            if (status == EFI_NOT_FOUND)
+            {
+                system_package_name = "system-payload.pak";
+                status = read_boot_package(root, L"\\installer\\system-payload.pak", &system_payload_buffer,
+                                           &system_payload_size, &installer_handoff.system, installer_root_size,
+                                           &package_diagnostic);
+            }
+            boot_package_report(system_package_name, status, &package_diagnostic);
             if (EFI_ERROR(status))
             {
-                puts(L"XJ380 installer payload is missing. Error code: SYSTEM_PAYLOAD_NOT_FOUND");
-                write_serial_string("System payload read failed. Stop.\n");
                 while (1)
                     ;
             }
@@ -1281,6 +1592,7 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, struct EFI_SYSTEM_TABLE *SystemTable
             int system_format = boot_installer_package_magic(system_payload_buffer, system_payload_size);
             if (root_format != XJ_INSTALLER_FORMAT_PAK1 || !system_format)
             {
+                puts(L"Invalid installer package format. Error code: PACKAGE_FORMAT_INVALID\r\n");
                 write_serial_string("Unsupported installer package profile. Stop.\n");
                 while (1) ;
             }
@@ -1290,11 +1602,14 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, struct EFI_SYSTEM_TABLE *SystemTable
             installer_handoff.root_format = root_format;
             installer_handoff.loader_image_physical = (UINT64)LIP->ImageBase;
             installer_handoff.loader_image_bytes = LIP->ImageSize;
-            installer_handoff.system_profile = system_format == XJ_INSTALLER_FORMAT_PAK2 ?
-                XJ_INSTALLER_PROFILE_EXT4_PAK2 : XJ_INSTALLER_PROFILE_FAT32_PAK1;
+            installer_handoff.system_profile = system_format == XJ_INSTALLER_FORMAT_STREAM_INDEX ?
+                XJ_INSTALLER_PROFILE_STREAM_INDEX : (system_format == XJ_INSTALLER_FORMAT_DUAL ?
+                XJ_INSTALLER_PROFILE_DUAL : (system_format == XJ_INSTALLER_FORMAT_PAK2 ?
+                XJ_INSTALLER_PROFILE_EXT4_PAK2 : XJ_INSTALLER_PROFILE_FAT32_PAK1));
             boot_installer_capture_source(&installer_handoff.source);
             if (!xj_installer_handoff_valid(&installer_handoff))
             {
+                puts(L"Invalid installer handoff. Error code: INSTALLER_HANDOFF_INVALID\r\n");
                 write_serial_string("Invalid installer handoff. Stop.\n");
                 while (1) ;
             }

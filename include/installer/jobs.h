@@ -22,6 +22,9 @@ struct JobSessionView
     const void *package;
     __SIZE_TYPE__ package_bytes;
     bool ready;
+    const void *fat32_package = nullptr;
+    __SIZE_TYPE__ fat32_package_bytes = 0;
+    xjpak2::DataReader source_reader = {};
 };
 
 // Implemented by the boot/session owner. Validation reauthenticates the retained
@@ -36,6 +39,7 @@ struct JobRequest
     // Trusted kernel-generated fresh-disk identities/geometry only. A syscall
     // must never copy arbitrary user GUID/LBA choices into this structure.
     xjinstaller::FactoryOptions factory;
+    uint32_t filesystem = 2;
 };
 
 enum class JobState : uint32_t
@@ -53,6 +57,7 @@ struct JobSnapshot
     // Running snapshots intentionally contain no concurrently read factory
     // output. The synchronous factory publishes its final snapshot on return.
     xjinstaller::FactoryStatus factory;
+    xjinstaller::InstallProgress progress;
 };
 
 // All pointers name kernel storage. Selection is a registry lookup, not authority:

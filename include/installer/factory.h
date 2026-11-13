@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <installer/disk_layout.h>
+#include <installer/progress.h>
+#include <installer/package.h>
 
 struct vfs_node;
 
@@ -14,6 +16,9 @@ struct FactoryOptions
     uint64_t time_seconds;
     uint32_t journal_mib;
     uint64_t esp_bytes;
+    uint32_t filesystem = 2;
+    ProgressObserver progress = {};
+    xjpak2::DataReader source_reader = {};
 };
 
 enum class FactoryPhase : uint32_t
@@ -36,12 +41,14 @@ struct FactoryStatus
 } // namespace xjinstaller
 
 // Trusted synchronous fresh-image build, not a user-pointer syscall. The
-// caller retains real source/target block nodes and a mapped immutable PAK2
+// caller retains real source/target block nodes and a mapped immutable package
 // until success, or until reboot after quarantine/forced task termination.
 // Source physical identity is excluded. The caller must identify the actual
 // boot/source medium; an arbitrary supplied source is not authentication.
-// Uses one exclusive whole-target lease through new GPT, native ext4 import,
-// private FAT32 ESP construction, complete readback and final binding sector.
+// Uses one exclusive whole-target lease through new GPT, native ext4/PAK2 or
+// FAT32/PAK1 root import, private FAT32 ESP construction, complete readback and
+// final binding sector. The historical function name is kept for callers;
+// FactoryOptions::filesystem selects the root profile (1 FAT32, 2 ext4).
 // All geometry uses 512-byte logical sectors. No repair/component filtering,
 // keep-users, live-root replacement, partition publication or upgrade rollback.
 // Before the first activation attempt both filesystems and all referenced

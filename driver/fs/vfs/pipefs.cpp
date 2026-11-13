@@ -174,7 +174,7 @@ int pipefs_try_write_packet(vfs_node_t node, const void *data, size_t size)
 void pipefs_open(void *parent, const char *name, vfs_node_t node) {
     (void)parent;
     (void)name;
-    node->type = file_pipe;
+    node->type = node == pipefs_root ? file_dir : file_pipe;
 }
 
 size_t pipefs_read(void *file, void *addr, size_t offset, size_t size)
@@ -373,6 +373,12 @@ int pipefs_poll(void *file, size_t events) {
 
 int pipefs_mount(const char *handle, vfs_node_t node) {
     if ((uint64_t)handle != PIEFS_REGISTER_ID) return VFS_STATUS_FAILED;
+    // The covered directory may own an ext4/FAT handle. Retire it before
+    // publishing pipefs; its root is a directory, never a pipe endpoint.
+    int error = vfs_close_cached_backend(node);
+    if (error) return error;
+    node->type = file_dir;
+    node->size = 0;
     node->fsid  = pipefs_id;
     pipefs_root = node;
     return VFS_STATUS_SUCCESS;
@@ -383,7 +389,15 @@ static int dummy() {
 }
 
 errno_t pipefs_stat(void *file, vfs_node_t node) {
+    if (node == NULL) return -EINVAL;
+    if (node == pipefs_root)
+    {
+        node->type = file_dir;
+        node->size = 0;
+        return EOK;
+    }
     pipe_specific_t *spec = (pipe_specific_t *)file;
+    if (spec == NULL) return EOK;
     pipe_info_t     *pipe = spec->info;
     if(pipe == NULL) return EOK;
     node->size = pipe->ptr;

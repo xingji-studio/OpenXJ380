@@ -250,17 +250,31 @@ int object(Ext4VerifyWorkspace &work, uint32_t index, const xjext4::Inode &inode
     {
         if (inode.size != record.payload.size) return -EUCLEAN;
         Size offset = 0;
+        uint32_t target_crc = ~0U;
         while (offset < record.payload.size)
         {
             Size amount = record.payload.size - offset;
             if (amount > sizeof(work.scratch)) amount = sizeof(work.scratch);
+            const uint8_t *expected = record.payload.data;
+            if (record.payload_external)
+            {
+                // Read the expected bytes first. A source failure must not be
+                // followed by any further target read or publication.
+                int error = xjpak2::read_payload(work.plan, record, offset, work.expected, amount);
+                if (error) { work.status.io_failed = true; return error; }
+                expected = work.expected;
+            }
+            else expected += offset;
             Size done = 0;
-            int error = work.volume->read(inode, offset, work.scratch, amount, done);
+            int error = work.volume->read(inode, offset, work.scratch, amount, done, 32);
             if (error) return error;
-            if (done != amount || !equal(work.scratch, record.payload.data + offset, amount)) return -EUCLEAN;
+            if (done != amount || !equal(work.scratch, expected, amount)) return -EUCLEAN;
+            if (record.payload_external)
+                target_crc = xjpak2::crc32c_update(target_crc, work.scratch, amount);
             if (record.kind == xjpak2::Kind::Regular) work.status.data_bytes_verified += amount;
             offset += amount;
         }
+        if (record.payload_external && ~target_crc != record.payload_crc32c) return -EUCLEAN;
     }
     work.current_record = index;
     work.xattr_entries = 0;
@@ -457,7 +471,8 @@ int allocation(Ext4VerifyWorkspace &work)
 
 int ext4_verify_package(const uint8_t *package, Size bytes, const xjpak2::Limits &requested,
                          const Ext4VerifyDevice &device, const uint8_t expected_uuid[16],
-                         Ext4VerifyWorkspace &work, Ext4VerifyStatus *status)
+                         Ext4VerifyWorkspace &work, Ext4VerifyStatus *status, const ProgressObserver *progress,
+                         const xjpak2::DataReader *source)
 {
     if (!expected_uuid || !device.read || device.bytes < 32ULL * 1024 * 1024 || device.bytes % kBlock ||
         device.bytes / kBlock > 0xffffffffULL) return -EINVAL;
@@ -466,6 +481,7 @@ int ext4_verify_package(const uint8_t *package, Size bytes, const xjpak2::Limits
     for (uint8_t byte : uuid) nonzero |= byte;
     if (!nonzero) return -EINVAL;
     Ext4VerifyDevice snapshot = device;
+    xjpak2::DataReader source_snapshot = source ? *source : xjpak2::DataReader{};
     xjpak2::Limits limits = requested;
     limits.allow_v1 = limits.allow_trusted = limits.allow_security = false;
     if (limits.max_entries > 262144) limits.max_entries = 262144;
@@ -488,11 +504,16 @@ int ext4_verify_package(const uint8_t *package, Size bytes, const xjpak2::Limits
         return work.status.error ? work.status.error : -EBUSY;
     }
     work.status = {}; work.plan = {}; work.lost_found_seen = false;
-    error = xjpak2::validate(package, bytes, limits, {work.records, work.capacity}, work.plan);
+    error = source ? xjpak2::validate_indexed(package, bytes, limits, {work.records, work.capacity}, work.plan,
+                                              source_snapshot) :
+                     xjpak2::validate(package, bytes, limits, {work.records, work.capacity}, work.plan);
     if (!error && work.plan.legacy_v1) error = -EOPNOTSUPP;
     if (!error) error = prepare(work);
     if (error) return finish(work, error, status);
     work.io = snapshot;
+    work.progress = progress ? *progress : ProgressObserver{};
+    // Reserve the final unit for the complete namespace/allocation census.
+    report_progress(work.progress, InstallStage::VerifyingRoot, 0, work.plan.count + 1);
     copy(work.uuid, uuid, 16);
     work.used = true;
     work.volume->reset();
@@ -516,7 +537,11 @@ int ext4_verify_package(const uint8_t *package, Size bytes, const xjpak2::Limits
             work.entries[i].inode = inode.number;
             error = object(work, uint32_t(i), inode);
         }
-        if (!error) ++work.status.records_verified;
+        if (!error)
+        {
+            ++work.status.records_verified;
+            report_progress(work.progress, InstallStage::VerifyingRoot, i + 1, work.plan.count + 1);
+        }
     }
     if (!error) error = directories(work);
     if (!error) error = identities(work);
@@ -524,7 +549,11 @@ int ext4_verify_package(const uint8_t *package, Size bytes, const xjpak2::Limits
     if (work.status.io_failed) error = -EIO;
     if (!error && (work.status.data_bytes_verified != work.plan.data_bytes ||
                    work.status.names_verified != work.plan.count - 1)) error = -EUCLEAN;
-    if (!error) work.status.complete = true;
+    if (!error)
+    {
+        work.status.complete = true;
+        report_progress(work.progress, InstallStage::VerifyingRoot, work.plan.count + 1, work.plan.count + 1);
+    }
     return finish(work, error, status);
 }
 

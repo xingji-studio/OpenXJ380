@@ -487,9 +487,11 @@ int Volume::map_block(const Inode &inode, uint32_t logical, uint64_t &physical, 
     return physical >= blocks_ ? -EUCLEAN : 0;
 }
 
-int Volume::read(const Inode &inode, uint64_t offset, void *output, Size length, Size &completed) const
+int Volume::read(const Inode &inode, uint64_t offset, void *output, Size length, Size &completed,
+                  unsigned maximum_transfer_blocks) const
 {
     completed = 0;
+    if (!maximum_transfer_blocks || maximum_transfer_blocks > 32) return -EINVAL;
     if (!ready_ || (!output && length)) return -EINVAL;
     if (!length || offset >= inode.size) return 0;
     uint16_t type = inode.mode & kTypeMask;
@@ -518,6 +520,22 @@ int Volume::read(const Inode &inode, uint64_t offset, void *output, Size length,
         if (!physical || unwritten) zero_bytes(destination + completed, take);
         else
         {
+            // Explicit read-only opt-in. Validate every logical mapping before
+            // joining adjacent physical blocks. Holes, unwritten extents, EOF
+            // and discontinuities end the run; ordinary VFS reads keep their
+            // original single-block contract and partial-progress behavior.
+            for (unsigned run = 1; run < maximum_transfer_blocks &&
+                 take < length - completed && logical + run <= 0xffffffffULL; ++run)
+            {
+                uint64_t next;
+                bool next_unwritten;
+                result = map_block(inode, uint32_t(logical + run), next, next_unwritten);
+                if (result) return result;
+                if (next_unwritten || !next || next != physical + run) break;
+                Size part = length - completed - take;
+                if (part > block_size_) part = block_size_;
+                take += part;
+            }
             result = fetch(physical * block_size_ + within, destination + completed, take);
             if (result) return result;
         }

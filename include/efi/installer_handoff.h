@@ -12,8 +12,11 @@ typedef __UINT64_TYPE__ XJ_IH_U64;
 #define XJ_INSTALLER_HANDOFF_VERSION 1U
 #define XJ_INSTALLER_PCI_MAX 16U
 #define XJ_INSTALLER_PATH_MAX 512U
-#define XJ_INSTALLER_PACKAGE_MAX (2ULL * 1024 * 1024 * 1024)
-#define XJ_INSTALLER_PACKAGES_MAX (3ULL * 1024 * 1024 * 1024)
+// 4 GiB per package, 8 GiB combined. Actual admission also depends on
+// contiguous firmware memory and the boot media's per-file size limit.
+// Keep decimal byte literals: the ISO preflight reads these same limits.
+#define XJ_INSTALLER_PACKAGE_MAX 4294967296ULL
+#define XJ_INSTALLER_PACKAGES_MAX 8589934592ULL
 #define XJ_INSTALLER_SOURCE_SUPPORTED 1U
 #define XJ_INSTALLER_SOURCE_UNSUPPORTED 2U
 #define XJ_INSTALLER_SOURCE_MALFORMED 3U
@@ -27,8 +30,12 @@ typedef __UINT64_TYPE__ XJ_IH_U64;
 #define XJ_INSTALLER_VOLUME_CD 3U
 #define XJ_INSTALLER_FORMAT_PAK1 1U
 #define XJ_INSTALLER_FORMAT_PAK2 2U
+#define XJ_INSTALLER_FORMAT_DUAL 3U
+#define XJ_INSTALLER_FORMAT_STREAM_INDEX 4U
 #define XJ_INSTALLER_PROFILE_FAT32_PAK1 1U
 #define XJ_INSTALLER_PROFILE_EXT4_PAK2 2U
+#define XJ_INSTALLER_PROFILE_DUAL 3U
+#define XJ_INSTALLER_PROFILE_STREAM_INDEX 4U
 
 typedef struct XJ_INSTALLER_PCI_LOCATION
 {
@@ -187,7 +194,10 @@ static inline XJ_IH_U32 xj_installer_parse_device_path(const XJ_IH_U8 *path, __S
                 s->sata_port = xj_installer_le16(n + 4);
                 s->sata_multiplier = xj_installer_le16(n + 6);
                 s->lun = xj_installer_le16(n + 8);
-                if (s->sata_port >= 32 || s->sata_multiplier != 0xffff || s->lun)
+                // Some firmware uses the historical direct-port value zero.
+                // Preserve it verbatim: the kernel must independently prove
+                // that this controller cannot address a port multiplier.
+                if (s->sata_port >= 32 || (s->sata_multiplier != 0xffff && s->sata_multiplier != 0) || s->lun)
                     return XJ_INSTALLER_SOURCE_UNSUPPORTED;
             }
             else if (n[1] == 0x17 && bytes == 16)
@@ -292,7 +302,9 @@ static inline int xj_installer_handoff_valid(const XJ_INSTALLER_HANDOFF *handoff
         !handoff->loader_image_physical || !handoff->loader_image_bytes ||
         handoff->loader_image_physical > (~(XJ_IH_U64)0) - handoff->loader_image_bytes ||
         (handoff->system_profile != XJ_INSTALLER_PROFILE_FAT32_PAK1 &&
-         handoff->system_profile != XJ_INSTALLER_PROFILE_EXT4_PAK2) ||
+         handoff->system_profile != XJ_INSTALLER_PROFILE_EXT4_PAK2 &&
+         handoff->system_profile != XJ_INSTALLER_PROFILE_DUAL &&
+         handoff->system_profile != XJ_INSTALLER_PROFILE_STREAM_INDEX) ||
         !xj_installer_bytes_zero(handoff->reserved, sizeof(handoff->reserved)) ||
         !xj_installer_package_span_valid(&handoff->root) ||
         !xj_installer_package_span_valid(&handoff->system) ||

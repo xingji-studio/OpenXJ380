@@ -109,7 +109,9 @@ extern "C" xj_inst_native_i64 xapi_InstallerNativeQuery(const xj_inst_native_han
     xj_inst_native_i64 result = read(XJ_INST_NATIVE_QUERY, handle, sizeof(*handle), output);
     if (result < 0) return result;
     if (output->session_epoch != handle->session_epoch || output->handle != handle->handle ||
-        output->state > XJ_INST_NATIVE_JOB_QUARANTINED)
+        output->state > XJ_INST_NATIVE_JOB_QUARANTINED || output->progress_permille > 1000 ||
+        output->progress_stage > XJ_INST_NATIVE_STAGE_COMPLETE ||
+        (output->total_units && output->completed_units > output->total_units))
     {
         xj_inst_native_initialize(output, sizeof(*output));
         return -5;
