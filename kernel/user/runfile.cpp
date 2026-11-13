@@ -84,7 +84,7 @@ static bool write_file_if_empty(const char *path, const void *data, size_t size)
 
 static int normalize_settings_language(int language)
 {
-    return language == XJ380_LANGUAGE_EN_US ? XJ380_LANGUAGE_EN_US : XJ380_LANGUAGE_ZH_CN;
+    return xj380_language_normalize(language);
 }
 
 static int read_default_settings_language()
@@ -99,8 +99,7 @@ static int read_default_settings_language()
     size_t read_size = seed->size < sizeof(buffer) - 1 ? seed->size : sizeof(buffer) - 1;
     if (read_size > 0 && vfs_read(seed, buffer, 0, read_size) > 0)
     {
-        if (buffer[0] == '1' || strncmp(buffer, "en", 2) == 0 || strncmp(buffer, "EN", 2) == 0)
-            language = XJ380_LANGUAGE_EN_US;
+        language = xj380_language_from_code(buffer);
     }
 
     vfs_close(seed);

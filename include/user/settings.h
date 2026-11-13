@@ -2,8 +2,7 @@
 
 #include <stdint.h>
 
-#define XJ380_LANGUAGE_ZH_CN 0
-#define XJ380_LANGUAGE_EN_US 1
+#include "language.h"
 #define XJ380_LANGUAGE_SEED_PATH "/system/config/language.dat"
 
 // settings.json stores the maximum interval between clicks in milliseconds.

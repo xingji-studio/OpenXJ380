@@ -89,13 +89,13 @@ def emit_tls(n, base, objects, interpreter):
     return [runtime, gd, ie, demo, cxx, cxx_demo]
 
 
-def emit_debug_demo(n, source="user/rtld_demo"):
+def emit_debug_demo(n, source="user/rtld_demo", dependencies=()):
     """Product-facing demo; share the already emitted interpreter/CRT rules."""
     source = Path(source)
     objects = []
     for name in ("main.c", "library.c"):
         obj = Path("out/rtld_demo") / (name + ".o")
-        n.build(obj, "native_rtld_cc", source / name, implicit=[source / "demo.h"])
+        n.build(obj, "native_rtld_cc", source / name, implicit=[source / "demo.h", *dependencies])
         objects.append(obj)
     library = Path("out/librtld-demo.so.1")
     program = Path("out/rtld-demo.elf")
@@ -110,7 +110,7 @@ def emit_debug_demo(n, source="user/rtld_demo"):
     return outputs
 
 
-def emit_xapi(n, base=".", product=False):
+def emit_xapi(n, base=".", product=False, extra_sources=(), extra_dependencies=()):
     """Build a separate PIC runtime; never reuse the static application's objects."""
     base = Path(base)
     source = base / "user/rtld"
@@ -131,9 +131,10 @@ def emit_xapi(n, base=".", product=False):
     else:
         names = PUBLIC_XAPI_SOURCES
     objects = []
-    for name in names:
+    for name in (*names, *extra_sources):
         obj = Path("out/xapi-shared") / (name + ".cpp.o")
-        n.build(obj, "xapi_shared_cxx", Path("user/xapi") / (name + ".cpp"))
+        n.build(obj, "xapi_shared_cxx", Path("user/xapi") / (name + ".cpp"),
+                implicit=list(extra_dependencies) if name in extra_sources else [])
         objects.append(obj)
     runtime = Path("out/xapi-shared/runtime.c.o")
     n.build(runtime, "xapi_shared_cc", source / "xapi_runtime.c",
