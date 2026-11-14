@@ -10,7 +10,7 @@ Several security properties cannot be completed safely as a small compatibility 
 
 1. `usereg.dat` persists plaintext passwords and is not authenticated. A writable registry can still be forged into an Admin record. The new code fails closed on a malformed existing file and prevents OOBE overwrite, but it does not protect a syntactically valid forged registry.
 2. Kernel modules are parser-hardened but unsigned. Loading an attacker-controlled valid `.sys` is still arbitrary ring-0 execution by design.
-3. On CPUs without `RDSEED`/`RDRAND`, RNG initialization has no formal entropy-readiness guarantee.
+3. Secure RNG readiness now uses RDSEED -> virtio-rng -> RDRAND, with explicit failure before a reliable seed. Ordinary compatibility bytes, including early AT_RANDOM, remain best effort without these sources; see [RANDOMNESS.md](RANDOMNESS.md).
 4. TLS/chat code is outside the current CLI build and still needs a proper entropy callback and authenticated peer protocol before re-enablement.
 5. BusyBox/libvterm and other vendored components need an inventory-driven upgrade and compatibility pass.
 6. The new parser boundaries need continuous fuzz regression, not only host mirrors of the old vulnerable snippets.
@@ -24,7 +24,7 @@ Several security properties cannot be completed safely as a small compatibility 
 - [ ] Add per-account plus global login throttling with monotonic time and auditable failure counters.
 - [ ] Define the kernel-module trust root, signature format, signed byte range, rollback/version policy and recovery-mode behavior.
 - [ ] Refuse automatic module execution unless signature verification succeeds; keep an explicit developer-mode override visibly tainted.
-- [ ] Add an entropy pool/readiness state, mix interrupt/device timing and hardware entropy, and define blocking/non-blocking `getrandom` semantics before readiness.
+- [x] Add a distinct secure readiness state, virtio entropy, and documented bounded/nonblocking `getrandom` behavior. Timing-derived compatibility bytes never become secure entropy.
 - [ ] Replace TLS entropy callbacks with the kernel random API and design authenticated chat handshake/replay protection before those apps return to the build.
 - [ ] Inventory exact vendored versions and configurations, choose supported upgrades, rebuild artifacts from source, and attach upstream test results.
 - [ ] Add ASAN/UBSAN fuzz targets for ELF headers/segments/dynamic tags/relocations, GPT/MBR tables, symlink chains, Runfile records and image dimensions.

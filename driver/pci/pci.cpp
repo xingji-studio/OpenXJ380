@@ -367,11 +367,12 @@ void pci_scan_function(uint16_t segment_group, uint8_t bus, uint8_t device, uint
             {
                 uint64_t bar_address = bar & 0xFFFFFFF0;
 
-                switch ((bar & ((1 << 3) | (1 << 2) | (1 << 1))) >> 1)
+                // Bit 3 is prefetchability, not part of the two-bit memory BAR type.
+                switch ((bar >> 1) & 3)
                 {
                 // 32 bit
                 case 0b00: {
-                    pci_device->bars[i].address = bar & 0xFFFFFFFC;
+                    pci_device->bars[i].address = bar & 0xFFFFFFF0;
                     pci_device->bars[i].mmio    = true;
 
                     uint32_t original_value = pci_device->op->read(bus, device, function, segment_group, offset);

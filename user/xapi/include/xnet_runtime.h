@@ -5,8 +5,10 @@
 extern "C" {
 #endif
 // SDK/provider glue, not a syscall ABI. Entropy never falls back to clocks or
-// addresses; unavailable checked hardware entropy is an explicit error.
+// addresses; unavailable secure entropy is an explicit error.
 int xapi_secure_random(void *output, uint32_t bytes);
+// Non-secret data only; permits the kernel software compatibility generator.
+int xapi_random_bytes(void *output, uint32_t bytes);
 int xapi_tls_runtime_init(void);
 struct mbedtls_x509_crt;
 int xapi_tls_verify_time(void *clock_error, struct mbedtls_x509_crt *certificate, int depth, uint32_t *flags);

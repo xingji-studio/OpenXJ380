@@ -2932,7 +2932,11 @@ static size_t urandom_read(int drive, uint8_t *buffer, size_t number, size_t lba
     UNUSED(lba);
     if (buffer == NULL) return 0;
 
-    get_random_bytes(buffer, number);
+    if (!get_secure_random_bytes(buffer, number))
+    {
+        permissions_set_file_error(ENODATA);
+        return VFS_STATUS_FAILED;
+    }
     return number;
 }
 

@@ -16,6 +16,8 @@
 #include <efi/root_binding.h>
 #include <task/scheduler.h>
 #include <ioctl.h>
+#include <rng.h>
+#include <fs/fatfs/diskio.h>
 #include <user/permissions.h>
 
 static FATFS volume[10];
@@ -113,10 +115,15 @@ int fatfs_factory_ready()
     return task && mutex_get_owner(&fatfs_operate_lock) == task ? -EBUSY : 0;
 }
 
+int fatfs_set_serial(unsigned, void *, uint32_t);
+
 int fatfs_format_node(vfs_node_t node)
 {
     if (node == NULL) return -EINVAL;
     if (!fatfs_lock()) return -EIO;
+    uint32_t serial;
+    if (!get_identifier_random_bytes(&serial, sizeof(serial))) { fatfs_unlock(); return -EIO; }
+    if (!serial) serial = 1;
     BlockExtent extent;
     BlockAccessToken lease = 0;
     int error = block_access_resolve_node(node, &extent);
@@ -169,7 +176,7 @@ int fatfs_format_node(vfs_node_t node)
         return -EIO;
     }
     FRESULT res = f_mkfs(path, &opt, work, FF_MAX_SS);
-    if (res != FR_OK)
+    if (res != FR_OK || fatfs_set_serial(unsigned(drive), work, serial))
     {
         // Do not retry, invalidate, unmount or recycle an ambiguous format
         // request. Retain its buffer, device reference and poisoned lease.
@@ -185,6 +192,31 @@ int fatfs_format_node(vfs_node_t node)
     vfs_close(node);
     fatfs_unlock();
     return res == FR_OK ? EOK : -EIO;
+}
+
+// FatFs supplies a time-derived default serial. Replace it in the adapter,
+// including the backup BPB, without changing upstream formatter internals.
+int fatfs_set_serial(unsigned drive, void *work, uint32_t serial)
+{
+    auto *sector = static_cast<byte *>(work);
+    if (disk_read(byte(drive), sector, 0, 1) != RES_OK) return -EIO;
+    unsigned reserved = unsigned(sector[14]) | unsigned(sector[15]) << 8;
+    unsigned backup = unsigned(sector[50]) | unsigned(sector[51]) << 8;
+    if (!serial || sector[510] != 0x55 || sector[511] != 0xaa ||
+        memcmp(sector + 82, "FAT32   ", 8) || !backup || backup >= reserved) return -EIO;
+    for (unsigned i = 0; i < 4; ++i) sector[67 + i] = byte(serial >> (8 * i));
+    if (disk_write(byte(drive), sector, 0, 1) != RES_OK ||
+        disk_write(byte(drive), sector, backup, 1) != RES_OK ||
+        disk_ioctl(byte(drive), CTRL_SYNC, nullptr) != RES_OK) return -EIO;
+    for (unsigned copy = 0; copy < 2; ++copy)
+    {
+        unsigned index = copy ? backup : 0;
+        if (disk_read(byte(drive), sector, index, 1) != RES_OK) return -EIO;
+        uint32_t actual = uint32_t(sector[67]) | uint32_t(sector[68]) << 8 |
+                          uint32_t(sector[69]) << 16 | uint32_t(sector[70]) << 24;
+        if (actual != serial) return -EIO;
+    }
+    return 0;
 }
 
 static u32 *fatfs_try_build_clmt(FIL *fp, size_t request_size) {
@@ -1607,12 +1639,8 @@ static int fatfs_root_contents(EspContext *context, uint32_t volume_id, bool ver
         if (esp_fresult(context, f_mkfs(context->path, &context->mkfs, context->mkfs_work,
                                        sizeof(context->mkfs_work)))) return context->error;
         context->formatting = false;
-        // Install a per-installation serial in both BPBs before mounting.
-        if (fatfs_esp_disk_read(context->drive, context->stream, 0, 1)) return context->error;
-        for (unsigned i = 0; i < 4; ++i) context->stream[67 + i] = uint8_t(volume_id >> (8 * i));
-        if (fatfs_esp_disk_write(context->drive, context->stream, 0, 1) ||
-            fatfs_esp_disk_write(context->drive, context->stream, 6, 1) ||
-            fatfs_esp_disk_sync(context->drive)) return context->error;
+        if (int error = fatfs_set_serial(context->drive, context->stream, volume_id))
+            return esp_stop(context, error);
     }
     if (esp_fresult(context, f_mount(&context->filesystem, context->path, 1))) return context->error;
     if (context->filesystem.fs_type != FS_FAT32 || context->filesystem.n_fats != 2 ||
@@ -1785,8 +1813,13 @@ static int fatfs_factory_window(const BlockAccessWindow *window, const xjinstall
         context->mkfs.n_fat = 2;
         context->mkfs.align = 1;
         context->mkfs.au_size = 512;
+        uint32_t serial;
+        if (!get_identifier_random_bytes(&serial, sizeof(serial))) { esp_stop(context, -EIO); break; }
+        if (!serial) serial = 1;
         if (esp_fresult(context, f_mkfs(context->path, &context->mkfs, context->mkfs_work,
                                        sizeof(context->mkfs_work)))) break;
+        if (int error = fatfs_set_serial(context->drive, context->stream, serial))
+        { esp_stop(context, error); break; }
         context->status.phase = xjinstaller::EspBuildPhase::Formatted;
         if (esp_fresult(context, f_mount(&context->filesystem, context->path, 1))) break;
         if (context->filesystem.fs_type != FS_FAT32) { esp_stop(context, -EIO); break; }
