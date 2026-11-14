@@ -414,10 +414,8 @@ int dnsfs_setup(void)
         return -EIO;
     }
 
-    vfs_mkdir("/etc");
-    if (vfs_open("/etc/resolv.conf") == NULL) {
-        vfs_symlink("/run/dns/server", "/etc/resolv.conf");
-    }
-
+    /* The kernel exposes /run/dns as a generic primitive.  It must not create
+     * distro layout such as /etc/resolv.conf: names like /etc belong to
+     * userspace policy. */
     return 0;
 }
