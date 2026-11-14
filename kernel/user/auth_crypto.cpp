@@ -11,16 +11,19 @@ namespace
 {
 mbedtls_hmac_drbg_context random_context;
 mbedtls_rsa_context private_key;
-bool random_ready, key_ready;
+bool random_ready, key_ready, entropy_failed;
 
 int entropy(void *, unsigned char *output, size_t bytes)
 {
-    return get_hardware_random_bytes(output, bytes) ? 0 : MBEDTLS_ERR_HMAC_DRBG_ENTROPY_SOURCE_FAILED;
+    if (get_secure_random_bytes(output, bytes)) return 0;
+    entropy_failed = true;
+    return MBEDTLS_ERR_HMAC_DRBG_ENTROPY_SOURCE_FAILED;
 }
 
 int prepare_random()
 {
     if (random_ready) return 0;
+    entropy_failed = false;
     mbedtls_hmac_drbg_init(&random_context);
     const char context[] = "XJ380 authentication v1";
     int error = mbedtls_hmac_drbg_seed(&random_context, mbedtls_md_info_from_type(MBEDTLS_MD_SHA256),
@@ -28,7 +31,7 @@ int prepare_random()
     if (error)
     {
         mbedtls_hmac_drbg_free(&random_context);
-        return -EIO;
+        return entropy_failed ? -ENODATA : -EIO;
     }
     random_ready = true;
     return 0;
@@ -76,7 +79,7 @@ int auth_public_key(uint8_t modulus[384])
             mbedtls_rsa_gen_key(&private_key, mbedtls_hmac_drbg_random, &random_context, 3072, 65537))
         {
             mbedtls_rsa_free(&private_key);
-            return -EIO;
+            return entropy_failed ? -ENODATA : -EIO;
         }
         key_ready = true;
     }

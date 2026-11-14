@@ -26,6 +26,7 @@
 #include <openxj380/socket.h>
 #include <openxj380/syscall.h>
 #include <pci/pci.h>
+#include <rng.h>
 #include <pipe.h>
 #include <power.h>
 #include <proto.hpp>
@@ -585,6 +586,7 @@ extern "C" void KernelMain(const FrameBufferConfig &fbc, EFI_SYSTEM_TABLE &Syste
     write_serial_string("BOOT: pci_setup done\n");
     write_serial_string("BOOT: pci_init begin\n");
     pci_init();
+    rng_init();
     write_serial_string("BOOT: pci_init done\n");
     write_serial_fmt("VM hint: %s\n", BootConfig.is_qemu == 1 ? "QEMU/BOCHS" : "generic/VMware/real hardware");
     if (BootConfig.boot_flags != 0) write_serial_fmt("Boot option flags: 0x%llx\n", BootConfig.boot_flags);

@@ -626,8 +626,8 @@ static int epf_choose_base(const uint8_t *file, EpfHeader &header, EpfRuntime &r
         uint64_t first = (lower + align - 1) & ~(align - 1), last = upper & ~(align - 1);
         if (first > last) return epf_reject("no aligned PIE base");
         uint64_t slots = (last - first) / align + 1, random = 0;
-        if (!get_hardware_random_bytes(&random, sizeof(random)))
-            return epf_reject("PIE requires checked hardware entropy", 0, -EOPNOTSUPP);
+        if (!get_secure_random_bytes(&random, sizeof(random)))
+            return epf_reject("PIE requires a seeded secure random source", 0, -EOPNOTSUPP);
         uint64_t index = random % slots;
         bool placed = false;
         for (uint64_t attempt = 0; attempt < min(slots, (uint64_t)64); ++attempt)
