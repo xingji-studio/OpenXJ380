@@ -441,7 +441,7 @@ def qemu_cmd() -> str:
     firmware = shlex.quote(str(ovmf_firmware()))
     return (
         f"{sudo_cmd}qemu-system-x86_64 --display {env('DISPLAY_BACKEND', 'gtk')} -M q35 -bios {firmware} "
-        f"-m 8192 -smp {env('SMP', '4')} {kvm_flag} -device qemu-xhci,id=xhci {storage} "
+        f"-m 8192 -smp {env('SMP', '4')} {kvm_flag} -object rng-builtin,id=rng0 -device virtio-rng-pci,rng=rng0 -device qemu-xhci,id=xhci {storage} "
         "-boot strict=on "
         f"{env('USB_XHCI_DEVICES', '-device usb-kbd,bus=xhci.0,port=1 -device usb-mouse,bus=xhci.0,port=2')} "
         f"-serial file:serial.log -audiodev {env('AUDIO_BACKEND', 'sdl')},id=snd0 "

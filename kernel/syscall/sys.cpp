@@ -4822,28 +4822,35 @@ sys_(sync)
 
 sys_(getrandom, void *buf, size_t buflen, uint64_t flags)
 {
-    (void)flags;
-    if (buf == NULL) return SYSCALL_FAULT_(EINVAL);
+    // Linux flag values: NONBLOCK=1, RANDOM=2, INSECURE=4. Secure reads use
+    // bounded device waits; lack of a seed is reported rather than fabricated.
+    if ((flags & ~7ULL) || (flags & 6) == 6) return SYSCALL_FAULT_(EINVAL);
     if (buflen == 0) return 0;
+    if (buf == NULL) return SYSCALL_FAULT_(EINVAL);
     if (!user_range_mapped(current_user_pagedir(), buf, buflen)) return SYSCALL_FAULT_(EFAULT);
-
     size_t bounce_len = MIN(buflen, USER_IO_BOUNCE_BYTES);
     uint8_t *bounce = (uint8_t *)malloc(bounce_len);
-    if (bounce == NULL) return SYSCALL_FAULT_(ENOMEM);
-
+    if (!bounce) return SYSCALL_FAULT_(ENOMEM);
     size_t written = 0;
     while (written < buflen)
     {
         size_t chunk = MIN(buflen - written, bounce_len);
-        get_random_bytes(bounce, chunk);
+        if (flags & 4) get_random_bytes(bounce, chunk);
+        else if (!get_secure_random_bytes(bounce, chunk, nullptr, (flags & 1) != 0))
+        {
+            memset(bounce, 0, bounce_len);
+            free(bounce);
+            return written ? written : SYSCALL_FAULT_((flags & 1) ? EAGAIN : ENODATA);
+        }
         if (!copy_to_user_pagedir(current_user_pagedir(), (uint8_t *)buf + written, bounce, chunk))
         {
+            memset(bounce, 0, bounce_len);
             free(bounce);
-            return written > 0 ? written : SYSCALL_FAULT_(EFAULT);
+            return written ? written : SYSCALL_FAULT_(EFAULT);
         }
         written += chunk;
     }
-
+    memset(bounce, 0, bounce_len);
     free(bounce);
     return written;
 }

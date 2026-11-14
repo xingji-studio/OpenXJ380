@@ -14,6 +14,7 @@
 #include <dlinker.h>
 #include <cpu/longm.h>
 #include <elf.h>
+#include <rng.h>
 #include <errno.h>
 #include <fs/vfs/vfs.h>
 #include <fs/ext4/ext4.h>
@@ -1149,16 +1150,11 @@ static uint64_t push_slice(tcb_t task, uint64_t ustack, const uint8_t *slice, ui
 
 static void fill_aux_random(uint8_t random_bytes[16], tcb_t task, uint64_t sp)
 {
-    uint64_t seed = nanoTime() ^ (uint64_t)(uintptr_t)task ^ (sp << 7);
-
-    for (size_t i = 0; i < 16; i++)
-    {
-        seed ^= seed >> 12;
-        seed ^= seed << 25;
-        seed ^= seed >> 27;
-        seed *= 0x2545f4914f6cdd1dULL;
-        random_bytes[i] = (uint8_t)(seed >> ((i & 7U) * 8));
-    }
+    (void)task;
+    (void)sp;
+    // Preserve compatibility startup without inventing cryptographic readiness.
+    // Strong entropy is preferred; low-entropy boot is reported by rng_init().
+    get_random_bytes(random_bytes, 16);
 }
 
 static uint64_t push_auxv(tcb_t task, uint64_t tmp_stack, uint64_t *tmp, uint64_t type, uint64_t value)
