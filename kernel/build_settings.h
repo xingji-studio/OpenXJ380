@@ -44,6 +44,7 @@
 #define RELEASE_VERSION 1
 
 #define CONFIG_OPEN_SERIAL_PRINT
+#define CONFIG_OPEN_BOOT_DEBUG_COLOR
 
 #ifndef CONFIG_OS_EDITION
 // Edition label exposed by the boot screen and system version interfaces.
@@ -177,6 +178,15 @@
 #define DEVELOP_MODE_SERIAL_OUTPUT 1
 #else
 #define DEVELOP_MODE_SERIAL_OUTPUT 0
+#endif
+
+#ifndef DEVELOP_MODE_BOOT_DEBUG_COLOR
+// Allow an explicit compiler override for hardware debugging and comparison builds.
+#if defined(CONFIG_OPEN_BOOT_DEBUG_COLOR)
+#define DEVELOP_MODE_BOOT_DEBUG_COLOR 1
+#else
+#define DEVELOP_MODE_BOOT_DEBUG_COLOR 0
+#endif
 #endif
 
 #define OS_EDITION CONFIG_OS_EDITION

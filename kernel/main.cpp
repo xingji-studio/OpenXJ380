@@ -1,6 +1,7 @@
 #include <net/xnet_provider.h>
 #include "build_settings.h"
 #include "build_config.h"
+#include "boot_debug_color.h"
 #include <ahci/ahci.h>
 #include <cpu/regio.h>
 #include <cpu/idle.h>
@@ -535,6 +536,10 @@ static void installer_check_mount(const char *path)
 
 extern "C" void KernelMain(const FrameBufferConfig &fbc, EFI_SYSTEM_TABLE &SystemTable, const void *BootConfigIn)
 {
+    using BootStep = boot_debug::Step;
+    boot_debug::initialize(fbc);
+    boot_debug::skip(fbc, BootStep::BootLogo, BootStep::AudioRuntime);
+    boot_debug::begin(fbc, BootStep::BootConfig);
     // Old bootloaders provide only the legacy prefix, with no extension tail.
     memset(&g_kernel_boot_config, 0, sizeof(g_kernel_boot_config));
     memcpy(&g_kernel_boot_config, BootConfigIn, BOOT_CONFIG_LEGACY_BYTES);
@@ -546,47 +551,84 @@ extern "C" void KernelMain(const FrameBufferConfig &fbc, EFI_SYSTEM_TABLE &Syste
                (const unsigned char *)BootConfigIn + __builtin_offsetof(BOOT_CONFIG, installer_handoff),
                sizeof(XJ_INSTALLER_HANDOFF));
     BOOT_CONFIG &BootConfig = g_kernel_boot_config;
+    boot_debug::returned(fbc, BootStep::BootConfig);
 
+    boot_debug::begin(fbc, BootStep::Console);
     fbc_addr = &fbc;
     console_init(fbc);
     no_interrupt = true;
     disable_intr();
     EFI_ST = &SystemTable;
     EFI_BC = &BootConfig;
+    boot_debug::returned(fbc, BootStep::Console);
 
+    boot_debug::begin(fbc, BootStep::Cpu);
     init_cpu();
+    boot_debug::returned(fbc, BootStep::Cpu);
+    boot_debug::begin(fbc, BootStep::Idt);
     init_idt();
+    boot_debug::returned(fbc, BootStep::Idt);
+    boot_debug::begin(fbc, BootStep::Gdt);
     init_gdt();
+    boot_debug::returned(fbc, BootStep::Gdt);
+    boot_debug::begin(fbc, BootStep::Hpet);
     init_hpet(BootConfig.HPET);
+    boot_debug::returned(fbc, BootStep::Hpet);
+    boot_debug::begin(fbc, BootStep::Apic);
     init_apic(BootConfig.MADT);
+    boot_debug::returned(fbc, BootStep::Apic);
 
+    boot_debug::begin(fbc, BootStep::Hhdm);
     init_hhdm();
+    boot_debug::returned(fbc, BootStep::Hhdm);
+    boot_debug::begin(fbc, BootStep::InstallerBoot);
     int installer_boot_status = installer::session_boot_prepare(BootConfig, BootConfigIn);
+    boot_debug::returned(fbc, BootStep::InstallerBoot);
     if ((BootConfig.boot_flags & BOOT_FLAG_INSTALLER) != 0)
         write_serial_fmt("installer: boot memory proof result=%d\n", installer_boot_status);
+    boot_debug::begin(fbc, BootStep::Frames);
     init_frame(BootConfig.MemoryMap);
+    boot_debug::returned(fbc, BootStep::Frames);
+    boot_debug::begin(fbc, BootStep::Heap);
     init_heap();
+    boot_debug::returned(fbc, BootStep::Heap);
 
     write_serial_string("BOOT: device_manager_init begin\n");
+    boot_debug::begin(fbc, BootStep::DeviceManager);
     device_manager_init();
+    boot_debug::returned(fbc, BootStep::DeviceManager);
     write_serial_string("BOOT: device_manager_init done\n");
     write_serial_string("BOOT: vfs_init begin\n");
+    boot_debug::begin(fbc, BootStep::Vfs);
     vfs_init();
+    boot_debug::returned(fbc, BootStep::Vfs);
     write_serial_string("BOOT: vfs_init done\n");
     write_serial_string("BOOT: fatfs_init begin\n");
+    boot_debug::begin(fbc, BootStep::FatFs);
     fatfs_init();
+    boot_debug::returned(fbc, BootStep::FatFs);
+    boot_debug::begin(fbc, BootStep::Ext4Fs);
     ext4fs_init();
+    boot_debug::returned(fbc, BootStep::Ext4Fs);
     write_serial_string("BOOT: fatfs_init done\n");
     write_serial_string("BOOT: devfs_setup begin\n");
+    boot_debug::begin(fbc, BootStep::DevFs);
     devfs_setup();
+    boot_debug::returned(fbc, BootStep::DevFs);
     write_serial_string("BOOT: devfs_setup done\n");
 
     write_serial_string("BOOT: pci_setup begin\n");
+    boot_debug::begin(fbc, BootStep::PciSetup);
     pci_setup(BootConfig.MCFG);
+    boot_debug::returned(fbc, BootStep::PciSetup);
     write_serial_string("BOOT: pci_setup done\n");
     write_serial_string("BOOT: pci_init begin\n");
+    boot_debug::begin(fbc, BootStep::PciInit);
     pci_init();
+    boot_debug::returned(fbc, BootStep::PciInit);
+    boot_debug::begin(fbc, BootStep::Rng);
     rng_init();
+    boot_debug::returned(fbc, BootStep::Rng);
     write_serial_string("BOOT: pci_init done\n");
     write_serial_fmt("VM hint: %s\n", BootConfig.is_qemu == 1 ? "QEMU/BOCHS" : "generic/VMware/real hardware");
     if (BootConfig.boot_flags != 0) write_serial_fmt("Boot option flags: 0x%llx\n", BootConfig.boot_flags);
@@ -594,47 +636,74 @@ extern "C" void KernelMain(const FrameBufferConfig &fbc, EFI_SYSTEM_TABLE &Syste
         write_serial_string("BOOT: last known good configuration selected\n");
     ahci_set_environment(BootConfig.is_qemu == 1);
     write_serial_string("BOOT: ahci_setup begin\n");
+    boot_debug::begin(fbc, BootStep::Ahci);
     ahci_setup();
+    boot_debug::returned(fbc, BootStep::Ahci);
     write_serial_string("BOOT: ahci_setup done\n");
     ahci_set_accel(false);
     write_serial_string("BOOT: nvme_setup begin\n");
+    boot_debug::begin(fbc, BootStep::Nvme);
     nvme_setup();
+    boot_debug::returned(fbc, BootStep::Nvme);
     write_serial_string("BOOT: nvme_setup done\n");
 
     extern void ide_setup(void);
     write_serial_string("BOOT: ide_setup begin\n");
+    boot_debug::begin(fbc, BootStep::Ide);
     ide_setup();
+    boot_debug::returned(fbc, BootStep::Ide);
     write_serial_string("BOOT: ide_setup done\n");
 #if CONFIG_KERNEL_BUILTIN_XHCI && !OPENXJ380_INPUT_OUTPUT_DISABLED
     write_serial_string("BOOT: xhci_setup begin\n");
+    boot_debug::begin(fbc, BootStep::Xhci);
     xhci_setup();
+    boot_debug::returned(fbc, BootStep::Xhci);
     write_serial_string("BOOT: xhci_setup done\n");
+#else
+    boot_debug::skip(fbc, BootStep::Xhci);
 #endif
     write_serial_string("BOOT: partition_init begin\n");
+    boot_debug::begin(fbc, BootStep::Partitions);
     partition_init();
+    boot_debug::returned(fbc, BootStep::Partitions);
     write_serial_string("BOOT: partition_init done\n");
     // enable_intr();
 
     // disable_intr();
 #if !OPENXJ380_INPUT_OUTPUT_DISABLED
     // Probe one shared audio output: HDA, ICH AC97, ES1371, then ISA SB16.
+    boot_debug::begin(fbc, BootStep::Audio);
     audio_backend_init();
+    boot_debug::returned(fbc, BootStep::Audio);
+#else
+    boot_debug::skip(fbc, BootStep::Audio);
 #endif
 
+    boot_debug::begin(fbc, BootStep::Keyboard);
     keyboard_init();
+    boot_debug::returned(fbc, BootStep::Keyboard);
+    boot_debug::begin(fbc, BootStep::Mouse);
     mouse_init();
+    boot_debug::returned(fbc, BootStep::Mouse);
 
     disable_intr();
 
+    boot_debug::begin(fbc, BootStep::Processes);
     process_setup();
+    boot_debug::returned(fbc, BootStep::Processes);
 
+    boot_debug::begin(fbc, BootStep::SmpParameters);
     // 超绝偷懒解法，等有内存管理且在这之前初始化的时候叫我来改
     saved_mtrrs = (uint64_t *)((uint64_t)BootConfig.saved_mtrrs + 0xffff800000000000);
     for (int i = 0; i < MAX_CPU_NUM; ++i)
         temp_stack[i] = BootConfig.temp_stack[i];
+    boot_debug::returned(fbc, BootStep::SmpParameters);
 
+    boot_debug::begin(fbc, BootStep::Smp);
     init_smp(BootConfig.MADT);
+    boot_debug::returned(fbc, BootStep::Smp);
 
+    boot_debug::begin(fbc, BootStep::IdleThread);
     const size_t idle_alloc_size = (sizeof(struct thread_control_block) + 15ULL) & ~15ULL;
     tcb_t idle_thread            = (tcb_t)aligned_alloc(16, idle_alloc_size);
     if (idle_thread != NULL) memset(idle_thread, 0, sizeof(struct thread_control_block));
@@ -658,11 +727,18 @@ extern "C" void KernelMain(const FrameBufferConfig &fbc, EFI_SYSTEM_TABLE &Syste
 
     get_current_cpu()->current_task = idle_thread;
     write_kgsbase((uint64_t)get_current_cpu());
+    boot_debug::returned(fbc, BootStep::IdleThread);
 
+    boot_debug::begin(fbc, BootStep::LowMappings);
     memset(phys_to_virt(get_cr3()), 0, PAGE_SIZE / 2);
+    boot_debug::returned(fbc, BootStep::LowMappings);
 
 #if CONFIG_KERNEL_BUILTIN_XHCI && !OPENXJ380_INPUT_OUTPUT_DISABLED
+    boot_debug::begin(fbc, BootStep::XhciWorkers);
     xhci_start_workers();
+    boot_debug::returned(fbc, BootStep::XhciWorkers);
+#else
+    boot_debug::skip(fbc, BootStep::XhciWorkers);
 #endif
 
     bool installer_mode = false;
@@ -670,15 +746,21 @@ extern "C" void KernelMain(const FrameBufferConfig &fbc, EFI_SYSTEM_TABLE &Syste
     {
         if (installer_boot_status == 0)
         {
+            boot_debug::begin(fbc, BootStep::InstallerPackages);
             installer_boot_status = installer::session_packages_prepare();
+            boot_debug::returned(fbc, BootStep::InstallerPackages);
             write_serial_fmt("installer: complete package validation result=%d\n", installer_boot_status);
             if (installer_boot_status == 0)
             {
+                boot_debug::begin(fbc, BootStep::InstallerSource);
                 installer_boot_status = installer::session_source_prepare();
+                boot_debug::returned(fbc, BootStep::InstallerSource);
                 write_serial_fmt("installer: retained source lifetime result=%d\n", installer_boot_status);
                 if (installer_boot_status == 0)
                 {
+                    boot_debug::begin(fbc, BootStep::InstallerRootPrepare);
                     installer_boot_status = installer::root_prepare_private();
+                    boot_debug::returned(fbc, BootStep::InstallerRootPrepare);
                     installer::RootStageSnapshot root_stage = {};
                     installer::root_stage_snapshot(&root_stage);
                     write_serial_fmt("installer: private root result=%d entries=%llu bytes=%llu published=%u\n",
@@ -686,63 +768,162 @@ extern "C" void KernelMain(const FrameBufferConfig &fbc, EFI_SYSTEM_TABLE &Syste
                                      unsigned(root_stage.published));
                     if (installer_boot_status == 0)
                     {
+                        boot_debug::begin(fbc, BootStep::InstallerRootPublish);
                         installer_boot_status = installer::root_publish_private();
+                        boot_debug::returned(fbc, BootStep::InstallerRootPublish);
                         installer::root_stage_snapshot(&root_stage);
                         write_serial_fmt("installer: root publication result=%d entries=%llu published=%u\n",
                                          installer_boot_status, root_stage.entries, unsigned(root_stage.published));
                     }
+                    else
+                        boot_debug::skip(fbc, BootStep::InstallerRootPublish);
                 }
+                else
+                    boot_debug::skip(fbc, BootStep::InstallerRootPrepare, BootStep::InstallerRootPublish);
             }
+            else
+                boot_debug::skip(fbc, BootStep::InstallerSource, BootStep::InstallerRootPublish);
         }
+        else
+            boot_debug::skip(fbc, BootStep::InstallerPackages, BootStep::InstallerRootPublish);
+        boot_debug::begin(fbc, BootStep::InstallerRootCheck);
         installer_boot_require(installer_boot_status, "root preparation");
+        boot_debug::returned(fbc, BootStep::InstallerRootCheck);
         installer_mode = true;
     }
+    else
+        boot_debug::skip(fbc, BootStep::InstallerPackages, BootStep::InstallerRootCheck);
     if (!installer_mode)
     {
+        boot_debug::begin(fbc, BootStep::MountRoot);
         mount_root();
+        boot_debug::returned(fbc, BootStep::MountRoot);
 #if CONFIG_KERNEL_BUSYBOX_ALIASES
+        boot_debug::begin(fbc, BootStep::BusyboxAliases);
         setup_busybox_vfs_aliases();
+        boot_debug::returned(fbc, BootStep::BusyboxAliases);
+#else
+        boot_debug::skip(fbc, BootStep::BusyboxAliases);
 #endif
+        boot_debug::begin(fbc, BootStep::XbpsAliases);
         setup_xbps_vfs_aliases();
+        boot_debug::returned(fbc, BootStep::XbpsAliases);
     }
-    if (!installer_root_is_tmpfs_ready()) tmpfs_setup();
-    if (installer_mode) installer_boot_require(installer::root_prepare_mountpoint("/pipe"), "pipe mountpoint");
-    pipefs_setup();
-    if (installer_mode) installer_check_mount("/pipe");
-    pty_init();
-    fsgsbase_init();
-    if (installer_mode) installer_boot_require(installer::root_prepare_mountpoint("/sock"), "socket mountpoint");
-    int socket_status = socketfs_setup();
+    else
+        boot_debug::skip(fbc, BootStep::MountRoot, BootStep::XbpsAliases);
+    if (!installer_root_is_tmpfs_ready())
+    {
+        boot_debug::begin(fbc, BootStep::TmpFs);
+        tmpfs_setup();
+        boot_debug::returned(fbc, BootStep::TmpFs);
+    }
+    else
+        boot_debug::skip(fbc, BootStep::TmpFs);
     if (installer_mode)
     {
+        boot_debug::begin(fbc, BootStep::PipeMountpoint);
+        installer_boot_require(installer::root_prepare_mountpoint("/pipe"), "pipe mountpoint");
+        boot_debug::returned(fbc, BootStep::PipeMountpoint);
+    }
+    else
+        boot_debug::skip(fbc, BootStep::PipeMountpoint);
+    boot_debug::begin(fbc, BootStep::PipeFs);
+    pipefs_setup();
+    boot_debug::returned(fbc, BootStep::PipeFs);
+    if (installer_mode)
+    {
+        boot_debug::begin(fbc, BootStep::PipeCheck);
+        installer_check_mount("/pipe");
+        boot_debug::returned(fbc, BootStep::PipeCheck);
+    }
+    else
+        boot_debug::skip(fbc, BootStep::PipeCheck);
+    boot_debug::begin(fbc, BootStep::Pty);
+    pty_init();
+    boot_debug::returned(fbc, BootStep::Pty);
+    boot_debug::begin(fbc, BootStep::Fsgsbase);
+    fsgsbase_init();
+    boot_debug::returned(fbc, BootStep::Fsgsbase);
+    if (installer_mode)
+    {
+        boot_debug::begin(fbc, BootStep::SocketMountpoint);
+        installer_boot_require(installer::root_prepare_mountpoint("/sock"), "socket mountpoint");
+        boot_debug::returned(fbc, BootStep::SocketMountpoint);
+    }
+    else
+        boot_debug::skip(fbc, BootStep::SocketMountpoint);
+    boot_debug::begin(fbc, BootStep::SocketFs);
+    int socket_status = socketfs_setup();
+    boot_debug::returned(fbc, BootStep::SocketFs);
+    if (installer_mode)
+    {
+        boot_debug::begin(fbc, BootStep::SocketCheck);
         installer_boot_require(socket_status, "socket setup");
         installer_check_mount("/sock");
+        boot_debug::returned(fbc, BootStep::SocketCheck);
+        boot_debug::begin(fbc, BootStep::ProcMountpoint);
         installer_boot_require(installer::root_prepare_mountpoint("/proc"), "proc mountpoint");
+        boot_debug::returned(fbc, BootStep::ProcMountpoint);
     }
+    else
+        boot_debug::skip(fbc, BootStep::SocketCheck, BootStep::ProcMountpoint);
+    boot_debug::begin(fbc, BootStep::ProcFs);
     procfs_setup();
-    if (installer_mode) installer_check_mount("/proc");
+    boot_debug::returned(fbc, BootStep::ProcFs);
+    if (installer_mode)
+    {
+        boot_debug::begin(fbc, BootStep::ProcCheck);
+        installer_check_mount("/proc");
+        boot_debug::returned(fbc, BootStep::ProcCheck);
+    }
+    else
+        boot_debug::skip(fbc, BootStep::ProcCheck);
     // The installer has no network modules or normal-user session services.
     if (!installer_mode)
     {
+        boot_debug::begin(fbc, BootStep::DnsFs);
         dnsfs_setup();
+        boot_debug::returned(fbc, BootStep::DnsFs);
+        boot_debug::begin(fbc, BootStep::NmFs);
         nmfs_setup();
+        boot_debug::returned(fbc, BootStep::NmFs);
     }
+    else
+        boot_debug::skip(fbc, BootStep::DnsFs, BootStep::NmFs);
+    boot_debug::begin(fbc, BootStep::Stdio);
     stdio_init();
+    boot_debug::returned(fbc, BootStep::Stdio);
 
+    boot_debug::begin(fbc, BootStep::Signals);
     signal_init();
+    boot_debug::returned(fbc, BootStep::Signals);
+    boot_debug::begin(fbc, BootStep::Syscalls);
     init_syscall();
+    boot_debug::returned(fbc, BootStep::Syscalls);
+    boot_debug::begin(fbc, BootStep::Xnet);
     if (int error = xnet_init()) write_serial_fmt("XNet worker initialization failed: %d\n", error);
+    boot_debug::returned(fbc, BootStep::Xnet);
+    boot_debug::begin(fbc, BootStep::Messages);
     init_message();
+    boot_debug::returned(fbc, BootStep::Messages);
 
     if (!OPENXJ380_INPUT_OUTPUT_DISABLED &&
         (BootConfig.boot_flags & (BOOT_FLAG_SAFE_MODE | BOOT_FLAG_DISABLE_KMOD | BOOT_FLAG_INSTALLER)) == 0) {
+        boot_debug::begin(fbc, BootStep::Modules);
         module_setup();
+        boot_debug::returned(fbc, BootStep::Modules);
+        boot_debug::begin(fbc, BootStep::Dlinker);
         dlinker_init();
+        boot_debug::returned(fbc, BootStep::Dlinker);
+        boot_debug::begin(fbc, BootStep::LoadModules);
         load_all_kernel_module();
+        boot_debug::returned(fbc, BootStep::LoadModules);
     } else {
+        boot_debug::skip(fbc, BootStep::Modules, BootStep::LoadModules);
         write_serial_string("BOOT: kernel modules skipped by boot menu\n");
     }
 
+    boot_debug::begin(fbc, BootStep::SmpReady);
     while (true)
     {
         __asm__ volatile("pause");
@@ -750,16 +931,22 @@ extern "C" void KernelMain(const FrameBufferConfig &fbc, EFI_SYSTEM_TABLE &Syste
             __atomic_load_n(&xsi->cpu_count, __ATOMIC_ACQUIRE))
             break;
     }
+    boot_debug::returned(fbc, BootStep::SmpReady);
 
+    boot_debug::begin(fbc, BootStep::Reaper);
     init_reaper();
+    boot_debug::returned(fbc, BootStep::Reaper);
     // Publish the permanent TX worker after all CPU queues exist. Bootstrap
     // output remains synchronous until this handoff succeeds.
+    boot_debug::begin(fbc, BootStep::SerialRuntime);
     if (!serial_runtime_start()) write_serial_string("Serial TX worker initialization failed.\n");
+    boot_debug::returned(fbc, BootStep::SerialRuntime);
     write_serial_string("Process Reaper is ready\n");
 
     if (BootConfig.is_qemu == 1) pr_warn("XJ380 is running under the QEMU/BOCHS.\n");
 
     // create_kernel_thread((void *)tst, NULL, (char *)"1", NULL);
+    boot_debug::begin(fbc, BootStep::StoragePolicy);
     if ((BootConfig.boot_flags & (BOOT_FLAG_SAFE_MODE | BOOT_FLAG_SAFE_STORAGE_IO)) != 0) {
         write_serial_string("AHCI: keeping conservative IO path by boot menu\n");
     } else if (ahci_is_qemu_environment()) {
@@ -767,12 +954,24 @@ extern "C" void KernelMain(const FrameBufferConfig &fbc, EFI_SYSTEM_TABLE &Syste
     } else {
         write_serial_string("AHCI: keeping conservative IO path on vmware/real hardware\n");
     }
+    boot_debug::returned(fbc, BootStep::StoragePolicy);
     // The Apache provider intentionally has no product graphical installer.
     // It can validate/publish the root, but never admits native writes or
     // falls back to a shell when that trusted entry is unavailable.
-    if (installer_mode) installer_boot_require(-EOPNOTSUPP, "graphical installer unavailable in provider");
+    if (installer_mode)
+    {
+        boot_debug::begin(fbc, BootStep::InstallerEntry);
+        installer_boot_require(-EOPNOTSUPP, "graphical installer unavailable in provider");
+        boot_debug::returned(fbc, BootStep::InstallerEntry);
+    }
+    else
+        boot_debug::skip(fbc, BootStep::InstallerEntry);
+    boot_debug::begin(fbc, BootStep::UserSession);
     user_session_use_login();
+    boot_debug::returned(fbc, BootStep::UserSession);
+    boot_debug::begin(fbc, BootStep::UserProcess);
     create_user_process_from_file((char *)"/apps/system/shell/shell.elf", NULL, NULL);
+    boot_debug::returned(fbc, BootStep::UserProcess);
 
     // delay_s_hp(60);
 
@@ -781,11 +980,15 @@ extern "C" void KernelMain(const FrameBufferConfig &fbc, EFI_SYSTEM_TABLE &Syste
     // create_user_thread((void *)utsk, NULL, (char *)"test_task2", ugp);
 
 
+    boot_debug::begin(fbc, BootStep::Scheduler);
+
     // Publish runtime IRQ policy before any CPU can dispatch a worker. A
     // pending timer can preempt immediately after STI, before the next store.
     no_interrupt = false;
     scheduler_start();
     open_interrupt;
+
+    boot_debug::returned(fbc, BootStep::Scheduler);
 
     // no_interrupt = true;
     // close_interrupt;

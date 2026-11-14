@@ -2,6 +2,7 @@
 #include <cpu/lock.h>
 #include <openxj380/config.h>
 #include <stdint.h>
+#include "boot_debug_color.h"
 
 extern const uint8_t _binary___font_hankaku_bin_start;
 
@@ -15,8 +16,20 @@ static uint32_t                 g_column      = 0;
 static uint32_t                 g_row         = 0;
 static uint32_t                 g_columns     = 0;
 static uint32_t                 g_rows        = 0;
+#if DEVELOP_MODE_BOOT_DEBUG_COLOR == 1
+static uint32_t                 g_top         = 0;
+#endif
 static uint8_t                  g_escape_state = 0;
 static spin_t                   g_console_lock = SPIN_INIT;
+
+static uint32_t text_top()
+{
+#if DEVELOP_MODE_BOOT_DEBUG_COLOR == 1
+    return g_top;
+#else
+    return 0;
+#endif
+}
 
 static void put_pixel(uint32_t x, uint32_t y, uint32_t color)
 {
@@ -42,7 +55,7 @@ static void put_pixel(uint32_t x, uint32_t y, uint32_t color)
 
 static void clear_screen()
 {
-    for (uint32_t y = 0; y < g_framebuffer->vertical_resolution; y++)
+    for (uint32_t y = text_top(); y < g_framebuffer->vertical_resolution; y++)
         for (uint32_t x = 0; x < g_framebuffer->horizontal_resolution; x++)
             put_pixel(x, y, BACKGROUND);
     g_column = 0;
@@ -53,7 +66,7 @@ static void scroll_screen()
 {
     uint32_t width  = g_framebuffer->horizontal_resolution;
     uint32_t height = g_framebuffer->vertical_resolution;
-    for (uint32_t y = CHARACTER_HEIGHT; y < height; y++)
+    for (uint32_t y = text_top() + CHARACTER_HEIGHT; y < height; y++)
     {
         uint32_t *source = (uint32_t *)(g_framebuffer->frame_buffer +
                            (uint64_t)y * g_framebuffer->pixels_per_scan_line * 4);
@@ -82,7 +95,7 @@ static void draw_character(uint8_t character)
 {
     const uint8_t *glyph = &_binary___font_hankaku_bin_start + (uint32_t)character * CHARACTER_HEIGHT;
     uint32_t origin_x = g_column * CHARACTER_WIDTH;
-    uint32_t origin_y = g_row * CHARACTER_HEIGHT;
+    uint32_t origin_y = text_top() + g_row * CHARACTER_HEIGHT;
     for (uint32_t y = 0; y < CHARACTER_HEIGHT; y++)
         for (uint32_t x = 0; x < CHARACTER_WIDTH; x++)
             put_pixel(origin_x + x, origin_y + y, (glyph[y] & (0x80U >> x)) ? FOREGROUND : BACKGROUND);
@@ -131,7 +144,10 @@ void console_init(const FrameBufferConfig &fbc)
 
     g_framebuffer = &fbc;
     g_columns     = fbc.horizontal_resolution / CHARACTER_WIDTH;
-    g_rows        = fbc.vertical_resolution / CHARACTER_HEIGHT;
+#if DEVELOP_MODE_BOOT_DEBUG_COLOR == 1
+    g_top         = boot_debug::reserved_height(fbc);
+#endif
+    g_rows        = (fbc.vertical_resolution - text_top()) / CHARACTER_HEIGHT;
     spin_init(&g_console_lock);
     clear_screen();
 #endif
