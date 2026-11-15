@@ -3690,10 +3690,44 @@ sys_(getdents64, int fd, void *dents, size_t size)
 
 sys_(newfstatat, int dirfd, char *pathname, struct stat *buf, uint64_t flags)
 {
-    if (buf == NULL) return SYSCALL_FAULT_(EINVAL);
-    char *resolved = NULL;
-    int path_ret = resolve_user_path_at(dirfd, pathname, &resolved);
-    if (path_ret < 0) return SYSCALL_FAULT_((int)-path_ret);
+    // glibc 2.35 implements fstat using newfstatat(fd, "", ..., AT_EMPTY_PATH).
+    // Such an fd may name a regular file or an O_PATH handle, not a directory.
+    constexpr uint64_t no_automount = 0x800;
+    if (flags & ~(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH | no_automount)) return SYSCALL_FAULT_(EINVAL);
+    if (buf == NULL) return SYSCALL_FAULT_(EFAULT);
+
+    char *kpath = NULL;
+    if (pathname != NULL)
+    {
+        int path_ret = copy_string_from_user(&kpath, pathname, USER_PATH_MAX);
+        if (path_ret < 0) return SYSCALL_FAULT_((int)-path_ret);
+    }
+    else if (!(flags & AT_EMPTY_PATH))
+        return SYSCALL_FAULT_(EFAULT);
+
+    if (kpath == NULL || kpath[0] == '\0')
+    {
+        if (!(flags & AT_EMPTY_PATH))
+        {
+            free(kpath);
+            return SYSCALL_FAULT_(ENOENT);
+        }
+        if (dirfd != AT_FDCWD)
+        {
+            free(kpath);
+            // Reuse fstat's operation pin and paged user copy, including O_PATH
+            // and unlinked files. Do not reconstruct a pathname from the fd.
+            return sys_fstat(dirfd, buf, 0, 0, 0, 0, regs);
+        }
+    }
+
+    char *resolved = at_resolve_pathname(dirfd, kpath != NULL ? kpath : (char *)"");
+    free(kpath);
+    if (resolved == NULL)
+    {
+        int error = vfs_last_error();
+        return SYSCALL_FAULT_(error > 0 ? error : ENOENT);
+    }
 
     struct stat kstat;
     uint64_t ret = (flags & AT_SYMLINK_NOFOLLOW) ?
