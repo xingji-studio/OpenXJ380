@@ -1,4 +1,5 @@
 #include <user/permissions.h>
+#include <user/linux_trace.h>
 #include <input_method.h>
 #include <syscall/syscall.h>
 #include <syscall/fd_lifetime.h>
@@ -255,6 +256,7 @@ static uint64_t lstat_kernel_path(const char *path, struct stat *out)
 
 static bool busybox_debug_current_linux_abi()
 {
+    if (!CONFIG_TRACE_LINUX_ABI) return false;
     tcb_t task = get_current_task();
     return task != NULL && task->parent_group != NULL && task->parent_group->linux_abi;
 }
@@ -849,8 +851,14 @@ sys_(write, int fd, uint8_t *buffer, size_t size)
     }
     if (unlikely(fd < 0 || buffer == NULL)) return SYSCALL_FAULT_(EINVAL);
     if (unlikely(size == 0)) return 0;
-    if (fd == 2) mirror_linux_output_to_serial("stderr", buffer, size);
-    else if (fd == 1 && trace_xbps_task()) mirror_linux_output_to_serial("stdout", buffer, size);
+    // Readline writes prompts and individual key echoes to stderr. Mirroring
+    // every write can wait for UART queue space before the PTY receives it.
+    // Keep this diagnostic copy scoped to the traced package-manager tasks.
+    if (trace_xbps_task())
+    {
+        if (fd == 2) mirror_linux_output_to_serial("stderr", buffer, size);
+        else if (fd == 1) mirror_linux_output_to_serial("stdout", buffer, size);
+    }
     FdOperation operation;
     int operation_error = operation.acquire(fd);
     if (operation_error) return SYSCALL_FAULT_(-operation_error);

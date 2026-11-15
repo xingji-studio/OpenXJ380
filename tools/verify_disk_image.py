@@ -120,9 +120,26 @@ def verify_image(image: Path) -> None:
             fat_file(image, partitions["esp"][0], name, destination)
             if name == "system/kernel.krl":
                 esp_kernel = file_digest(destination)
+                esp_kernel_path = destination
         if "root" in partitions:
             root = work / "root.img"
             extract_partition(image, partitions["root"], root)
+            descriptor = work / "root-binding.bin"
+            fat_file(image, partitions["esp"][0], images.ROOT_BINDING_PATH, descriptor)
+            binding = images.parse_root_binding(descriptor.read_bytes())
+            if binding["filesystem"] != "ext4":
+                raise ValueError("ext4 root has an incompatible boot binding")
+            if images.file_fingerprint(esp_kernel_path) != (binding["kernel_size"], binding["kernel_crc32c"]):
+                raise ValueError("EFI kernel does not match root binding")
+            layout = [(name, first, last, "8300" if name == "root" else "ef00")
+                      for name, (first, last) in partitions.items()]
+            identities = {name: binding[name + "_guid"] for name in ("disk", "root", "esp")}
+            images.verify_gpt(image, layout, identities)
+            with root.open("rb") as stream:
+                stream.seek(1024)
+                superblock = stream.read(120)
+            if superblock[56:58] != b"\x53\xef" or superblock[104:120] != binding["filesystem_uuid"].bytes:
+                raise ValueError("ext4 UUID does not match root binding")
         for index, name in enumerate(ROOT_FILES):
             destination = work / f"root-{index}"
             if "root" in partitions:

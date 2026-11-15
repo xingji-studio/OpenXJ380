@@ -255,6 +255,7 @@ uint32_t pci_read_command(pci_device_t *device, uint8_t offset)
     outl(PCI_COMMAND_PORT, address);
     return inl(PCI_DATA_PORT);
 }
+EXPORT_SYMBOL(pci_read_command);
 
 void pci_write_command(pci_device_t *device, uint8_t offset, uint32_t value)
 {
@@ -263,6 +264,7 @@ void pci_write_command(pci_device_t *device, uint8_t offset, uint32_t value)
     outl(PCI_COMMAND_PORT, address);
     outl(PCI_DATA_PORT, value);
 }
+EXPORT_SYMBOL(pci_write_command);
 
 uint32_t pci_enumerate_capability_list(pci_device_t *pci_dev, uint32_t cap_type) {
     uint32_t cap_offset;

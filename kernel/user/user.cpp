@@ -3,6 +3,7 @@
 #include <user/permissions.h>
 #include <user/special_permissions.h>
 #include <user/process_launch.h>
+#include <user/linux_trace.h>
 #include "../build_settings.h"
 #include <ahci/ahci.h>
 #include <efi/boot.h>
@@ -954,7 +955,8 @@ int create_user_process_with_options(char *path, pcb_t pcb, char *argv[], const 
     {
         for (int i = 0; argv[i]; i++)
         {
-            write_serial_fmt("[busybox-debug] create_process argv[%d]=%s\n", i, argv[i]);
+            if (CONFIG_TRACE_LINUX_ABI)
+                write_serial_fmt("[busybox-debug] create_process argv[%d]=%s\n", i, argv[i]);
             if (!append_cmdline_arg(cmdline, sizeof(cmdline), &cmdline_ptr, argv[i]))
             {
                 write_serial_fmt("Create User Process Failed. Reason: Command Line Too Long.\n");
@@ -984,10 +986,13 @@ int create_user_process_with_options(char *path, pcb_t pcb, char *argv[], const 
 
     char *old_cmdline = group->cmdline;
     group->cmdline    = strdup(cmdline);
-    write_serial_fmt("[busybox-debug] create_process cmdline=%s argc=%d linux_abi=%d\n",
-                     cmdline,
-                     argc,
-                     group->linux_abi);
+    if (CONFIG_TRACE_LINUX_ABI)
+    {
+        write_serial_fmt("[busybox-debug] create_process cmdline=%s argc=%d linux_abi=%d\n",
+                         cmdline,
+                         argc,
+                         group->linux_abi);
+    }
     if (group->cmdline == NULL)
     {
         group->cmdline = old_cmdline;

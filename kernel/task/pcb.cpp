@@ -2,6 +2,7 @@
 #include <screen_capture.h>
 #include <user/permissions.h>
 #include <user/process_launch.h>
+#include <user/linux_trace.h>
 #include <input_method.h>
 #include "task/pcb.h"
 #include "cpu/fsgsbase.h"
@@ -1189,17 +1190,20 @@ static uint64_t build_user_stack(tcb_t task, uint64_t sp, uint64_t entry_point, 
         return 0;
     }
     if (argc > (int)EXECVE_VECTOR_MAX) argc = (int)EXECVE_VECTOR_MAX;
-    write_serial_fmt("[busybox-debug] build_user_stack proc=%s pid=%llu argc=%d argv_source=%s cmdline=%s\n",
-                     task->parent_group ? task->parent_group->name : "(null)",
-                     task->parent_group ? (unsigned long long)task->parent_group->pid : 0ULL,
-                     argc,
-                     argv_owned_by_parser ? "cmdline" : "tcb",
-                     task->parent_group && task->parent_group->cmdline ? task->parent_group->cmdline : "(null)");
-    if (argv != NULL)
+    if (CONFIG_TRACE_LINUX_ABI)
     {
-        for (int i = 0; i < argc && argv[i] != NULL; i++)
+        write_serial_fmt("[busybox-debug] build_user_stack proc=%s pid=%llu argc=%d argv_source=%s cmdline=%s\n",
+                         task->parent_group ? task->parent_group->name : "(null)",
+                         task->parent_group ? (unsigned long long)task->parent_group->pid : 0ULL,
+                         argc,
+                         argv_owned_by_parser ? "cmdline" : "tcb",
+                         task->parent_group && task->parent_group->cmdline ? task->parent_group->cmdline : "(null)");
+        if (argv != NULL)
         {
-            write_serial_fmt("[busybox-debug] build_user_stack argv[%d]=%s\n", i, argv[i]);
+            for (int i = 0; i < argc && argv[i] != NULL; i++)
+            {
+                write_serial_fmt("[busybox-debug] build_user_stack argv[%d]=%s\n", i, argv[i]);
+            }
         }
     }
 
@@ -1905,7 +1909,7 @@ uint64_t process_execve(char *path, char **argv, char **envp)
         return (uint64_t)-ENOMEM;
     }
     vfs_node_t node      = vfs_open(norm_path);
-    if (process != NULL && process->linux_abi)
+    if (CONFIG_TRACE_LINUX_ABI && process != NULL && process->linux_abi)
     {
         write_serial_fmt("[busybox-debug] execve request path=%s argv0=%s open=%s\n",
                          norm_path,
