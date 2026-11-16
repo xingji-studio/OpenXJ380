@@ -641,7 +641,10 @@ void partition_init()
 extern "C" void partition_device_added(size_t vdisk_id)
 {
     if (!partition_runtime_ready) return;
-    partition_scan_single_device(vdisk_id, true);
+    // Installer sources and targets stay raw. A hotplug automount would race
+    // source retention or consume a target's exclusive installation lease.
+    bool auto_mount = !EFI_BC || !(EFI_BC->boot_flags & BOOT_FLAG_INSTALLER);
+    partition_scan_single_device(vdisk_id, auto_mount);
 }
 EXPORT_SYMBOL(partition_device_added);
 

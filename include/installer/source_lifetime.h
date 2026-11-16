@@ -11,8 +11,9 @@ namespace installer
 // this object. A published or quarantined lifetime remains reserved to reboot.
 // Unpublished retain/release is boot-serialized. After publication metadata is
 // immutable; cross-thread validation and atomic quarantine are permitted.
-// The explicit read_only_stream mode requires real unwritable media and keeps
-// an exclusion lease that permits bounded trusted source reads from workers.
+// Stream reads require either real unwritable media or the built-in USB BOT
+// source guard, plus an unwritable devfs node and a retained exclusion lease.
+// Hardware flags remain truthful for software-protected USB source devices.
 struct SourceLifetime
 {
     XJ_INSTALLER_SOURCE identity;

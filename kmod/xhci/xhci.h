@@ -510,6 +510,11 @@ struct xhci_msc_state {
     xhci_controller *controller;
     volatile uint32_t io_lock;
     int device_id;
+    uint64_t          device_generation;
+    uint32_t          io_users;
+    bool              hardware_read_only;
+    bool              boot_source_read_only;
+    bool              disconnected;
 };
 
 struct xhci_msc_cbw {
@@ -653,6 +658,7 @@ struct usb_hub {
     usb_device *usbdev;
     const usb_hub_ops *ops;
     uint8_t port_count;
+    uint8_t            interface_number;
     bool registered;
     bool needs_rescan;
     usb_device **children;
@@ -667,6 +673,9 @@ struct usb_device {
     usb_hub *child_hub;
     bool is_root_hub;
     bool online;
+    // A disconnected device with retained/source I/O keeps its DMA and slot
+    // storage until reboot. It must never be reused by a new enumeration.
+    bool                  quarantined;
     uint8_t port;
     uint8_t speed_id;
     uint8_t level;
@@ -734,6 +743,7 @@ int xhci_msc_scsi_read_capacity10(xhci_controller *xhci,
                                   xhci_slot_state *slot, void *data);
 int xhci_msc_scsi_read_capacity16(xhci_controller *xhci,
                                   xhci_slot_state *slot, void *data);
+int  xhci_msc_scsi_mode_sense6(xhci_controller *xhci, xhci_slot_state *slot, void *data);
 int xhci_msc_scsi_rw(xhci_controller *xhci, xhci_slot_state *slot,
                      void *buffer, uint64_t lba, uint32_t blocks, bool write);
 

@@ -16,6 +16,7 @@ struct SourceRegistration
     BlockSourceHardware hardware;
     uint64_t generation;
     bool valid;
+    bool                disconnected;
 };
 SourceRegistration source_devices[kSourceDevices];
 unsigned char source_lock;
@@ -71,6 +72,13 @@ static bool valid_hardware(const BlockSourceHardware &h)
         h.controller->func > 7 || h.block_size < 512 || h.block_size > 65536 ||
         (h.block_size & (h.block_size - 1)) || !h.bytes || h.bytes % h.block_size ||
         !config_available(h.controller, h.controller->segment, h.controller->bus)) return false;
+    if (h.transport == XJ_INSTALLER_SOURCE_USB)
+        return h.controller->class_code == 0x0c0330 && h.usb_depth && h.usb_depth <= XJ_INSTALLER_USB_DEPTH_MAX &&
+               !h.sata_port && !h.sata_multiplier && !h.lun && !h.ide_channel && !h.ide_unit && !h.nvme_namespace &&
+               !h.sata_direct_zero && xj_installer_bytes_zero(h.nvme_eui64, sizeof(h.nvme_eui64));
+    if (h.usb_depth || h.usb_source_guard || !xj_installer_bytes_zero(h.usb_ports, sizeof(h.usb_ports)) ||
+        !xj_installer_bytes_zero(h.usb_interfaces, sizeof(h.usb_interfaces)))
+        return false;
     if (h.transport == XJ_INSTALLER_SOURCE_AHCI)
         return h.controller->class_code == 0x010601 && h.sata_port < 32 && h.sata_multiplier == 0xffff &&
                !h.lun && !h.ide_channel && !h.ide_unit && !h.nvme_namespace &&
@@ -88,6 +96,15 @@ static bool valid_hardware(const BlockSourceHardware &h)
 
 static bool same_hardware(const BlockSourceHardware &h, const XJ_INSTALLER_SOURCE &s)
 {
+    if (s.transport == XJ_INSTALLER_SOURCE_USB)
+    {
+        XJ_INSTALLER_PATH_INFO parsed;
+        if (xj_installer_parse_device_path(s.path, s.path_bytes, &parsed) != XJ_INSTALLER_SOURCE_SUPPORTED ||
+            h.usb_depth != parsed.usb_depth)
+            return false;
+        for (unsigned i = 0; i < h.usb_depth; ++i)
+            if (h.usb_ports[i] != parsed.usb_ports[i] || h.usb_interfaces[i] != parsed.usb_interfaces[i]) return false;
+    }
     const XJ_INSTALLER_PCI_LOCATION &leaf = s.pci[s.pci_count - 1];
     // Do not globally normalize multiplier zero: on a PMP-capable controller
     // it could name a different physical device. The driver's CAP observation
@@ -141,6 +158,7 @@ int block_source_register(uint32_t device, const BlockSourceHardware &hardware)
     entry.hardware = hardware;
     entry.generation = whole.generation;
     entry.valid = true;
+    entry.disconnected = false;
     ++source_revision;
     return 0;
 }
@@ -165,6 +183,7 @@ int block_source_match(const XJ_INSTALLER_SOURCE &source, BlockExtent *whole)
             entry = source_devices[device];
         }
         if (!entry.valid || !same_hardware(entry.hardware, source)) continue;
+        if (entry.disconnected) return -ESTALE;
         // Do not silently discard stale/ambiguous hardware identities and pick
         // another slot. Re-registration requires a fresh trusted declaration.
         BlockExtent extent;
@@ -195,4 +214,43 @@ int block_source_match(const XJ_INSTALLER_SOURCE &source, BlockExtent *whole)
         current.physical_generation != candidate.physical_generation) return -ESTALE;
     *whole = current;
     return 0;
+}
+
+bool block_source_is_boot_usb(const XJ_INSTALLER_SOURCE &source, const BlockSourceHardware &hardware)
+{
+    return source.transport == XJ_INSTALLER_SOURCE_USB && xj_installer_source_valid(&source) &&
+           valid_hardware(hardware) && same_hardware(hardware, source) && hardware.bytes == source.physical_bytes &&
+           hardware.block_size == source.physical_block_size &&
+           hardware.read_only == bool(source.flags & XJ_INSTALLER_SOURCE_READ_ONLY) &&
+           authentic_pci_path(hardware, source);
+}
+
+int block_source_require_usb_guard(const XJ_INSTALLER_SOURCE &source, const BlockExtent &whole)
+{
+    if (source.transport != XJ_INSTALLER_SOURCE_USB) return -EOPNOTSUPP;
+    BlockExtent current;
+    int         result = block_source_match(source, &current);
+    if (result) return result;
+    if (current.device != whole.device || current.physical_device != whole.physical_device ||
+        current.generation != whole.generation || current.physical_generation != whole.physical_generation ||
+        current.start != whole.start || current.bytes != whole.bytes)
+        return -ESTALE;
+    SourceLock  lock;
+    const auto &entry = source_devices[whole.device];
+    return entry.valid && !entry.disconnected && entry.generation == whole.generation && entry.hardware.usb_source_guard
+               ? 0
+               : -EOPNOTSUPP;
+}
+
+void block_source_disconnect(uint32_t device, uint64_t generation)
+{
+    if (device >= kSourceDevices) return;
+    SourceLock lock;
+    auto      &entry = source_devices[device];
+    if (entry.valid && entry.generation == generation)
+    {
+        entry.disconnected = true;
+        // Saturation keeps all future match attempts stale, without wraparound.
+        if (source_revision != uint64_t(-1)) ++source_revision;
+    }
 }

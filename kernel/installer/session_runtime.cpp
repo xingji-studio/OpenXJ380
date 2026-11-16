@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Original package lifetime staging and explicit native-service admission.
 
+#include <block_source.h>
 #include <installer/boot_proof.h>
 #include <installer/package.h>
 #include <installer/session.h>
@@ -440,9 +441,30 @@ bool session_snapshot(SessionSnapshot *output)
     return true;
 }
 
+static int wait_for_usb_source(const XJ_INSTALLER_SOURCE &source)
+{
+    // Bootstrap completes the nested hub scan before scheduler startup. Later
+    // arrivals may use the sleepable hotplug worker, with no registry/source
+    // lock held here. Never sleep while the boot scheduler gate is closed.
+    for (unsigned attempt = 0; attempt < 750; ++attempt)
+    {
+        BlockExtent whole;
+        int         result = block_source_match(source, &whole);
+        if (result != -19) return result;
+        if (!scheduler_is_enabled()) return result;
+        scheduler_sleep_ns(20000000ULL);
+    }
+    return -19;
+}
+
 int session_source_prepare()
 {
     if (__atomic_load_n(&state, __ATOMIC_ACQUIRE) != packages_proven) return -19;
+    if (saved_config.installer_handoff.source.transport == XJ_INSTALLER_SOURCE_USB)
+    {
+        int result = wait_for_usb_source(saved_config.installer_handoff.source);
+        if (result < 0) return refuse(result);
+    }
     // Boot-owned storage survives caller exit. The exclusive source lease
     // prevents deletion/re-registration and excludes every physical alias.
     // Other worker TCBs may validate it but never borrow its I/O authority.

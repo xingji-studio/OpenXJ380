@@ -1,10 +1,66 @@
 #include "xhci.h"
+#ifdef XHCI_BUILTIN
+#    include <block_source.h>
+#    include <efi/boot.h>
+extern BOOT_CONFIG *EFI_BC;
+#endif
 extern "C" {
 #include "../../include/fs/partition.h"
 }
 
 static xhci_msc_state *g_usb_msc_by_drive[256];
 static uint32_t g_usb_msc_count = 0;
+static unsigned char   g_usb_msc_lock;
+
+// Only pointer capture/publication is locked. Transfers, device-manager calls
+// and buffer teardown run with the caller's interrupt/scheduler state intact.
+class UsbMscRegistryLock {
+    uint64_t flags;
+
+  public:
+    UsbMscRegistryLock()
+    {
+        __asm__ volatile("pushfq; pop %0; cli" : "=r"(flags) : : "memory");
+        while (__atomic_test_and_set(&g_usb_msc_lock, __ATOMIC_ACQUIRE))
+            __asm__ volatile("pause");
+    }
+    ~UsbMscRegistryLock()
+    {
+        __atomic_clear(&g_usb_msc_lock, __ATOMIC_RELEASE);
+        __asm__ volatile("push %0; popfq" : : "r"(flags) : "memory", "cc");
+    }
+};
+
+#ifdef XHCI_BUILTIN
+static bool usb_msc_source_hardware(const usb_device *device, BlockSourceHardware &hardware)
+{
+    hardware            = {};
+    hardware.controller = device->controller->pci_dev;
+    hardware.transport  = XJ_INSTALLER_SOURCE_USB;
+    hardware.block_size = device->slot->msc.block_size;
+    hardware.bytes      = device->slot->msc.block_count * hardware.block_size;
+    hardware.read_only  = device->slot->msc.hardware_read_only;
+    uint8_t  ports[XJ_INSTALLER_USB_DEPTH_MAX], interfaces[XJ_INSTALLER_USB_DEPTH_MAX];
+    unsigned count     = 0;
+    uint8_t  interface = device->slot->msc.interface_number;
+    while (device && !device->is_root_hub)
+    {
+        if (!device->parent_hub || !device->port || count == XJ_INSTALLER_USB_DEPTH_MAX) return false;
+        ports[count]        = device->port - 1;
+        interfaces[count++] = interface;
+        interface           = device->parent_hub->interface_number;
+        device              = device->parent_hub->usbdev;
+    }
+    if (!device || !count) return false;
+    hardware.usb_depth = count;
+    for (unsigned i = 0; i < count; ++i)
+    {
+        hardware.usb_ports[i]      = ports[count - i - 1];
+        hardware.usb_interfaces[i] = interfaces[count - i - 1];
+    }
+    return true;
+}
+#endif
 
 static bool usb_msc_iface_is_bot(const usb_interface_info *iface) {
     return iface &&
@@ -169,10 +225,14 @@ static size_t usb_msc_device_rw(int drive, uint8_t *buffer, size_t number,
         return 0;
     }
 
-    xhci_msc_state *msc = g_usb_msc_by_drive[drive];
-    if (!msc || !msc->ready || !msc->slot || !msc->controller ||
-        msc->block_size == 0) {
-        return 0;
+    xhci_msc_state *msc;
+    {
+        UsbMscRegistryLock lock;
+        msc = g_usb_msc_by_drive[drive];
+        if (!msc || !msc->ready || msc->disconnected || !msc->slot || !msc->controller || !msc->block_size ||
+            (write && (msc->hardware_read_only || msc->boot_source_read_only)))
+            return 0;
+        __atomic_add_fetch(&msc->io_users, 1U, __ATOMIC_ACQ_REL);
     }
 
     while (__sync_lock_test_and_set(&msc->io_lock, 1U) != 0U) {
@@ -185,6 +245,7 @@ static size_t usb_msc_device_rw(int drive, uint8_t *buffer, size_t number,
     size_t remaining = number;
 
     while (remaining != 0) {
+        if (__atomic_load_n(&msc->disconnected, __ATOMIC_ACQUIRE)) break;
         uint32_t chunk = (remaining > 0xFFFFU) ? 0xFFFFU : (uint32_t)remaining;
         if (cur_lba + chunk > msc->block_count) {
             break;
@@ -202,6 +263,7 @@ static size_t usb_msc_device_rw(int drive, uint8_t *buffer, size_t number,
     }
 
     __sync_lock_release(&msc->io_lock);
+    __atomic_sub_fetch(&msc->io_users, 1U, __ATOMIC_RELEASE);
     return transferred;
 }
 
@@ -222,7 +284,7 @@ static void usb_msc_fill_block_device(device_t *dev,
     dev->sector_size = msc->block_size;
     dev->type = DEVICE_BLOCK;
     dev->read = usb_msc_device_read;
-    dev->write = usb_msc_device_write;
+    dev->write       = (msc->hardware_read_only || msc->boot_source_read_only) ? NULL : usb_msc_device_write;
     dev->flag = 1;
     dev->ioctl = (ioctlf)empty;
     dev->poll = (pollf)empty;
@@ -236,6 +298,21 @@ static void usb_msc_fill_block_device(device_t *dev,
 
 static int usb_msc_register_disk(usb_device *usbdev, xhci_msc_state *msc,
                                  const uint8_t *inquiry) {
+#ifdef XHCI_BUILTIN
+    BlockSourceHardware hardware;
+    bool                have_hardware = usb_msc_source_hardware(usbdev, hardware);
+    if (have_hardware && EFI_BC && (EFI_BC->boot_flags & BOOT_FLAG_INSTALLER_HANDOFF) &&
+        (EFI_BC->boot_flags & BOOT_FLAG_INSTALLER) &&
+        block_source_is_boot_usb(EFI_BC->installer_handoff.source, hardware))
+    {
+        // Freeze before either the whole node or a partition alias is exposed.
+        // The BOT command helper independently enforces this immutable guard.
+        msc->boot_source_read_only = true;
+        hardware.usb_source_guard  = true;
+        printk("usb: installer source protected topology=%s hardware_read_only=%u\n", usbdev->topology,
+               unsigned(msc->hardware_read_only));
+    }
+#endif
     device_t dev;
     usb_msc_fill_block_device(&dev, msc);
 
@@ -246,10 +323,34 @@ static int usb_msc_register_disk(usb_device *usbdev, xhci_msc_state *msc,
         return -ENOSPC;
     }
 
-    g_usb_msc_by_drive[device_id] = msc;
     msc->device_id = device_id;
+#ifdef XHCI_BUILTIN
+    msc->device_generation = block_access_generation(device_id);
+#endif
+    {
+        UsbMscRegistryLock lock;
+        g_usb_msc_by_drive[device_id] = msc;
+    }
     usbdev->driver_data = msc;
+    // Publish source provenance only after the hotplug partition scan has
+    // released its discovery lease. A waiting installer may retain it at once.
     partition_device_added((size_t)device_id);
+#ifdef XHCI_BUILTIN
+    if (have_hardware)
+    {
+        int result = block_source_register(device_id, hardware);
+        if (result)
+        {
+            {
+                UsbMscRegistryLock lock;
+                g_usb_msc_by_drive[device_id] = NULL;
+            }
+            delete_device(device_id);
+            usbdev->driver_data = NULL;
+            return result;
+        }
+    }
+#endif
 
     char vendor[9];
     char product[17];
@@ -367,6 +468,14 @@ static int usb_msc_probe(usb_device *usbdev, const usb_interface_info *iface) {
 
     msc->block_size = block_size;
     msc->block_count = last_lba + 1ULL;
+    if (!msc->block_count || msc->block_count > (~uint64_t(0)) / block_size)
+    {
+        xhci_release_msc(slot);
+        return -EOVERFLOW;
+    }
+    uint8_t mode[4]         = {};
+    int     mode_result     = xhci_msc_scsi_mode_sense6(usbdev->controller, slot, mode);
+    msc->hardware_read_only = mode_result == 0 && (mode[2] & 0x80);
 
     rc = usb_msc_register_disk(usbdev, msc, inquiry);
     if (rc != 0) {
@@ -383,11 +492,22 @@ static void usb_msc_remove(usb_device *usbdev) {
 
     xhci_msc_state *msc = &usbdev->slot->msc;
     if (msc->device_id >= 0 && msc->device_id < 256) {
-        g_usb_msc_by_drive[msc->device_id] = NULL;
+        {
+            UsbMscRegistryLock lock;
+            __atomic_store_n(&msc->disconnected, true, __ATOMIC_RELEASE);
+            g_usb_msc_by_drive[msc->device_id] = NULL;
+            usbdev->quarantined = msc->boot_source_read_only || __atomic_load_n(&msc->io_users, __ATOMIC_ACQUIRE) != 0;
+        }
+#ifdef XHCI_BUILTIN
+        block_source_disconnect(msc->device_id, msc->device_generation);
+        if (msc->boot_source_read_only)
+            printk("usb: installer source disconnected topology=%s generation=%llu; retained until reboot\n",
+                   usbdev->topology, msc->device_generation);
+#endif
         delete_device(msc->device_id);
     }
     usbdev->driver_data = NULL;
-    xhci_release_msc(usbdev->slot);
+    if (!usbdev->quarantined) xhci_release_msc(usbdev->slot);
 }
 
 static const usb_driver_id g_usb_msc_ids[] = {

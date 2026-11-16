@@ -270,17 +270,25 @@ void usb_hub_mark_port_changed(usb_hub *hub, uint32_t port_idx) {
 }
 
 void usb_scan_all_hubs(void) {
-    usb_hub *snapshot[64];
-    uint32_t count = 0;
-
-    for (usb_hub *hub = g_usb_hubs; hub && count < 64; hub = hub->next) {
-        snapshot[count++] = hub;
-    }
-
-    for (uint32_t i = 0; i < count; ++i) {
-        usb_hub *hub = snapshot[i];
-        if (hub && hub->registered) {
-            usb_scan_hub(hub);
+    usb_hub *scanned[64];
+    uint32_t scanned_count = 0;
+    // The initial scan runs before the scheduler opens. Probing a hub adds a
+    // new list head; complete those newly discovered levels in this same call
+    // rather than depending on a worker that cannot run until bootstrap ends.
+    // Each hub is visited once, retaining the existing 64-hub bound.
+    while (scanned_count < 64) {
+        usb_hub *snapshot[64];
+        uint32_t count = 0, walked = 0;
+        for (usb_hub *hub = g_usb_hubs; hub && walked++ < 64 && count < 64 - scanned_count; hub = hub->next) {
+            bool seen = false;
+            for (uint32_t i = 0; i < scanned_count; ++i) seen |= scanned[i] == hub;
+            if (!seen) snapshot[count++] = hub;
+        }
+        if (!count) break;
+        for (uint32_t i = 0; i < count; ++i) {
+            usb_hub *hub = snapshot[i];
+            scanned[scanned_count++] = hub;
+            if (hub && hub->registered) usb_scan_hub(hub);
         }
     }
 }
@@ -477,7 +485,8 @@ void usb_disconnect_device(usb_device *usbdev) {
     }
 
     usbdev->online = false;
-    if (!usbdev->is_root_hub) {
+    if (!usbdev->is_root_hub && !usbdev->quarantined)
+    {
         xhci_usb_release_device(usbdev);
         free(usbdev);
     }

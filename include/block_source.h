@@ -20,6 +20,12 @@ struct BlockSourceHardware
     // Trusted AHCI CAP.SPM was clear. Only then may a firmware path's legacy
     // multiplier value zero identify the driver's direct HBA port (0xffff).
     bool sata_direct_zero;
+    uint8_t       usb_depth;
+    uint8_t       usb_ports[XJ_INSTALLER_USB_DEPTH_MAX];
+    uint8_t       usb_interfaces[XJ_INSTALLER_USB_DEPTH_MAX];
+    // Independently enforced by the built-in BOT write-command path before
+    // publication. This is a software source guard, not hardware read-only.
+    bool          usb_source_guard;
 };
 
 // Trusted built-in drivers call after whole-device registration, using the
@@ -34,3 +40,11 @@ int block_source_register(uint32_t device, const BlockSourceHardware &hardware);
 // generation before claiming the source lifetime. This function neither opens
 // a node nor takes a mount/target lease, and makes no target-512 assumption.
 int block_source_match(const XJ_INSTALLER_SOURCE &source, BlockExtent *whole);
+
+// Boot-only selection before USB partition publication. The caller supplies
+// actual native topology and the validated LoadedImage handoff identity.
+bool block_source_is_boot_usb(const XJ_INSTALLER_SOURCE &, const BlockSourceHardware &);
+int  block_source_require_usb_guard(const XJ_INSTALLER_SOURCE &, const BlockExtent &);
+// Disconnect tombstones preserve identity until reboot, preventing a new USB
+// incarnation at the same port from replacing a retained installation source.
+void block_source_disconnect(uint32_t device, uint64_t generation);

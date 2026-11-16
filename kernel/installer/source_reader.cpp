@@ -48,6 +48,10 @@ int read_stream_source(void *opaque, uint64_t offset, void *output, size_t bytes
             error = -5;
             break;
         }
+        // A physical disconnect can race the completed transfer. Recheck the
+        // native registration/guard before publishing any bytes to the parser.
+        error = validate_source(source);
+        if (error) break;
         memcpy(static_cast<uint8_t *>(output) + done, reader.bounce + within, amount);
         done += amount;
     }

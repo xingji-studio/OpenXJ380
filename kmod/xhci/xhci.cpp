@@ -1757,6 +1757,10 @@ static int xhci_msc_bot_command(xhci_controller *xhci, xhci_slot_state *slot,
         cdb_len > sizeof(((xhci_msc_cbw *)0)->cdb)) {
         return -EINVAL;
     }
+    if (__atomic_load_n(&slot->msc.disconnected, __ATOMIC_ACQUIRE)) return -ENODEV;
+    if ((slot->msc.boot_source_read_only || slot->msc.hardware_read_only) && !in_dir &&
+        static_cast<const uint8_t *>(cdb)[0] != SCSI_TEST_UNIT_READY)
+        return -EROFS;
 
     xhci_msc_cbw *cbw = NULL;
     xhci_msc_csw *csw = NULL;
@@ -1895,6 +1899,8 @@ int xhci_msc_scsi_read_capacity16(xhci_controller *xhci,
 
 int xhci_msc_scsi_rw(xhci_controller *xhci, xhci_slot_state *slot,
                      void *buffer, uint64_t lba, uint32_t blocks, bool write) {
+    if (__atomic_load_n(&slot->msc.disconnected, __ATOMIC_ACQUIRE)) return -ENODEV;
+    if (write && (slot->msc.hardware_read_only || slot->msc.boot_source_read_only)) return -EROFS;
     if (blocks == 0) {
         return 0;
     }
@@ -1920,6 +1926,13 @@ int xhci_msc_scsi_rw(xhci_controller *xhci, xhci_slot_state *slot,
     return xhci_msc_bot_command(xhci, slot, cdb, sizeof(cdb), buffer,
                                 blocks * slot->msc.block_size, !write, true,
                                 NULL);
+}
+
+int xhci_msc_scsi_mode_sense6(xhci_controller *xhci, xhci_slot_state *slot, void *data)
+{
+    // The four-byte mode parameter header contains the device's WP bit.
+    uint8_t cdb[6] = {0x1a, 0x08, 0x3f, 0, 4, 0};
+    return xhci_msc_bot_command(xhci, slot, cdb, sizeof(cdb), data, 4, true, false, NULL);
 }
 
 static bool xhci_has_active_hid(const xhci_controller *xhci) {

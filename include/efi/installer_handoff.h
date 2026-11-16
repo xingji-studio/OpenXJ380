@@ -24,6 +24,8 @@ typedef __UINT64_TYPE__ XJ_IH_U64;
 #define XJ_INSTALLER_SOURCE_AHCI 1U
 #define XJ_INSTALLER_SOURCE_NVME 2U
 #define XJ_INSTALLER_SOURCE_IDE 3U
+#define XJ_INSTALLER_SOURCE_USB           4U
+#define XJ_INSTALLER_USB_DEPTH_MAX        8U
 #define XJ_INSTALLER_SOURCE_READ_ONLY 1U
 #define XJ_INSTALLER_VOLUME_WHOLE 1U
 #define XJ_INSTALLER_VOLUME_HD 2U
@@ -140,6 +142,12 @@ typedef struct XJ_INSTALLER_PATH_INFO
     XJ_IH_U32 physical_path_bytes;
     XJ_IH_U64 media_start;
     XJ_IH_U64 media_blocks;
+    // Derived from the captured path, outside the fixed handoff ABI. Ports
+    // use UEFI's zero-based numbering, in root-to-device order.
+    XJ_IH_U8            usb_depth;
+    XJ_IH_U8            usb_ports[XJ_INSTALLER_USB_DEPTH_MAX];
+    XJ_IH_U8            usb_interfaces[XJ_INSTALLER_USB_DEPTH_MAX];
+    XJ_IH_U8            usb_lun_present;
 } XJ_INSTALLER_PATH_INFO;
 
 static inline XJ_IH_U32 xj_installer_parse_device_path(const XJ_IH_U8 *path, __SIZE_TYPE__ limit,
@@ -186,38 +194,62 @@ static inline XJ_IH_U32 xj_installer_parse_device_path(const XJ_IH_U8 *path, __S
         }
         else if (n[0] == 3)
         {
-            if (!s->pci_count || s->transport || s->volume_kind) return XJ_INSTALLER_SOURCE_MALFORMED;
-            s->controller_path_bytes = (XJ_IH_U32)offset;
-            if (n[1] == 0x12 && bytes == 10)
+            if (!s->pci_count || s->volume_kind) return XJ_INSTALLER_SOURCE_MALFORMED;
+            if (n[1] == 5)
             {
-                s->transport = XJ_INSTALLER_SOURCE_AHCI;
-                s->sata_port = xj_installer_le16(n + 4);
-                s->sata_multiplier = xj_installer_le16(n + 6);
-                s->lun = xj_installer_le16(n + 8);
-                // Some firmware uses the historical direct-port value zero.
-                // Preserve it verbatim: the kernel must independently prove
-                // that this controller cannot address a port multiplier.
-                if (s->sata_port >= 32 || (s->sata_multiplier != 0xffff && s->sata_multiplier != 0) || s->lun)
-                    return XJ_INSTALLER_SOURCE_UNSUPPORTED;
-            }
-            else if (n[1] == 0x17 && bytes == 16)
-            {
-                s->transport = XJ_INSTALLER_SOURCE_NVME;
-                s->nvme_namespace = xj_installer_le32(n + 4);
-                if (!s->nvme_namespace || s->nvme_namespace == 0xffffffffU)
+                if (bytes != 6 || (s->transport && s->transport != XJ_INSTALLER_SOURCE_USB) || info->usb_lun_present ||
+                    n[4] == 255)
                     return XJ_INSTALLER_SOURCE_MALFORMED;
-                for (unsigned i = 0; i < 8; ++i) s->nvme_eui64[i] = n[8 + i];
+                if (info->usb_depth == XJ_INSTALLER_USB_DEPTH_MAX) return XJ_INSTALLER_SOURCE_UNSUPPORTED;
+                if (!s->transport) s->controller_path_bytes = (XJ_IH_U32)offset;
+                s->transport            = XJ_INSTALLER_SOURCE_USB;
+                unsigned i              = info->usb_depth++;
+                info->usb_ports[i]      = n[4];
+                info->usb_interfaces[i] = n[5];
             }
-            else if (n[1] == 1 && bytes == 8)
+            else if (n[1] == 0x11 && bytes == 5 && s->transport == XJ_INSTALLER_SOURCE_USB)
             {
-                s->transport = XJ_INSTALLER_SOURCE_IDE;
-                s->ide_channel = n[4];
-                s->ide_unit = n[5];
-                s->lun = xj_installer_le16(n + 6);
-                if (s->ide_channel > 1 || s->ide_unit > 1 || s->lun)
+                if (info->usb_lun_present) return XJ_INSTALLER_SOURCE_MALFORMED;
+                info->usb_lun_present = 1;
+                s->lun                = n[4];
+                // The native BOT driver currently exposes only logical unit 0.
+                if (s->lun) return XJ_INSTALLER_SOURCE_UNSUPPORTED;
+            }
+            else
+            {
+                if (s->transport) return XJ_INSTALLER_SOURCE_MALFORMED;
+                s->controller_path_bytes = (XJ_IH_U32)offset;
+                if (n[1] == 0x12 && bytes == 10)
+                {
+                    s->transport       = XJ_INSTALLER_SOURCE_AHCI;
+                    s->sata_port       = xj_installer_le16(n + 4);
+                    s->sata_multiplier = xj_installer_le16(n + 6);
+                    s->lun             = xj_installer_le16(n + 8);
+                    // Some firmware uses the historical direct-port value zero.
+                    // Preserve it verbatim: the kernel must independently prove
+                    // that this controller cannot address a port multiplier.
+                    if (s->sata_port >= 32 || (s->sata_multiplier != 0xffff && s->sata_multiplier != 0) || s->lun)
+                        return XJ_INSTALLER_SOURCE_UNSUPPORTED;
+                }
+                else if (n[1] == 0x17 && bytes == 16)
+                {
+                    s->transport      = XJ_INSTALLER_SOURCE_NVME;
+                    s->nvme_namespace = xj_installer_le32(n + 4);
+                    if (!s->nvme_namespace || s->nvme_namespace == 0xffffffffU) return XJ_INSTALLER_SOURCE_MALFORMED;
+                    for (unsigned i = 0; i < 8; ++i)
+                        s->nvme_eui64[i] = n[8 + i];
+                }
+                else if (n[1] == 1 && bytes == 8)
+                {
+                    s->transport   = XJ_INSTALLER_SOURCE_IDE;
+                    s->ide_channel = n[4];
+                    s->ide_unit    = n[5];
+                    s->lun         = xj_installer_le16(n + 6);
+                    if (s->ide_channel > 1 || s->ide_unit > 1 || s->lun) return XJ_INSTALLER_SOURCE_UNSUPPORTED;
+                }
+                else
                     return XJ_INSTALLER_SOURCE_UNSUPPORTED;
             }
-            else return XJ_INSTALLER_SOURCE_UNSUPPORTED;
             info->physical_path_bytes = (XJ_IH_U32)(offset + bytes);
         }
         else if (n[0] == 4)

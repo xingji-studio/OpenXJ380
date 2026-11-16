@@ -881,7 +881,8 @@ static void boot_installer_capture_source(XJ_INSTALLER_SOURCE *output)
             (i + 1 == source.pci_count &&
              ((source.transport == XJ_INSTALLER_SOURCE_AHCI && class_code != 0x010601) ||
               (source.transport == XJ_INSTALLER_SOURCE_NVME && (class_code >> 8) != 0x0108) ||
-              (source.transport == XJ_INSTALLER_SOURCE_IDE && (class_code >> 8) != 0x0101))))
+              (source.transport == XJ_INSTALLER_SOURCE_IDE && (class_code >> 8) != 0x0101) ||
+              (source.transport == XJ_INSTALLER_SOURCE_USB && class_code != 0x0c0330))))
         { reason = XJ_INSTALLER_SOURCE_UNSUPPORTED; goto failure; }
     }
     EFI_HANDLE physical_handle = NULL, volume_handle = NULL;

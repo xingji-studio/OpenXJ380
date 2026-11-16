@@ -280,8 +280,11 @@ device_t *get_device(size_t id) {
 }
 size_t rw_device(int drive, size_t lba, uint8_t *buffer, size_t number, int read) {
     int indx = drive;
-    if (indx >= 256){ return 0;}
+    if (indx < 0 || indx >= 256) { return 0; }
     if (device_ctl[indx].flag == 0){return 0;}
+    // Read-only USB sources deliberately publish no write callback. Check
+    // before allocating a bounce buffer or forwarding a partition write.
+    if (read ? !device_ctl[indx].read : !device_ctl[indx].write) return 0;
 
     size_t   sector_size = device_ctl[indx].sector_size;
     if (sector_size == 0 || (number != 0 && sector_size > (size_t)-1 / number)) {

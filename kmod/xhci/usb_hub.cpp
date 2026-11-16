@@ -62,6 +62,7 @@ static int usb_hub_probe(usb_device *usbdev, const usb_interface_info *iface) {
     hub->usbdev = usbdev;
     hub->ops = &g_external_hub_ops;
     hub->port_count = usbdev->slot->hub_port_count;
+    hub->interface_number = iface->number;
 
     usbdev->child_hub = hub;
     usb_register_hub(hub);
