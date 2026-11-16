@@ -352,6 +352,13 @@ must remain allocation-free and must not acquire the signal disposition lock:
 it is called inside this publication scope. Linux signal handler pointers are
 published atomically, while complete disposition snapshots use the PCB lock.
 
+`scheduler_wake_task()` must acquire the target queue lock even if an initial
+status observation would find RUNNING/START. The waiter can already own that
+lock after checking an unset event but before publishing WAIT. Returning before
+the lock in that window loses the notification. Recheck WAIT only under the
+queue lock; preserve the terminal-state CAS rules. The sleep/wake regression
+pauses exactly in this window and also rejects the old early-return policy.
+
 Clear abandoned futex records before publishing child-TID zero, after all CPU
 references disappear. TID zero permits libc to unmap/reuse the old TLS/stack;
 an older waiter must not consume a wake intended for a new use of that address.
@@ -362,6 +369,14 @@ the saved GPR frame in `handler.S`. Changing exception/syscall frame allocation
 or enabling additional XCR0 components requires updating that contract and its
 tests. The Linux frame contains only user addresses, sanitized FPU state and
 user-modifiable flags; native XAPI retains its existing signal-frame format.
+
+Returning from a signal can restore arbitrary RCX/R11 independently of RIP
+and RFLAGS. SYSRET consumes those two registers; use the full IRET restore
+when their saved values differ, or when RF/TF requires it. The shared return
+path validates user selectors and sanitizes privileged flags before IRET.
+Keep the frame offsets and normal syscall fast path intact. The first-party
+Linux signal-roundtrip probe checks live GPRs, arithmetic flags and XMM state
+through an actual fault/handler/rt_sigreturn sequence in the guest.
 
 ## Sheet composition and GUI state
 

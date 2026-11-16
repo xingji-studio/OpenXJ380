@@ -1606,13 +1606,17 @@ sys_(uname, struct utsname *utsname)
     if (unlikely(utsname == NULL)) return SYSCALL_FAULT_(EINVAL);
     struct utsname kname;
     memset(&kname, 0, sizeof(kname));
-    char sysname[] = KN_NAME;
+    tcb_t task = get_current_task();
+    bool linux_abi = task && task->parent_group && task->parent_group->linux_abi;
+    const char *sysname = linux_abi ? "Linux" : KN_NAME;
     char machine[] = "x86_64";
-    char release[] = "2.1.0";   // 太棒了 glibc 你终于觉醒了
+    // Static glibc checks the numeric Linux release before entering main.
+    // This is a compatibility identity, separate from the native OS version.
+    const char *release = linux_abi ? "3.2.0-xj380" : "2.1.0";
     char version[] = OS_VERSION;
-    memcpy(kname.sysname, sysname, sizeof(sysname));
+    strncpy(kname.sysname, sysname, sizeof(kname.sysname) - 1);
     memcpy(kname.nodename, "localhost", 10);
-    memcpy(kname.release, release, sizeof(release));
+    strncpy(kname.release, release, sizeof(kname.release) - 1);
     memcpy(kname.version, version, sizeof(version));
     memcpy(kname.machine, machine, sizeof(machine));
     if (!copy_to_user_pagedir(current_user_pagedir(), utsname, &kname, sizeof(kname))) return SYSCALL_FAULT_(EFAULT);
@@ -3301,6 +3305,19 @@ sys_(shutdown, int fd, int how)
 }
 
 
+static bool linux_mkdir_path_exists(const char *path)
+{
+    tcb_t task = get_current_task();
+    if (!task || !task->parent_group || !task->parent_group->linux_abi) return false;
+    // Linux mkdir reports an existing entry without requiring write access to
+    // that entry. In particular, mkdir -p must traverse an existing root/home.
+    // Keep the recursive native VFS mkdir API and its write checks unchanged.
+    vfs_node_t existing = vfs_open_no_follow(path);
+    if (!existing) return false;
+    vfs_close(existing);
+    return true;
+}
+
 sys_(mkdir, char *name, uint64_t mode)
 {
     if (name == NULL) return SYSCALL_FAULT_(EINVAL);
@@ -3311,6 +3328,11 @@ sys_(mkdir, char *name, uint64_t mode)
     char  *npath = vfs_cwd_path_build(user_path);
     free(user_path);
     if (npath == NULL) return SYSCALL_FAULT_(ENOMEM);
+    if (linux_mkdir_path_exists(npath))
+    {
+        free(npath);
+        return SYSCALL_FAULT_(EEXIST);
+    }
     pcb_t process = get_current_task()->parent_group;
     uint16_t create_mode = (uint16_t)(mode & 07777 & ~(process ? process->umask : 0));
     size_t ret = vfs_mkdir_mode(npath, create_mode, current_uid(), current_gid()) != 0 ?
@@ -4076,6 +4098,12 @@ sys_(mkdirat, int dirfd, char *pathname, uint64_t mode)
     char *resolved = NULL;
     int path_ret = resolve_user_path_at(dirfd, pathname, &resolved);
     if (path_ret < 0) return SYSCALL_FAULT_((int)-path_ret);
+
+    if (linux_mkdir_path_exists(resolved))
+    {
+        free(resolved);
+        return SYSCALL_FAULT_(EEXIST);
+    }
 
     errno_t ret = vfs_mkdir(resolved);
     free(resolved);

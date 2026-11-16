@@ -377,6 +377,15 @@ ENTRY(ret_from_syscall)
     cli
     movq RIP(%rsp), %rcx
     movq RFLAGS(%rsp), %r11
+    // Signal return can restore RCX/R11 values unrelated to RIP/RFLAGS.
+    // SYSRET would overwrite those live registers in resumed JIT code.
+    cmpq RCX(%rsp), %rcx
+    jne .Lsyscall_full_return
+    cmpq R11(%rsp), %r11
+    jne .Lsyscall_full_return
+    testq $0x10100, %r11           // RF/TF also require the full return path.
+    jne .Lsyscall_full_return
+.Lsyscall_fast_return:
     // Signal delivery and sigreturn may replace the saved user stack.
     movq OLD_RSP(%rsp), %rax
     movq %rax, %gs:CPU_SYSCALL_USER_RSP
@@ -403,3 +412,15 @@ ENTRY(ret_from_syscall)
     movq %gs:CPU_SYSCALL_USER_RSP, %rsp
     swapgs
     sysretq
+
+.Lsyscall_full_return:
+    // Match SELECTOR_USER_CS/DS from pctable/gdt.h. Legacy native signal
+    // frames must never introduce privileged selectors through this path.
+    cmpq $0x23, CS(%rsp)
+    jne .Lsyscall_fast_return
+    cmpq $0x1b, OLDSS(%rsp)
+    jne .Lsyscall_fast_return
+    andq $0x250dd5, RFLAGS(%rsp)
+    orq $0x202, RFLAGS(%rsp)
+    swapgs
+    jmp Restore_all
