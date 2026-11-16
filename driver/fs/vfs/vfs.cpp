@@ -1781,19 +1781,28 @@ void vfs_deinit() {
     // 目前并不支持
 }
 
+static fd_file_handle *fd_link_duplicate(fd_file_handle *source, fd_file_handle *copy)
+{
+    int error = fd_share_description(source, copy);
+    if (!error) return copy;
+    fd_retire_handle(copy);
+    permissions_set_file_error(-error);
+    return NULL;
+}
+
 fd_file_handle *fd_dup(fd_file_handle *src) {
     fd_file_handle *nw = (fd_file_handle *)malloc(sizeof(fd_file_handle));
     // not_null_assets(new, "fd_dup out of memory.");
     if (!nw) { permissions_set_file_error(ENOMEM); return NULL; }
     nw->node       = src->node;
-    nw->offset     = src->offset;
-    nw->flags      = src->flags;
+    nw->offset     = 0;
+    nw->flags      = __atomic_load_n(&src->flags, __ATOMIC_ACQUIRE);
     nw->fd         = src->fd;
     vfs_node_t node = nw->node;
     if ((node->type & (file_ptmx | file_pts)) && fs_callbacks[node->fsid]->dup != (void *)empty_func) {
         fs_callbacks[node->fsid]->dup(node);
         node->refcount++;
-        return nw;
+        return fd_link_duplicate(src, nw);
     }
     if ((node->type & file_pipe) && node->handle != NULL) {
         pipe_specific_t *spec = (pipe_specific_t *)node->handle;
@@ -1824,7 +1833,7 @@ fd_file_handle *fd_dup(fd_file_handle *src) {
         vfs_child_unlock();
     }
     else node->refcount++;
-    return nw;
+    return fd_link_duplicate(src, nw);
 }
 
 vfs_node_t get_rootdir() {

@@ -32,6 +32,7 @@
 #include <procfs.h>
 #include <syscall/syscall.h>
 #include <syscall/fd_lifetime.h>
+#include <syscall/file_io_scope.h>
 #include <block_access.h>
 #include <installer/jobs.h>
 #include <task/ipc.h>
@@ -2314,13 +2315,6 @@ uint64_t process_execve(char *path, char **argv, char **envp)
     return (uint64_t)-(EAGAIN);
 }
 
-static void *file_copy(void *ptr)
-{
-    if (ptr == NULL) return NULL;
-    fd_file_handle *src = (fd_file_handle *)ptr;
-    return fd_dup(src);
-}
-
 static void close_exec_file_descriptors(pcb_t process)
 {
     while (fd_file_handle *handle = fd_detach_matching(process, 0, size_t(-1), true)) fd_retire_handle(handle);
@@ -2364,6 +2358,32 @@ static bool fd_table_unref(pcb_t pcb)
     pcb->file_open_shared_refs = NULL;
     return false;
 }
+
+class ForkFileTable
+{
+    lock_queue *table_ = NULL;
+    size_t *references_ = NULL;
+
+public:
+    ~ForkFileTable()
+    {
+        // Every caller restores runtime state before returning. Failed drafts
+        // may close files and must not inherit syscall-entry IRQ masking.
+        FileIoSyscallScope io(SYS_CLOSE);
+        fd_discard_file_table(table_);
+        free(references_);
+    }
+    int prepare(pcb_t source)
+    {
+        FileIoSyscallScope io(SYS_CLOSE);
+        int error = fd_clone_file_table(source, &table_);
+        if (error) return error;
+        references_ = alloc_fd_table_ref();
+        return references_ ? 0 : -ENOMEM;
+    }
+    lock_queue *take_table() { lock_queue *table = table_; table_ = NULL; return table; }
+    size_t *take_references() { size_t *references = references_; references_ = NULL; return references; }
+};
 
 static void close_process_file_table(pcb_t pcb)
 {
@@ -2493,8 +2513,7 @@ uint64_t process_fork(struct X64_REGS *reg, bool is_vfork, uint64_t user_stack, 
 
     bool is_sti                = are_interrupts_enabled();
     uint64_t scheduler_depth = scheduler_disable_depth();
-    close_interrupt;
-    disable_scheduler();
+    if (scheduler_depth != 0) return (uint64_t)-EDEADLK;
 
     tcb_t parent_task = get_current_task();
     if (parent_task == NULL || parent_task->parent_group == NULL)
@@ -2520,6 +2539,16 @@ uint64_t process_fork(struct X64_REGS *reg, bool is_vfork, uint64_t user_stack, 
         return (uint64_t)-EFAULT;
     }
 
+    // Snapshot and pin the whole descriptor table before the existing fork
+    // publication gate. No allocations or VFS duplication under its locks.
+    ForkFileTable files;
+    if (!(clone_flags & CLONE_FILES_FLAG))
+    {
+        int error = files.prepare(current_pcb);
+        if (error) return (uint64_t)error;
+    }
+    close_interrupt;
+    disable_scheduler();
     spin_lock(&create_thread_lock);
 
     pcb_t new_pcb = (pcb_t)malloc(sizeof(struct process_control_block));
@@ -2588,8 +2617,8 @@ uint64_t process_fork(struct X64_REGS *reg, bool is_vfork, uint64_t user_stack, 
     }
     else
     {
-        new_pcb->file_open = queue_copy(current_pcb->file_open, file_copy);
-        new_pcb->file_open_shared_refs = alloc_fd_table_ref();
+        new_pcb->file_open = files.take_table();
+        new_pcb->file_open_shared_refs = files.take_references();
     }
     new_pcb->ipc_queue    = queue_init();
     new_pcb->tty          = alloc_default_tty();

@@ -223,6 +223,38 @@ from task context in the reaper, outside spin locks and scheduler-disabled
 sections. PCB collection and waitpid claims must retain their private lifetime
 pins while any cleanup or user-memory copy is in progress.
 
+Kernel-private bindings associate duplicated/forked descriptors with one open
+file description. Independent opens have separate descriptions, even when they
+reference the same VFS node. Keep the public 32-byte `fd_file_handle` prefix
+unchanged. Its offset is a cache valid inside `FdPositionScope`; every syscall
+that consumes or changes an implicit position must acquire that scope after
+pinning the descriptor. Positioned IO does not publish a new cursor. File status
+flags belong to the description; descriptor numbers and CLOEXEC remain local.
+
+Position ownership is recorded in heap operation tickets, never stack pointers.
+The registry spin lock protects bindings, references, cursor ownership and short
+cache publication only. VFS, user copies, allocation, free and yielding happen
+after unlocking. Two-file operations acquire both descriptions in one metadata
+transaction, so opposite-direction copies cannot deadlock while holding one.
+Aliases of one description are acquired once with explicit per-handle cursor
+commit rules. The final binding/lease releases description storage outside locks.
+
+A quiescent abandoned position owner may have stopped inside a write. Its ticket
+cleanup releases ownership and poisons that description with EIO rather than
+guessing a cursor and silently overwriting data. Never dereference another
+ticket's FD during abandoned pair cleanup: its handle may already be retired;
+the pair's description references must outlive that handle. Normal IO commits
+before dropping the operation pins and does not poison descriptions.
+
+Fork prepares its FD table outside the existing publication gate with IRQs and
+preemption available. Preallocate snapshot tickets/nodes, pin the entire table
+under registry-then-table locks, then duplicate VFS references after unlocking.
+Preserve the captured descriptor numbers/CLOEXEC, including close/reuse races;
+never look those numbers up again while constructing the child. All allocation
+failures unwind the complete private table before returning. Publishing the
+prepared table/reference counter performs no FD allocation or VFS operation.
+This boundary does not make all other legacy fork/image preparation resumable.
+
 Known limit: forced termination of a waiter after it claims exclusive PCB
 collection can retain that partially collected child until reboot. Collection
 is not a resumable transaction, so another task must not blindly take over its
