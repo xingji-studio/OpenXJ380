@@ -254,3 +254,42 @@ void block_source_disconnect(uint32_t device, uint64_t generation)
         if (source_revision != uint64_t(-1)) ++source_revision;
     }
 }
+
+bool block_source_usb_diagnostics(const XJ_INSTALLER_SOURCE &source, BlockSourceUsbDiagnostics *output)
+{
+    if (!output) return false;
+    *output = {};
+    if (source.transport != XJ_INSTALLER_SOURCE_USB || !xj_installer_source_valid(&source)) return false;
+    XJ_INSTALLER_PATH_INFO parsed;
+    if (xj_installer_parse_device_path(source.path, source.path_bytes, &parsed) != XJ_INSTALLER_SOURCE_SUPPORTED)
+        return false;
+    output->expected_depth     = parsed.usb_depth;
+    output->expected_port      = parsed.usb_ports[0];
+    output->expected_interface = parsed.usb_interfaces[parsed.usb_depth - 1];
+    const auto &leaf = source.pci[source.pci_count - 1];
+    for (unsigned device = 0; device < kSourceDevices; ++device)
+    {
+        SourceRegistration entry;
+        {
+            SourceLock lock;
+            entry = source_devices[device];
+        }
+        // No PCI/VFS/driver callbacks, logging or allocation under the lock.
+        const auto &hardware = entry.hardware;
+        if (!entry.valid || hardware.transport != XJ_INSTALLER_SOURCE_USB) continue;
+        ++output->registrations;
+        if (entry.disconnected) ++output->disconnected;
+        const auto *controller = hardware.controller;
+        if (controller->segment != leaf.segment || controller->bus != leaf.bus || controller->slot != leaf.device ||
+            controller->func != leaf.function)
+            continue;
+        if (!output->controller_matches++)
+        {
+            output->observed_depth     = hardware.usb_depth;
+            output->observed_port      = hardware.usb_ports[0];
+            output->observed_interface = hardware.usb_interfaces[hardware.usb_depth - 1];
+        }
+        if (same_hardware(hardware, source)) ++output->topology_matches;
+    }
+    return true;
+}

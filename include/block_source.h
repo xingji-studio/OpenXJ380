@@ -48,3 +48,13 @@ int  block_source_require_usb_guard(const XJ_INSTALLER_SOURCE &, const BlockExte
 // Disconnect tombstones preserve identity until reboot, preventing a new USB
 // incarnation at the same port from replacing a retained installation source.
 void block_source_disconnect(uint32_t device, uint64_t generation);
+
+// Best-effort boot diagnostics only; this snapshot never authorizes source I/O.
+// Port numbers remain zero-based, matching the captured UEFI device path.
+struct BlockSourceUsbDiagnostics
+{
+    uint32_t registrations, controller_matches, topology_matches, disconnected;
+    uint8_t expected_port, expected_interface, expected_depth;
+    uint8_t observed_port, observed_interface, observed_depth;
+};
+bool block_source_usb_diagnostics(const XJ_INSTALLER_SOURCE &, BlockSourceUsbDiagnostics *);

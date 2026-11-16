@@ -2763,14 +2763,18 @@ static void xhci_bios_handoff(xhci_controller *xhci) {
         uint32_t next = (header >> 8) & 0xFFU;
 
         if (cap_id == XHCI_LEGACY_CAP_ID) {
-            volatile uint32_t *legacy_sup = (volatile uint32_t *)(addr + 4);
-            volatile uint32_t *legacy_ctl = (volatile uint32_t *)(addr + 8);
+            // xHCI 7.1: USBLEGSUP is the capability header itself. Its
+            // control/status register follows at +4, not +8. Claim only the
+            // OS semaphore byte so a concurrent BIOS release is not rewritten.
+            volatile uint32_t *legacy_sup = (volatile uint32_t *)addr;
+            volatile uint32_t *legacy_ctl = (volatile uint32_t *)(addr + 4);
             uint32_t value = xhci_read32(legacy_sup);
+            volatile uint8_t *os_owned = (volatile uint8_t *)(addr + 3);
+            *os_owned |= 1U;
+            __sync_synchronize();
 
             if (value & (1U << 16)) {
                 pr_info("xhci: BIOS owns controller, requesting handoff\n");
-                xhci_write32(legacy_sup, value | (1U << 24));
-
                 for (uint32_t waited = 0; waited < 1000; ++waited) {
                     value = xhci_read32(legacy_sup);
                     if ((value & (1U << 16)) == 0) {

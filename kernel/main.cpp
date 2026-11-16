@@ -3,6 +3,7 @@
 #include "build_config.h"
 #include "boot_debug_color.h"
 #include <ahci/ahci.h>
+#include <block_source.h>
 #include <cpu/regio.h>
 #include <cpu/idle.h>
 #include <device.h>
@@ -53,6 +54,7 @@
 #include <errno.h>
 
 const FrameBufferConfig *fbc_addr;
+static int g_boot_xhci_status = -EOPNOTSUPP;
 
 extern volatile int  scheduler_is_ready;
 extern XSK_SMP_INFO *xsi;
@@ -523,6 +525,16 @@ static void installer_boot_require(int result, const char *phase)
 {
     if (result >= 0) return;
     write_serial_fmt("installer: %s failed=%d; no system-root fallback\n", phase, result);
+    BlockSourceUsbDiagnostics usb = {};
+    bool have_usb = EFI_BC && (EFI_BC->boot_flags & BOOT_FLAG_INSTALLER_HANDOFF) &&
+                    block_source_usb_diagnostics(EFI_BC->installer_handoff.source, &usb);
+    if (have_usb)
+        write_serial_fmt_heapless("installer: USB source xhci=%d registered=%u pci_match=%u path_match=%u "
+                                  "disconnected=%u expected=%u/%u/%u observed=%u/%u/%u\n",
+                                  g_boot_xhci_status, usb.registrations, usb.controller_matches, usb.topology_matches,
+                                  usb.disconnected, unsigned(usb.expected_port), unsigned(usb.expected_interface),
+                                  unsigned(usb.expected_depth), unsigned(usb.observed_port),
+                                  unsigned(usb.observed_interface), unsigned(usb.observed_depth));
     for (;;) __asm__ volatile("cli; hlt" ::: "memory");
 }
 
@@ -656,7 +668,8 @@ extern "C" void KernelMain(const FrameBufferConfig &fbc, EFI_SYSTEM_TABLE &Syste
 #if CONFIG_KERNEL_BUILTIN_XHCI && !OPENXJ380_INPUT_OUTPUT_DISABLED
     write_serial_string("BOOT: xhci_setup begin\n");
     boot_debug::begin(fbc, BootStep::Xhci);
-    xhci_setup();
+    g_boot_xhci_status = xhci_setup();
+    write_serial_fmt("BOOT: xhci_setup result=%d\n", g_boot_xhci_status);
     boot_debug::returned(fbc, BootStep::Xhci);
     write_serial_string("BOOT: xhci_setup done\n");
 #else
@@ -741,23 +754,27 @@ extern "C" void KernelMain(const FrameBufferConfig &fbc, EFI_SYSTEM_TABLE &Syste
     boot_debug::skip(fbc, BootStep::XhciWorkers);
 #endif
 
+    const char *installer_failure_phase = "boot memory proof";
     bool installer_mode = false;
     if ((BootConfig.boot_flags & BOOT_FLAG_INSTALLER) != 0)
     {
         if (installer_boot_status == 0)
         {
+            installer_failure_phase = "package validation";
             boot_debug::begin(fbc, BootStep::InstallerPackages);
             installer_boot_status = installer::session_packages_prepare();
             boot_debug::returned(fbc, BootStep::InstallerPackages);
             write_serial_fmt("installer: complete package validation result=%d\n", installer_boot_status);
             if (installer_boot_status == 0)
             {
+                installer_failure_phase = "installation source";
                 boot_debug::begin(fbc, BootStep::InstallerSource);
                 installer_boot_status = installer::session_source_prepare();
                 boot_debug::returned(fbc, BootStep::InstallerSource);
                 write_serial_fmt("installer: retained source lifetime result=%d\n", installer_boot_status);
                 if (installer_boot_status == 0)
                 {
+                    installer_failure_phase = "private root creation";
                     boot_debug::begin(fbc, BootStep::InstallerRootPrepare);
                     installer_boot_status = installer::root_prepare_private();
                     boot_debug::returned(fbc, BootStep::InstallerRootPrepare);
@@ -768,6 +785,7 @@ extern "C" void KernelMain(const FrameBufferConfig &fbc, EFI_SYSTEM_TABLE &Syste
                                      unsigned(root_stage.published));
                     if (installer_boot_status == 0)
                     {
+                        installer_failure_phase = "root publication";
                         boot_debug::begin(fbc, BootStep::InstallerRootPublish);
                         installer_boot_status = installer::root_publish_private();
                         boot_debug::returned(fbc, BootStep::InstallerRootPublish);
@@ -787,7 +805,7 @@ extern "C" void KernelMain(const FrameBufferConfig &fbc, EFI_SYSTEM_TABLE &Syste
         else
             boot_debug::skip(fbc, BootStep::InstallerPackages, BootStep::InstallerRootPublish);
         boot_debug::begin(fbc, BootStep::InstallerRootCheck);
-        installer_boot_require(installer_boot_status, "root preparation");
+        installer_boot_require(installer_boot_status, installer_failure_phase);
         boot_debug::returned(fbc, BootStep::InstallerRootCheck);
         installer_mode = true;
     }
