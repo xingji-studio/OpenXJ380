@@ -22,6 +22,7 @@
 #include <tty.h>
 #include <task/ipc.h>
 #include <task/futex.h>
+#include <task/eventfd.h>
 #include <smp/smp.h>
 #include <mutex.h>
 #include <math.hpp>
@@ -330,6 +331,7 @@ static int resolve_user_path_at(int dirfd, char *pathname, char **resolved)
 static int64_t write_from_user_buffer(fd_file_handle *handle, const uint8_t *buffer, size_t size, bool socket_mode)
 {
     if (handle == NULL || buffer == NULL) return -EINVAL;
+    if (eventfd_is_node(handle->node)) return eventfd_write_user(handle, buffer, size);
     if (size == 0) return 0;
 
     pcb_t process = get_current_task()->parent_group;
@@ -879,6 +881,7 @@ sys_(write, int fd, uint8_t *buffer, size_t size)
 
 static uint64_t read_from_handle(fd_file_handle *handle, uint8_t *buffer, size_t size)
 {
+    if (eventfd_is_node(handle->node)) return eventfd_read_user(handle, buffer, size);
     if (handle->node->type & file_socket)
     {
         int64_t ret = read_to_user_buffer(handle, buffer, size, true, 0, false);
@@ -1515,6 +1518,56 @@ sys_(accept, int fd, struct sockaddr *addr, socklen_t *addrlen)
     return ret;
 }
 
+sys_(accept4, int fd, struct sockaddr *addr, socklen_t *addrlen, int flags)
+{
+    if (flags & ~(SOCK_NONBLOCK | SOCK_CLOEXEC)) return SYSCALL_FAULT_(EINVAL);
+    socklen_t length = sizeof(struct sockaddr_in6);
+    if (addr && !addrlen) return SYSCALL_FAULT_(EFAULT);
+    if (addrlen && !copy_from_user_pagedir(current_user_pagedir(), &length, addrlen, sizeof(length)))
+        return SYSCALL_FAULT_(EFAULT);
+    if (length > sizeof(struct sockaddr_in6)) length = sizeof(struct sockaddr_in6);
+    size_t capacity = length;
+    struct sockaddr_in6 address = {};
+    int result = socket_accept4(fd, addr ? (struct sockaddr *)&address : NULL, addr ? &length : NULL, flags);
+    if (result < 0) return SYSCALL_FAULT_(-result);
+    if (addr)
+    {
+        FdOperation accepted;
+        int error = accepted.acquire(result);
+        if (error) return SYSCALL_FAULT_(-error);
+        if (!copy_to_user_pagedir(current_user_pagedir(), addr, &address, MIN(capacity, MIN(length, sizeof(address)))) ||
+            !copy_to_user_pagedir(current_user_pagedir(), addrlen, &length, sizeof(length)))
+        {
+            fd_file_handle *retired = fd_detach_descriptor_if(get_current_task()->parent_group, result, accepted.get());
+            if (retired) fd_retire_handle(retired);
+            return SYSCALL_FAULT_(EFAULT);
+        }
+    }
+    return result;
+}
+
+static bool scheduler_query_is_current(int pid)
+{
+    tcb_t task = get_current_task();
+    return task && (pid == 0 || pid == (int)task->tid || pid == (int)task->parent_group->pid);
+}
+
+sys_(sched_getparam, int pid, int *priority)
+{
+    if (pid < 0) return SYSCALL_FAULT_(EINVAL);
+    if (!scheduler_query_is_current(pid)) return SYSCALL_FAULT_(ESRCH);
+    int normal_priority = 0;
+    if (!copy_to_user_pagedir(current_user_pagedir(), priority, &normal_priority, sizeof(normal_priority)))
+        return SYSCALL_FAULT_(EFAULT);
+    return 0;
+}
+
+sys_(sched_getscheduler, int pid)
+{
+    if (pid < 0) return SYSCALL_FAULT_(EINVAL);
+    return scheduler_query_is_current(pid) ? 0 : SYSCALL_FAULT_(ESRCH); // SCHED_OTHER.
+}
+
 
 sys_(stat, char *fn, struct stat *buf)
 {
@@ -1902,12 +1955,20 @@ static uint64_t find_user_mmap_range(pcb_t process, uint64_t hint, uint64_t leng
 {
     if (process == NULL || length == 0) return 0;
 
-    uint64_t start_addr = hint >= USER_MMAP_START ? (hint & PAGE_MASK) : USER_MMAP_START;
+    uint64_t start_addr = hint >= PAGE_SIZE ? (hint & PAGE_MASK) : USER_MMAP_START;
     if (start_addr >= USER_BRK_START || length > USER_BRK_START - start_addr) return 0;
 
     uint64_t limit = USER_BRK_START - length;
     while (start_addr <= limit)
     {
+        // ELF segments are also VMAs. Skip an occupied interval as a whole;
+        // V8 asks for a large code reservation near its executable image.
+        vma_t *overlap = vma_find_intersection(&process->vma_manager, start_addr, start_addr + length);
+        if (overlap)
+        {
+            if (!align_up_u64(overlap->vm_end, PAGE_SIZE, &start_addr)) return 0;
+            continue;
+        }
         if (user_range_available(process, start_addr, length)) return start_addr;
         if (start_addr > limit - PAGE_SIZE) return 0;
         start_addr += PAGE_SIZE;
@@ -2121,12 +2182,11 @@ uint64_t sys_brk(uint64_t brk) {
 sys_(mmap, uint64_t addr, size_t length, uint64_t prot, uint64_t flags, int fd,
          uint64_t offset) {
 
+    if ((flags & MAP_FIXED) && (addr & (PAGE_SIZE - 1))) return SYSCALL_FAULT_(EINVAL);
     addr = addr & (~(PAGE_SIZE - 1));
 
     uint64_t aligned_len = 0;
     if (!align_up_u64(length, PAGE_SIZE, &aligned_len)) { return SYSCALL_FAULT_(EINVAL); }
-
-    if (check_user_overflow(addr, aligned_len)) { return -EFAULT; }
 
     if (aligned_len == 0) { return SYSCALL_FAULT_(EINVAL); }
     pcb_t process = get_current_task()->parent_group;
@@ -2142,8 +2202,10 @@ sys_(mmap, uint64_t addr, size_t length, uint64_t prot, uint64_t flags, int fd,
         if (check_user_overflow(start_addr, aligned_len)) return SYSCALL_FAULT_(EINVAL);
         end_addr = start_addr + aligned_len;
     } else if (addr) {
-        if (addr < USER_MMAP_START || addr >= USER_BRK_START || aligned_len > USER_BRK_START - addr)
-            return SYSCALL_FAULT_(ENOMEM);
+        // A non-fixed address is a placement hint, not a mandatory range.
+        // Low executable-adjacent hints are valid; unusable hints fall back.
+        if (addr >= USER_BRK_START || aligned_len > USER_BRK_START - addr ||
+            check_user_overflow(addr, aligned_len)) addr = 0;
     }
 
     FdOperation mapping_descriptor;
@@ -2164,20 +2226,12 @@ sys_(mmap, uint64_t addr, size_t length, uint64_t prot, uint64_t flags, int fd,
         if (process->mmap_start < USER_MMAP_START || process->mmap_start >= USER_BRK_START)
             process->mmap_start = USER_MMAP_START;
         uint64_t search_start = addr ? addr : process->mmap_start;
-        if (addr) {
-            start_addr = addr;
-            if (!user_range_available(process, start_addr, aligned_len)) {
-                mm_op_lock_release();
-                return SYSCALL_FAULT_(ENOMEM);
-            }
-        } else {
-            start_addr = find_user_mmap_range(process, search_start, aligned_len);
-            if (!start_addr && search_start != USER_MMAP_START)
-                start_addr = find_user_mmap_range(process, USER_MMAP_START, aligned_len);
-            if (!start_addr) {
-                mm_op_lock_release();
-                return SYSCALL_FAULT_(ENOMEM);
-            }
+        start_addr = find_user_mmap_range(process, search_start, aligned_len);
+        if (!start_addr && search_start != USER_MMAP_START)
+            start_addr = find_user_mmap_range(process, USER_MMAP_START, aligned_len);
+        if (!start_addr) {
+            mm_op_lock_release();
+            return SYSCALL_FAULT_(ENOMEM);
         }
         end_addr = start_addr + aligned_len;
     }
@@ -2239,7 +2293,9 @@ sys_(mmap, uint64_t addr, size_t length, uint64_t prot, uint64_t flags, int fd,
 
     uint64_t pt_flags = prot_to_pte_flags(prot);
 
-    if (!lazy_infoalloc(process, start_addr, aligned_len, pt_flags, flags)) {
+    // MAP_FIXED replacement was already removed above. Keep anonymous
+    // reservations lazy, including PROT_NONE code/guard reservations.
+    if (!lazy_infoalloc(process, start_addr, aligned_len, pt_flags, flags & ~MAP_FIXED)) {
         vma_unmap_range(mgr, start_addr, end_addr);
         mm_op_lock_release();
         return SYSCALL_FAULT_(ENOMEM);
@@ -2666,35 +2722,13 @@ static uint64_t poll_kernel_fds(struct pollfd *fds_user, size_t nfds, size_t tim
     return ready;
 }
 
-static epoll_file_t *epoll_from_fd(int epfd)
+static epoll_file_t *epoll_from_handle(fd_file_handle *handle)
 {
-    if (epfd < 0) return NULL;
-    pcb_t process = get_current_task()->parent_group;
-    if (process == NULL || process->file_open == NULL) return NULL;
-
-    fd_file_handle *handle = (fd_file_handle *)queue_get(process->file_open, epfd);
-    if (handle == NULL || handle->node == NULL || !(handle->node->type & file_epoll)) return NULL;
+    if (!handle || !handle->node || !(handle->node->type & file_epoll)) return NULL;
     return (epoll_file_t *)handle->node->handle;
 }
 
-static epoll_watch_t *epoll_find_watch(epoll_file_t *ep, int fd)
-{
-    if (ep == NULL || ep->watches == NULL) return NULL;
 
-    epoll_watch_t *found = NULL;
-    spin_lock(&ep->watches->lock);
-    queue_foreach(ep->watches, node)
-    {
-        epoll_watch_t *watch = (epoll_watch_t *)node->data;
-        if (watch != NULL && watch->fd == fd)
-        {
-            found = watch;
-            break;
-        }
-    }
-    spin_unlock(&ep->watches->lock);
-    return found;
-}
 
 static int epoll_poll_fd(int fd, uint32_t events, uint32_t *revents)
 {
@@ -2705,7 +2739,10 @@ static int epoll_poll_fd(int fd, uint32_t events, uint32_t *revents)
     pcb_t process = get_current_task()->parent_group;
     if (process == NULL || process->file_open == NULL) return -EBADF;
 
-    fd_file_handle *handle = (fd_file_handle *)queue_get(process->file_open, fd);
+    FdOperation descriptor;
+    int error = descriptor.acquire(fd);
+    if (error) return error;
+    fd_file_handle *handle = descriptor.get();
     if (handle == NULL || handle->node == NULL) return -EBADF;
 
     extern vfs_callback_t fs_callbacks[256];
@@ -2805,6 +2842,16 @@ sys_(epoll_create, int size)
     return epoll_create_common(0);
 }
 
+sys_(eventfd, uint32_t initial)
+{
+    return eventfd_create(initial, 0);
+}
+
+sys_(eventfd2, uint32_t initial, int flags)
+{
+    return eventfd_create(initial, flags);
+}
+
 sys_(epoll_create1, int flags)
 {
     return epoll_create_common(flags);
@@ -2812,111 +2859,136 @@ sys_(epoll_create1, int flags)
 
 sys_(epoll_ctl, int epfd, int op, int fd, struct epoll_event *event)
 {
-    epoll_file_t *ep = epoll_from_fd(epfd);
-    if (ep == NULL) return SYSCALL_FAULT_(EBADF);
+    FdOperation operation;
+    int error = operation.acquire(epfd);
+    if (error) return SYSCALL_FAULT_(-error);
+    epoll_file_t *ep = epoll_from_handle(operation.get());
+    if (!ep) return SYSCALL_FAULT_(EINVAL);
     if (fd < 0 || fd == epfd) return SYSCALL_FAULT_(EINVAL);
+    if (op != EPOLL_CTL_ADD && op != EPOLL_CTL_MOD && op != EPOLL_CTL_DEL) return SYSCALL_FAULT_(EINVAL);
+    FdOperation target;
+    error = target.acquire(fd);
+    if (error) return SYSCALL_FAULT_(-error);
+    struct epoll_event requested = {};
+    if (op != EPOLL_CTL_DEL &&
+        (!event || !copy_from_user_pagedir(current_user_pagedir(), &requested, event, sizeof(requested))))
+        return SYSCALL_FAULT_(EFAULT);
 
-    pcb_t process = get_current_task()->parent_group;
-    fd_file_handle *target = (fd_file_handle *)queue_get(process->file_open, fd);
-    if (target == NULL || target->node == NULL) return SYSCALL_FAULT_(EBADF);
-
-    struct epoll_event kev = {};
-    if (op != EPOLL_CTL_DEL)
+    auto *prepared = op == EPOLL_CTL_ADD ? (epoll_watch_t *)calloc(1, sizeof(epoll_watch_t)) : NULL;
+    auto *entry = op == EPOLL_CTL_ADD ? (lock_node *)calloc(1, sizeof(lock_node)) : NULL;
+    if (op == EPOLL_CTL_ADD && (!prepared || !entry))
     {
-        if (event == NULL) return SYSCALL_FAULT_(EFAULT);
-        if (!copy_from_user_pagedir(current_user_pagedir(), &kev, event, sizeof(kev)))
-            return SYSCALL_FAULT_(EFAULT);
+        free(prepared);
+        free(entry);
+        return SYSCALL_FAULT_(ENOMEM);
     }
-
-    epoll_watch_t *watch = epoll_find_watch(ep, fd);
-    switch (op)
+    lock_queue *queue = ep->watches;
+    lock_node *removed = NULL;
+    spin_lock(&queue->lock);
+    lock_node *found = NULL;
+    for (lock_node *node = queue->head; node; node = node->next)
     {
-    case EPOLL_CTL_ADD:
-        if (watch != NULL) return SYSCALL_FAULT_(EEXIST);
-        watch = (epoll_watch_t *)calloc(1, sizeof(epoll_watch_t));
-        if (watch == NULL) return SYSCALL_FAULT_(ENOMEM);
-        watch->fd = fd;
-        watch->event = kev;
-        if (lock_queue_enqueue(ep->watches, watch) == (size_t)-1)
-        {
-            free(watch);
-            return SYSCALL_FAULT_(ENOMEM);
-        }
-        return 0;
-    case EPOLL_CTL_MOD:
-        if (watch == NULL) return SYSCALL_FAULT_(ENOENT);
-        watch->event = kev;
-        return 0;
-    case EPOLL_CTL_DEL:
-        if (watch == NULL) return SYSCALL_FAULT_(ENOENT);
-        {
-            spin_lock(&ep->watches->lock);
-            lock_node *found_node = NULL;
-            queue_foreach(ep->watches, node)
-            {
-                epoll_watch_t *candidate = (epoll_watch_t *)node->data;
-                if (candidate != NULL && candidate->fd == fd)
-                {
-                    found_node = node;
-                    break;
-                }
-            }
-            spin_unlock(&ep->watches->lock);
-            epoll_watch_t *removed = (epoll_watch_t *)queue_remove_node(ep->watches, found_node);
-            free(removed);
-        }
-        return 0;
-    default:
-        return SYSCALL_FAULT_(EINVAL);
+        auto *watch = (epoll_watch_t *)node->data;
+        if (watch && watch->fd == fd) { found = node; break; }
     }
+    error = 0;
+    if (op == EPOLL_CTL_ADD)
+    {
+        if (found) error = EEXIST;
+        else if (queue->next_index == (size_t)-1) error = ENOMEM;
+        else
+        {
+            prepared->fd = fd;
+            prepared->event = requested;
+            entry->data = prepared;
+            entry->index = queue->next_index++;
+            entry->prev = queue->tail;
+            if (queue->tail) queue->tail->next = entry;
+            else queue->head = entry;
+            queue->tail = entry;
+            if (!queue->rr_cursor) queue->rr_cursor = entry;
+            ++queue->size;
+            entry = NULL;
+            prepared = NULL;
+        }
+    }
+    else if (!found) error = ENOENT;
+    else if (op == EPOLL_CTL_MOD) ((epoll_watch_t *)found->data)->event = requested;
+    else
+    {
+        if (found->prev) found->prev->next = found->next;
+        else queue->head = found->next;
+        if (found->next) found->next->prev = found->prev;
+        else queue->tail = found->prev;
+        if (queue->rr_cursor == found) queue->rr_cursor = found->next ? found->next : queue->head;
+        --queue->size;
+        removed = found;
+    }
+    spin_unlock(&queue->lock);
+    if (removed) { free(removed->data); free(removed); }
+    free(prepared);
+    free(entry);
+    return error ? SYSCALL_FAULT_(error) : 0;
 }
 
 sys_(epoll_wait, int epfd, struct epoll_event *events, int maxevents, int timeout)
 {
-    epoll_file_t *ep = epoll_from_fd(epfd);
-    if (ep == NULL) return SYSCALL_FAULT_(EBADF);
-    if (events == NULL || maxevents <= 0) return SYSCALL_FAULT_(EINVAL);
-
-    uint64_t start_time = nanoTime();
-    uint64_t timeout_ns = timeout < 0 ? (uint64_t)-1 : (uint64_t)timeout * 1000000ULL;
-    int ready = 0;
-
-    do
+    FdOperation operation;
+    int error = operation.acquire(epfd);
+    if (error) return SYSCALL_FAULT_(-error);
+    epoll_file_t *ep = epoll_from_handle(operation.get());
+    if (!ep) return SYSCALL_FAULT_(EINVAL);
+    if (!events) return SYSCALL_FAULT_(EFAULT);
+    if (maxevents <= 0 || maxevents > 0x7fffffff / (int)sizeof(struct epoll_event)) return SYSCALL_FAULT_(EINVAL);
+    uint64_t start = nanoTime();
+    uint64_t duration = timeout < 0 ? (uint64_t)-1 : (uint64_t)timeout * 1000000ULL;
+    while (true)
     {
-        ready = 0;
         spin_lock(&ep->watches->lock);
-        queue_foreach(ep->watches, node)
+        size_t capacity = ep->watches->size;
+        spin_unlock(&ep->watches->lock);
+        if (capacity > (size_t)-1 / sizeof(epoll_watch_t)) return SYSCALL_FAULT_(ENOMEM);
+        auto *snapshot = capacity ? (epoll_watch_t *)malloc(capacity * sizeof(epoll_watch_t)) : NULL;
+        if (capacity && !snapshot) return SYSCALL_FAULT_(ENOMEM);
+        size_t count = 0;
+        // Keep only values across unlock. VFS callbacks, FD acquisition and
+        // user copies may allocate, fault or wait and must not hold this lock.
+        spin_lock(&ep->watches->lock);
+        queue_foreach(ep->watches, entry)
         {
-            if (ready >= maxevents) break;
-            epoll_watch_t *watch = (epoll_watch_t *)node->data;
-            if (watch == NULL) continue;
-
+            if (count == capacity) break;
+            auto *watch = (epoll_watch_t *)entry->data;
+            if (watch) snapshot[count++] = *watch;
+        }
+        spin_unlock(&ep->watches->lock);
+        int ready = 0;
+        for (size_t index = 0; index < count && ready < maxevents; ++index)
+        {
             uint32_t revents = 0;
-            int poll_ret = epoll_poll_fd(watch->fd, watch->event.events, &revents);
-            if (poll_ret < 0) revents = EPOLLERR;
-            revents &= watch->event.events | EPOLLERR | EPOLLHUP | EPOLLRDHUP;
-            if (revents == 0) continue;
-
-            struct epoll_event out = watch->event;
+            epoll_watch_t &watch = snapshot[index];
+            int result = epoll_poll_fd(watch.fd, watch.event.events, &revents);
+            if (result == -EBADF) continue;
+            if (result < 0) revents = EPOLLERR;
+            revents &= watch.event.events | EPOLLERR | EPOLLHUP | EPOLLRDHUP;
+            if (!revents) continue;
+            struct epoll_event out = watch.event;
             out.events = revents;
             if (!copy_to_user_pagedir(current_user_pagedir(), &events[ready], &out, sizeof(out)))
             {
-                spin_unlock(&ep->watches->lock);
-                return SYSCALL_FAULT_(EFAULT);
+                free(snapshot);
+                return ready ? (uint64_t)ready : SYSCALL_FAULT_(EFAULT);
             }
-            ready++;
+            ++ready;
         }
-        spin_unlock(&ep->watches->lock);
-
-        if (ready > 0 || timeout == 0) break;
-
-        open_interrupt;
-        scheduler_yield();
-        __asm__ volatile("pause");
-        close_interrupt;
-    } while (timeout < 0 || (nanoTime() - start_time) < timeout_ns);
-
-    return ready;
+        free(snapshot);
+        if (ready || timeout == 0) return ready;
+        if (signals_pending_quick(get_current_task())) return SYSCALL_FAULT_(EINTR);
+        uint64_t elapsed = nanoTime() - start;
+        if (timeout >= 0 && elapsed >= duration) return 0;
+        // Existing VFS providers expose readiness polling. A bounded sleep
+        // avoids spinning a CPU while retaining their current callback ABI.
+        scheduler_sleep_ns(timeout < 0 ? 1000000ULL : MIN(1000000ULL, duration - elapsed));
+    }
 }
 
 sys_(epoll_pwait, int epfd, struct epoll_event *events, int maxevents, int timeout, sigset_t *sigmask, size_t sigsetsize)
@@ -3784,20 +3856,52 @@ sys_(newfstatat, int dirfd, char *pathname, struct stat *buf, uint64_t flags)
 
 sys_(statx, int dirfd, char *pathname, uint64_t flags, uint64_t mask, struct statx *buff)
 {
-    if (pathname == NULL || buff == NULL) return SYSCALL_FAULT_(EINVAL);
+    constexpr uint64_t no_automount = 0x800, sync_type = 0x6000;
+    if ((flags & ~(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH | no_automount | sync_type)) ||
+        (flags & sync_type) == sync_type || (mask & 0x80000000)) return SYSCALL_FAULT_(EINVAL);
+    if (buff == NULL || (pathname == NULL && !(flags & AT_EMPTY_PATH))) return SYSCALL_FAULT_(EFAULT);
 
     struct stat simple;
-    char *resolved = NULL;
-    int path_ret = resolve_user_path_at(dirfd, pathname, &resolved);
-    if (path_ret < 0) return SYSCALL_FAULT_((int)-path_ret);
+    char *path = NULL;
+    if (pathname)
+    {
+        int error = copy_string_from_user(&path, pathname, USER_PATH_MAX);
+        if (error < 0) return SYSCALL_FAULT_(-error);
+    }
+    bool empty = path == NULL || path[0] == '\0';
+    if (empty && !(flags & AT_EMPTY_PATH))
+    {
+        free(path);
+        return SYSCALL_FAULT_(ENOENT);
+    }
 
-    uint64_t ret = stat_kernel_path(resolved, &simple);
-    free(resolved);
+    uint64_t ret;
+    if (empty && dirfd != AT_FDCWD)
+    {
+        free(path);
+        FdOperation descriptor;
+        int error = descriptor.acquire(dirfd);
+        if (error) return SYSCALL_FAULT_(-error);
+        fd_file_handle *handle = descriptor.get();
+        if (!handle || !handle->node) return SYSCALL_FAULT_(EBADF);
+        // libuv implements fstat with statx(fd, "", AT_EMPTY_PATH). An open
+        // descriptor remains authoritative after unlink or rename.
+        ret = fill_stat_from_node(handle->node, &simple);
+    }
+    else
+    {
+        char *resolved = at_resolve_pathname(dirfd, path ? path : (char *)"");
+        free(path);
+        if (!resolved) return SYSCALL_FAULT_(vfs_last_error() ? vfs_last_error() : ENOENT);
+        ret = flags & AT_SYMLINK_NOFOLLOW ? lstat_kernel_path(resolved, &simple) :
+                                          stat_kernel_path(resolved, &simple);
+        free(resolved);
+    }
     if ((int64_t)ret < 0) return ret;
 
     struct statx kstatx;
     memset(&kstatx, 0, sizeof(kstatx));
-    kstatx.stx_mask            = mask;
+    kstatx.stx_mask            = 0x7ff; // STATX_BASIC_STATS; no synthetic birth time.
     kstatx.stx_blksize         = simple.st_blksize;
     kstatx.stx_attributes      = 0;
     kstatx.stx_nlink           = simple.st_nlink;
@@ -3811,9 +3915,6 @@ sys_(statx, int dirfd, char *pathname, uint64_t flags, uint64_t mask, struct sta
 
     kstatx.stx_atime.tv_sec  = (long)simple.st_atim.tv_sec;
     kstatx.stx_atime.tv_nsec = simple.st_atim.tv_nsec;
-
-    kstatx.stx_btime.tv_sec  = (long)simple.st_ctim.tv_sec;
-    kstatx.stx_btime.tv_nsec = simple.st_ctim.tv_nsec;
 
     kstatx.stx_ctime.tv_sec  = (long)simple.st_ctim.tv_sec;
     kstatx.stx_ctime.tv_nsec = simple.st_ctim.tv_nsec;

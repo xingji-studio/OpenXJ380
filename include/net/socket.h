@@ -162,6 +162,7 @@ int     socket_getpeername(int fd, struct sockaddr *addr, socklen_t *addrlen);
 int     socket_getsockopt(int fd, int level, int optname, void *optval, socklen_t *optlen);
 int     socket_listen(int fd, int backlog);
 int     socket_accept(int fd, struct sockaddr *addr, socklen_t *addrlen);
+int     socket_accept4(int fd, struct sockaddr *addr, socklen_t *addrlen, int flags);
 int     socket_shutdown(int fd, int how);
 ssize_t socket_read(vfs_node_t node, void *buffer, size_t size);
 ssize_t socket_write(vfs_node_t node, const void *buffer, size_t size);

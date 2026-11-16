@@ -93,6 +93,13 @@ static inline bool syscall_file_io_may_block(uint64_t number)
     case SYS_POLL:
     case SYS_SELECT:
     case SYS_PSELECT6:
+    case SYS_ACCEPT4:
+    case SYS_SCHED_GETPARAM:
+    case SYS_EVENTFD:
+    case SYS_EVENTFD2:
+    case SYS_EPOLL_CREATE:
+    case SYS_EPOLL_CREATE1:
+    case SYS_EPOLL_CTL:
     case SYS_EPOLL_WAIT:
     case SYS_EPOLL_PWAIT:
     case XAPI_AUTH_BEGIN:

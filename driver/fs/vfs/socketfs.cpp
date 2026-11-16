@@ -8,6 +8,7 @@
 #include <krlibc.h>
 #include <net/socket.h>
 #include <syscall/syscall.h>
+#include <syscall/fd_lifetime.h>
 #include <task/pcb.h>
 
 typedef struct socketfs_handle {
@@ -116,14 +117,14 @@ static void socketfs_open(void *parent, const char *name, vfs_node_t node)
         node->type = file_dir;
         return;
     }
-    node->type = file_socket;
+    node->type = (node->type & file_delete) | file_socket;
     node->size = (uint64_t)-1;
 }
 
 static errno_t socketfs_stat(void *file, vfs_node_t node)
 {
     (void)file;
-    node->type = file_socket;
+    node->type = (node->type & file_delete) | file_socket;
     node->size = (uint64_t)-1;
     node->fsid = socketfs_id;
     return EOK;
@@ -456,6 +457,55 @@ int socket_accept(int fd, struct sockaddr *addr, socklen_t *addrlen)
         return new_fd;
     }
     return new_fd;
+}
+
+int socket_accept4(int fd, struct sockaddr *addr, socklen_t *addrlen, int flags)
+{
+    if (flags & ~(SOCK_NONBLOCK | SOCK_CLOEXEC)) return -EINVAL;
+    FdOperation listener;
+    int error = listener.acquire(fd);
+    if (error) return error;
+    fd_file_handle *source = listener.get();
+    if (!source || !(source->node->type & file_socket)) return -ENOTSOCK;
+    socketfs_handle_t *provider_handle = socketfs_get_handle(source->node);
+    if (!provider_handle || !provider_handle->provider.accept) return -EBADF;
+    const socket_provider_t &provider = provider_handle->provider;
+    void *socket = NULL;
+    error = provider.accept(provider_handle->socket, &socket, addr, addrlen);
+    if (error < 0) return error;
+
+    uint64_t open_flags = O_RDWR;
+    if (flags & SOCK_NONBLOCK) open_flags |= O_NONBLOCK;
+    if (flags & SOCK_CLOEXEC) open_flags |= O_CLOEXEC;
+    if (provider.set_flags && (error = provider.set_flags(socket, open_flags)) < 0)
+    {
+        provider.close(socket);
+        return error;
+    }
+    // Accepted endpoints have no pathname. Configure their provider and FD
+    // flags before publication, so another thread's exec sees CLOEXEC at once.
+    vfs_node_t node = vfs_node_alloc(NULL, "anon_socket");
+    auto *object = static_cast<socketfs_handle_t *>(calloc(1, sizeof(socketfs_handle_t)));
+    auto *handle = static_cast<fd_file_handle *>(calloc(1, sizeof(fd_file_handle)));
+    if (!node || !object || !handle)
+    {
+        if (node) { free(node->name); free(node); }
+        free(object);
+        free(handle);
+        provider.close(socket);
+        return -ENOMEM;
+    }
+    object->provider = provider;
+    object->socket = socket;
+    node->type = file_socket | file_delete;
+    node->fsid = socketfs_id;
+    node->handle = object;
+    node->size = (uint64_t)-1;
+    node->flags = handle->flags = open_flags;
+    handle->node = node;
+    int result = fd_install_handle(get_current_task()->parent_group, handle, 0, false);
+    if (result < 0) fd_retire_handle(handle);
+    return result;
 }
 
 int socket_shutdown(int fd, int how)

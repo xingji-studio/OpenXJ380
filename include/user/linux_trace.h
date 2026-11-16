@@ -6,3 +6,7 @@
 #ifndef CONFIG_TRACE_LINUX_ABI
 #define CONFIG_TRACE_LINUX_ABI 0
 #endif
+
+#ifndef CONFIG_TRACE_LINUX_VM
+#define CONFIG_TRACE_LINUX_VM 0
+#endif
