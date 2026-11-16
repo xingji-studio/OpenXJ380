@@ -1538,6 +1538,7 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, struct EFI_SYSTEM_TABLE *SystemTable
     if (EFI_ERROR(status) || (bound_root_mode && !boot_loaded_esp_matches_root_binding(&root_binding)))
     {
         puts(L"XJ380 boot binding is invalid. Error code: ROOT_BINDING_INVALID");
+        puts(L"Please visit https://xingjisoft.com/os/xj380/error.\r\n");
         write_serial_string("Root binding invalid or wrong ESP. Stop.\n");
         while (1)
             ;
@@ -1593,6 +1594,7 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, struct EFI_SYSTEM_TABLE *SystemTable
             if (root_format != XJ_INSTALLER_FORMAT_PAK1 || !system_format)
             {
                 puts(L"Invalid installer package format. Error code: PACKAGE_FORMAT_INVALID\r\n");
+                puts(L"Please visit https://xingjisoft.com/os/xj380/error.\r\n");
                 write_serial_string("Unsupported installer package profile. Stop.\n");
                 while (1) ;
             }
@@ -1610,6 +1612,7 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, struct EFI_SYSTEM_TABLE *SystemTable
             if (!xj_installer_handoff_valid(&installer_handoff))
             {
                 puts(L"Invalid installer handoff. Error code: INSTALLER_HANDOFF_INVALID\r\n");
+                puts(L"Please visit https://xingjisoft.com/os/xj380/error.\r\n");
                 write_serial_string("Invalid installer handoff. Stop.\n");
                 while (1) ;
             }
@@ -1621,6 +1624,8 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, struct EFI_SYSTEM_TABLE *SystemTable
             // authorize legacy boot. Never borrow a marker from another disk.
             if (!boot_volume_has_system_markers(root))
             {
+                puts(L"Root binding and local legacy system markers missing.\r\n");
+                puts(L"Please visit https://xingjisoft.com/os/xj380/error. Error code: ROOT_BINDING_WITHOUT_LEGACY_MARK\r\n");
                 write_serial_string("Root binding and local legacy system markers missing. Stop.\n");
                 while (1)
                     ;

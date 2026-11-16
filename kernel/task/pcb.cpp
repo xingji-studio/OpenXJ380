@@ -2234,6 +2234,10 @@ uint64_t process_execve(char *path, char **argv, char **envp)
     spin_unlock(&create_thread_lock);
     scheduler_restore_depth(scheduler_depth);
     if (!no_interrupt) open_interrupt;
+#if defined(XJ380)
+    // Resource reclamation may free memory; keep it outside the image commit lock.
+    OpenXJ380Socket_NotifyProcessImage(OPENXJ380_PROCESS_EXEC, process, old_page_dir);
+#endif
     if (old_cmdline != NULL) free(old_cmdline);
     if (old_process_argv != NULL) free_envp(old_process_argv);
     free(old_exe_path);
@@ -2703,6 +2707,19 @@ uint64_t process_fork(struct X64_REGS *reg, bool is_vfork, uint64_t user_stack, 
 
     new_task->window_count = 0;
 
+#if defined(XJ380)
+    // The product hook copies bounded metadata only, before the child can run.
+    int image_result = OpenXJ380Socket_NotifyProcessImage(OPENXJ380_PROCESS_FORK, current_pcb, new_pcb);
+    if (image_result < 0)
+    {
+        queue_remove_at(new_pcb->thread_queue, new_task->group_index);
+        spin_unlock(&create_thread_lock);
+        restore_runtime_state(scheduler_depth, is_sti);
+        free_partial_process(new_pcb, !is_vfork);
+        free_fork_task(new_task);
+        return (uint64_t)image_result;
+    }
+#endif
     screen_capture_process_inherit(current_pcb, new_pcb);
     procfs_on_new_task(new_pcb);
     if (add_task(new_task) == (size_t)-1)
@@ -2710,6 +2727,9 @@ uint64_t process_fork(struct X64_REGS *reg, bool is_vfork, uint64_t user_stack, 
         queue_remove_at(new_pcb->thread_queue, new_task->group_index);
         spin_unlock(&create_thread_lock);
         restore_runtime_state(scheduler_depth, is_sti);
+#if defined(XJ380)
+        OpenXJ380Socket_NotifyProcessImage(OPENXJ380_PROCESS_FORK_ABORT, new_pcb, NULL);
+#endif
         free_partial_process(new_pcb, !is_vfork);
         free_fork_task(new_task);
         return (uint64_t)-ENOMEM;
