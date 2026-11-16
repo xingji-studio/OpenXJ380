@@ -2,6 +2,27 @@
 #include <proto.hpp>
 #include <stdint.h>
 #include <task/scheduler.h>
+#include <cpu/regio.h>
+
+extern bool no_interrupt;
+
+static bool deliver_user_exception(X64_REGS *regs, int sig, int code, uint64_t trap, uint64_t address)
+{
+    tcb_t task = get_current_task();
+    if (!regs || (regs->cs & 3) != 3 || !task || !task->parent_group ||
+        !task->parent_group->linux_abi || scheduler_disable_depth()) return false;
+    if (!no_interrupt) open_interrupt;
+    bool delivered = signal_deliver_fault(regs, sig, code, address, trap, regs->errcode);
+    close_interrupt;
+    if (delivered) return true;
+    // A Linux application's unhandled synchronous exception terminates that
+    // process; it must never close the global boot scheduler gate.
+    kill_proc(task->parent_group, 128 + sig, true);
+    open_interrupt;
+    scheduler_yield();
+    while (true) __asm__ volatile("hlt");
+}
+
 
 void do_wsod(const char *err_code, struct X64_REGS *regs)
 {
@@ -50,11 +71,13 @@ void c_device_not_avaliable(struct X64_REGS *regs, uint64_t error_code)
 
 void wsod_divide_error(struct X64_REGS *regs, uint64_t error_code)
 {
+    if (deliver_user_exception(regs, SIGFPE, 1, 0, regs->rip)) return;
     do_wsod("DIVIDE_ERROR", regs);
 }
 
 void wsod_undefined_opcode(struct X64_REGS *regs, uint64_t error_code)
 {
+    if (deliver_user_exception(regs, SIGILL, 2, 6, regs->rip)) return;
     scheduler_stop();
 
     write_serial_string("Undefined opcode at RIP: ");
@@ -114,6 +137,7 @@ void wsod_system_kernel_error(struct X64_REGS *regs, uint64_t error_code)
 // 一般保护性异常
 void wsod_general_protection(struct X64_REGS *regs, uint64_t error_code)
 {
+    if (deliver_user_exception(regs, SIGSEGV, 128, 13, 0)) return;
     scheduler_stop();
 
     write_serial_string("Fault Thread Name: ");
@@ -156,6 +180,7 @@ void wsod_general_protection(struct X64_REGS *regs, uint64_t error_code)
 // DEBUG
 void wsod_debug(struct X64_REGS *regs, uint64_t error_code)
 {
+    if (deliver_user_exception(regs, SIGTRAP, 1, 3, regs->rip)) return;
     do_wsod("DEBUG_BREAKPOINT", regs);
 }
 

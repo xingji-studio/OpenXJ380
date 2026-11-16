@@ -406,6 +406,7 @@
 #define SYS_EPOLL_CREATE1 291
 #define SYS_PIPE2 293
 #define SYS_PRLIMIT64 302
+#define SYS_GETCPU 309
 #define SYS_SENDMMSG 307
 #define SYS_GETRANDOM 318
 #define SYS_COPY_FILE_RANGE 326
@@ -424,8 +425,9 @@
 #define CLOSE_RANGE_UNSHARE  (1U << 1)
 #define CLOSE_RANGE_CLOEXEC  (1U << 2)
 
-#define CLONE_ARGS_SIZE_VER0 80
-#define CLONE_ARGS_SIZE_VER1 88
+#define CLONE_ARGS_SIZE_VER0 64
+#define CLONE_ARGS_SIZE_VER1 80
+#define CLONE_ARGS_SIZE_VER2 88
 
 struct clone_args {
     uint64_t flags;
@@ -699,6 +701,7 @@ sys_(epoll_ctl, int epfd, int op, int fd, struct epoll_event *event);
 sys_(epoll_wait, int epfd, struct epoll_event *events, int maxevents, int timeout);
 sys_(epoll_pwait, int epfd, struct epoll_event *events, int maxevents, int timeout, sigset_t *sigmask, size_t sigsetsize);
 sys_(sched_getaffinity, int pid, size_t cpusetsize, void *mask);
+sys_(getcpu, uint32_t *cpu, uint32_t *node, void *cache);
 sys_(rt_sigprocmask, int how, sigset_t *set, sigset_t *oldset);
 sys_(kill, int pid, int sig);
 sys_(tgkill, int tgid, int tid, int sig);

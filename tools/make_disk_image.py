@@ -397,6 +397,11 @@ def prepare_partition(partition: Path, usage: StagedUsage, *, filesystem: str,
         raise ValueError(f"{filesystem} partition must be at least {minimum} MiB")
     inodes = None
     while True:
+        if automatic and filesystem == "ext4" and capacity >= 128:
+            # mke2fs can discard a tiny final group (for example 769 MiB
+            # becomes 768 MiB). Keep large automatic roots on complete group
+            # boundaries so their filesystem and partition sizes still agree.
+            capacity = round_up(capacity, 128)
         if filesystem == "ext4" and capacity * MIB > NATIVE_MAX_ROOT_BYTES:
             raise ValueError("ext4 root exceeds the reviewed 1 TiB host-image profile")
         create_file(partition, capacity * MIB)

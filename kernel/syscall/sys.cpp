@@ -21,6 +21,8 @@
 #include <rtc.h>
 #include <tty.h>
 #include <task/ipc.h>
+#include <task/futex.h>
+#include <smp/smp.h>
 #include <mutex.h>
 #include <math.hpp>
 #include <user/user.h>
@@ -2956,12 +2958,30 @@ sys_(sched_getaffinity, int pid, size_t cpusetsize, void *mask)
     if (cpusetsize == 0 || mask == NULL) return SYSCALL_FAULT_(EINVAL);
     if (pid < 0) return SYSCALL_FAULT_(ESRCH);
 
-    uint8_t *kbuf = (uint8_t *)calloc(1, cpusetsize);
+    size_t processors = get_cpu_num();
+    size_t bytes = ((processors + 63) / 64) * sizeof(uint64_t);
+    if (!bytes || cpusetsize < bytes) return SYSCALL_FAULT_(EINVAL);
+    uint8_t *kbuf = (uint8_t *)calloc(1, bytes);
     if (kbuf == NULL) return SYSCALL_FAULT_(ENOMEM);
-    kbuf[0] = 1;
-    bool ok = copy_to_user_pagedir(current_user_pagedir(), mask, kbuf, cpusetsize);
+    for (size_t cpu = 0; cpu < processors; ++cpu) kbuf[cpu / 8] |= 1U << (cpu % 8);
+    bool ok = copy_to_user_pagedir(current_user_pagedir(), mask, kbuf, bytes);
     free(kbuf);
-    return ok ? 0 : SYSCALL_FAULT_(EFAULT);
+    return ok ? bytes : SYSCALL_FAULT_(EFAULT);
+}
+
+sys_(getcpu, uint32_t *cpu, uint32_t *node, void *cache)
+{
+    (void)cache;
+    tcb_t task = get_current_task();
+    if (!task || !task->parent_group) return SYSCALL_FAULT_(ESRCH);
+    page_directory_t *directory = task->parent_group->pagedir;
+    uint32_t processor = task->cpu_id;
+    uint32_t numa_node = 0;
+    if ((cpu && !user_range_mapped(directory, cpu, sizeof(*cpu), true)) ||
+        (node && !user_range_mapped(directory, node, sizeof(*node), true))) return SYSCALL_FAULT_(EFAULT);
+    if (cpu && !copy_to_user_pagedir(directory, cpu, &processor, sizeof(processor))) return SYSCALL_FAULT_(EFAULT);
+    if (node && !copy_to_user_pagedir(directory, node, &numa_node, sizeof(numa_node))) return SYSCALL_FAULT_(EFAULT);
+    return 0;
 }
 
 sys_(rt_sigprocmask, int how, sigset_t *set, sigset_t *oldset)
@@ -2994,8 +3014,7 @@ sys_(tgkill, int tgid, int tid, int sig)
     if (target == NULL) return SYSCALL_FAULT_(ESRCH);
     if (tid <= 0 || found_thread(target, tid) == NULL) return SYSCALL_FAULT_(ESRCH);
 
-    int ret = signal_send_process(target, sig);
-    return ret < 0 ? (uint64_t)ret : (uint64_t)ret;
+    return signal_send_thread(target, tid, sig);
 }
 
 extern fd_file_handle *fd_dup(fd_file_handle *src);
@@ -3098,7 +3117,7 @@ sys_(clone, uint64_t flags, uint64_t stack, int *parent_tid, int *child_tid, uin
 
 sys_(clone3, struct clone_args *cl_args, size_t size)
 {
-    if (size < sizeof(uint64_t)) return SYSCALL_FAULT_(EINVAL);
+    if (size < 64) return SYSCALL_FAULT_(EINVAL);
     if (size > sizeof(struct clone_args)) size = sizeof(struct clone_args);
 
     struct clone_args args;
@@ -3107,13 +3126,22 @@ sys_(clone3, struct clone_args *cl_args, size_t size)
     memset(&args, 0, sizeof(args));
     if (!copy_from_user_pagedir(pagedir, &args, cl_args, size)) return SYSCALL_FAULT_(EFAULT);
 
-    if (args.pidfd != 0) return SYSCALL_FAULT_(EINVAL);
+    // pidfd is unused without CLONE_PIDFD; glibc also supplies parent_tid in
+    // this field for clone fallback. Do not reject that otherwise valid call.
+    if (args.flags & (0x00001000ULL | 0x200000000ULL)) return SYSCALL_FAULT_(ENOSYS);
+    if (args.set_tid_size) return SYSCALL_FAULT_(ENOSYS);
 
     uint64_t flags = args.flags;
     if (args.exit_signal != 0 && (flags & 0xFF) == 0)
         flags |= (args.exit_signal & 0xFF);
 
-    uint64_t stack      = args.stack;
+    uint64_t stack = args.stack;
+    if (stack)
+    {
+        if (!args.stack_size || check_user_overflow(stack, args.stack_size)) return SYSCALL_FAULT_(EINVAL);
+        stack += args.stack_size; // x86 stacks grow down from the upper bound.
+    }
+    else if (args.stack_size || (flags & 0x100)) return SYSCALL_FAULT_(EINVAL);
     int     *parent_tid = (args.parent_tid != 0) ? (int *)(uintptr_t)args.parent_tid : NULL;
     int     *child_tid  = (args.child_tid != 0)  ? (int *)(uintptr_t)args.child_tid  : NULL;
     uint64_t tls        = args.tls;
@@ -3138,29 +3166,36 @@ sys_(set_tid_address, int *tidptr)
 
 sys_(futex, uint32_t *uaddr, int op, uint32_t val, const struct timespec *timeout, uint32_t *uaddr2, uint32_t val3)
 {
-    (void)timeout;
     (void)uaddr2;
-    (void)val3;
-
-    if (uaddr == NULL) return SYSCALL_FAULT_(EFAULT);
-
-    uint32_t current = 0;
     int cmd = op & 0x7f;
-
-    switch (cmd)
+    bool private_key = (op & 128) != 0;
+    if (cmd == FUTEX_WAKE || cmd == 10 /* FUTEX_WAKE_BITSET */)
     {
-    case FUTEX_WAIT:
-    case FUTEX_WAIT_BITSET:
-        if (!copy_from_user_pagedir(current_user_pagedir(), &current, uaddr, sizeof(current)))
-            return SYSCALL_FAULT_(EFAULT);
-        if (current != val) return SYSCALL_FAULT_(EAGAIN);
-        scheduler_yield();
-        return SYSCALL_FAULT_(ETIMEDOUT);
-    case FUTEX_WAKE:
-        return 0;
-    default:
-        return SYSCALL_FAULT_(ENOSYS);
+        if ((int32_t)val < 0) return SYSCALL_FAULT_(EINVAL);
+        return futex_wake_user(current_user_pagedir(), uaddr, private_key, val,
+                               cmd == FUTEX_WAKE ? ~0U : val3);
     }
+    if (cmd != FUTEX_WAIT && cmd != FUTEX_WAIT_BITSET) return SYSCALL_FAULT_(ENOSYS);
+    uint64_t deadline = ~0ULL;
+    if (timeout)
+    {
+        struct timespec requested;
+        if (!copy_from_user_pagedir(current_user_pagedir(), &requested, timeout, sizeof(requested)))
+            return SYSCALL_FAULT_(EFAULT);
+        if (requested.tv_sec < 0 || requested.tv_nsec < 0 || requested.tv_nsec >= 1000000000)
+            return SYSCALL_FAULT_(EINVAL);
+        uint64_t ns = (uint64_t)requested.tv_sec > (~0ULL - requested.tv_nsec) / 1000000000 ? ~0ULL :
+                       (uint64_t)requested.tv_sec * 1000000000 + requested.tv_nsec;
+        uint64_t now = bootNanoTime();
+        if (cmd == FUTEX_WAIT_BITSET)
+        {
+            uint64_t clock_now = (op & 256) ? realtime_ns() : now;
+            ns = ns > clock_now ? ns - clock_now : 0;
+        }
+        deadline = ns > ~0ULL - now ? ~0ULL : now + ns;
+    }
+    return futex_wait_user(current_user_pagedir(), uaddr, val, private_key,
+                           cmd == FUTEX_WAIT ? ~0U : val3, deadline);
 }
 
 sys_(vfork)

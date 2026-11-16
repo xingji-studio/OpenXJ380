@@ -17,6 +17,7 @@
 #include <cpu/longm.h>
 #include <elf.h>
 #include <rng.h>
+#include <task/futex.h>
 #include <errno.h>
 #include <fs/vfs/vfs.h>
 #include <fs/ext4/ext4.h>
@@ -954,7 +955,8 @@ static void clear_child_tid_if_requested(tcb_t task)
     if (task == NULL || task->clear_child_tid == 0 || task->tid_directory == NULL) return;
 
     int zero = 0;
-    copy_to_user_pagedir(task->tid_directory, (void *)task->clear_child_tid, &zero, sizeof(zero));
+    if (copy_to_user_pagedir(task->tid_directory, (void *)task->clear_child_tid, &zero, sizeof(zero)))
+        futex_wake_user(task->tid_directory, (uint32_t *)task->clear_child_tid, false, 1, ~0U);
     task->clear_child_tid = 0;
     task->tid_directory = NULL;
 }
@@ -1003,7 +1005,13 @@ void reap_quiesced_thread_tids()
     spin_unlock(&pcb_group_queue->lock);
     spin_unlock(&create_thread_lock);
     if (!target) { free(pin); return; }
-    if (!scheduler_task_referenced(target)) clear_child_tid_if_requested(target);
+    if (!scheduler_task_referenced(target))
+    {
+        // TID zero lets libc reuse the TLS/stack and its futex addresses.
+        // Withdraw an abandoned wait before publishing that reuse boundary.
+        futex_thread_exit(target);
+        clear_child_tid_if_requested(target);
+    }
     process_preparation_release(pin);
 }
 
@@ -1096,6 +1104,7 @@ void kill_thread0(tcb_t task)
     procfs_operation_thread_exit(task);
     xnet_thread_release(task);
     permissions_thread_exit(task);
+    futex_thread_exit(task);
     __atomic_store_n(&task->status, OUT, __ATOMIC_RELEASE);
     clear_child_tid_if_requested(task);
     if (task->argv != NULL)
@@ -2202,6 +2211,7 @@ uint64_t process_execve(char *path, char **argv, char **envp)
     process->brk_current = USER_BRK_START;
     process->mmap_start = image.mmap_start;
     process->linux_abi = image.linux_abi;
+    signal_exec_process(process);
     process->load_start = image.load_start;
     process->aux_phdr = image.aux_phdr;
     process->aux_phent = image.aux_phent;
@@ -2531,6 +2541,7 @@ uint64_t process_fork(struct X64_REGS *reg, bool is_vfork, uint64_t user_stack, 
     new_pcb->vfork      = is_vfork;
     new_pcb->ppid       = current_pcb->pid;
     new_pcb->linux_abi  = current_pcb->linux_abi;
+    signal_fork_process(new_pcb, current_pcb);
     new_pcb->load_start = current_pcb->load_start;
     new_pcb->aux_phdr   = current_pcb->aux_phdr;
     new_pcb->aux_phent  = current_pcb->aux_phent;

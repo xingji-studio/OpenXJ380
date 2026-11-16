@@ -336,6 +336,33 @@ and stale threads still entering user mode after another thread commits exec
 need stronger page-directory lifetime references/deferred reclamation. Do not
 claim this race is solved by the boot/readiness or allocator fixes.
 
+## Linux futex and signal entry
+
+Futex address translation/comparison and wait publication use the preemptible
+memory-operation mutex. Fault in user words and allocate waiter records before
+acquiring a bucket spin lock. The lock order is memory-operation mutex, futex
+bucket, then target CPU run queue; no path may acquire a futex bucket while
+holding a run-queue lock. Waiter records pin their TCB pointers until the caller
+withdraws them or a quiescent terminal-thread cleanup removes them.
+
+`scheduler_wait_event()` checks the notification word while owning the same
+run-queue lock used by remote wake. A waker stores notification before taking
+that lock, so wake-before-WAIT cannot be lost. The pending-signal quick check
+must remain allocation-free and must not acquire the signal disposition lock:
+it is called inside this publication scope. Linux signal handler pointers are
+published atomically, while complete disposition snapshots use the PCB lock.
+
+Clear abandoned futex records before publishing child-TID zero, after all CPU
+references disappear. TID zero permits libc to unmap/reuse the old TLS/stack;
+an older waiter must not consume a wake intended for a new use of that address.
+Keep process-wide exit cleanup as an idempotent final withdrawal path.
+
+Linux signal delivery/return uses the private FXSAVE64 image immediately below
+the saved GPR frame in `handler.S`. Changing exception/syscall frame allocation
+or enabling additional XCR0 components requires updating that contract and its
+tests. The Linux frame contains only user addresses, sanitized FPU state and
+user-modifiable flags; native XAPI retains its existing signal-frame format.
+
 ## Sheet composition and GUI state
 
 The sheet manager spin lock protects list links, positions, sizes, and types.

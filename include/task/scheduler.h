@@ -34,6 +34,8 @@ uint64_t scheduler_disable_depth();
 void scheduler_restore_depth(uint64_t depth);
 void scheduler_yield();
 void scheduler_sleep_ns(uint64_t nano);
+// Publish WAIT only while *event is zero, closing wake-before-sleep races.
+void scheduler_wait_event(const uint32_t *event, uint64_t nano);
 void scheduler_wake_task(tcb_t task);
 void scheduler_tick();
 void scheduler_init_task(tcb_t task);

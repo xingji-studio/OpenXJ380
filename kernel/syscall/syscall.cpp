@@ -400,6 +400,10 @@ extern "C" uint64_t c_syscall_handler(struct X64_REGS *regs, uint64_t user_rsp)
     case SYS_SCHED_GETAFFINITY:
         regs->rax = (uint64_t)sys_sched_getaffinity(regs->rdi, regs->rsi, (void *)regs->rdx, 0, 0, 0, regs);
         break;
+    case SYS_GETCPU:
+        regs->rax = (uint64_t)sys_getcpu((uint32_t *)regs->rdi, (uint32_t *)regs->rsi, (void *)regs->rdx,
+                                        0, 0, 0, regs);
+        break;
     case SYS_DUP: regs->rax = (uint64_t)sys_dup(regs->rdi, 0, 0, 0, 0, 0, regs); break;
     case SYS_DUP2: regs->rax = (uint64_t)sys_dup2(regs->rdi, regs->rsi, 0, 0, 0, 0, regs); break;
     case SYS_DUP3: regs->rax = (uint64_t)sys_dup3(regs->rdi, regs->rsi, regs->rdx, 0, 0, 0, regs); break;

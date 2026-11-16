@@ -855,6 +855,34 @@ void scheduler_sleep_ns(uint64_t nano)
 }
 EXPORT_SYMBOL(scheduler_sleep_ns);
 
+void scheduler_wait_event(const uint32_t *event, uint64_t nano)
+{
+    if (!scheduler_is_enabled() || !event || !nano) return;
+    tcb_t current = get_current_task();
+    PROCESSOR_INFO *cpu = get_current_cpu();
+    lock_queue *queue = cpu ? cpu->scheduler_queue : NULL;
+    if (!current || !queue || current->task_level == TASK_IDLE_LEVEL) return;
+    uint64_t now = nanoTime();
+    uint64_t deadline = nano > ~0ULL - now ? ~0ULL : now + nano;
+    // Wakers store the event before acquiring this same run-queue lock. A
+    // wake either observes WAIT or makes this check decline publication.
+    spin_lock(&queue->lock);
+    TaskStatus expected = __atomic_load_n(&current->status, __ATOMIC_ACQUIRE);
+    bool sleeping = false;
+    if (!__atomic_load_n(event, __ATOMIC_ACQUIRE) && !signals_pending_quick(current) &&
+        (expected == RUNNING || expected == START))
+    {
+        current->wakeup_time = deadline;
+        sleeping = __atomic_compare_exchange_n(&current->status, &expected, WAIT, false,
+                                               __ATOMIC_RELEASE, __ATOMIC_RELAXED);
+    }
+    spin_unlock(&queue->lock);
+    if (!sleeping) return;
+    do { scheduler_yield(); } while (__atomic_load_n(&current->status, __ATOMIC_ACQUIRE) == WAIT);
+    expected = START;
+    __atomic_compare_exchange_n(&current->status, &expected, RUNNING, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+}
+
 static uint64_t wakeup_base_vruntime_locked(PROCESSOR_INFO *cpu)
 {
     // Each run queue has its own vruntime origin. A remote interrupt must not

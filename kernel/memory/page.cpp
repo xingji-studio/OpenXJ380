@@ -380,6 +380,31 @@ extern "C" void handle_page_fault(struct X64_REGS *frame, uint64_t error_code)
         }
     }
 err:;
+    if (frame && (frame->cs & 3) == 3 && current_task && current_task->parent_group &&
+        current_task->parent_group->linux_abi && !scheduler_depth)
+    {
+        scheduler_restore_depth(scheduler_depth);
+        if (!no_interrupt) open_interrupt;
+        bool delivered = signal_deliver_fault(frame, SIGSEGV, (error_code & 1) ? 2 : 1,
+                                               faulting_address, 14, error_code);
+        if (!delivered)
+        {
+            uint64_t mapping = 0, offset = 0;
+            mm_op_lock_acquire();
+            vma_t *area = vma_find(&current_task->parent_group->vma_manager, frame->rip);
+            if (area) { mapping = area->vm_start; offset = area->vm_offset + frame->rip - area->vm_start; }
+            mm_op_lock_release();
+            write_serial_fmt("[linux-fault] pid=%llu tid=%llu rip=%llx addr=%llx map=%llx offset=%llx "
+                             "rax=%llx rbx=%llx rcx=%llx rdx=%llx rdi=%llx rsi=%llx rbp=%llx rsp=%llx\n",
+                             current_task->parent_group->pid, current_task->tid, frame->rip, faulting_address,
+                             mapping, offset, frame->rax, frame->rbx, frame->rcx, frame->rdx,
+                             frame->rdi, frame->rsi, frame->rbp, frame->rsp);
+        }
+        close_interrupt;
+        if (delivered) return;
+        disable_scheduler();
+    }
+
     write_serial_string("Page fault virtual address (cr2): ");
     write_serial_hex(faulting_address);
     write_serial_string(" ");

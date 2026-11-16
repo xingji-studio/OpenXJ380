@@ -151,6 +151,9 @@ struct process_control_block
     // 4 exclusive collection preparation, 5 drain with collection requested.
     uint32_t fd_cleanup_state;
     tcb_t wait_owner; // Exclusive waitpid claim; cleared before this TCB is freed.
+    // Linux CLONE_SIGHAND threads share dispositions; masks remain per TCB.
+    spin_t linux_signal_lock;
+    sigaction_t linux_actions[64];
 };
 #ifndef CONFIG_USER_ELF_HEADER_START
 #define CONFIG_USER_ELF_HEADER_START 0x0000300000000000UL

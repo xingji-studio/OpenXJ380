@@ -194,9 +194,14 @@ int  syscall_ssetmask(int how, sigset_t *nset, sigset_t *oset);
 int  syscall_sig_action(int sig, sigaction_t *action, sigaction_t *oldaction);
 int  syscall_sigaltstack(stack_t *ss, stack_t *old_ss);
 int  signal_send_process(pcb_t process, int sig);
+int  signal_send_thread(pcb_t process, int tid, int sig);
 int  signal_send_group(int pgid, int sig);
 bool signal_deliver_pending(struct X64_REGS *regs);
 uint64_t signal_return(struct X64_REGS *regs);
+bool signal_deliver_fault(struct X64_REGS *regs, int sig, int code, uint64_t address,
+                           uint64_t trap, uint64_t error);
+void signal_fork_process(pcb_t child, pcb_t parent);
+void signal_exec_process(pcb_t process);
 
 void register_signal(pcb_t task, int sig, void (*handler)(int));
 void check_pending_signals(pcb_t proc, tcb_t thread);
