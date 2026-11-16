@@ -94,6 +94,7 @@ static inline bool syscall_file_io_may_block(uint64_t number)
     case SYS_SELECT:
     case SYS_PSELECT6:
     case SYS_ACCEPT4:
+    case SYS_SETSOCKOPT:
     case SYS_SCHED_GETPARAM:
     case SYS_EVENTFD:
     case SYS_EVENTFD2:

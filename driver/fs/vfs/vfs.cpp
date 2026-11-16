@@ -1,5 +1,4 @@
 #include <user/permissions.h>
-#include <syscall/fd_position.h>
 #include <input_method.h>
 /**
  * Virtual File System Interface
@@ -35,6 +34,7 @@ static vfs_prepare_unmount_t fs_prepare_unmount[256];
 static vfs_checked_unmount_t fs_checked_unmount[256];
 static vfs_link_node_t fs_link_node[256];
 static vfs_finalize_node_t fs_finalize_node[256];
+static vfs_name_lookup_t fs_name_lookup[256];
 static bool fs_unlinked_lifetime[256];
 static bool fs_reject_overmount[256];
 // Protected by vfs_child_list_lock; lookups cannot enter a retiring managed mount.
@@ -109,6 +109,11 @@ void vfs_set_link_node(int fsid, vfs_link_node_t callback)
 void vfs_set_finalize_node(int fsid, vfs_finalize_node_t callback)
 {
     if (fsid > 0 && fsid < 256) __atomic_store_n(&fs_finalize_node[fsid], callback, __ATOMIC_RELEASE);
+}
+
+void vfs_set_name_lookup(int fsid, vfs_name_lookup_t callback)
+{
+    if (fsid > 0 && fsid < 256) __atomic_store_n(&fs_name_lookup[fsid], callback, __ATOMIC_RELEASE);
 }
 
 void vfs_set_unlinked_lifetime(int fsid, bool enabled)
@@ -642,7 +647,7 @@ static bool legacy_cache_domain(vfs_node_t node)
                      __atomic_load_n(&fs_unmount_quiescence[node->fsid], __ATOMIC_ACQUIRE)));
 }
 
-static vfs_node_t vfs_child_find_for_open(vfs_node_t parent, const char *name, bool final,
+static vfs_node_t vfs_child_find_for_open_exact(vfs_node_t parent, const char *name, bool final,
                                          bool reject_endpoints, bool &endpoint_rejected)
 {
     if (parent == NULL || name == NULL) return NULL;
@@ -670,6 +675,32 @@ static vfs_node_t vfs_child_find_for_open(vfs_node_t parent, const char *name, b
     }
     if (child) ++child->refcount;
     vfs_child_unlock();
+    return child;
+}
+
+// Optional filesystem spelling resolution preserves the normal ref path.
+static vfs_node_t vfs_child_find_for_open(vfs_node_t parent, const char *name, bool final,
+                                         bool reject_endpoints, bool &endpoint_rejected)
+{
+    if (!parent || !name) return NULL;
+    vfs_name_lookup_t lookup = parent->fsid < 256 ?
+        __atomic_load_n(&fs_name_lookup[parent->fsid], __ATOMIC_ACQUIRE) : NULL;
+    if (!lookup) return vfs_child_find_for_open_exact(parent, name, final, reject_endpoints, endpoint_rejected);
+    // The caller retains its parent. Pin managed mounts over backend work and
+    // reference acquisition; decoding/I/O/allocation/backend mutexes stay
+    // outside the child lock. Existing callback ABI stays intact.
+    ReadonlyTraversalGuard traversal;
+    if (!traversal.ready()) { permissions_set_file_error(EBUSY); return NULL; }
+    char *canonical = static_cast<char *>(malloc(1024));
+    if (!canonical) { permissions_set_file_error(ENOMEM); return NULL; }
+    canonical[0] = canonical[1023] = 0;
+    int error = lookup(parent, name, canonical, 1024);
+    vfs_node_t child = NULL;
+    if (!error && canonical[0] && memchr(canonical, 0, 1024))
+        child = vfs_child_find_for_open_exact(parent, canonical, final, reject_endpoints, endpoint_rejected);
+    else if (!error) error = -EIO;
+    free(canonical);
+    if (error) permissions_set_file_error(error < 0 ? -error : error);
     return child;
 }
 
@@ -882,6 +913,55 @@ errno_t vfs_mkdir(const char *name)
 errno_t vfs_mkdir_mode(const char *name, uint16_t mode, uint32_t uid, uint32_t gid)
 {
     return mkdir_with_metadata(name, true, mode, uid, gid);
+}
+
+errno_t vfs_mkdir_leaf_mode(const char *name, uint16_t mode, uint32_t uid, uint32_t gid)
+{
+    permissions_clear_file_error();
+    ReadonlyTraversalGuard traversal;
+    if (!traversal.ready()) { permissions_set_file_error(EBUSY); return VFS_STATUS_FAILED; }
+    if (!name || name[0] != '/') { permissions_set_file_error(EINVAL); return VFS_STATUS_FAILED; }
+    char *path = strdup(name);
+    if (!path) { permissions_set_file_error(ENOMEM); return VFS_STATUS_FAILED; }
+    size_t length = strlen(path);
+    while (length > 1 && path[length - 1] == '/') path[--length] = '\0';
+
+    // Check the entry itself, including dangling links, before asking for
+    // write permission. Existing directories are EEXIST, not successful mkdir.
+    vfs_node_t existing = vfs_open_no_follow(path);
+    if (existing)
+    {
+        vfs_close(existing);
+        free(path);
+        permissions_set_file_error(EEXIST);
+        return VFS_STATUS_FAILED;
+    }
+    char *parent_path = strdup(path);
+    if (!parent_path) { free(path); permissions_set_file_error(ENOMEM); return VFS_STATUS_FAILED; }
+    char *separator = strrchr(parent_path, '/');
+    const char *leaf = strrchr(path, '/') + 1;
+    if (separator == parent_path) parent_path[1] = '\0';
+    else *separator = '\0';
+
+    // A retained parent prevents cache retirement during the callback. Never
+    // create an intermediate directory on behalf of Linux's recursive libc
+    // helper: another worker may be creating that parent concurrently.
+    vfs_node_t parent = vfs_open(parent_path);
+    int error = parent ? 0 : permissions_file_error();
+    if (!parent && !error) error = ENOENT;
+    if (!error && !(parent->type & file_dir)) error = ENOTDIR;
+    if (!error && (!*leaf || streq(leaf, ".") || streq(leaf, ".."))) error = EEXIST;
+    if (!error && !check_child_creation(parent, leaf)) error = vfs_last_error();
+    if (!error)
+    {
+        int result = create_child(parent, leaf, file_dir, callbackof(parent, mkdir), true, mode, uid, gid, NULL);
+        if (result) error = -result;
+    }
+    if (parent) vfs_close(parent);
+    free(parent_path);
+    free(path);
+    permissions_set_file_error(error);
+    return error ? VFS_STATUS_FAILED : EOK;
 }
 
 errno_t vfs_link(const char *name, const char *target_name) {
@@ -1782,26 +1862,28 @@ void vfs_deinit() {
     // 目前并不支持
 }
 
+static fd_file_handle *fd_link_duplicate(fd_file_handle *source, fd_file_handle *copy)
+{
+    int error = fd_share_description(source, copy);
+    if (!error) return copy;
+    fd_retire_handle(copy);
+    permissions_set_file_error(-error);
+    return NULL;
+}
+
 fd_file_handle *fd_dup(fd_file_handle *src) {
     fd_file_handle *nw = (fd_file_handle *)malloc(sizeof(fd_file_handle));
     // not_null_assets(new, "fd_dup out of memory.");
     if (!nw) { permissions_set_file_error(ENOMEM); return NULL; }
     nw->node       = src->node;
     nw->offset     = 0;
-    nw->flags      = src->flags;
+    nw->flags      = __atomic_load_n(&src->flags, __ATOMIC_ACQUIRE);
     nw->fd         = src->fd;
-    int position_error = fd_position_share(src, nw);
-    if (position_error)
-    {
-        free(nw);
-        permissions_set_file_error(-position_error);
-        return NULL;
-    }
     vfs_node_t node = nw->node;
     if ((node->type & (file_ptmx | file_pts)) && fs_callbacks[node->fsid]->dup != (void *)empty_func) {
         fs_callbacks[node->fsid]->dup(node);
         node->refcount++;
-        return nw;
+        return fd_link_duplicate(src, nw);
     }
     if ((node->type & file_pipe) && node->handle != NULL) {
         pipe_specific_t *spec = (pipe_specific_t *)node->handle;
@@ -1824,7 +1906,6 @@ fd_file_handle *fd_dup(fd_file_handle *src) {
         if (node->refcount == uint32_t(-1))
         {
             vfs_child_unlock();
-            fd_position_forget(nw);
             free(nw);
             permissions_set_file_error(EOVERFLOW);
             return NULL;
@@ -1833,7 +1914,7 @@ fd_file_handle *fd_dup(fd_file_handle *src) {
         vfs_child_unlock();
     }
     else node->refcount++;
-    return nw;
+    return fd_link_duplicate(src, nw);
 }
 
 vfs_node_t get_rootdir() {

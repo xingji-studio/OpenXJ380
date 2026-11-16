@@ -198,6 +198,10 @@ typedef int (*vfs_link_node_t)(void *parent, vfs_node_t source, vfs_node_t creat
 void vfs_set_link_node(int fsid, vfs_link_node_t callback);
 typedef int (*vfs_finalize_node_t)(void *handle, vfs_node_t node);
 void vfs_set_finalize_node(int fsid, vfs_finalize_node_t callback);
+// Optional canonical lookup runs outside spin locks while managed mounts are
+// pinned. It returns a cached spelling, never a borrowed vnode/reference.
+typedef int (*vfs_name_lookup_t)(vfs_node_t, const char *, char *, size_t);
+void vfs_set_name_lookup(int fsid, vfs_name_lookup_t callback);
 // Bootstrap mount handoff only: caller exclusively owns this empty, unmounted
 // directory through backend close AND replacement/publication. No spin/backend
 // lock may be held. This is not a concurrent runtime mount reservation API.
@@ -252,6 +256,8 @@ void vfs_child_unlock();
  */
 errno_t vfs_mkdir(const char *name);
 errno_t vfs_mkdir_mode(const char *name, uint16_t mode, uint32_t uid, uint32_t gid);
+// POSIX mkdir creates only the final component; its parent must already exist.
+errno_t vfs_mkdir_leaf_mode(const char *name, uint16_t mode, uint32_t uid, uint32_t gid);
 
 /**
  * 创建文件节点

@@ -151,6 +151,9 @@ typedef struct socket_provider {
     int     (*get_netinfo)(socket_netinfo_t *out_info);
 } socket_provider_t;
 
+// Optional extension registered separately to preserve the module provider ABI.
+typedef int (*socket_setsockopt_fn)(void *socket, int level, int optname, const void *optval, socklen_t optlen);
+int     socket_provider_register_with_options(const socket_provider_t *provider, socket_setsockopt_fn setter);
 int     socket_provider_register(const socket_provider_t *provider);
 int     socketfs_setup(void);
 int     socketfs_alloc_fd_with_provider(void *impl, uint64_t flags, const socket_provider_t *provider);
@@ -160,6 +163,7 @@ int     socket_connect(int fd, const struct sockaddr *addr, socklen_t addrlen);
 int     socket_getsockname(int fd, struct sockaddr *addr, socklen_t *addrlen);
 int     socket_getpeername(int fd, struct sockaddr *addr, socklen_t *addrlen);
 int     socket_getsockopt(int fd, int level, int optname, void *optval, socklen_t *optlen);
+int     socket_setsockopt(int fd, int level, int optname, const void *optval, socklen_t optlen);
 int     socket_listen(int fd, int backlog);
 int     socket_accept(int fd, struct sockaddr *addr, socklen_t *addrlen);
 int     socket_accept4(int fd, struct sockaddr *addr, socklen_t *addrlen, int flags);

@@ -23,7 +23,6 @@
 #include <task/ipc.h>
 #include <task/futex.h>
 #include <task/eventfd.h>
-#include <syscall/fd_position.h>
 #include <smp/smp.h>
 #include <mutex.h>
 #include <math.hpp>
@@ -329,11 +328,13 @@ static int resolve_user_path_at(int dirfd, char *pathname, char **resolved)
     return 0;
 }
 
-static int64_t write_from_user_buffer(fd_file_handle *handle, const uint8_t *buffer, size_t size, bool socket_mode)
+static int64_t write_from_user_buffer(fd_file_handle *handle, const uint8_t *buffer, size_t size, bool socket_mode,
+                                      size_t explicit_offset = 0, bool positioned = false)
 {
-    if (handle == NULL || buffer == NULL) return -EINVAL;
+    if (handle == NULL) return -EBADF;
     if (eventfd_is_node(handle->node)) return eventfd_write_user(handle, buffer, size);
     if (size == 0) return 0;
+    if (buffer == NULL) return -EFAULT;
 
     pcb_t process = get_current_task()->parent_group;
     size_t bounce_bytes = MIN(size, USER_IO_BOUNCE_BYTES);
@@ -363,7 +364,9 @@ static int64_t write_from_user_buffer(fd_file_handle *handle, const uint8_t *buf
             continue;
         }
 
-        size_t write_offset = (handle->node->type & file_pipe) ? 0 : handle->offset;
+        size_t write_offset = (handle->node->type & file_pipe) ? 0 :
+            (__atomic_load_n(&handle->flags, __ATOMIC_ACQUIRE) & O_APPEND) ? handle->node->size :
+            positioned ? explicit_offset + total : handle->offset;
         size_t wrote        = vfs_write(handle->node, bounce, write_offset, chunk);
         if ((handle->node->type & file_pipe) && wrote == (size_t)-EPIPE)
         {
@@ -376,7 +379,8 @@ static int64_t write_from_user_buffer(fd_file_handle *handle, const uint8_t *buf
             free(bounce);
             return total > 0 ? (int64_t)total : wrote == (size_t)VFS_STATUS_FAILED ? -vfs_last_error() : (int64_t)wrote;
         }
-        if (!(handle->node->type & file_pipe) && handle->node->size != (uint64_t)-1) handle->offset += wrote;
+        if (!positioned && !(handle->node->type & file_pipe) && handle->node->size != (uint64_t)-1)
+            handle->offset = write_offset + wrote;
         total += wrote;
         if (wrote < chunk) break;
     }
@@ -539,12 +543,12 @@ static int64_t read_to_user_buffer(fd_file_handle *handle, uint8_t *buffer, size
             return total > 0 ? (int64_t)total : -EFAULT;
         }
 
+        if (update_offset && handle->node->size != (uint64_t)-1) handle->offset += (size_t)read_now;
         total += (size_t)read_now;
         if ((size_t)read_now < chunk) break;
     }
 
     free(bounce);
-    if (update_offset && handle->node->size != (uint64_t)-1) handle->offset += total;
     return (int64_t)total;
 }
 
@@ -854,8 +858,7 @@ sys_(write, int fd, uint8_t *buffer, size_t size)
     {
         // write_serial_fmt("[busybox-debug] sys_write fd=%d size=%llu\n", fd, (unsigned long long)size);
     }
-    if (unlikely(fd < 0 || buffer == NULL)) return SYSCALL_FAULT_(EINVAL);
-    if (unlikely(size == 0)) return 0;
+    if (unlikely(fd < 0)) return SYSCALL_FAULT_(EBADF);
     // Readline writes prompts and individual key echoes to stderr. Mirroring
     // every write can wait for UART queue space before the PTY receives it.
     // Keep this diagnostic copy scoped to the traced package-manager tasks.
@@ -867,9 +870,10 @@ sys_(write, int fd, uint8_t *buffer, size_t size)
     FdOperation operation;
     int operation_error = operation.acquire(fd);
     if (operation_error) return SYSCALL_FAULT_(-operation_error);
+    FdPositionScope position;
+    operation_error = position.acquire(operation);
+    if (operation_error) return SYSCALL_FAULT_(-operation_error);
     fd_file_handle *handle = operation.get();
-    FdPositionScope position_scope(handle);
-    if (position_scope.error()) return SYSCALL_FAULT_(-position_scope.error());
     if (!handle) return SYSCALL_FAULT_(EBADF);
     if (handle->node->type & file_socket)
     {
@@ -893,7 +897,7 @@ static uint64_t read_from_handle(fd_file_handle *handle, uint8_t *buffer, size_t
     if (handle->node->type & file_pipe)
     {
         vfs_update(handle->node);
-        if (handle->node->size == 0 && handle->flags & O_NONBLOCK)
+        if (handle->node->size == 0 && (__atomic_load_n(&handle->flags, __ATOMIC_ACQUIRE) & O_NONBLOCK))
         {
             pipe_specific_t *spec = (pipe_specific_t *)handle->node->handle;
             pipe_info_t *pipe = spec != NULL ? spec->info : NULL;
@@ -902,7 +906,8 @@ static uint64_t read_from_handle(fd_file_handle *handle, uint8_t *buffer, size_t
         int64_t ret = pipe_read_to_user_buffer(handle, buffer, size);
         return ret < 0 ? SYSCALL_FAULT_((int)-ret) : (uint64_t)ret;
     }
-    if (handle->node->type & file_pipe && handle->node->size == 0 && handle->flags & O_NONBLOCK)
+    if (handle->node->type & file_pipe && handle->node->size == 0 &&
+        (__atomic_load_n(&handle->flags, __ATOMIC_ACQUIRE) & O_NONBLOCK))
     {
         return SYSCALL_FAULT_(EWOULDBLOCK);
     }
@@ -940,9 +945,10 @@ sys_(read, int fd, uint8_t *buffer, size_t size)
     FdOperation operation;
     int operation_error = operation.acquire(fd);
     if (operation_error) return SYSCALL_FAULT_(-operation_error);
+    FdPositionScope position;
+    operation_error = position.acquire(operation);
+    if (operation_error) return SYSCALL_FAULT_(-operation_error);
     fd_file_handle *handle = operation.get();
-    FdPositionScope position_scope(handle);
-    if (position_scope.error()) return SYSCALL_FAULT_(-position_scope.error());
     if (!handle) return SYSCALL_FAULT_(EBADF);
     return read_from_handle(handle, buffer, size);
 }
@@ -1273,9 +1279,16 @@ sys_(setsockopt, int fd, int level, int optname, const void *optval, socklen_t o
     if (optlen > 4096) return SYSCALL_FAULT_(EINVAL);
     if (optlen != 0 && !user_range_mapped(current_user_pagedir(), optval, optlen)) return SYSCALL_FAULT_(EFAULT);
 
-    (void)level;
-    (void)optname;
-    return 0;
+    // Preserve the existing compatibility behavior for other options. In
+    // particular, glibc DNS uses advisory options absent from this provider.
+    if (level != SOL_SOCKET || optname != SO_REUSEADDR) return 0;
+    if (optlen < sizeof(int)) return SYSCALL_FAULT_(EINVAL);
+    // The implemented option receives a kernel copy, never a user pointer.
+    int value = 0;
+    if (!copy_from_user_pagedir(current_user_pagedir(), &value, optval, sizeof(value)))
+        return SYSCALL_FAULT_(EFAULT);
+    int result = socket_setsockopt(fd, level, optname, &value, sizeof(value));
+    return result < 0 ? SYSCALL_FAULT_(-result) : 0;
 }
 
 sys_(getsockopt, int fd, int level, int optname, void *optval, socklen_t *optlen)
@@ -1792,11 +1805,15 @@ sys_(ioctl, int fd, int options, void *arg2)
             return SYSCALL_FAULT_(EFAULT);
         }
         nonblock = *(int *)karg;
+        int flag_error = descriptor_pin.set_status_flags(O_NONBLOCK, nonblock ? O_NONBLOCK : 0);
+        if (flag_error)
+        {
+            if (arg_size > 0) free(karg);
+            return SYSCALL_FAULT_(-flag_error);
+        }
         if (nonblock) {
-            handle->flags |= O_NONBLOCK;
             handle->node->flags |= O_NONBLOCK;
         } else {
-            handle->flags &= ~O_NONBLOCK;
             handle->node->flags &= ~O_NONBLOCK;
         }
         int ret = socket_apply_flags(handle->node, handle->node->flags);
@@ -1829,22 +1846,23 @@ sys_(ioctl, int fd, int options, void *arg2)
 
 sys_(writev, int fd, struct iovec *iov, int iovcnt)
 {
-    if (unlikely(fd < 0 || iov == NULL)) return SYSCALL_FAULT_(EINVAL);
+    if (unlikely(fd < 0)) return SYSCALL_FAULT_(EBADF);
     if (unlikely(iovcnt < 0 || (size_t)iovcnt > USER_IOV_MAX)) return SYSCALL_FAULT_(EINVAL);
-    if (iovcnt == 0) return 0;
-    size_t iov_bytes = 0;
-    if (!checked_mul_size((size_t)iovcnt, sizeof(struct iovec), &iov_bytes) ||
-        !user_range_mapped(current_user_pagedir(), iov, iov_bytes))
-    {
-        return SYSCALL_FAULT_(EFAULT);
-    }
     page_directory_t *pagedir = get_current_task()->parent_group->pagedir;
     FdOperation operation;
     int operation_error = operation.acquire(fd);
     if (operation_error) return SYSCALL_FAULT_(-operation_error);
+    if (iovcnt == 0) return 0;
+    size_t iov_bytes = 0;
+    if (iov == NULL || !checked_mul_size((size_t)iovcnt, sizeof(struct iovec), &iov_bytes) ||
+        !user_range_mapped(current_user_pagedir(), iov, iov_bytes))
+    {
+        return SYSCALL_FAULT_(EFAULT);
+    }
+    FdPositionScope position;
+    operation_error = position.acquire(operation);
+    if (operation_error) return SYSCALL_FAULT_(-operation_error);
     fd_file_handle *handle = operation.get();
-    FdPositionScope position_scope(handle);
-    if (position_scope.error()) return SYSCALL_FAULT_(-position_scope.error());
     if (handle == NULL) return SYSCALL_FAULT_(EBADF);
     if (handle->node->type & file_socket)
     {
@@ -1892,9 +1910,10 @@ sys_(readv, int fd, struct iovec *iov, int iovcnt0)
     FdOperation operation;
     int operation_error = operation.acquire(fd);
     if (operation_error) return SYSCALL_FAULT_(-operation_error);
+    FdPositionScope position;
+    operation_error = position.acquire(operation);
+    if (operation_error) return SYSCALL_FAULT_(-operation_error);
     fd_file_handle *handle = operation.get();
-    FdPositionScope position_scope(handle);
-    if (position_scope.error()) return SYSCALL_FAULT_(-position_scope.error());
     if (handle == NULL) return SYSCALL_FAULT_(EBADF);
 
     size_t iov_bytes = 0;
@@ -3113,8 +3132,8 @@ static int duplicate_descriptor(int fd, int newfd, bool exact, bool cloexec)
     if (exact && fd == newfd) return newfd;
     fd_file_handle *copy = fd_dup(operation.get());
     if (!copy) return -ENOMEM;
-    if (cloexec) copy->flags |= O_CLOEXEC;
-    else copy->flags &= ~O_CLOEXEC;
+    if (cloexec) __atomic_fetch_or(&copy->flags, uint64_t(O_CLOEXEC), __ATOMIC_RELEASE);
+    else __atomic_fetch_and(&copy->flags, ~uint64_t(O_CLOEXEC), __ATOMIC_RELEASE);
     int result = fd_install_handle(get_current_task()->parent_group, copy, newfd, exact);
     if (result < 0) fd_retire_handle(copy);
     return result;
@@ -3142,8 +3161,8 @@ static int fd_dup_from(fd_file_handle *handle, int minfd, bool cloexec)
     if (!handle || minfd < 0) return -EINVAL;
     fd_file_handle *copy = fd_dup(handle);
     if (!copy) return -ENOMEM;
-    if (cloexec) copy->flags |= O_CLOEXEC;
-    else copy->flags &= ~O_CLOEXEC;
+    if (cloexec) __atomic_fetch_or(&copy->flags, uint64_t(O_CLOEXEC), __ATOMIC_RELEASE);
+    else __atomic_fetch_and(&copy->flags, ~uint64_t(O_CLOEXEC), __ATOMIC_RELEASE);
     int result = fd_install_handle(get_current_task()->parent_group, copy, minfd, false);
     if (result < 0) fd_retire_handle(copy);
     return result;
@@ -3160,26 +3179,36 @@ sys_(fcntl, int fd, int cmd, uint64_t arg)
 
     switch (cmd)
     {
-    case F_GETFD: return (handle->flags & O_CLOEXEC) ? FD_CLOEXEC : 0;
+    case F_GETFD: return (__atomic_load_n(&handle->flags, __ATOMIC_ACQUIRE) & O_CLOEXEC) ? FD_CLOEXEC : 0;
     case F_SETFD:
-        if (arg & FD_CLOEXEC) handle->flags |= O_CLOEXEC;
-        else handle->flags &= ~O_CLOEXEC;
+        if (arg & FD_CLOEXEC) __atomic_fetch_or(&handle->flags, uint64_t(O_CLOEXEC), __ATOMIC_RELEASE);
+        else __atomic_fetch_and(&handle->flags, ~uint64_t(O_CLOEXEC), __ATOMIC_RELEASE);
         return 0;
     case F_DUPFD_CLOEXEC:
         return fd_dup_from(handle, (int)arg, true);
     case F_DUPFD:
         return fd_dup_from(handle, (int)arg, false);
-    case F_GETFL: return handle->flags;
+    case F_GETFL:
+    {
+        uint64_t flags;
+        int error = operation.status_flags(flags);
+        return error ? SYSCALL_FAULT_(-error) : flags;
+    }
     case F_SETFL:
-        {uint32_t valid_flags  = O_APPEND | O_DIRECT | O_NOATIME | O_NONBLOCK;
-        handle->node->flags  &= ~valid_flags;
-        handle->node->flags  |= arg & valid_flags;
-        handle->flags        &= ~valid_flags;
-        handle->flags        |= arg & valid_flags;
-        if (handle->node->type & file_socket) {
+    {
+        uint64_t valid_flags = O_APPEND | O_DIRECT | O_NOATIME | O_NONBLOCK;
+        int error = operation.set_status_flags(valid_flags, arg);
+        if (error) return SYSCALL_FAULT_(-error);
+        if (handle->node->type & file_socket)
+        {
+            uint64_t flags;
+            error = operation.status_flags(flags);
+            if (error) return SYSCALL_FAULT_(-error);
+            handle->node->flags = (handle->node->flags & ~valid_flags) | (flags & valid_flags);
             int ret = socket_apply_flags(handle->node, handle->node->flags);
             if (ret < 0) return SYSCALL_FAULT_(-ret);
-        }}
+        }
+    }
         return 0;
     case F_GETLK:
     case F_SETLK:
@@ -3386,6 +3415,19 @@ sys_(shutdown, int fd, int how)
 }
 
 
+static bool linux_mkdir_path_exists(const char *path)
+{
+    tcb_t task = get_current_task();
+    if (!task || !task->parent_group || !task->parent_group->linux_abi) return false;
+    // Linux mkdir reports an existing entry without requiring write access to
+    // that entry. In particular, mkdir -p must traverse an existing root/home.
+    // Keep the recursive native VFS mkdir API and its write checks unchanged.
+    vfs_node_t existing = vfs_open_no_follow(path);
+    if (!existing) return false;
+    vfs_close(existing);
+    return true;
+}
+
 sys_(mkdir, char *name, uint64_t mode)
 {
     if (name == NULL) return SYSCALL_FAULT_(EINVAL);
@@ -3396,9 +3438,17 @@ sys_(mkdir, char *name, uint64_t mode)
     char  *npath = vfs_cwd_path_build(user_path);
     free(user_path);
     if (npath == NULL) return SYSCALL_FAULT_(ENOMEM);
+    if (linux_mkdir_path_exists(npath))
+    {
+        free(npath);
+        return SYSCALL_FAULT_(EEXIST);
+    }
     pcb_t process = get_current_task()->parent_group;
     uint16_t create_mode = (uint16_t)(mode & 07777 & ~(process ? process->umask : 0));
-    size_t ret = vfs_mkdir_mode(npath, create_mode, current_uid(), current_gid()) != 0 ?
+    errno_t created = process && process->linux_abi ?
+                      vfs_mkdir_leaf_mode(npath, create_mode, current_uid(), current_gid()) :
+                      vfs_mkdir_mode(npath, create_mode, current_uid(), current_gid());
+    size_t ret = created != 0 ?
                  SYSCALL_FAULT_(vfs_last_error()) : 0;
     if (ret == 0)
     {
@@ -3441,9 +3491,10 @@ sys_(lseek, int fd, int64_t offset, size_t whence)
     FdOperation descriptor_pin;
     int descriptor_error = descriptor_pin.acquire(fd);
     if (descriptor_error) return SYSCALL_FAULT_(-descriptor_error);
+    FdPositionScope position;
+    descriptor_error = position.acquire(descriptor_pin);
+    if (descriptor_error) return SYSCALL_FAULT_(-descriptor_error);
     fd_file_handle *handle = descriptor_pin.get();
-    FdPositionScope position_scope(handle);
-    if (position_scope.error()) return SYSCALL_FAULT_(-position_scope.error());
     if (unlikely(handle == NULL)) return SYSCALL_FAULT_(EBADF);
     if (handle->node->type & (file_socket | file_pipe)) return SYSCALL_FAULT_(ESPIPE);
 
@@ -3706,9 +3757,10 @@ sys_(getdents, int fd, struct dirent *dents, size_t size)
     FdOperation descriptor_pin;
     int descriptor_error = descriptor_pin.acquire(fd);
     if (descriptor_error) return SYSCALL_FAULT_(-descriptor_error);
+    FdPositionScope position;
+    descriptor_error = position.acquire(descriptor_pin);
+    if (descriptor_error) return SYSCALL_FAULT_(-descriptor_error);
     fd_file_handle *handle = descriptor_pin.get();
-    FdPositionScope position_scope(handle);
-    if (position_scope.error()) return SYSCALL_FAULT_(-position_scope.error());
     if (unlikely(handle == NULL)) { return SYSCALL_FAULT_(EBADF); }
     if (handle->node->type != file_dir) { return SYSCALL_FAULT_(ENOTDIR); }
     if (!vfs_check_access(handle->node, NULL, IME_FILE_LIST)) return SYSCALL_FAULT_(vfs_last_error());
@@ -3765,9 +3817,10 @@ sys_(getdents64, int fd, void *dents, size_t size)
     FdOperation descriptor_pin;
     int descriptor_error = descriptor_pin.acquire(fd);
     if (descriptor_error) return SYSCALL_FAULT_(-descriptor_error);
+    FdPositionScope position;
+    descriptor_error = position.acquire(descriptor_pin);
+    if (descriptor_error) return SYSCALL_FAULT_(-descriptor_error);
     fd_file_handle *handle = descriptor_pin.get();
-    FdPositionScope position_scope(handle);
-    if (position_scope.error()) return SYSCALL_FAULT_(-position_scope.error());
     if (unlikely(handle == NULL)) { return SYSCALL_FAULT_(EBADF); }
     if (handle->node->type != file_dir) { return SYSCALL_FAULT_(ENOTDIR); }
     if (!vfs_check_access(handle->node, NULL, IME_FILE_LIST)) return SYSCALL_FAULT_(vfs_last_error());
@@ -4190,14 +4243,22 @@ sys_(openat)
 
 sys_(mkdirat, int dirfd, char *pathname, uint64_t mode)
 {
-    (void)mode;
     if (pathname == NULL) return SYSCALL_FAULT_(EINVAL);
 
     char *resolved = NULL;
     int path_ret = resolve_user_path_at(dirfd, pathname, &resolved);
     if (path_ret < 0) return SYSCALL_FAULT_((int)-path_ret);
 
-    errno_t ret = vfs_mkdir(resolved);
+    if (linux_mkdir_path_exists(resolved))
+    {
+        free(resolved);
+        return SYSCALL_FAULT_(EEXIST);
+    }
+
+    pcb_t process = get_current_task()->parent_group;
+    uint16_t create_mode = (uint16_t)(mode & 07777 & ~(process ? process->umask : 0));
+    errno_t ret = process && process->linux_abi ?
+                  vfs_mkdir_leaf_mode(resolved, create_mode, current_uid(), current_gid()) : vfs_mkdir(resolved);
     free(resolved);
     return ret == VFS_STATUS_SUCCESS ? 0 : SYSCALL_FAULT_(vfs_last_error());
 }
@@ -4213,6 +4274,9 @@ sys_(copy_file_range, int fd_in, uint64_t *off_in, int fd_out, uint64_t *off_out
     int descriptor_error = source_pin.acquire(fd_in);
     if (!descriptor_error) descriptor_error = destination_pin.acquire(fd_out);
     if (descriptor_error) return SYSCALL_FAULT_(-descriptor_error);
+    FdPositionScope position;
+    descriptor_error = position.acquire(source_pin, &destination_pin, off_in == NULL, off_out == NULL);
+    if (descriptor_error) return SYSCALL_FAULT_(-descriptor_error);
     fd_file_handle *src_handle = source_pin.get();
     fd_file_handle *dst_handle = destination_pin.get();
     if (src_handle == NULL || dst_handle == NULL) { return SYSCALL_FAULT_(EBADF); }
@@ -4220,8 +4284,6 @@ sys_(copy_file_range, int fd_in, uint64_t *off_in, int fd_out, uint64_t *off_out
     if (src_handle->node->type & (file_socket | file_pipe) || dst_handle->node->type & (file_socket | file_pipe))
         return SYSCALL_FAULT_(EINVAL);
 
-    FdPositionScope position_scope(src_handle, off_in == NULL, dst_handle, off_out == NULL);
-    if (position_scope.error()) return SYSCALL_FAULT_(-position_scope.error());
 
     uint64_t src_offset = src_handle->offset;
     uint64_t dst_offset = dst_handle->offset;
@@ -4243,22 +4305,23 @@ sys_(copy_file_range, int fd_in, uint64_t *off_in, int fd_out, uint64_t *off_out
     if (buffer == NULL) return SYSCALL_FAULT_(ENOMEM);
 
     size_t copy_total = 0;
+    int copy_error = 0;
     while (remaining > 0)
     {
         size_t chunk = remaining < SENDFILE_BUF_SIZE ? remaining : SENDFILE_BUF_SIZE;
         size_t got = vfs_read(src_handle->node, buffer, src_offset, chunk);
-        if (got == (size_t)VFS_STATUS_FAILED)
+        if ((ssize_t)got < 0)
         {
-            free(buffer);
-            return copy_total > 0 ? copy_total : SYSCALL_FAULT_(vfs_last_error());
+            copy_error = got == (size_t)VFS_STATUS_FAILED ? vfs_last_error() : (int)-(ssize_t)got;
+            break;
         }
         if (got == 0) break;
 
         size_t wrote = vfs_write(dst_handle->node, buffer, dst_offset, got);
-        if (wrote == (size_t)VFS_STATUS_FAILED)
+        if ((ssize_t)wrote < 0)
         {
-            free(buffer);
-            return copy_total > 0 ? copy_total : SYSCALL_FAULT_(vfs_last_error());
+            copy_error = wrote == (size_t)VFS_STATUS_FAILED ? vfs_last_error() : (int)-(ssize_t)wrote;
+            break;
         }
         if (wrote == 0) break;
 
@@ -4272,25 +4335,23 @@ sys_(copy_file_range, int fd_in, uint64_t *off_in, int fd_out, uint64_t *off_out
     vfs_update(dst_handle->node);
     free(buffer);
 
+    // Commit all successful bytes even if a later chunk or offset copy fails.
+    // Explicit offsets must never change the shared description's cursor.
+    if (off_in == NULL) src_handle->offset = (size_t)src_offset;
+    if (off_out == NULL) dst_handle->offset = (size_t)dst_offset;
     if (off_in != NULL)
     {
-        if (!copy_to_user_pagedir(pagedir, off_in, &src_offset, sizeof(src_offset))) return SYSCALL_FAULT_(EFAULT);
-    }
-    else
-    {
-        src_handle->offset = (size_t)src_offset;
+        if (!copy_to_user_pagedir(pagedir, off_in, &src_offset, sizeof(src_offset)))
+            return copy_total ? copy_total : SYSCALL_FAULT_(EFAULT);
     }
 
     if (off_out != NULL)
     {
-        if (!copy_to_user_pagedir(pagedir, off_out, &dst_offset, sizeof(dst_offset))) return SYSCALL_FAULT_(EFAULT);
-    }
-    else
-    {
-        dst_handle->offset = (size_t)dst_offset;
+        if (!copy_to_user_pagedir(pagedir, off_out, &dst_offset, sizeof(dst_offset)))
+            return copy_total ? copy_total : SYSCALL_FAULT_(EFAULT);
     }
 
-    return copy_total;
+    return copy_total || !copy_error ? copy_total : SYSCALL_FAULT_(copy_error);
 }
 
 sys_(pread, int fd, uint8_t *buffer, size_t size, uint64_t offset)
@@ -4300,6 +4361,9 @@ sys_(pread, int fd, uint8_t *buffer, size_t size, uint64_t offset)
 
     FdOperation operation;
     int operation_error = operation.acquire(fd);
+    if (operation_error) return SYSCALL_FAULT_(-operation_error);
+    FdPositionScope position;
+    operation_error = position.acquire(operation, NULL, false);
     if (operation_error) return SYSCALL_FAULT_(-operation_error);
     fd_file_handle *handle = operation.get();
     if (handle == NULL || handle->node == NULL) return SYSCALL_FAULT_(EBADF);
@@ -4321,17 +4385,15 @@ sys_(pwrite, int fd, uint8_t *buffer, size_t size, int64_t offset)
     FdOperation operation;
     int operation_error = operation.acquire(fd);
     if (operation_error) return SYSCALL_FAULT_(-operation_error);
+    FdPositionScope position;
+    operation_error = position.acquire(operation, NULL, false);
+    if (operation_error) return SYSCALL_FAULT_(-operation_error);
     fd_file_handle *handle = operation.get();
-    FdPositionScope position_scope(handle, false);
-    if (position_scope.error()) return SYSCALL_FAULT_(-position_scope.error());
     if (handle == NULL || handle->node == NULL) return SYSCALL_FAULT_(EBADF);
     if (handle->node->type & file_socket) return SYSCALL_FAULT_(ESPIPE);
     if (handle->node->type & file_pipe) return SYSCALL_FAULT_(ESPIPE);
 
-    size_t old_offset = handle->offset;
-    handle->offset = (size_t)offset;
-    int64_t ret = write_from_user_buffer(handle, buffer, size, false);
-    handle->offset = old_offset;
+    int64_t ret = write_from_user_buffer(handle, buffer, size, false, (size_t)offset, true);
     return ret < 0 ? SYSCALL_FAULT_((int)-ret) : (uint64_t)ret;
 }
 
@@ -5733,12 +5795,13 @@ sys_(sendfile, int out_fd, int in_fd, uint64_t *offset_ptr, size_t count)
     int descriptor_error = source_pin.acquire(in_fd);
     if (!descriptor_error) descriptor_error = destination_pin.acquire(out_fd);
     if (descriptor_error) return SYSCALL_FAULT_(-descriptor_error);
+    FdPositionScope position;
+    descriptor_error = position.acquire(source_pin, &destination_pin, offset_ptr == NULL, true);
+    if (descriptor_error) return SYSCALL_FAULT_(-descriptor_error);
     fd_file_handle *out_handle = destination_pin.get();
     fd_file_handle *in_handle = source_pin.get();
     if (out_handle == NULL || in_handle == NULL) return SYSCALL_FAULT_(EBADF);
 
-    FdPositionScope position_scope(in_handle, offset_ptr == NULL, out_handle, true);
-    if (position_scope.error()) return SYSCALL_FAULT_(-position_scope.error());
 
     uint64_t current_offset = in_handle->offset;
     if (offset_ptr && !copy_from_user_pagedir(current_user_pagedir(), &current_offset, offset_ptr,
@@ -5766,15 +5829,16 @@ sys_(sendfile, int out_fd, int in_fd, uint64_t *offset_ptr, size_t count)
             break;
         }
         bytes_written = vfs_write(out_handle->node, buffer, out_handle->offset, bytes_read);
-        if (bytes_written == (size_t)VFS_STATUS_FAILED)
+        if ((ssize_t)bytes_written < 0)
         {
             if (total_sent == 0)
             {
                 free(buffer);
-                return SYSCALL_FAULT_(vfs_last_error());
+                return bytes_written == (size_t)VFS_STATUS_FAILED ? SYSCALL_FAULT_(vfs_last_error()) : bytes_written;
             }
             break;
         }
+        if (bytes_written == 0) break;
         if (bytes_written < bytes_read) { bytes_read = bytes_written; }
         current_offset     += bytes_read;
         out_handle->offset += bytes_read;

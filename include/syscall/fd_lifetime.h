@@ -8,6 +8,14 @@
 // Kernel-private operation references. The public fd_file_handle layout and
 // filesystem/module callbacks remain unchanged.
 struct FdOperationRecord;
+// Private open-file state; fd_file_handle remains the same public ABI.
+int fd_share_description(fd_file_handle *source, fd_file_handle *copy);
+int fd_get_status_flags(FdOperationRecord *record, uint64_t &flags);
+int fd_set_status_flags(FdOperationRecord *record, uint64_t mask, uint64_t flags);
+int fd_position_begin(FdOperationRecord *first, FdOperationRecord *second, bool update_first, bool update_second);
+void fd_position_end(FdOperationRecord *record);
+int fd_clone_file_table(pcb_t source, lock_queue **copy);
+void fd_discard_file_table(lock_queue *table);
 FdOperationRecord *fd_operation_acquire(int fd, int &error);
 // Trusted procfs observer: caller must retain the target PCB for the complete
 // acquisition. The returned ticket retains the descriptor independently of
@@ -34,8 +42,6 @@ fd_file_handle *fd_detach_matching(pcb_t process, size_t first, size_t last, boo
 fd_file_handle *fd_detach_first(lock_queue *table);
 void fd_mark_cloexec(pcb_t process, size_t first, size_t last);
 lock_queue *fd_detach_process_table(pcb_t process);
-// Snapshot operation pins under table locks, then duplicate outside locks.
-lock_queue *fd_clone_process_table(pcb_t process);
 // Call only after a dead thread has no current/selected/previous-stack
 // scheduler references. False means its operation references must remain intact.
 bool fd_operation_thread_exit(tcb_t task);
@@ -47,6 +53,7 @@ void process_reap_wait_claims();
 
 class FdOperation
 {
+    friend class FdPositionScope;
     FdOperationRecord *record_ = NULL;
 
 public:
@@ -74,4 +81,28 @@ public:
         return fd_install_handle(process, handle, minimum, exact, &record_);
     }
     fd_file_handle *get() const { return fd_operation_handle(record_); }
+    int status_flags(uint64_t &flags) const { return fd_get_status_flags(record_, flags); }
+    int set_status_flags(uint64_t mask, uint64_t flags) { return fd_set_status_flags(record_, mask, flags); }
+};
+
+// Declare after the operation pin(s), so they outlive this scope. A pair is
+// acquired atomically, including two descriptors for the same description.
+// No spin lock is held across user copies, VFS callbacks, or waits.
+class FdPositionScope
+{
+    FdOperationRecord *owner_ = NULL;
+
+public:
+    FdPositionScope() = default;
+    FdPositionScope(const FdPositionScope &) = delete;
+    FdPositionScope &operator=(const FdPositionScope &) = delete;
+    ~FdPositionScope() { fd_position_end(owner_); }
+    int acquire(FdOperation &first, FdOperation *second = NULL, bool update_first = true,
+                bool update_second = true)
+    {
+        if (owner_) return -EBUSY;
+        int error = fd_position_begin(first.record_, second ? second->record_ : NULL, update_first, update_second);
+        if (!error) owner_ = first.record_;
+        return error;
+    }
 };

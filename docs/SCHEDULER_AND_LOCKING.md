@@ -127,6 +127,14 @@ TCB or per-CPU scratch buffer: C code and nested entries can overwrite it.
 
 ## Lock and allocator rules
 
+Initial user stacks store argument strings contiguously in increasing `argv`
+order, followed by environment strings in increasing `envp` order. Only the
+pointer tables, auxiliary vector and final stack pointer need ABI alignment.
+Do not align or reverse individual strings: libuv bounds process-title writes
+using the complete first-to-last argument range. Reversed strings let a title
+write corrupt adjacent environment data during `npm run`. The stack-string
+harness and guest Express environment probe exercise that boundary.
+
 liballoc's internal lock does not mask interrupts. If an interrupt arrives
 while a CPU owns that lock and the interrupt path allocates or frees memory,
 the same CPU can spin forever waiting for the interrupted owner. Kernel
@@ -173,6 +181,14 @@ preemption and consumer-reentrant producers must never wait for queue space.
 Log acceptance is decided when a record is enqueued. Keep prompt state and
 console/observer delivery in FIFO record order; raw output retains its original
 log-filter behavior.
+
+Input workers and window-lifetime diagnostics use `try_write_serial_fmt()`.
+It formats into one private bounded record and publishes a closed copy without
+retaining a TCB. Queue saturation rejects the new record; oversize diagnostics
+retain a truncated prefix, with both losses counted. A false return indicates
+rejection or truncation. This entry point never waits, polls UART, or invokes
+console/observer delivery, including before runtime startup and during fatal
+shutdown. Ordinary serial entry points retain streaming and panic behavior.
 
 The separate serial owner-lifetime lock pins an incomplete record's TCB during
 recovery. The consumer releases the serial queue lock before checking scheduler
@@ -222,6 +238,38 @@ after the scheduler reference scan proves quiescence. Process exit drains FDs
 from task context in the reaper, outside spin locks and scheduler-disabled
 sections. PCB collection and waitpid claims must retain their private lifetime
 pins while any cleanup or user-memory copy is in progress.
+
+Kernel-private bindings associate duplicated/forked descriptors with one open
+file description. Independent opens have separate descriptions, even when they
+reference the same VFS node. Keep the public 32-byte `fd_file_handle` prefix
+unchanged. Its offset is a cache valid inside `FdPositionScope`; every syscall
+that consumes or changes an implicit position must acquire that scope after
+pinning the descriptor. Positioned IO does not publish a new cursor. File status
+flags belong to the description; descriptor numbers and CLOEXEC remain local.
+
+Position ownership is recorded in heap operation tickets, never stack pointers.
+The registry spin lock protects bindings, references, cursor ownership and short
+cache publication only. VFS, user copies, allocation, free and yielding happen
+after unlocking. Two-file operations acquire both descriptions in one metadata
+transaction, so opposite-direction copies cannot deadlock while holding one.
+Aliases of one description are acquired once with explicit per-handle cursor
+commit rules. The final binding/lease releases description storage outside locks.
+
+A quiescent abandoned position owner may have stopped inside a write. Its ticket
+cleanup releases ownership and poisons that description with EIO rather than
+guessing a cursor and silently overwriting data. Never dereference another
+ticket's FD during abandoned pair cleanup: its handle may already be retired;
+the pair's description references must outlive that handle. Normal IO commits
+before dropping the operation pins and does not poison descriptions.
+
+Fork prepares its FD table outside the existing publication gate with IRQs and
+preemption available. Preallocate snapshot tickets/nodes, pin the entire table
+under registry-then-table locks, then duplicate VFS references after unlocking.
+Preserve the captured descriptor numbers/CLOEXEC, including close/reuse races;
+never look those numbers up again while constructing the child. All allocation
+failures unwind the complete private table before returning. Publishing the
+prepared table/reference counter performs no FD allocation or VFS operation.
+This boundary does not make all other legacy fork/image preparation resumable.
 
 Known limit: forced termination of a waiter after it claims exclusive PCB
 collection can retain that partially collected child until reboot. Collection
@@ -352,6 +400,13 @@ must remain allocation-free and must not acquire the signal disposition lock:
 it is called inside this publication scope. Linux signal handler pointers are
 published atomically, while complete disposition snapshots use the PCB lock.
 
+`scheduler_wake_task()` must acquire the target queue lock even if an initial
+status observation would find RUNNING/START. The waiter can already own that
+lock after checking an unset event but before publishing WAIT. Returning before
+the lock in that window loses the notification. Recheck WAIT only under the
+queue lock; preserve the terminal-state CAS rules. The sleep/wake regression
+pauses exactly in this window and also rejects the old early-return policy.
+
 Clear abandoned futex records before publishing child-TID zero, after all CPU
 references disappear. TID zero permits libc to unmap/reuse the old TLS/stack;
 an older waiter must not consume a wake intended for a new use of that address.
@@ -362,6 +417,14 @@ the saved GPR frame in `handler.S`. Changing exception/syscall frame allocation
 or enabling additional XCR0 components requires updating that contract and its
 tests. The Linux frame contains only user addresses, sanitized FPU state and
 user-modifiable flags; native XAPI retains its existing signal-frame format.
+
+Returning from a signal can restore arbitrary RCX/R11 independently of RIP
+and RFLAGS. SYSRET consumes those two registers; use the full IRET restore
+when their saved values differ, or when RF/TF requires it. The shared return
+path validates user selectors and sanitizes privileged flags before IRET.
+Keep the frame offsets and normal syscall fast path intact. The first-party
+Linux signal-roundtrip probe checks live GPRs, arithmetic flags and XMM state
+through an actual fault/handler/rt_sigreturn sequence in the guest.
 
 ## Sheet composition and GUI state
 

@@ -14,6 +14,7 @@
 typedef struct socketfs_handle {
     socket_provider_t provider;
     void             *socket;
+    socket_setsockopt_fn setsockopt;
 } socketfs_handle_t;
 
 static int        socketfs_id      = 0;
@@ -23,6 +24,17 @@ static vfs_node_t socketfs_root    = NULL;
 static spin_t           g_socket_provider_lock  = SPIN_INIT;
 static socket_provider_t g_socket_provider_data = {};
 static bool              g_socket_provider_ready = false;
+static socket_setsockopt_fn g_socket_provider_setter = NULL;
+
+static socket_setsockopt_fn socketfs_snapshot_setter(const socket_provider_t *provider)
+{
+    spin_lock(&g_socket_provider_lock);
+    // Each socket keeps this extension with the provider that created it.
+    socket_setsockopt_fn setter = provider->create == g_socket_provider_data.create &&
+                                 provider->close == g_socket_provider_data.close ? g_socket_provider_setter : NULL;
+    spin_unlock(&g_socket_provider_lock);
+    return setter;
+}
 
 static inline bool socketfs_provider_valid(const socket_provider_t *provider)
 {
@@ -234,6 +246,7 @@ int socketfs_alloc_fd_with_provider(void *impl, uint64_t flags, const socket_pro
 
     socket_handle->provider = *provider;
     socket_handle->socket   = impl;
+    socket_handle->setsockopt = socketfs_snapshot_setter(provider);
 
     node->type   = file_socket | file_delete;
     node->fsid   = socketfs_id;
@@ -280,7 +293,7 @@ static int socketfs_alloc_fd(void *impl, uint64_t flags)
 extern socket_provider_t g_unix_provider;
 extern void init_unix_provider(void);
 
-int socket_provider_register(const socket_provider_t *provider)
+int socket_provider_register_with_options(const socket_provider_t *provider, socket_setsockopt_fn setter)
 {
     if (!socketfs_provider_valid(provider)) {
         return -EINVAL;
@@ -288,9 +301,16 @@ int socket_provider_register(const socket_provider_t *provider)
 
     spin_lock(&g_socket_provider_lock);
     g_socket_provider_data  = *provider;
+    g_socket_provider_setter = setter;
     g_socket_provider_ready = true;
     spin_unlock(&g_socket_provider_lock);
     return 0;
+}
+EXPORT_SYMBOL(socket_provider_register_with_options);
+
+int socket_provider_register(const socket_provider_t *provider)
+{
+    return socket_provider_register_with_options(provider, NULL);
 }
 EXPORT_SYMBOL(socket_provider_register);
 
@@ -417,6 +437,18 @@ int socket_getsockopt(int fd, int level, int optname, void *optval, socklen_t *o
     return handle->provider.getsockopt(handle->socket, level, optname, optval, optlen);
 }
 
+int socket_setsockopt(int fd, int level, int optname, const void *optval, socklen_t optlen)
+{
+    FdOperation descriptor;
+    int error = descriptor.acquire(fd);
+    if (error) return error;
+    fd_file_handle *file = descriptor.get();
+    if (!file || !file->node || !(file->node->type & file_socket)) return -ENOTSOCK;
+    socketfs_handle_t *handle = socketfs_get_handle(file->node);
+    if (!handle || !handle->setsockopt) return -ENOPROTOOPT;
+    return handle->setsockopt(handle->socket, level, optname, optval, optlen);
+}
+
 int socket_listen(int fd, int backlog)
 {
     fd_file_handle *fd_handle = NULL;
@@ -497,6 +529,7 @@ int socket_accept4(int fd, struct sockaddr *addr, socklen_t *addrlen, int flags)
     }
     object->provider = provider;
     object->socket = socket;
+    object->setsockopt = provider_handle->setsockopt;
     node->type = file_socket | file_delete;
     node->fsid = socketfs_id;
     node->handle = object;

@@ -32,6 +32,7 @@
 #include <procfs.h>
 #include <syscall/syscall.h>
 #include <syscall/fd_lifetime.h>
+#include <syscall/file_io_scope.h>
 #include <block_access.h>
 #include <installer/jobs.h>
 #include <task/ipc.h>
@@ -1165,6 +1166,24 @@ static uint64_t push_slice(tcb_t task, uint64_t ustack, const uint8_t *slice, ui
     return tmp_stack;
 }
 
+static bool push_user_strings(tcb_t task, uint64_t &stack, char *const *strings, size_t count, uint64_t *addresses)
+{
+    // Linux programs may reuse the complete argv string range for their
+    // process title. Store strings in ascending argv/envp order, without
+    // per-string padding, so that range ends before the environment begins.
+    for (size_t index = count; index != 0;)
+    {
+        --index;
+        if (!strings[index]) return false;
+        size_t length = strlen(strings[index]) + 1;
+        if (stack < length) return false;
+        stack -= length;
+        if (!copy_to_user_pagedir(task->parent_group->pagedir, (void *)stack, strings[index], length)) return false;
+        addresses[index] = stack;
+    }
+    return true;
+}
+
 static void fill_aux_random(uint8_t random_bytes[16], tcb_t task, uint64_t sp)
 {
     (void)task;
@@ -1253,25 +1272,10 @@ static uint64_t build_user_stack(tcb_t task, uint64_t sp, uint64_t entry_point, 
         return 0;
     }
 
-    if (envp != NULL)
-    {
-        for (size_t i = 0; ok && i < env_limit; i++)
-        {
-            if (envp[i] != NULL)
-            {
-                tmp_stack       = push_slice(task, tmp_stack, (const uint8_t *)envp[i], strlen(envp[i]) + 1);
-                ok              = tmp_stack != 0;
-                envps[env_i++] = tmp_stack;
-            }
-        }
-    }
-
-    for (argv_i = 0; ok && argv_i < argc; argv_i++)
-    {
-        tmp_stack      = push_slice(task, tmp_stack, (const uint8_t *)argv[argv_i], strlen(argv[argv_i]) + 1);
-        ok             = tmp_stack != 0;
-        argvps[argv_i] = tmp_stack;
-    }
+    if (ok && envp != NULL) ok = push_user_strings(task, tmp_stack, envp, env_limit, envps);
+    if (ok) env_i = env_limit;
+    if (ok) ok = push_user_strings(task, tmp_stack, argv, (size_t)argc, argvps);
+    if (ok) argv_i = argc;
     uint8_t aux_random[16];
     fill_aux_random(aux_random, task, sp);
     if (ok) tmp_stack = push_slice(task, tmp_stack, aux_random, sizeof(aux_random));
@@ -2364,6 +2368,32 @@ static bool fd_table_unref(pcb_t pcb)
     return false;
 }
 
+class ForkFileTable
+{
+    lock_queue *table_ = NULL;
+    size_t *references_ = NULL;
+
+public:
+    ~ForkFileTable()
+    {
+        // Every caller restores runtime state before returning. Failed drafts
+        // may close files and must not inherit syscall-entry IRQ masking.
+        FileIoSyscallScope io(SYS_CLOSE);
+        fd_discard_file_table(table_);
+        free(references_);
+    }
+    int prepare(pcb_t source)
+    {
+        FileIoSyscallScope io(SYS_CLOSE);
+        int error = fd_clone_file_table(source, &table_);
+        if (error) return error;
+        references_ = alloc_fd_table_ref();
+        return references_ ? 0 : -ENOMEM;
+    }
+    lock_queue *take_table() { lock_queue *table = table_; table_ = NULL; return table; }
+    size_t *take_references() { size_t *references = references_; references_ = NULL; return references; }
+};
+
 static void close_process_file_table(pcb_t pcb)
 {
     xnet_process_release(pcb);
@@ -2492,9 +2522,7 @@ uint64_t process_fork(struct X64_REGS *reg, bool is_vfork, uint64_t user_stack, 
 
     bool is_sti                = are_interrupts_enabled();
     uint64_t scheduler_depth = scheduler_disable_depth();
-    if (!(clone_flags & CLONE_FILES_FLAG) && (scheduler_depth != 0 || no_interrupt)) return (uint64_t)-EAGAIN;
-    close_interrupt;
-    disable_scheduler();
+    if (scheduler_depth != 0) return (uint64_t)-EDEADLK;
 
     tcb_t parent_task = get_current_task();
     if (parent_task == NULL || parent_task->parent_group == NULL)
@@ -2520,27 +2548,16 @@ uint64_t process_fork(struct X64_REGS *reg, bool is_vfork, uint64_t user_stack, 
         return (uint64_t)-EFAULT;
     }
 
-    struct PreparedFiles
-    {
-        lock_queue *table = NULL;
-        ~PreparedFiles() { if (table) free_fd_handle_queue(table); }
-        lock_queue *take() { lock_queue *result = table; table = NULL; return result; }
-    } prepared_files;
+    // Snapshot and pin the whole descriptor table before the existing fork
+    // publication gate. No allocations or VFS duplication under its locks.
+    ForkFileTable files;
     if (!(clone_flags & CLONE_FILES_FLAG))
     {
-        // Capture retained descriptors in one short table transaction. VFS
-        // duplication and shared-position allocation must run preemptibly,
-        // before the child is published and outside the creator spin lock.
-        restore_runtime_state(scheduler_depth, true);
-        prepared_files.table = fd_clone_process_table(current_pcb);
-        close_interrupt;
-        disable_scheduler();
-        if (!prepared_files.table)
-        {
-            restore_runtime_state(scheduler_depth, is_sti);
-            return (uint64_t)-ENOMEM;
-        }
+        int error = files.prepare(current_pcb);
+        if (error) return (uint64_t)error;
     }
+    close_interrupt;
+    disable_scheduler();
     spin_lock(&create_thread_lock);
 
     pcb_t new_pcb = (pcb_t)malloc(sizeof(struct process_control_block));
@@ -2609,8 +2626,8 @@ uint64_t process_fork(struct X64_REGS *reg, bool is_vfork, uint64_t user_stack, 
     }
     else
     {
-        new_pcb->file_open = prepared_files.take();
-        new_pcb->file_open_shared_refs = alloc_fd_table_ref();
+        new_pcb->file_open = files.take_table();
+        new_pcb->file_open_shared_refs = files.take_references();
     }
     new_pcb->ipc_queue    = queue_init();
     new_pcb->tty          = alloc_default_tty();
