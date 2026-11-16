@@ -1,4 +1,9 @@
 #include "xhci.h"
+#ifdef XHCI_BUILTIN
+#include <block_source.h>
+#include <efi/boot.h>
+extern BOOT_CONFIG *EFI_BC;
+#endif
 
 static xhci_controller *g_xhci = NULL;
 static const uint32_t XHCI_INVALID_INDEX = (uint32_t)-1;
@@ -47,6 +52,164 @@ static inline void xhci_write32(volatile uint32_t *reg, uint32_t value) {
     *reg = value;
     __sync_synchronize();
 }
+
+#ifdef XHCI_BUILTIN
+// Written only by synchronous bootstrap probes. Capture stops before workers
+// can run; the snapshot contains no owning pointers and grants no I/O rights.
+static xhci_controller *g_boot_probe_controller;
+static UsbBootDiagnostics g_boot_probe;
+static bool g_boot_probe_valid, g_boot_probe_capture;
+
+static void xhci_boot_init(xhci_controller *xhci)
+{
+    if (!EFI_BC || !(EFI_BC->boot_flags & BOOT_FLAG_INSTALLER_HANDOFF) ||
+        !(EFI_BC->boot_flags & BOOT_FLAG_INSTALLER)) return;
+    const auto &source = EFI_BC->installer_handoff.source;
+    if (source.transport != XJ_INSTALLER_SOURCE_USB || !xj_installer_source_valid(&source)) return;
+    const auto &leaf = source.pci[source.pci_count - 1];
+    const auto *pci = xhci->pci_dev;
+    if (pci->segment != leaf.segment || pci->bus != leaf.bus || pci->slot != leaf.device ||
+        pci->func != leaf.function) return;
+    XJ_INSTALLER_PATH_INFO parsed;
+    if (xj_installer_parse_device_path(source.path, source.path_bytes, &parsed) != XJ_INSTALLER_SOURCE_SUPPORTED)
+        return;
+    g_boot_probe = {};
+    g_boot_probe.expected_port = uint32_t(parsed.usb_ports[0]) + 1;
+    g_boot_probe.expected.port = g_boot_probe.expected_port;
+    g_boot_probe.expected.stage = UsbBootStage::PortConnect;
+    g_boot_probe.expected.result = -ENODEV;
+    g_boot_probe_controller = xhci;
+    g_boot_probe_valid = g_boot_probe_capture = true;
+    write_serial_fmt_heapless("xhci: boot USB diagnostics armed root-port=%u\n", g_boot_probe.expected_port);
+}
+
+static void xhci_boot_publish()
+{
+    if (g_boot_probe.last.port == g_boot_probe.expected_port) g_boot_probe.expected = g_boot_probe.last;
+}
+
+void xhci_boot_stage(xhci_controller *xhci, uint32_t port, UsbBootStage stage)
+{
+    if (!g_boot_probe_capture || xhci != g_boot_probe_controller) return;
+    auto &probe = g_boot_probe.last;
+    if (port && (probe.port != port || stage == UsbBootStage::PortReset)) probe = {};
+    if (port) probe.port = port;
+    probe.stage = stage;
+    probe.result = 0;
+    xhci_boot_publish();
+}
+
+void xhci_boot_result(xhci_controller *xhci, int result)
+{
+    if (!g_boot_probe_capture || xhci != g_boot_probe_controller) return;
+    g_boot_probe.last.result = result;
+    if (result < 0 && !g_boot_probe.last.first_error)
+    {
+        g_boot_probe.last.first_error = result;
+        g_boot_probe.last.failed_stage = g_boot_probe.last.stage;
+    }
+    xhci_boot_publish();
+}
+
+void xhci_boot_device(xhci_controller *xhci, const xhci_slot_state *slot)
+{
+    if (!g_boot_probe_capture || xhci != g_boot_probe_controller) return;
+    auto &probe = g_boot_probe.last;
+    probe.vendor = slot->device_desc.idVendor;
+    probe.product = slot->device_desc.idProduct;
+    probe.interface_class = slot->active_iface_class;
+    probe.interface_subclass = slot->active_iface_subclass;
+    probe.interface_protocol = slot->active_iface_protocol;
+    xhci_boot_publish();
+}
+
+static void xhci_boot_transfer_error(xhci_controller *xhci, uint32_t cc, bool timed_out,
+                                     const usb_setup_packet *setup = nullptr)
+{
+    if (!g_boot_probe_capture || xhci != g_boot_probe_controller) return;
+    auto &probe = g_boot_probe.last;
+    probe.completion_code = cc;
+    probe.timed_out |= uint32_t(timed_out);
+    if (!probe.first_error)
+    {
+        probe.first_error = timed_out ? -ETIMEDOUT : -EIO;
+        probe.failed_stage = probe.stage;
+    }
+    if (setup)
+    {
+        probe.request = setup->bRequest;
+        probe.request_type = setup->bmRequestType;
+        probe.transfer_bytes = setup->wLength;
+    }
+    xhci_boot_publish();
+}
+
+void xhci_boot_scsi(xhci_controller *xhci, uint32_t opcode, uint32_t status)
+{
+    if (!g_boot_probe_capture || xhci != g_boot_probe_controller) return;
+    g_boot_probe.last.opcode = opcode;
+    g_boot_probe.last.scsi_status = status;
+    xhci_boot_publish();
+}
+
+bool xhci_boot_diagnostics(UsbBootDiagnostics *output)
+{
+    if (!output || !g_boot_probe_valid) return false;
+    auto *xhci = g_boot_probe_controller;
+    if (xhci)
+    {
+        g_boot_probe.ports = xhci->num_ports;
+        g_boot_probe.connected = 0;
+        g_boot_probe.connected_mask = 0;
+        for (uint32_t port = 0; port < xhci->num_ports; ++port)
+        {
+            uint32_t value = xhci_read32(&xhci->ports[port].portsc);
+            if (port + 1 == g_boot_probe.expected_port) g_boot_probe.expected_portsc = value;
+            if (value & XHCI_PORTSC_CCS)
+            {
+                ++g_boot_probe.connected;
+                if (port < 64) g_boot_probe.connected_mask |= 1ULL << port;
+            }
+        }
+        g_boot_probe.command = xhci_read32(&xhci->op->usb_cmd);
+        g_boot_probe.status = xhci_read32(&xhci->op->usb_sts);
+    }
+    *output = g_boot_probe;
+    return true;
+}
+
+static void xhci_wait_boot_source()
+{
+    if (!EFI_BC || !(EFI_BC->boot_flags & BOOT_FLAG_INSTALLER_HANDOFF) ||
+        !(EFI_BC->boot_flags & BOOT_FLAG_INSTALLER)) return;
+    const auto &source = EFI_BC->installer_handoff.source;
+    if (source.transport != XJ_INSTALLER_SOURCE_USB || !xj_installer_source_valid(&source)) return;
+    // Link recovery after HCRST/power-on can outlast the first 20-ms scan.
+    // Bootstrap cannot use worker sleeps before the global scheduler opens.
+    // Each probe retains its own timeout; also cap the number of rescans if a
+    // broken clock makes the elapsed-time guard unusable.
+    uint64_t begin = nanoTime();
+    for (unsigned attempt = 0; attempt < 15; ++attempt)
+    {
+        BlockExtent whole;
+        int result = block_source_match(source, &whole);
+        if (result != -ENODEV)
+        {
+            if (attempt)
+                write_serial_fmt_heapless("xhci: installer USB rescan result=%d attempts=%u\n", result, attempt);
+            return;
+        }
+        if (nanoTime() - begin >= 1500000000ULL) return;
+        if (!attempt) write_serial_fmt_heapless("xhci: waiting for installer USB source\n");
+        delay_ms_hp(100);
+        usb_scan_all_hubs();
+    }
+}
+#else
+static void xhci_boot_init(xhci_controller *) {}
+static void xhci_boot_transfer_error(xhci_controller *, uint32_t, bool,
+                                     const usb_setup_packet * = nullptr) {}
+#endif
 
 static inline uint32_t xhci_portsc_neutral(uint32_t portsc) {
     return portsc & (XHCI_PORTSC_RO_BITS | XHCI_PORTSC_RWS_BITS);
@@ -865,6 +1028,7 @@ static int xhci_wait_for_ring(xhci_controller *xhci, xhci_ring *ring,
     }
 
     ring->completion_idx = ring->enqueue_idx;
+    xhci_boot_transfer_error(xhci, 0, true);
     XHCI_DIAG_FAIL(XHCI_DIAG_CMD_TIMEOUT);
     return XHCI_CC_USB_TRANSACTION_ERROR;
 }
@@ -891,6 +1055,7 @@ static int xhci_cmd_enable_slot(xhci_controller *xhci) {
     int cc = xhci_cmd_submit(
         xhci, 0, XHCI_TRB_TYPE_ENABLE_SLOT_CMD << XHCI_TRB_TYPE_SHIFT);
     if (cc != XHCI_CC_SUCCESS) {
+        xhci_boot_transfer_error(xhci, cc, false);
         pr_info("xhci: enable slot failed cc=%d status=0x%x control=0x%x\n",
                cc, xhci->cmd_ring.event.status, xhci->cmd_ring.event.control);
         return -EIO;
@@ -917,6 +1082,7 @@ static int xhci_cmd_address_device(xhci_controller *xhci, uint32_t slot_id,
     int cc = xhci_cmd_submit(
         xhci, input_ctx_phys, control);
     if (cc != XHCI_CC_SUCCESS) {
+        xhci_boot_transfer_error(xhci, cc, false);
         xhci_diag_byte(XHCI_DIAG_ADDRESS_CC0, (uint8_t)cc);
         pr_info("xhci: address device failed slot=%u bsr=%u cc=%d status=0x%x control=0x%x\n",
                slot_id, block_set_address ? 1U : 0U, cc,
@@ -933,6 +1099,7 @@ static int xhci_cmd_configure_endpoint(xhci_controller *xhci, uint32_t slot_id,
         (XHCI_TRB_TYPE_CONFIGURE_ENDPOINT_CMD << XHCI_TRB_TYPE_SHIFT) |
             (slot_id << XHCI_TRB_SLOT_ID_SHIFT));
     if (cc != XHCI_CC_SUCCESS) {
+        xhci_boot_transfer_error(xhci, cc, false);
         pr_info("xhci: configure endpoint failed slot=%u cc=%d status=0x%x control=0x%x\n",
                slot_id, cc, xhci->cmd_ring.event.status,
                xhci->cmd_ring.event.control);
@@ -947,6 +1114,7 @@ static int xhci_cmd_evaluate_context(xhci_controller *xhci, uint32_t slot_id,
         (XHCI_TRB_TYPE_EVALUATE_CONTEXT_CMD << XHCI_TRB_TYPE_SHIFT) |
             (slot_id << XHCI_TRB_SLOT_ID_SHIFT));
     if (cc != XHCI_CC_SUCCESS) {
+        xhci_boot_transfer_error(xhci, cc, false);
         pr_info("xhci: evaluate context failed slot=%u cc=%d status=0x%x control=0x%x\n",
                slot_id, cc, xhci->cmd_ring.event.status,
                xhci->cmd_ring.event.control);
@@ -1172,6 +1340,7 @@ static int xhci_control_transfer(xhci_controller *xhci, xhci_slot_state *slot,
     int cc = xhci_wait_for_ring_target(xhci, &slot->ep0_ring, status_index,
                                        5000);
     if (cc != XHCI_CC_SUCCESS && cc != XHCI_CC_SHORT_PACKET) {
+        xhci_boot_transfer_error(xhci, cc, false, setup);
         pr_info("xhci: control transfer failed slot=%u req=0x%x type=0x%x len=%u cc=%d status=0x%x control=0x%x\n",
                slot->slot_id, setup->bRequest, setup->bmRequestType, data_len,
                cc, slot->ep0_ring.event.status, slot->ep0_ring.event.control);
@@ -1643,6 +1812,7 @@ static int xhci_submit_bulk_transfer(xhci_controller *xhci,
 
     int cc = xhci_wait_for_ring(xhci, ring, 1000);
     if (cc != XHCI_CC_SUCCESS && cc != XHCI_CC_SHORT_PACKET) {
+        xhci_boot_transfer_error(xhci, cc, false);
         return -EIO;
     }
 
@@ -1806,6 +1976,7 @@ static int xhci_msc_bot_command(xhci_controller *xhci, xhci_slot_state *slot,
     cbw->lun = 0;
     cbw->cb_length = cdb_len;
     memcpy(cbw->cdb, cdb, cdb_len);
+    xhci_boot_scsi(xhci, cbw->cdb[0], 0xffffffffU);
 
     rc = xhci_submit_bulk_transfer(xhci, slot, false, cbw_phys, sizeof(*cbw),
                                    NULL);
@@ -1827,6 +1998,7 @@ static int xhci_msc_bot_command(xhci_controller *xhci, xhci_slot_state *slot,
         return rc;
     }
 
+    xhci_boot_scsi(xhci, cbw->cdb[0], csw_actual >= sizeof(*csw) ? csw->status : 0xffffffffU);
     if (csw_actual < sizeof(*csw) || csw->signature != XHCI_MSC_CSW_SIGNATURE ||
         csw->tag != tag || csw->status != 0) {
         (void)xhci_msc_reset_recovery(xhci, slot);
@@ -2206,6 +2378,7 @@ static int xhci_prepare_slot(xhci_controller *xhci,
     XHCI_DIAG_OK(XHCI_DIAG_OUTPUT_CTX);
 
     XHCI_DIAG_PENDING(XHCI_DIAG_ENABLE_SLOT);
+    xhci_boot_stage(xhci, slot->port_id, UsbBootStage::EnableSlot);
     int slot_id = xhci_cmd_enable_slot(xhci);
     if (slot_id <= 0 || (uint32_t)slot_id > xhci->num_slots) {
         XHCI_DIAG_FAIL(XHCI_DIAG_ENABLE_SLOT);
@@ -2224,6 +2397,7 @@ static int xhci_prepare_slot(xhci_controller *xhci,
 
     XHCI_DIAG_PENDING(XHCI_DIAG_ADDRESS_DEVICE);
     XHCI_DIAG_PENDING(XHCI_DIAG_INPUT_CTX);
+    xhci_boot_stage(xhci, slot->port_id, UsbBootStage::Address);
     rc = xhci_address_device(xhci, slot, block_set_address);
     if (rc != 0) {
         XHCI_DIAG_FAIL(XHCI_DIAG_INPUT_CTX);
@@ -2302,11 +2476,13 @@ static void xhci_release_slot_tree(xhci_controller *xhci, uint32_t slot_id) {
 
 static int xhci_reset_port(xhci_controller *xhci, uint32_t port_idx,
                            uint8_t *speed_out) {
+    xhci_boot_stage(xhci, port_idx + 1, UsbBootStage::PortReset);
     XHCI_DIAG_PENDING(XHCI_DIAG_PORT_RESET);
     volatile uint32_t *portsc_reg = &xhci->ports[port_idx].portsc;
     uint32_t portsc = xhci_read32(portsc_reg);
     if ((portsc & XHCI_PORTSC_CCS) == 0) {
         XHCI_DIAG_FAIL(XHCI_DIAG_PORT_PRESENT);
+        xhci_boot_result(xhci, -ENODEV);
         return -ENODEV;
     }
     XHCI_DIAG_OK(XHCI_DIAG_PORT_PRESENT);
@@ -2326,6 +2502,7 @@ static int xhci_reset_port(xhci_controller *xhci, uint32_t port_idx,
             if ((portsc & XHCI_PORTSC_CCS) == 0) {
                 xhci_diag_portsc(portsc);
                 XHCI_DIAG_FAIL(XHCI_DIAG_PORT_RESET);
+                xhci_boot_result(xhci, -ENODEV);
                 return -ENODEV;
             }
             if ((portsc & XHCI_PORTSC_PR) == 0 &&
@@ -2351,6 +2528,7 @@ static int xhci_reset_port(xhci_controller *xhci, uint32_t port_idx,
     if ((portsc & XHCI_PORTSC_PED) == 0) {
         xhci_diag_portsc(portsc);
         XHCI_DIAG_FAIL(XHCI_DIAG_PORT_RESET);
+        xhci_boot_result(xhci, -ETIMEDOUT);
         return -ETIMEDOUT;
     }
 
@@ -2361,6 +2539,7 @@ static int xhci_reset_port(xhci_controller *xhci, uint32_t port_idx,
     if ((portsc & XHCI_PORTSC_CCS) == 0 ||
         (portsc & XHCI_PORTSC_PED) == 0) {
         XHCI_DIAG_FAIL(XHCI_DIAG_PORT_RESET);
+        xhci_boot_result(xhci, -ENODEV);
         return -ENODEV;
     }
 
@@ -2386,6 +2565,7 @@ int xhci_usb_enumerate_device(xhci_controller *xhci, usb_hub *parent_hub,
                parent_slot ? parent_slot->port_id : parent_port,
                parent_slot ? parent_slot->slot_id : 0, parent_port, speed_id,
                rc);
+        xhci_boot_result(xhci, rc);
         return rc;
     }
     XHCI_DIAG_OK(XHCI_DIAG_SLOT);
@@ -2406,6 +2586,7 @@ int xhci_usb_enumerate_device(xhci_controller *xhci, usb_hub *parent_hub,
 
     uint32_t actual = 0;
     XHCI_DIAG_PENDING(XHCI_DIAG_DESCRIPTOR);
+    xhci_boot_stage(xhci, slot->port_id, UsbBootStage::Descriptor8);
     rc = xhci_control_transfer(xhci, slot, &first_read, &first_desc, 8,
                                true, &actual);
     if (rc != 0) {
@@ -2413,6 +2594,7 @@ int xhci_usb_enumerate_device(xhci_controller *xhci, usb_hub *parent_hub,
         pr_info("xhci: initial device descriptor read failed slot=%u root-port=%u rc=%d\n",
                slot->slot_id, slot->port_id, rc);
         xhci_release_slot(xhci, slot);
+        xhci_boot_result(xhci, rc);
         return rc;
     }
 
@@ -2427,6 +2609,7 @@ int xhci_usb_enumerate_device(xhci_controller *xhci, usb_hub *parent_hub,
                 pr_info("xhci: update ep0 packet failed slot=%u root-port=%u mps=%u rc=%d\n",
                        slot->slot_id, slot->port_id, desc_ep0, rc);
                 xhci_release_slot(xhci, slot);
+                xhci_boot_result(xhci, rc);
                 return rc;
             }
         }
@@ -2440,6 +2623,7 @@ int xhci_usb_enumerate_device(xhci_controller *xhci, usb_hub *parent_hub,
             pr_info("xhci: reset ep0 ring failed slot=%u root-port=%u rc=%d\n",
                    slot->slot_id, slot->port_id, rc);
             xhci_release_slot(xhci, slot);
+            xhci_boot_result(xhci, rc);
             return rc;
         }
         XHCI_DIAG_OK(XHCI_DIAG_EP0_RING);
@@ -2451,18 +2635,21 @@ int xhci_usb_enumerate_device(xhci_controller *xhci, usb_hub *parent_hub,
             pr_info("xhci: finalize address failed slot=%u root-port=%u rc=%d\n",
                    slot->slot_id, slot->port_id, rc);
             xhci_release_slot(xhci, slot);
+            xhci_boot_result(xhci, rc);
             return rc;
         }
         XHCI_DIAG_OK(XHCI_DIAG_ADDRESS_DEVICE);
         delay_ms_hp(10);
     }
 
+    xhci_boot_stage(xhci, slot->port_id, UsbBootStage::Descriptor);
     rc = xhci_read_device_descriptor(xhci, slot, &slot->device_desc);
     if (rc != 0) {
         XHCI_DIAG_FAIL(XHCI_DIAG_DESCRIPTOR);
         pr_info("xhci: full device descriptor read failed slot=%u root-port=%u rc=%d\n",
                slot->slot_id, slot->port_id, rc);
         xhci_release_slot(xhci, slot);
+        xhci_boot_result(xhci, rc);
         return rc;
     }
     XHCI_DIAG_OK(XHCI_DIAG_DESCRIPTOR);
@@ -2472,6 +2659,7 @@ int xhci_usb_enumerate_device(xhci_controller *xhci, usb_hub *parent_hub,
         XHCI_DIAG_PENDING(XHCI_DIAG_CONFIG);
         void *config_buffer = NULL;
         uint16_t config_length = 0;
+        xhci_boot_stage(xhci, slot->port_id, UsbBootStage::Configuration);
         rc = xhci_read_config_descriptor(xhci, slot, &config_buffer,
                                          &config_length);
         if (rc == 0) {
@@ -2480,6 +2668,7 @@ int xhci_usb_enumerate_device(xhci_controller *xhci, usb_hub *parent_hub,
             xhci_parse_config(slot);
 
             if (slot->config_value != 0) {
+                xhci_boot_stage(xhci, slot->port_id, UsbBootStage::SetConfiguration);
                 rc = xhci_set_configuration(xhci, slot, slot->config_value);
                 if (rc == 0) {
                     slot->configured = true;
@@ -2567,6 +2756,8 @@ int xhci_usb_enumerate_device(xhci_controller *xhci, usb_hub *parent_hub,
              slot->active_iface_class, slot->active_iface_subclass,
              slot->active_iface_protocol, slot->configured ? 1U : 0U);
 
+    xhci_boot_device(xhci, slot);
+    xhci_boot_stage(xhci, slot->port_id, UsbBootStage::DriverProbe);
     int probe_rc = usb_probe_device(usbdev);
     if (probe_rc != 0 && slot->configured &&
         (slot->msc.supported ||
@@ -2580,6 +2771,7 @@ int xhci_usb_enumerate_device(xhci_controller *xhci, usb_hub *parent_hub,
         probe_rc = usb_fallback_probe_hub(usbdev);
     }
     if (probe_rc != 0) {
+        xhci_boot_result(xhci, probe_rc);
         pr_info("xhci: probe failed topology=%s slot=%u rc=%d active=%02x/%02x/%02x ifaces=%u\n",
                usbdev->topology, slot->slot_id, probe_rc,
                slot->active_iface_class, slot->active_iface_subclass,
@@ -3025,6 +3217,14 @@ static void xhci_free_controller(xhci_controller *xhci) {
     if (!xhci) {
         return;
     }
+#ifdef XHCI_BUILTIN
+    if (xhci == g_boot_probe_controller)
+    {
+        UsbBootDiagnostics snapshot;
+        (void)xhci_boot_diagnostics(&snapshot);
+        g_boot_probe_controller = nullptr;
+    }
+#endif
     if (xhci->root_hub) {
         free(xhci->root_hub->port_changed);
         free(xhci->root_hub->children);
@@ -3101,6 +3301,7 @@ static xhci_controller *xhci_create_controller(pci_device_t *pci_dev,
         return NULL;
     }
 
+    xhci_boot_init(xhci);
     xhci_bios_handoff(xhci);
     xhci_parse_protocol_caps(xhci);
     pr_info("xhci: spec version %u.%u (raw=0x%04x)\n",
@@ -3238,6 +3439,10 @@ int xhci_setup(void) {
         }
     }
 
+#ifdef XHCI_BUILTIN
+    if (ready_count) xhci_wait_boot_source();
+    g_boot_probe_capture = false;
+#endif
     if (ready_count != 0) {
         XHCI_DIAG_OK(XHCI_DIAG_SETUP);
         pr_info("xhci: initialized %u/%u controller(s)\n", ready_count, xhci_count);

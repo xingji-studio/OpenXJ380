@@ -4,6 +4,7 @@
 #include "boot_debug_color.h"
 #include <ahci/ahci.h>
 #include <block_source.h>
+#include <usb_boot_diagnostics.h>
 #include <cpu/regio.h>
 #include <cpu/idle.h>
 #include <device.h>
@@ -535,6 +536,24 @@ static void installer_boot_require(int result, const char *phase)
                                   usb.disconnected, unsigned(usb.expected_port), unsigned(usb.expected_interface),
                                   unsigned(usb.expected_depth), unsigned(usb.observed_port),
                                   unsigned(usb.observed_interface), unsigned(usb.observed_depth));
+    UsbBootDiagnostics trace = {};
+    bool have_trace = false;
+#if CONFIG_KERNEL_BUILTIN_XHCI && !OPENXJ380_INPUT_OUTPUT_DISABLED
+    have_trace = xhci_boot_diagnostics(&trace);
+#endif
+    const auto &probe = trace.expected.port ? trace.expected : trace.last;
+    if (have_trace)
+        write_serial_fmt_heapless("installer: USB probe port=%u stage=%s rc=%d cc=%u timeout=%u "
+                                  "portsc=0x%x cmd=0x%x sts=0x%x connected=%u mask=0x%llx VID=%04x PID=%04x "
+                                  "iface=%02x/%02x/%02x req=%x type=%x cdb=%x csw=%x\n",
+                                  probe.port, usb_boot_stage_name(probe.first_error ? probe.failed_stage : probe.stage),
+                                  probe.first_error ? probe.first_error : probe.result,
+                                  probe.completion_code, probe.timed_out, trace.expected_portsc, trace.command, trace.status,
+                                  trace.connected,
+                                  (unsigned long long)trace.connected_mask, unsigned(probe.vendor), unsigned(probe.product),
+                                  unsigned(probe.interface_class), unsigned(probe.interface_subclass),
+                                  unsigned(probe.interface_protocol), probe.request, probe.request_type,
+                                  probe.opcode, probe.scsi_status);
     for (;;) __asm__ volatile("cli; hlt" ::: "memory");
 }
 

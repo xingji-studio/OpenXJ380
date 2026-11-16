@@ -385,12 +385,14 @@ static int usb_msc_probe(usb_device *usbdev, const usb_interface_info *iface) {
              slot->msc.bulk_in_epid, slot->msc.bulk_out_address,
              slot->msc.bulk_out_epid);
 
+    xhci_boot_stage(usbdev->controller, slot->port_id, UsbBootStage::MscEndpoints);
     int rc = xhci_configure_msc_endpoints(usbdev->controller, slot);
     if (rc != 0) {
         printk("usb: msc probe failed topology=%s stage=configure rc=%d in=0x%02x/%u out=0x%02x/%u\n",
                usbdev->topology, rc, slot->msc.bulk_in_address,
                slot->msc.bulk_in_epid, slot->msc.bulk_out_address,
                slot->msc.bulk_out_epid);
+        xhci_boot_result(usbdev->controller, rc);
         return rc;
     }
 
@@ -413,6 +415,7 @@ static int usb_msc_probe(usb_device *usbdev, const usb_interface_info *iface) {
     (void)xhci_msc_scsi_inquiry(usbdev->controller, slot, inquiry,
                                 sizeof(inquiry));
 
+    xhci_boot_stage(usbdev->controller, slot->port_id, UsbBootStage::MscReady);
     rc = -EIO;
     for (int attempt = 0; attempt < 20; ++attempt) {
         rc = xhci_msc_scsi_test_unit_ready(usbdev->controller, slot);
@@ -429,9 +432,11 @@ static int usb_msc_probe(usb_device *usbdev, const usb_interface_info *iface) {
         printk("usb: msc probe failed topology=%s stage=test-unit-ready rc=%d\n",
                usbdev->topology, rc);
         xhci_release_msc(slot);
+        xhci_boot_result(usbdev->controller, rc);
         return rc;
     }
 
+    xhci_boot_stage(usbdev->controller, slot->port_id, UsbBootStage::MscCapacity);
     uint8_t cap10[8];
     memset(cap10, 0, sizeof(cap10));
     rc = xhci_msc_scsi_read_capacity10(usbdev->controller, slot, cap10);
@@ -439,6 +444,7 @@ static int usb_msc_probe(usb_device *usbdev, const usb_interface_info *iface) {
         printk("usb: msc probe failed topology=%s stage=read-capacity10 rc=%d\n",
                usbdev->topology, rc);
         xhci_release_msc(slot);
+        xhci_boot_result(usbdev->controller, rc);
         return rc;
     }
 
@@ -452,6 +458,7 @@ static int usb_msc_probe(usb_device *usbdev, const usb_interface_info *iface) {
             printk("usb: msc probe failed topology=%s stage=read-capacity16 rc=%d\n",
                    usbdev->topology, rc);
             xhci_release_msc(slot);
+            xhci_boot_result(usbdev->controller, rc);
             return rc;
         }
         last_lba = usb_msc_get_be64(&cap16[0]);
@@ -477,9 +484,11 @@ static int usb_msc_probe(usb_device *usbdev, const usb_interface_info *iface) {
     int     mode_result     = xhci_msc_scsi_mode_sense6(usbdev->controller, slot, mode);
     msc->hardware_read_only = mode_result == 0 && (mode[2] & 0x80);
 
+    xhci_boot_stage(usbdev->controller, slot->port_id, UsbBootStage::MscRegister);
     rc = usb_msc_register_disk(usbdev, msc, inquiry);
     if (rc != 0) {
         xhci_release_msc(slot);
+        xhci_boot_result(usbdev->controller, rc);
         return rc;
     }
     return 0;

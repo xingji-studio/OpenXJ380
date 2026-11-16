@@ -15,6 +15,7 @@ extern "C" {
 
 #include "../../include/task/pcb.h"
 #include <stdint.h>
+#include <usb_boot_diagnostics.h>
 
 #define XHCI_PCI_CLASS 0x0C0330U
 #define XHCI_MMIO_PTE_FLAGS (PTE_PRESENT | PTE_WRITEABLE | (1ULL << 3) | (1ULL << 4))
@@ -765,3 +766,15 @@ int xhci_hub_reset_port(xhci_controller *xhci, xhci_slot_state *slot,
 int xhci_setup_hub(xhci_controller *xhci, xhci_slot_state *slot);
 int xhci_setup(void);
 void xhci_start_workers(void);
+
+#ifdef XHCI_BUILTIN
+void xhci_boot_stage(xhci_controller *, uint32_t port, UsbBootStage);
+void xhci_boot_result(xhci_controller *, int result);
+void xhci_boot_device(xhci_controller *, const xhci_slot_state *);
+void xhci_boot_scsi(xhci_controller *, uint32_t opcode, uint32_t status);
+#else
+inline void xhci_boot_stage(xhci_controller *, uint32_t, UsbBootStage) {}
+inline void xhci_boot_result(xhci_controller *, int) {}
+inline void xhci_boot_device(xhci_controller *, const xhci_slot_state *) {}
+inline void xhci_boot_scsi(xhci_controller *, uint32_t, uint32_t) {}
+#endif
