@@ -157,7 +157,7 @@ int message_enqueue(FdOperationRecord *operation, const MessageInfoFormat &value
         free(packet);
         fd_operation_release(operation);
     }
-    if (report) write_serial_string("message: pending queue full; new delivery rejected, existing FIFO retained\n");
+    if (report) try_write_serial_fmt("message: pending queue full; new delivery rejected, existing FIFO retained\n");
     return error;
 }
 
@@ -224,7 +224,7 @@ void message_report_failure_once(int error)
     bool report = !message_allocation_reported;
     message_allocation_reported = true;
     spin_unlock(&message_queue_lock);
-    if (report) write_serial_fmt("message: asynchronous delivery failed: %d\n", error);
+    if (report) try_write_serial_fmt("message: asynchronous delivery failed: %d\n", error);
 }
 }
 

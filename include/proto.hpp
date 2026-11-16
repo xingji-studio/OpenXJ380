@@ -38,6 +38,9 @@ void   write_serial_string(const char *str);
 void   write_serial_dec(unsigned long long dec);
 void   write_serial_hex(unsigned long long hex);
 int    write_serial_fmt(const char *fmt, ...);
+// False means rejected or truncated; never waits for UART or queue space.
+bool   try_write_serial_fmt(const char *fmt, ...);
+bool   try_vprintk(const char *fmt, va_list args);
 void   write_serial_fmt_heapless(const char *fmt, ...);
 void   serial_wprintf(const char *fmt, ...);
 void   serial_log_config_set(uint64_t flags);

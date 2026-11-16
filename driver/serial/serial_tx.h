@@ -9,6 +9,8 @@ static constexpr size_t kSerialTxRecords = 32;
 static constexpr size_t kSerialTxRecordBytes = 1024;
 static constexpr size_t kSerialTxChunkBytes = 128;
 static constexpr size_t kSerialTxServiceBytes = 16;
+static constexpr size_t   kSerialTxBatchSteps         = 64;
+static constexpr uint64_t kSerialTxBatchBudgetNs      = 250000ULL;
 static constexpr size_t kSerialTxBootstrapPollLimit = 4096;
 
 struct SerialTxRecord
@@ -70,6 +72,47 @@ static bool serial_tx_can_wait(tcb_t task)
            task != __atomic_load_n(&serial_tx_worker_task, __ATOMIC_ACQUIRE) &&
            task != __atomic_load_n(&serial_tx_consumer_task, __ATOMIC_ACQUIRE) &&
            !no_interrupt && are_interrupts_enabled() && scheduler_is_enabled();
+}
+
+// Diagnostics on input/window paths cannot wait for the consumer, even when
+// their caller is otherwise preemptible. Publish a complete private snapshot:
+// no producer TCB or unfinished record survives this short queue transaction.
+static bool serial_tx_try_record(const char *bytes, size_t length, size_t lost_bytes, bool log)
+{
+    if (__atomic_load_n(&serial_tx_emergency, __ATOMIC_ACQUIRE)) return false;
+    if (!length && !lost_bytes) return true;
+    bool newline = memchr(bytes, '\n', length) != nullptr;
+
+    spin_lock(&serial_tx_lock);
+    if (serial_tx_count == kSerialTxRecords)
+    {
+        ++serial_tx_dropped_records;
+        serial_tx_dropped_bytes += length + lost_bytes;
+        spin_unlock(&serial_tx_lock);
+        return false;
+    }
+
+    SerialTxRecord &record = serial_tx_records[serial_tx_tail];
+    memcpy(record.bytes, bytes, length);
+    record.read       = 0;
+    record.write      = length % kSerialTxRecordBytes;
+    record.count      = length;
+    record.generation = ++serial_tx_next_generation;
+    record.owner      = nullptr;
+    record.used = record.closed = true;
+    record.log                  = log;
+    record.raw_prompt = record.uart_only = false;
+    record.newline                       = newline;
+    record.truncated                     = lost_bytes != 0;
+    if (lost_bytes)
+    {
+        ++serial_tx_dropped_records;
+        serial_tx_dropped_bytes += lost_bytes;
+    }
+    serial_tx_tail = (serial_tx_tail + 1) % kSerialTxRecords;
+    ++serial_tx_count;
+    spin_unlock(&serial_tx_lock);
+    return !lost_bytes;
 }
 
 static void serial_tx_reap_head()
@@ -482,13 +525,30 @@ static bool serial_tx_service_once()
     return progress;
 }
 
+// Each UART access still uses the bounded service helper outside queue locks.
+// Limit both work and elapsed time so a writable UART cannot monopolize a CPU;
+// an empty queue, unfinished head or busy UART ends the batch immediately.
+static bool serial_tx_service_batch()
+{
+    uint64_t started = nanoTime();
+    for (size_t step = 0; step < kSerialTxBatchSteps; ++step)
+    {
+        if (!serial_tx_service_once()) return false;
+        uint64_t now = nanoTime();
+        if (now < started || now - started >= kSerialTxBatchBudgetNs) return true;
+    }
+    return true;
+}
+
 static void serial_runtime_worker(void *)
 {
     __atomic_store_n(&serial_tx_worker_task, get_current_task(), __ATOMIC_RELEASE);
     for (;;)
     {
-        serial_tx_service_once();
-        scheduler_sleep_ns(1000000ULL);
+        if (serial_tx_service_batch())
+            scheduler_yield();
+        else
+            scheduler_sleep_ns(1000000ULL);
     }
 }
 

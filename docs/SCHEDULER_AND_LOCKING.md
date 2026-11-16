@@ -174,6 +174,22 @@ Log acceptance is decided when a record is enqueued. Keep prompt state and
 console/observer delivery in FIFO record order; raw output retains its original
 log-filter behavior.
 
+Input workers and window-lifetime diagnostics use `try_write_serial_fmt()`.
+It formats into one private bounded record and publishes a closed copy without
+retaining a TCB. Queue saturation rejects the new record; oversize diagnostics
+retain a truncated prefix, with both losses counted. A false return indicates
+rejection or truncation. This entry point never waits, polls UART, or invokes
+console/observer delivery, including before runtime startup and during fatal
+shutdown. Ordinary serial entry points retain streaming and panic behavior.
+
+`try_vprintk()` uses the same bounded publication with normal log filtering and
+prefixing. Netserver's first-party platform override uses it for opt-in tracing,
+rate-limited failures and nonblocking-retry summaries; protocol sources remain
+unchanged. The runtime consumer services up to 64 FIFO batches or 250 microseconds
+per turn, reading the clock outside queue locks. It yields on exhausted budgets
+and sleeps when the queue cannot progress. Bootstrap/panic polling remains
+separate, and every individual UART FIFO access retains its existing bound.
+
 The separate serial owner-lifetime lock pins an incomplete record's TCB during
 recovery. The consumer releases the serial queue lock before checking scheduler
 references, then revalidates the record generation before closing it. Producers

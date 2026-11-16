@@ -452,6 +452,54 @@ static void serial_format_record(bool log, const char *prefix, const char *fmt, 
     vwprintf(&writer, fmt, args);
 }
 
+struct SerialTryWriter
+{
+    char   bytes[kSerialTxRecordBytes];
+    size_t length = 0, lost_bytes = 0;
+};
+
+static uint8_t serial_try_write_handler(Writer *writer, char byte)
+{
+    auto *output = static_cast<SerialTryWriter *>(writer->data);
+    if (output->length < sizeof(output->bytes))
+        output->bytes[output->length++] = byte;
+    else
+        ++output->lost_bytes;
+    return 0;
+}
+
+static bool serial_try_format_record(bool log, const char *prefix, const char *fmt, va_list args)
+{
+    // The explicit nonwaiting API never falls back to bootstrap/panic UART
+    // polling. Ordinary serial entry points retain their existing behavior.
+    if (!fmt || __atomic_load_n(&serial_tx_emergency, __ATOMIC_ACQUIRE)) return false;
+    if (log && !serial_logging_allowed()) return false;
+    SerialTryWriter output;
+    Writer          writer = {.data = &output, .handler = serial_try_write_handler};
+    if (prefix)
+        while (*prefix)
+            serial_try_write_handler(&writer, *prefix++);
+    vwprintf(&writer, fmt, args);
+    if (serial_crash_record && output.length) serial_crash_record(output.bytes, output.length);
+    return serial_tx_try_record(output.bytes, output.length, output.lost_bytes, log);
+}
+
+bool try_write_serial_fmt(const char *fmt, ...)
+{
+    va_list args;
+    va_start(args, fmt);
+    bool accepted = serial_try_format_record(false, nullptr, fmt, args);
+    va_end(args);
+    return accepted;
+}
+EXPORT_SYMBOL(try_write_serial_fmt);
+
+bool try_vprintk(const char *fmt, va_list args)
+{
+    return serial_try_format_record(true, "[XJ380 System Kernel][MESSAGE] ", fmt, args);
+}
+EXPORT_SYMBOL(try_vprintk);
+
 void serial_wprintf(const char *fmt, ...)
 {
     va_list args;
