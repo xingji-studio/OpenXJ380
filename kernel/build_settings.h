@@ -61,6 +61,11 @@
 #define CONFIG_OS_VERSION "XINGJI XJ380 Singularity 1.0.0"
 #endif
 
+#ifndef CONFIG_KN_NAME
+// Kernel release string reported by the bootloader/kernel.
+#define CONFIG_KN_NAME "XSK"
+#endif
+
 #ifndef CONFIG_STACK_SIZE
 // Default stack size in bytes for kernel-created thread contexts.
 #define CONFIG_STACK_SIZE 262144
@@ -192,6 +197,8 @@
 #define OS_EDITION CONFIG_OS_EDITION
 #define KN_VERSION CONFIG_KN_VERSION
 #define OS_VERSION CONFIG_OS_VERSION
+
+#define KN_NAME CONFIG_KN_NAME
 
 #define ENVP_SYSTEM_VERSION "SYSTEM_VERSION=" CONFIG_OS_VERSION
 

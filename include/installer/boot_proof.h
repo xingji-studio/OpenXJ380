@@ -9,6 +9,15 @@ namespace installer
 constexpr uint64_t direct_map_base = 0xffff800000000000ULL;
 constexpr uint64_t direct_map_bytes = 1ULL << 47;
 
+struct BootProofDiagnostic
+{
+    // Optional first-failure context, initialized by the caller. Validators
+    // record values without I/O; the boot adapter owns serial output.
+    const char *reason  = nullptr;
+    uint64_t    address = 0, bytes = 0, physical = 0, table = 0, entry = 0;
+    unsigned    level = 0, index = 0;
+};
+
 struct TableReader
 {
     void *context;
@@ -18,6 +27,7 @@ struct TableReader
     uint8_t physical_bits = 52;
     bool nx_enabled = true;
     bool gigabyte_pages = true;
+    BootProofDiagnostic *diagnostic     = nullptr;
 };
 
 struct Mapping

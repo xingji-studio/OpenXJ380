@@ -1604,9 +1604,9 @@ sys_(uname, struct utsname *utsname)
     if (unlikely(utsname == NULL)) return SYSCALL_FAULT_(EINVAL);
     struct utsname kname;
     memset(&kname, 0, sizeof(kname));
-    char sysname[] = KN_VERSION;
+    char sysname[] = KN_NAME;
     char machine[] = "x86_64";
-    char release[] = "6.6.30"; // byd 咱就非要检查吗
+    char release[] = "2.1.0";   // 太棒了 glibc 你终于觉醒了
     char version[] = OS_VERSION;
     memcpy(kname.sysname, sysname, sizeof(sysname));
     memcpy(kname.nodename, "localhost", 10);

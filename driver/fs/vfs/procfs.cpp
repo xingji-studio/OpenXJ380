@@ -244,6 +244,7 @@ static int udummy() {
     return VFS_STATUS_FAILED;
 }
 
+// 为保证兼容性，这块只能装 Linux 了（恼）
 static const char *procfs_kernel_cmdline()
 {
     return "";
