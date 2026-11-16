@@ -12,8 +12,13 @@ struct ProcessLaunchOptions
     bool file_dialog = false;
     // Ownership transfers to the launch function even when creation fails.
     vfs_node_t result_writer = NULL;
+    // Kernel-owned input; copied before the first user thread is published.
+    // NULL preserves legacy selection, { NULL } requests an empty environment.
+    char *const *envp = NULL;
 };
 
 pcb_t create_process_group_with_credentials(const char *name, pcb_t parent, page_directory_t *directory,
                                              char *cmdline, ProcessCredentialSource source);
 int create_user_process_with_options(char *path, pcb_t parent, char *argv[], const ProcessLaunchOptions &options);
+int rewrite_shebang_exec(vfs_node_t *node, char **path, char ***argv, size_t *argc,
+                          const char *fallback = NULL);

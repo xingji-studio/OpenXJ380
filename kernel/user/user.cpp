@@ -3,6 +3,7 @@
 #include <user/permissions.h>
 #include <user/special_permissions.h>
 #include <user/process_launch.h>
+#include <user/environment.h>
 #include <user/linux_trace.h>
 #include "../build_settings.h"
 #include <ahci/ahci.h>
@@ -46,7 +47,7 @@ UserInfo root_user = {
     .name = "Root",
     .user_type = XUT_Root,
     .envp = current_user_envp,
-    .envc = 3,
+    .envc = 2,
 };
 
 static uint32_t stable_user_name_id(const char *name)
@@ -154,7 +155,7 @@ static void set_current_user_from_info(UserInfo *info)
     if (current_user == NULL) return;
     UserInfo snapshot = *info;
     memset(snapshot.password, 0, sizeof(snapshot.password));
-    snapshot.envc = 3;
+    snapshot.envc = 2;
     snapshot.envp = current_user_envp;
     permissions_session_publish(&snapshot);
 }
@@ -167,6 +168,7 @@ bool user_session_is_ready()
 void user_session_set_ready(bool ready)
 {
     __atomic_store_n(&user_session_ready_flag, ready ? 1U : 0U, __ATOMIC_RELEASE);
+    if (ready) environment_start_worker();
 }
 
 void user_session_use_root()
@@ -755,7 +757,8 @@ uint64_t parse_elf_file(char *path, pcb_t group)
         return (uint64_t)ret;
     }
 
-    group->linux_abi = !native_image && (interp_buf != NULL || ehdr.e_ident[EI_OSABI] == ELFOSABI_LINUX);
+    group->linux_abi = !native_image && !environment_elf_native_entry(buf, file_size) &&
+                       (interp_buf != NULL || ehdr.e_ident[EI_OSABI] == ELFOSABI_LINUX);
     group->load_start = main_elf.map_start;
     group->aux_phdr = main_elf.phdr;
     group->aux_phent = main_elf.phent;
@@ -877,6 +880,62 @@ int create_user_process_with_options(char *path, pcb_t pcb, char *argv[], const 
         return -EINVAL;
     }
 
+    struct ScriptInput
+    {
+        vfs_node_t node = NULL;
+        char *path = NULL;
+        char **argv = NULL;
+        ~ScriptInput()
+        {
+            if (node) vfs_close(node);
+            free(path);
+            environment_free(argv);
+        }
+    } script;
+    // Native spawn uses the same interpreter/argument rules as execve. Prepare
+    // owned strings before the PCB or its first thread becomes visible.
+    char script_directory[4096] = {};
+    script.node = vfs_open(path);
+    for (unsigned depth = 0; script.node; ++depth)
+    {
+        unsigned char magic[4] = {};
+        size_t got = vfs_read(script.node, magic, 0, sizeof(magic));
+        bool shebang = got >= 2 && magic[0] == '#' && magic[1] == '!';
+        const char *extension = strrchr(path, '.');
+        bool binary = got == 4 && ((magic[0] == 0x7f && magic[1] == 'E' && magic[2] == 'L' && magic[3] == 'F') ||
+                                  epf_has_magic(magic, got));
+        bool shell_text = depth == 0 && !binary && extension && !strcmp(extension, ".sh");
+        if (!shebang && !shell_text) break;
+        if (!depth)
+        {
+            int error = permissions_executable_directory(script.node, script_directory, sizeof(script_directory));
+            if (error) return error;
+        }
+        if (depth == 4) return -ELOOP;
+        size_t count = 0;
+        if (!script.path)
+        {
+            while (argv && argv[count])
+                if (++count > 256) return -E2BIG;
+            if (!count) count = 1;
+            script.path = strdup(path);
+            script.argv = copy_process_argv(path, argv, (int)count);
+            if (!script.path || !script.argv) return -ENOMEM;
+        }
+        else while (script.argv[count]) ++count;
+        const char *fallback = NULL;
+        if (!shebang)
+        {
+            vfs_node_t shell = vfs_open("/bin/sh");
+            fallback = shell ? "/bin/sh" : "/usr/bin/bash";
+            if (shell) vfs_close(shell);
+        }
+        int error = rewrite_shebang_exec(&script.node, &script.path, &script.argv, &count, fallback);
+        if (error) return error;
+        path = script.path;
+        argv = script.argv;
+    }
+
     char  process_name[32];
     void *entry;
     int   argc = 0;
@@ -906,6 +965,19 @@ int create_user_process_with_options(char *path, pcb_t pcb, char *argv[], const 
         write_serial_fmt("Create User Process Failed. Reason: Cannot Create Process Group.\n");
         return -ENOMEM;
     }
+    if (options.envp)
+    {
+        size_t count = 0;
+        char **environment = environment_clone(options.envp, &count);
+        if (!environment)
+        {
+            kill_proc_deferred(group, 0);
+            return -ENOMEM;
+        }
+        environment_free(group->envp);
+        group->envp = environment;
+        group->envc = count;
+    }
     vfs_node_t executable_node = vfs_open(path);
     char executable_directory[4096];
     int directory_error = executable_node ?
@@ -917,7 +989,9 @@ int create_user_process_with_options(char *path, pcb_t pcb, char *argv[], const 
         kill_proc_deferred(group, 0);
         return directory_error;
     }
-    permissions_process_exec(group, executable_directory);
+    // A script owns its original directory, so the interpreter can read it
+    // without inheriting the launching shell's broader file grants.
+    permissions_process_exec(group, script_directory[0] ? script_directory : executable_directory);
     if (group->exe_path == NULL)
     {
         write_serial_fmt("Create User Process Failed. Reason: Cannot Copy Exec Path.\n");
@@ -1009,7 +1083,7 @@ int create_user_process_with_options(char *path, pcb_t pcb, char *argv[], const 
         return -ENOMEM;
     }
     group->argc = argc;
-    char *cwd = getCwd(path);
+    char *cwd = script_directory[0] ? strdup(script_directory) : getCwd(path);
     if (cwd == NULL)
     {
         free_process_argv(thread_argv);

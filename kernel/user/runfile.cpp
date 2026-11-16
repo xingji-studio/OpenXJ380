@@ -23,6 +23,7 @@
 #include <user/runfile.h>
 #include <user/settings.h>
 #include <user/permissions.h>
+#include <user/environment.h>
 
 extern UserInfo *current_user;
 
@@ -238,7 +239,10 @@ bool init_user_profile(const char *username)
 {
     PermissionProfileScope scope(username);
 
-    return init_user_dirs(username) && init_user_runfile(username) && init_user_settings(username);
+    if (!init_user_dirs(username) || !init_user_runfile(username) || !init_user_settings(username)) return false;
+    if (!environment_init_profile(username))
+        write_serial_fmt("Environment: cannot create user.env for %s; retaining available defaults\n", username);
+    return true;
 }
 
 void init_runfile()

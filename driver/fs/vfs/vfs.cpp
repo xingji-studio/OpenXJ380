@@ -1797,7 +1797,12 @@ void *vfs_map(vfs_node_t node, uint64_t addr, uint64_t len, uint64_t prot, uint6
     permissions_clear_file_error();
     if (unlikely(node == NULL)) return NULL;
     if (unlikely(node->type == file_dir)) return NULL;
-    if (!vfs_check_access(node, NULL, (prot & 2) ? ((prot & 1) ? IME_FILE_READ_WRITE : IME_FILE_WRITE) : IME_FILE_READ)) return NULL;
+    // Relocations modify a private copy of a regular library, not its backing
+    // file. Shared writable maps and device maps still need file write access.
+    bool private_file = node->type == file_none && (flags & MAP_PRIVATE) && !(flags & MAP_SHARED);
+    int access = private_file || !(prot & PROT_WRITE) ? IME_FILE_READ :
+                 (prot & PROT_READ) ? IME_FILE_READ_WRITE : IME_FILE_WRITE;
+    if (!vfs_check_access(node, NULL, access)) return NULL;
     return callbackof(node, map)(node->handle, (void *)addr, offset, len, prot, flags);
 }
 

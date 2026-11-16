@@ -635,9 +635,10 @@ static bool shared_resource_path(const char *path)
 
 static bool public_read_path(const char *path)
 {
-    // Native interpreters and shared libraries are readable system runtime
+    // Native and Linux shared libraries are readable system runtime
     // files. Their writes still require the ordinary protected-system policy.
-    return shared_resource_path(path) || under(path, "/system/lib") || under(path, "/etc");
+    return shared_resource_path(path) || under(path, "/system/lib") || under(path, "/etc") ||
+           under(path, "/lib") || under(path, "/lib64") || under(path, "/usr/lib") || under(path, "/usr/lib64");
 }
 
 static bool system_path(const char *path)
@@ -801,7 +802,9 @@ static bool file_access(vfs_node_t node, const char *path, int operation, unsign
             (equal_fold(resolved, "/users") || (leaf && (!leaf[0] || equal_fold(leaf, "/desktop") ||
                 equal_fold(leaf, "/picture") ||
                 equal_fold(leaf, "/settings.json") || equal_fold(leaf, "/settings.dat") ||
-                equal_fold(leaf, "/runfile.dat"))) ||
+                equal_fold(leaf, "/runfile.dat") || equal_fold(leaf, "/user.env"))) ||
+             (equal_fold(resolved, "/system/system.env") &&
+                 (operation == IME_FILE_READ || operation == IME_FILE_STAT)) ||
              (equal_fold(resolved, "/system/config/language.dat") &&
                 (operation == IME_FILE_READ || operation == IME_FILE_STAT)));
         free(resolved);

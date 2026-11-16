@@ -138,6 +138,8 @@ typedef struct {
 
 #define XAPI_RUN            7439
 #define XAPI_RUN_ARGS       7451
+#define XAPI_RUN_ENV        7520
+#define XAPI_ENVIRONMENT    7521
 #define XAPI_USER_OOBE_REQUIRED 7452
 #define XAPI_USER_LIST          7453
 #define XAPI_USER_LOGIN         7454
@@ -333,6 +335,8 @@ void do_xapi_GetTimeX(uint64_t tt);
 uint64_t do_xapi_GetMemorySize();
 void do_xapi_Run(char *path);
 uint64_t do_xapi_RunArgs(char *path, char **argv);
+uint64_t do_xapi_RunEnv(char *path, char **argv, char **envp);
+uint64_t do_xapi_Environment(uint64_t buffer, uint64_t capacity, uint64_t reload);
 uint64_t do_xapi_SpawnInherited(char *path, char **argv);
 uint64_t do_xapi_QueryFileAccess(uint64_t path, uint64_t access);
 uint64_t do_xapi_RequestFileAccess(uint64_t path, uint64_t access, uint64_t offered);

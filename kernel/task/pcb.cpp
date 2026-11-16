@@ -2,6 +2,7 @@
 #include <screen_capture.h>
 #include <user/permissions.h>
 #include <user/process_launch.h>
+#include <user/environment.h>
 #include <user/linux_trace.h>
 #include <input_method.h>
 #include "task/pcb.h"
@@ -1405,12 +1406,15 @@ static void switch_task_to_user_mode(tcb_t task)
             fd_file_handle *stdout = (fd_file_handle *)calloc(1, sizeof(fd_file_handle));
             stdout->node           = stdio;
             stdout->offset         = 0;
+            stdout->flags          = O_WRONLY;
             fd_file_handle *stdin  = (fd_file_handle *)calloc(1, sizeof(fd_file_handle));
             stdin->node            = stdio;
             stdin->offset          = 0;
+            stdin->flags           = O_RDONLY;
             fd_file_handle *stderr = (fd_file_handle *)calloc(1, sizeof(fd_file_handle));
             stderr->node           = stdio;
             stderr->offset         = 0;
+            stderr->flags          = O_WRONLY;
             stdin->fd              = queue_enqueue_lowest(task->parent_group->file_open, stdin);
             stdout->fd             = queue_enqueue_lowest(task->parent_group->file_open, stdout);
             stderr->fd             = queue_enqueue_lowest(task->parent_group->file_open, stderr);
@@ -1501,7 +1505,7 @@ void jump_to_message(uint64_t tcb)
 size_t envp_length(char **envp)
 {
     size_t count = 0;
-    while (envp[count] != NULL)
+    while (envp && envp[count] != NULL)
     {
         count++;
     }
@@ -1511,7 +1515,7 @@ size_t envp_length(char **envp)
 char **copy_envp(char **envp)
 {
     size_t count = 0;
-    while (envp[count] != NULL)
+    while (envp && envp[count] != NULL)
     {
         count++;
     }
@@ -1574,18 +1578,18 @@ static int copy_exec_string_from_user(page_directory_t *pagedir, char **out, con
 }
 
 static int copy_exec_string_vector_from_user(page_directory_t *pagedir, char **user_vec, char ***out_vec,
-                                             size_t *out_count)
+                                             size_t *out_count, size_t maximum = EXECVE_VECTOR_MAX)
 {
     if (out_vec == NULL || out_count == NULL) return -EINVAL;
     *out_vec = NULL;
     *out_count = 0;
     if (user_vec == NULL) return 0;
 
-    char **vec = (char **)calloc(EXECVE_VECTOR_MAX + 1, sizeof(char *));
+    char **vec = (char **)calloc(maximum + 1, sizeof(char *));
     if (vec == NULL) return -ENOMEM;
 
     size_t total_bytes = 0;
-    for (size_t i = 0; i < EXECVE_VECTOR_MAX; i++)
+    for (size_t i = 0; i < maximum; i++)
     {
         char *user_str = NULL;
         if (!copy_from_user_pagedir(pagedir, &user_str, &user_vec[i], sizeof(user_str)))
@@ -1609,10 +1613,10 @@ static int copy_exec_string_vector_from_user(page_directory_t *pagedir, char **u
     }
 
     char *extra = NULL;
-    if (copy_from_user_pagedir(pagedir, &extra, &user_vec[EXECVE_VECTOR_MAX], sizeof(extra)) && extra == NULL)
+    if (copy_from_user_pagedir(pagedir, &extra, &user_vec[maximum], sizeof(extra)) && extra == NULL)
     {
         *out_vec = vec;
-        *out_count = EXECVE_VECTOR_MAX;
+        *out_count = maximum;
         return 0;
     }
 
@@ -1659,7 +1663,7 @@ static char *dup_trimmed_slice(const char *start, const char *end)
     return out;
 }
 
-static int rewrite_shebang_exec(vfs_node_t *node, char **norm_path, char ***argv, size_t *argc)
+int rewrite_shebang_exec(vfs_node_t *node, char **norm_path, char ***argv, size_t *argc, const char *fallback)
 {
     if (node == NULL || *node == NULL || norm_path == NULL || *norm_path == NULL || argv == NULL || argc == NULL)
         return 0;
@@ -1667,7 +1671,12 @@ static int rewrite_shebang_exec(vfs_node_t *node, char **norm_path, char ***argv
     char header[EXECVE_STRING_MAX];
     memset(header, 0, sizeof(header));
     size_t got = vfs_read(*node, header, 0, sizeof(header) - 1);
-    if (got < 2 || header[0] != '#' || header[1] != '!') return 0;
+    if (got < 2 || header[0] != '#' || header[1] != '!')
+    {
+        if (!fallback) return 0;
+        snprintf(header, sizeof(header), "#!%s\n", fallback);
+        got = strlen(header);
+    }
 
     char *line_end = header + 2;
     char *limit = header + got;
@@ -1888,7 +1897,7 @@ uint64_t process_execve(char *path, char **argv, char **envp)
         restore_runtime_state(scheduler_depth, is_sti);
         return (uint64_t)copy_ret;
     }
-    copy_ret = copy_exec_string_vector_from_user(caller_pagedir, envp, &kenvp, &kenvc);
+    copy_ret = copy_exec_string_vector_from_user(caller_pagedir, envp, &kenvp, &kenvc, ENVIRONMENT_COUNT_MAX);
     if (copy_ret < 0)
     {
         free(kpath);
@@ -2057,25 +2066,15 @@ uint64_t process_execve(char *path, char **argv, char **envp)
         new_envc = kenvc;
         kenvp = NULL;
     }
+    else if (process->linux_abi)
+    {
+        // Linux permits NULL envp as an empty environment. Native legacy
+        // callers retain their account-default convention below.
+        new_envp = (char **)calloc(1, sizeof(char *));
+    }
     else
     {
-        UserInfo *exec_user = current_user != NULL ? current_user : &root_user;
-        if (exec_user->envp == NULL)
-        {
-            vfs_close(node);
-            free(norm_path);
-            free(kpath);
-            free(new_cmdline);
-            free_envp(new_task_argv);
-            free_envp(new_process_argv);
-            free(new_exe_path);
-            free_envp(kargv);
-            free_page_directory(new_page_dir);
-            restore_runtime_state(scheduler_depth, is_sti);
-            return (uint64_t)-EFAULT;
-        }
-        new_envp = copy_envp(exec_user->envp);
-        new_envc = exec_user->envc;
+        new_envp = environment_for_user(process->permission_user.name, &new_envc);
     }
     if (new_envp == NULL)
     {
@@ -3119,14 +3118,13 @@ pcb_t create_process_group_prepared(const char *name, pcb_t parent, page_directo
         UserInfo *user = &pcb->permission_user;
         if (source == XPCS_INHERIT && parent)
         {
-            UserInfo *fallback = current_user ? current_user : &root_user;
-            pcb->envc = parent->envp ? parent->envc : fallback->envc;
-            pcb->envp = copy_envp(parent->envp ? parent->envp : fallback->envp);
+            pcb->envp = parent->envp ? copy_envp(parent->envp) :
+                environment_for_user(user->name, &pcb->envc);
+            if (parent->envp) pcb->envc = envp_length(pcb->envp);
         }
         else
         {
-            pcb->envc = user->envc;
-            pcb->envp = copy_envp(user->envp);
+            pcb->envp = environment_for_user(user->name, &pcb->envc);
         }
         pcb->cmdline = strdup(cmdline ? cmdline : "");
         pcb->xtttp_stc = static_cast<xtttp_dtt *>(calloc(1, sizeof(xtttp_dtt)));
