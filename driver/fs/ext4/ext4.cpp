@@ -12,6 +12,7 @@
 #include <input_method.h>
 #include <installer/ext4_import.h>
 #include <ioctl.h>
+#include <wsod_storage.h>
 #include <krlibc.h>
 #include <mutex.h>
 #include <rtc.h>
@@ -1771,4 +1772,32 @@ int ext4fs_sync_all()
         if (error && !first_error) first_error = error;
     }
     return failure(first_error);
+}
+
+int ext4fs_wsod_map(vfs_node_t node, WsodFileMap *map)
+{
+    if (!node || node->fsid != filesystem_id || !map) return -EOPNOTSUPP;
+    Guard guard;
+    Node *handle = (Node *)node->handle;
+    if (!handle || handle->deleted || !handle->mount->writable) return -EROFS;
+    Mount *mount = handle->mount;
+    if (inode_is_open(mount, handle->inode.number, node, 1)) return -EBUSY;
+    int error = mutable_mount(mount);
+    if (!error) error = mount->writer->sync();
+    xjext4::Inode inode = {};
+    if (!error) error = view(mount).read_inode(handle->inode.number, inode);
+    if (!error && inode.size != WSOD_FILE_SECTORS * 512ULL) error = -EINVAL;
+    map->extent        = mount->extent;
+    unsigned per_block = view(mount).block_size() / 512;
+    for (unsigned i = 0; !error && i < WSOD_FILE_SECTORS;)
+    {
+        uint64_t physical = 0;
+        error             = view(mount).initialized_data_block(inode, i / per_block, physical);
+        if (error) break;
+        uint64_t sector = physical * per_block;
+        if (sector >= mount->extent.bytes / 512 || per_block > mount->extent.bytes / 512 - sector) return -EIO;
+        for (unsigned j = 0; j < per_block && i < WSOD_FILE_SECTORS; ++j, ++i)
+            map->sectors[i] = mount->extent.start / 512 + sector + j;
+    }
+    return error;
 }

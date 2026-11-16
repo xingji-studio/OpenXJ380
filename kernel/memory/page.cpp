@@ -11,6 +11,7 @@
 #include <task/pcb.h>
 #include <task/scheduler.h>
 #include <stdint.h>
+#include <wsod.h>
 
 spin_t page_lock;
 
@@ -404,6 +405,7 @@ err:;
         if (delivered) return;
         disable_scheduler();
     }
+    if (!(error_code & 0x4)) do_wsod("PAGE_FAULT", frame);
 
     write_serial_string("Page fault virtual address (cr2): ");
     write_serial_hex(faulting_address);

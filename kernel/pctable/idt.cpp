@@ -75,7 +75,7 @@ void  init_idt_desc(uint8_t number, uint8_t gate_type, int_func function, uint8_
 
     p_gate->offset_1        = f_base & 0xFFFF;
     p_gate->selector        = SELECTOR_KERNEL_CS;
-    p_gate->ist             = 0; // 不使用IST
+    p_gate->ist             = number == 2 ? 2 : number == 8 ? 3 : 0; // NMI and #DF have private stacks.
     p_gate->type_attributes = gate_type | (privilege << 5);
     p_gate->offset_2        = (f_base >> 16) & 0xFFFF;
     p_gate->offset_3        = (f_base >> 32) & 0xFFFFFFFF;

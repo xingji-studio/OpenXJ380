@@ -57,6 +57,7 @@ public:
                       Size capacity, Size &required) const;
     int list_xattr_raw(uint32_t number, XattrVisitor visitor, void *context) const;
 
+    int initialized_data_block(const Inode &inode, uint32_t logical, uint64_t &physical) const;
     uint32_t block_size() const { return block_size_; }
     uint64_t blocks_count() const { return blocks_; }
     uint64_t free_blocks() const { return free_blocks_; }

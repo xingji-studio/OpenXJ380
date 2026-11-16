@@ -209,6 +209,7 @@ struct SerialRecordWriter
     void flush()
     {
         if (!length) return;
+        if (serial_crash_record && !filtered) serial_crash_record(chunk, length);
         if (discarded) { length = 0; return; }
         if (emergency)
         {

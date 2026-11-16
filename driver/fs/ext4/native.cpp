@@ -650,3 +650,10 @@ int Volume::lookup(const Inode &directory, const char *name, Inode &inode) const
 }
 
 } // namespace xjext4
+
+int xjext4::Volume::initialized_data_block(const Inode &inode, uint32_t logical, uint64_t &physical) const
+{
+    bool unwritten = false;
+    int  error     = map_block(inode, logical, physical, unwritten);
+    return error ? error : (!physical || unwritten) ? -EIO : 0;
+}

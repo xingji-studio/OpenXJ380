@@ -20,6 +20,7 @@ static constexpr const char serial_shell_prompt[] = "xj380$ ";
 /* Optional product hook. OpenXJ380 remains usable without a product overlay. */
 extern "C" void serial_output_observer(const char *str) __attribute__((weak));
 extern "C" bool serial_logging_allowed() __attribute__((weak));
+extern "C" void serial_crash_record(const char *, size_t) __attribute__((weak));
 
 #define PORT 0x3f8 // COM1
 

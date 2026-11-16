@@ -203,3 +203,12 @@ The real devfs capture, read-only lease query and quiescent job-reaper hooks
 reuse existing kernel types and retain their ABI/layout. These are separate
 original Apache-2.0 source reviews, outside the 18-file ext4 directory inventory;
 no new external implementation, library, archive or distribution tool is added.
+
+The WSOD integration adds an original preparation-only initialized-data-block
+lookup and VFS adapter. It maps an already written and synced file while the
+ordinary mount guard is held; holes and unwritten extents are rejected. It does
+not introduce another filesystem implementation, parser, linked dependency or
+on-disk mutation algorithm. Fatal writes use the captured data-sector map outside
+the filesystem only after permanent CPU quiescence; normal boot performs report
+recovery through existing VFS writes. Updated first-party source hashes remain
+recorded in SOURCE.json.

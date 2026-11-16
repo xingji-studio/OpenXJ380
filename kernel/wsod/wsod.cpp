@@ -3,6 +3,7 @@
 #include <stdint.h>
 #include <task/scheduler.h>
 #include <cpu/regio.h>
+#include <wsod.h>
 
 extern bool no_interrupt;
 
@@ -23,29 +24,29 @@ static bool deliver_user_exception(X64_REGS *regs, int sig, int code, uint64_t t
     while (true) __asm__ volatile("hlt");
 }
 
+void process_wsod(const char *err_code, struct X64_REGS *regs) __attribute__((weak));
+void process_wsod_without_regs(const char *err_code) __attribute__((weak));
 
-void do_wsod(const char *err_code, struct X64_REGS *regs)
+[[noreturn]] void do_wsod(const char *err_code, struct X64_REGS *regs)
 {
-    // TODO: WSOD
-
-    disable_intr();
-    scheduler_stop();
-    while (1)
+    if (process_wsod) process_wsod(err_code, regs);
+    if (wsod_begin(regs))
     {
-        __asm__("pause");
-    };
+        wsod_stop_other_cpus();
+        write_serial_fmt("OpenXJ380 fatal: %s RIP=0x%llx\n", err_code, regs ? regs->rip : 0);
+    }
+    wsod_halt();
 }
 
-void no_regs_wsod(const char *err_code)
+[[noreturn]] void no_regs_wsod(const char *err_code)
 {
-    // TODO: WSOD
-
-    disable_intr();
-    scheduler_stop();
-    while (1)
+    if (process_wsod_without_regs) process_wsod_without_regs(err_code);
+    if (wsod_begin(nullptr))
     {
-        __asm__ __volatile__("pause");
-    };
+        wsod_stop_other_cpus();
+        write_serial_fmt("OpenXJ380 fatal: %s (no exception frame)\n", err_code);
+    }
+    wsod_halt();
 }
 
 /**
@@ -78,47 +79,13 @@ void wsod_divide_error(struct X64_REGS *regs, uint64_t error_code)
 void wsod_undefined_opcode(struct X64_REGS *regs, uint64_t error_code)
 {
     if (deliver_user_exception(regs, SIGILL, 2, 6, regs->rip)) return;
-    scheduler_stop();
-
-    write_serial_string("Undefined opcode at RIP: ");
-    write_serial_hex(regs->rip);
-    write_serial_string(" RSP: ");
-    write_serial_hex(regs->rsp);
-    write_serial_string(" CS: ");
-    write_serial_hex(regs->cs);
-    write_serial_string("\n");
-
-    write_serial_string("Fault Thread Name: ");
-    if (get_current_task() != NULL)
-    {
-        write_serial_string(get_current_task()->name);
-        write_serial_string(" ");
-        write_serial_hex((uint64_t)get_current_task());
-    }
-    else
-    {
-        write_serial_string("<none>");
-    }
-    write_serial_string("\n");
-
-    if (regs->rip >= 8 && (regs->cs & 0x3) == 0x3)
-    {
-        write_serial_string("Opcode bytes: ");
-        uint8_t *code = (uint8_t *)(regs->rip - 8);
-        for (int i = 0; i < 24; i++)
-        {
-            write_serial_hex(code[i]);
-            write_serial_string(" ");
-        }
-        write_serial_string("\n");
-    }
-
     do_wsod("UNDEFINED_OPCODE", regs);
 }
 
 // 不可屏蔽中断
 void wsod_nmi(struct X64_REGS *regs, uint64_t error_code)
 {
+    if (wsod_nmi_stop(regs)) return;
     do_wsod("NMI", regs);
 }
 
@@ -138,42 +105,6 @@ void wsod_system_kernel_error(struct X64_REGS *regs, uint64_t error_code)
 void wsod_general_protection(struct X64_REGS *regs, uint64_t error_code)
 {
     if (deliver_user_exception(regs, SIGSEGV, 128, 13, 0)) return;
-    scheduler_stop();
-
-    write_serial_string("Fault Thread Name: ");
-    write_serial_string(get_current_task()->name);
-    write_serial_string(" ");
-    write_serial_hex((uint64_t)get_current_task());
-    write_serial_string("\n");
-
-    if (error_code & 0x01)
-        write_serial_string(
-            "The exception occurred during delivery of an event external to the program,such as an interrupt "
-            "or an earlier exception.\n");
-
-    if (error_code & 0x02)
-        write_serial_string("Refers to a gate descriptor in the IDT;\n");
-    else
-        write_serial_string("Refers to a descriptor in the GDT or the current LDT;\n");
-
-    if ((error_code & 0x02) == 0)
-    {
-        if (error_code & 0x04)
-            write_serial_string("Refers to a segment or gate descriptor in the LDT;\n");
-        else
-            write_serial_string("Refers to a descriptor in the current GDT;\n");
-    }
-
-    write_serial_string("Error Code:");
-    write_serial_hex(error_code);
-    write_serial_string("\n");
-
-    write_serial_string("Adrress:");
-    write_serial_hex(regs->rip);
-    write_serial_string("\n");
-
-    backtrace(regs);
-
     do_wsod("GENERAL_PROTECTION", regs);
 }
 

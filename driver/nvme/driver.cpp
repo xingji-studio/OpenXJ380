@@ -6,6 +6,7 @@
 #include <ioctl.h>
 #include <errno.h>
 #include <mutex.h>
+#include <wsod_storage.h>
 
 #define NVME_CSTS_FATAL (1U << 1)
 #define NVME_CSTS_RDY (1U << 0)
@@ -700,4 +701,101 @@ NVME_CONTROLLER *nvme_driver_init(uint64_t bar0, uint64_t bar_size)
         if (source_status) write_serial_fmt("NVMe source provenance unavailable: %d\n", source_status);
     }
     return ctrl;
+}
+
+// Fatal polling is deliberately separate from NVMEWaitingCMD: no sleeping
+// driver mutex, heap/PRP construction, HPET deadline, reset, or diagnostic hook.
+int nvme_wsod_prepare(const BlockExtent &extent, WsodDiskTarget *target)
+{
+    device_t *device = get_device(extent.physical_device);
+    if (!target || !device || device->write != (writef)nvme_write || device->vdiskid >= 256) return -EOPNOTSUPP;
+    NVME_NAMESPACE *ns = NV_MAP[device->vdiskid];
+    if (!ns || ns->BSZ != 512 || ns->META || ns->MXRS < 8 || ns->CTRL->FAILED || ns->CTRL->WRITE_FAILED)
+        return -EOPNOTSUPP;
+    uint64_t page = alloc_frames(1);
+    if (!page) return -ENOMEM;
+    target->transport       = 2;
+    target->disk            = ns;
+    target->physical_buffer = page;
+    target->buffer          = (void *)phys_to_virt(page);
+    return 0;
+}
+
+static int wsod_nvme_completion(NVME_SUBMISSION_QUEUE &sq, uint16_t expected)
+{
+    NVME_CONTROLLER       *ctrl = sq.COM.CTR;
+    NVME_COMPLETION_QUEUE &cq   = *sq.ICQ;
+    for (unsigned polls = 0; polls < 10000000; ++polls)
+    {
+        if (ctrl->CAP->CST & NVME_CSTS_FATAL) return -EIO;
+        if ((__atomic_load_n(&cq.CQE[cq.COM.HAD].STS, __ATOMIC_ACQUIRE) & 1) == cq.COM.PHA)
+        {
+            NVME_COMPLETION_QUEUE_ENTRY entry;
+            memcpy(&entry, &cq.CQE[cq.COM.HAD], sizeof(entry));
+            if (entry.CID != expected || entry.QID != sq.COM.ID || entry.QHD > sq.COM.MSK) return -EIO;
+            sq.COM.HAD    = entry.QHD;
+            unsigned next = (cq.COM.HAD + 1) & cq.COM.MSK;
+            if (next < cq.COM.HAD) cq.COM.PHA ^= 1;
+            cq.COM.HAD = next;
+            __atomic_thread_fence(__ATOMIC_RELEASE);
+            *cq.COM.DBL = next;
+            return nvme_status_success(entry.STS) ? 0 : -EIO;
+        }
+        asm volatile("pause");
+    }
+    return -ETIMEDOUT;
+}
+
+static int wsod_nvme_command(WsodDiskTarget *target, uint64_t lba, const void *data, unsigned sectors)
+{
+    NVME_NAMESPACE *ns = target ? (NVME_NAMESPACE *)target->disk : nullptr;
+    if (!ns || !target->buffer || sectors > 8 || lba > ns->NLBA || sectors > ns->NLBA - lba) return -EINVAL;
+    NVME_CONTROLLER       *ctrl = ns->CTRL;
+    NVME_SUBMISSION_QUEUE &sq   = ctrl->ISQ;
+    if (ctrl->FAILED || ctrl->WRITE_FAILED || !sq.ICQ || !sq.SQE || !sq.ICQ->CQE || sq.COM.HAD > sq.COM.MSK ||
+        sq.COM.TAL > sq.COM.MSK || sq.ICQ->COM.HAD > sq.ICQ->COM.MSK)
+        return -EIO;
+    // Normal I/O is synchronous and serialized. A stopped owner may have one
+    // outstanding request. Consume its actual completion before reusing SQ
+    // storage; never reclaim that owner's buffers, even after completion.
+    if (sq.COM.HAD != sq.COM.TAL)
+    {
+        int error = wsod_nvme_completion(sq, sq.COM.HAD);
+        if (error || sq.COM.HAD != sq.COM.TAL) return error ? error : -EBUSY;
+    }
+    // A half-published CQ head/phase is ambiguous. Refuse it rather than
+    // treating an old completion as the new crash write's authorization.
+    auto &cq = *sq.ICQ;
+    if ((__atomic_load_n(&cq.CQE[cq.COM.HAD].STS, __ATOMIC_ACQUIRE) & 1) == cq.COM.PHA) return -EBUSY;
+    NVME_SUBMISSION_QUEUE_ENTRY command = {};
+    command.CDW0                        = sectors ? NVME_SQE_OPC_IO_WRITE : NVME_SQE_OPC_IO_FLUSH;
+    command.NSID                        = ns->NSID;
+    if (sectors)
+    {
+        if (!data) return -EINVAL;
+        memcpy(target->buffer, data, sectors * 512);
+        command.DATA[0] = target->physical_buffer;
+        command.CDWA    = uint32_t(lba);
+        command.CDWB    = uint32_t(lba >> 32);
+        command.CDWC    = sectors - 1;
+    }
+    unsigned id   = sq.COM.TAL;
+    command.CDW0 |= id << 16;
+    memcpy(&sq.SQE[id], &command, sizeof(command));
+    sq.COM.TAL = (id + 1) & sq.COM.MSK;
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    *sq.COM.DBL = sq.COM.TAL;
+    // Submission makes the private page controller-owned until completion.
+    // On failure the permanent fatal state retains all DMA memory unchanged.
+    return wsod_nvme_completion(sq, id);
+}
+
+int nvme_wsod_write(WsodDiskTarget *target, uint64_t lba, const void *data, unsigned sectors)
+{
+    return sectors ? wsod_nvme_command(target, lba, data, sectors) : -EINVAL;
+}
+
+int nvme_wsod_flush(WsodDiskTarget *target)
+{
+    return wsod_nvme_command(target, 0, nullptr, 0);
 }

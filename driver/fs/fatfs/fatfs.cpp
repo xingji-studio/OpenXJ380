@@ -17,6 +17,7 @@
 #include <task/scheduler.h>
 #include <ioctl.h>
 #include <rng.h>
+#include <wsod_storage.h>
 #include <fs/fatfs/diskio.h>
 #include <user/permissions.h>
 
@@ -1894,4 +1895,53 @@ int xjinstaller::fatfs_verify_root_window(const BlockAccessWindow *window, const
                                           const ProgressObserver &observer)
 {
     return fatfs_factory_window(window, nullptr, plan, volume_id, status, observer, true);
+}
+
+// Map only an already allocated, synced ordinary file. This is a preparation
+// helper; fatal code never enters FatFs, its cache, or the block access registry.
+int fatfs_wsod_map(vfs_node_t node, WsodFileMap *map)
+{
+    if (!node || node->fsid != fatfs_id || !map) return -EOPNOTSUPP;
+    if (!fatfs_lock()) return -EIO;
+    file_t file  = (file_t)node->handle;
+    FIL   *fp    = file && !file->is_dir ? (FIL *)file->handle : nullptr;
+    int    error = -EINVAL;
+    if (fp && fp->obj.fs && fp->obj.objsize == WSOD_FILE_SECTORS * 512ULL)
+    {
+        FATFS   *fs    = fp->obj.fs;
+        unsigned drive = fs->pdrv;
+        error          = drive < 10 ? block_access_resolve_node(drive_number_mapping[drive], &map->extent) : -ENODEV;
+        // One pair per possible cluster, followed by the terminator.
+        u32  links[WSOD_FILE_SECTORS * 2 + 2] = {};
+        u32 *saved                            = fp->cltbl;
+        links[0]                              = sizeof(links) / sizeof(links[0]);
+        fp->cltbl                             = links;
+        if (!error && (f_sync(fp) != FR_OK || f_lseek(fp, CREATE_LINKMAP) != FR_OK)) error = -EIO;
+        fp->cltbl       = saved;
+        unsigned output = 0;
+        for (unsigned i = 1; !error && i + 1 < sizeof(links) / sizeof(links[0]) && links[i]; i += 2)
+        {
+            uint64_t cluster = links[i + 1], count = links[i];
+            if (cluster < 2 || cluster >= fs->n_fatent || count > fs->n_fatent - cluster)
+            {
+                error = -EIO;
+                break;
+            }
+            uint64_t start = fs->database + (cluster - 2) * fs->csize;
+            for (uint64_t j = 0; j < count * fs->csize && output < WSOD_FILE_SECTORS; ++j)
+            {
+                uint64_t sector = start + j;
+                if (sector >= map->extent.bytes / 512)
+                {
+                    error = -EIO;
+                    break;
+                }
+                map->sectors[output++] = map->extent.start / 512 + sector;
+            }
+        }
+        if (!error && output != WSOD_FILE_SECTORS) error = -EIO;
+        if (!error) error = vfs_ioctl(drive_number_mapping[drive], IOBLKSYNC, nullptr);
+    }
+    fatfs_unlock();
+    return error;
 }

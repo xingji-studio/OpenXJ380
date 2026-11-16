@@ -1,3 +1,4 @@
+#include <wsod.h>
 #if defined(__x86_64__) || defined(__i386__)
 
 #    include "smp/smp.h"
@@ -23,6 +24,7 @@ void tss_setup()
     gdt_entries[5]       = (((low_base | mid_base) | limit) | access_byte);
     gdt_entries[6]       = high_base;
 
+    wsod_setup_stacks(&tss0, 0);
     tss0.ist[0] = ((uint64_t)&tss_stack) + sizeof(tss_stack_t);
 
     __asm__ volatile("ltr %[offset];" : : [offset] "rm"(0x28U) : "memory");

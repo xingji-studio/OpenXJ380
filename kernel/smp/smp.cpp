@@ -8,6 +8,7 @@
 #include <apic/apic.h>
 #include <apic/madt.h>
 #include <cpu/msr.h>
+#include <wsod.h>
 #include <cpu/fsgsbase.h>
 #include <krlibc.h>
 #include <mm/alloc/alloc.h>
@@ -142,6 +143,7 @@ extern "C" void apu_entry(uint64_t cpu_id, uint64_t tr)
     info->gdt_entries_t[5] = (((low_base | mid_base) | limit) | access_byte);
     info->gdt_entries_t[6] = high_base;
 
+    wsod_setup_stacks(&info->tss0, unsigned(info - xsi->pcr_inf));
     info->tss0.ist[0] = ((uint64_t)&(info->tss_stack)) + sizeof(tss_stack_t);
 
     __asm__ volatile("ltr %[offset]\n\t" : : [offset] "rm"(0x28U) : "memory");

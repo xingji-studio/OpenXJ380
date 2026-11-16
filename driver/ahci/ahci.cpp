@@ -8,6 +8,7 @@
 #include <errno.h>
 #include <mutex.h>
 #include "deadline.h"
+#include <wsod_storage.h>
 
 void              *op_buffer;
 static uint32_t    cdb_size[] = {SCSI_CDB12, SCSI_CDB16, 0, 0};
@@ -729,4 +730,85 @@ void ahci_setup() {
     }
     write_serial_fmt("AHCI initialized: online_ports=%d ready_ports=%d implemented_ports=%d version=%d.%d.%d\n",
                      online_ports, ready_ports, hba->ports_num, major, minor, patch);
+}
+
+int ahci_wsod_prepare(const BlockExtent &extent, WsodDiskTarget *target)
+{
+    device_t *physical = get_device(extent.physical_device);
+    if (!target || !physical || physical->write != ahci_write || physical->sector_size != 512 ||
+        physical->vdiskid >= AHCI_MAX_DEVICES)
+        return -EOPNOTSUPP;
+    hba_device *disk = hbaDevice[physical->vdiskid];
+    if (!disk || !(disk->flags & HBA_DEV_FEXTLBA) || !(disk->flags & (HBA_DEV_FFLUSH | HBA_DEV_FFLUSH_EXT)))
+        return -EOPNOTSUPP;
+    uint64_t page = alloc_frames(1);
+    if (!page) return -ENOMEM;
+    target->transport       = 1;
+    target->disk            = disk;
+    target->physical_buffer = page;
+    target->buffer          = phys_to_virt(page);
+    return 0;
+}
+
+static int wsod_ahci_command(WsodDiskTarget *target, uint64_t lba, const void *data, unsigned sectors)
+{
+    hba_device *disk = target ? (hba_device *)target->disk : nullptr;
+    if (!disk || !target->buffer || sectors > 8 || lba > disk->max_lba || sectors > disk->max_lba - lba) return -EINVAL;
+    hba_port *port = disk->port;
+    if (port->io_error || port->hba->quarantined || !port->cmd_tables[0]) return -EIO;
+    // A stopped software owner may have left a command in flight. Wait only
+    // for hardware; never reset/retry/reclaim its buffers or take its mutex.
+    unsigned polls = 0;
+    while ((port->regs[HBA_RPxCI] || port->regs[HBA_RPxSACT] ||
+            (port->regs[HBA_RPxTFD] & (HBA_PxTFD_BSY | HBA_PxTFD_DRQ))) &&
+           ++polls < 2000000)
+        asm volatile("pause");
+    if (polls == 2000000) return -EBUSY;
+    hba_cmdt *table;
+    hba_cmdh *header;
+    int       slot = hba_prepare_cmd(port, &table, &header);
+    if (slot < 0) return -EIO;
+    if (sectors)
+    {
+        if (!data) return -EINVAL;
+        memcpy(target->buffer, data, sectors * 512);
+        header->options                   |= HBA_CMDH_WRITE;
+        header->prdt_len                   = 1;
+        table->entries[0].data_base        = uint32_t(target->physical_buffer);
+        table->entries[0].data_base_upper  = uint32_t(target->physical_buffer >> 32);
+        table->entries[0].byte_count       = sectors * 512 - 1;
+    }
+    uint8_t       command = sectors                              ? ATA_WRITE_DMA_EXT
+                            : (disk->flags & HBA_DEV_FFLUSH_EXT) ? ATA_FLUSH_CACHE_EXT
+                                                                 : ATA_FLUSH_CACHE;
+    sata_reg_fis *fis     = (sata_reg_fis *)table->command_fis;
+    sata_create_fis(fis, command, lba, sectors);
+    fis->dev              = 1 << 6;
+    port->regs[HBA_RPxIS] = 0xffffffff;
+    asm volatile("mfence" : : : "memory");
+    port->regs[HBA_RPxCI] = 1U << slot;
+    for (polls = 0; polls < 10000000; ++polls)
+    {
+        if (!(port->regs[HBA_RPxCI] & (1U << slot)))
+        {
+            asm volatile("mfence" : : : "memory");
+            return (port->regs[HBA_RPxTFD] & 1) || (port->regs[HBA_RPxIS] & (1U << 30)) ||
+                           header->transferred_size != sectors * 512
+                       ? -EIO
+                       : 0;
+        }
+        asm volatile("pause");
+    }
+    // Fatal mode never resumes: retain table, page and all interrupted DMA.
+    return -ETIMEDOUT;
+}
+
+int ahci_wsod_write(WsodDiskTarget *target, uint64_t lba, const void *data, unsigned sectors)
+{
+    return sectors ? wsod_ahci_command(target, lba, data, sectors) : -EINVAL;
+}
+
+int ahci_wsod_flush(WsodDiskTarget *target)
+{
+    return wsod_ahci_command(target, 0, nullptr, 0);
 }

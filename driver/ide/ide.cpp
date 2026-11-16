@@ -4,6 +4,8 @@
 #include <block_source.h>
 #include <fs/vfs/vfs.h>
 #include <ioctl.h>
+#include <wsod_storage.h>
+#include <errno.h>
 
 static ide_device_t ide_devices[4]; // 最多 4 个 IDE 设备
 extern vfs_node_t devfs_root;
@@ -429,6 +431,9 @@ void ide_setup(void) {
     
     // 查找 IDE 控制器
     pci_device_t *ide_controller = pci_find_class(0x01018a);
+    // PIIX exposes fixed compatibility channels (ProgIF 80h); the existing
+    // 8Ah profile also permits switching, with both channels in compatibility.
+    if (!ide_controller) ide_controller = pci_find_class(0x010180);
     if (ide_controller == NULL) {
         write_serial_string("IDE: No IDE controller found\n");
         return;
@@ -539,4 +544,82 @@ void ide_setup(void) {
     }
     
     write_serial_string("IDE controller initialized.\n");
+}
+
+int ide_wsod_prepare(const BlockExtent &extent, WsodDiskTarget *target)
+{
+    device_t *device = get_device(extent.physical_device);
+    if (!target || !device || device->write != ide_write_callback) return -EOPNOTSUPP;
+    for (auto &disk : ide_devices)
+        if (disk.exists && disk.drive_id == int(device->vdiskid) && disk.device_type == IDE_DEVICE_ATA &&
+            disk.sector_size == 512 && disk.sectors <= (1ULL << 28))
+        {
+            target->transport = 3;
+            target->disk      = &disk;
+            return 0;
+        }
+    return -EOPNOTSUPP;
+}
+
+static int wsod_ide_ready(uint16_t base, bool data)
+{
+    for (unsigned polls = 0; polls < 1000000; ++polls)
+    {
+        unsigned status = inb(base + 7);
+        if (!status || status == 255 || (status & (IDE_STATUS_ERR | IDE_STATUS_DF))) return -EIO;
+        if (!(status & IDE_STATUS_BSY))
+        {
+            if (data && (status & IDE_STATUS_DRQ)) return 0;
+            if (!data) return status & IDE_STATUS_DRQ ? -EBUSY : 0;
+        }
+        asm volatile("pause");
+    }
+    return -ETIMEDOUT;
+}
+
+int ide_wsod_write(WsodDiskTarget *target, uint64_t lba, const void *data, unsigned sectors)
+{
+    ide_device_t *disk = target ? (ide_device_t *)target->disk : nullptr;
+    if (!disk || !data || !sectors || sectors > 8 || lba > disk->sectors || sectors > disk->sectors - lba)
+        return -EINVAL;
+    uint16_t base = disk->is_primary ? IDE_PRIMARY_DATA_PORT : IDE_SECONDARY_DATA_PORT;
+    for (unsigned i = 0; i < sectors; ++i)
+    {
+        // An interrupted PIO transfer with outstanding DRQ is not recoverable
+        // by issuing another command. Refuse it without touching its payload.
+        int error = wsod_ide_ready(base, false);
+        if (error) return error;
+        outb(base + 0x206, 2);
+        uint64_t sector = lba + i;
+        outb(base + 6, (disk->is_master ? IDE_DEVICE_MASTER : IDE_DEVICE_SLAVE) | 0x40 | ((sector >> 24) & 15));
+        ide_delay_400ns(base);
+        outb(base + 2, 1);
+        outb(base + 3, sector);
+        outb(base + 4, sector >> 8);
+        outb(base + 5, sector >> 16);
+        outb(base + 7, IDE_CMD_WRITE_SECTORS);
+        error = wsod_ide_ready(base, true);
+        if (error) return error;
+        const unsigned char *bytes = (const unsigned char *)data + i * 512;
+        for (unsigned j = 0; j < 512; j += 2)
+            outw(base, bytes[j] | (unsigned(bytes[j + 1]) << 8));
+        ide_delay_400ns(base);
+        error = wsod_ide_ready(base, false);
+        if (error) return error;
+    }
+    return 0;
+}
+
+int ide_wsod_flush(WsodDiskTarget *target)
+{
+    ide_device_t *disk = target ? (ide_device_t *)target->disk : nullptr;
+    if (!disk) return -EINVAL;
+    uint16_t base  = disk->is_primary ? IDE_PRIMARY_DATA_PORT : IDE_SECONDARY_DATA_PORT;
+    int      error = wsod_ide_ready(base, false);
+    if (error) return error;
+    outb(base + 6, disk->is_master ? IDE_DEVICE_MASTER : IDE_DEVICE_SLAVE);
+    ide_delay_400ns(base);
+    outb(base + 7, IDE_CMD_CACHE_FLUSH);
+    ide_delay_400ns(base);
+    return wsod_ide_ready(base, false);
 }

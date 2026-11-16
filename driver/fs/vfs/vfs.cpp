@@ -17,6 +17,7 @@
 #include "rtc.h"
 #include "task/pcb.h"
 #include <ioctl.h>
+#include <wsod_storage.h>
 #include <cpu/lock.h>
 // #include "pipefs.h"
 #include <syscall/syscall.h>
@@ -125,9 +126,52 @@ bool vfs_uses_unlinked_lifetime(vfs_node_t node)
            __atomic_load_n(&fs_unlinked_lifetime[node->fsid], __ATOMIC_ACQUIRE);
 }
 
+static vfs_node_t wsod_pinned_file;
+static tcb_t wsod_preparer;
+static uint64_t wsod_preparer_tid;
+static bool wsod_sealed;
+
+int vfs_wsod_pin(vfs_node_t node)
+{
+    if (!node || (node->type & (file_dir | file_symlink | file_block))) return -EINVAL;
+    tcb_t task = get_current_task();
+    if (!task) return -EINVAL;
+    vfs_child_lock();
+    if (wsod_pinned_file || node->refcount > 2)
+    {
+        vfs_child_unlock();
+        return -EBUSY;
+    }
+    wsod_preparer = task;
+    wsod_preparer_tid = task->tid;
+    __atomic_store_n(&wsod_pinned_file, node, __ATOMIC_RELEASE);
+    vfs_child_unlock();
+    // Caller transfers its open reference permanently; root unmount cannot
+    // cross it. Only this TCB/TID may initialize/replay it until seal. Pinning
+    // precedes allocation and mapping, so no concurrent FD can move its blocks.
+    return 0;
+}
+
+void vfs_wsod_seal()
+{
+    __atomic_store_n(&wsod_sealed, true, __ATOMIC_RELEASE);
+}
+
 bool vfs_check_access(vfs_node_t node, const char *path, int operation)
 {
     permissions_clear_file_error();
+    vfs_node_t pinned = __atomic_load_n(&wsod_pinned_file, __ATOMIC_ACQUIRE);
+    if (pinned && node && node->fsid == pinned->fsid && node->dev == pinned->dev && node->inode == pinned->inode &&
+        (operation == IME_FILE_WRITE || operation == IME_FILE_READ_WRITE || operation == IME_FILE_REMOVE))
+    {
+        tcb_t task = get_current_task();
+        if (__atomic_load_n(&wsod_sealed, __ATOMIC_ACQUIRE) ||
+            !task || task != wsod_preparer || task->tid != wsod_preparer_tid)
+        {
+            permissions_set_file_error(EBUSY);
+            return false;
+        }
+    }
     if (!ime_vfs_access(node, path, (ImeFileOperation)operation))
     {
         if (!permissions_file_error()) permissions_set_file_error(EACCES);
