@@ -47,23 +47,43 @@
 #define CONFIG_OPEN_BOOT_DEBUG_COLOR
 
 #ifndef CONFIG_OS_EDITION
-// Edition label exposed by the boot screen and system version interfaces.
-#define CONFIG_OS_EDITION "BetaVersion"
+// 操作系统发行阶段
+#define CONFIG_OS_EDITION "Pre-test Version"
 #endif
 
 #ifndef CONFIG_KN_VERSION
-// Kernel release string reported by the bootloader/kernel.
+// 操作系统内核版本
 #define CONFIG_KN_VERSION "XSK 2.1.0"
 #endif
 
 #ifndef CONFIG_OS_VERSION
-// User-visible operating system version string.
-#define CONFIG_OS_VERSION "XINGJI XJ380 Singularity 1.0.0"
+// 操作系统完整名称
+#define CONFIG_OS_VERSION "XINGJI XJ380OS Singularity 1.0.0"
+#endif
+
+#ifndef CONFIG_OS_VERSION_NUM
+// 操作系统版本
+#define CONFIG_OS_VERSION_NUM "1.0.0"
+#endif
+
+#ifndef CONFIG_OS_RELEASE_NUM
+// 操作系统发行版完整版本号
+#define CONFIG_OS_RELEASE_NUM "xrls-1.0.0.202611161510-PTE"
 #endif
 
 #ifndef CONFIG_KN_NAME
-// Kernel release string reported by the bootloader/kernel.
+// 操作系统内核名称
 #define CONFIG_KN_NAME "XSK"
+#endif
+
+#ifndef CONFIG_OS_NAME
+// 操作系统名称
+#define CONFIG_OS_NAME "XJ380"
+#endif
+
+#ifndef CONFIG_OS_CODE
+// 操作系统代号
+#define CONFIG_OS_CODE "Singularity"
 #endif
 
 #ifndef CONFIG_STACK_SIZE
@@ -197,8 +217,11 @@
 #define OS_EDITION CONFIG_OS_EDITION
 #define KN_VERSION CONFIG_KN_VERSION
 #define OS_VERSION CONFIG_OS_VERSION
-
 #define KN_NAME CONFIG_KN_NAME
+#define OS_VERSION_NUM CONFIG_OS_VERSION_NUM
+#define OS_RELEASE_NUM CONFIG_OS_RELEASE_NUM
+#define OS_NAME CONFIG_OS_NAME
+#define OS_CODE CONFIG_OS_CODE
 
 #define ENVP_SYSTEM_VERSION "SYSTEM_VERSION=" CONFIG_OS_VERSION
 
