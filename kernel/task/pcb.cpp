@@ -271,21 +271,22 @@ static bool notify_parent_exit(pcb_t child, int exit_code)
     // Parent collection changes parent_task under the process-list lock. Both
     // allocations precede that lock; publication transfers ownership at unlock.
     auto *message = static_cast<ipc_message_t>(malloc(sizeof(struct ipc_message)));
-    if (!message) return false;
-    auto *node = static_cast<lock_node *>(malloc(sizeof(lock_node)));
-    if (!node) { free(message); return false; }
-    memset(message, 0, sizeof(*message));
-    message->type = IPC_MSG_TYPE_EPID;
-    for (unsigned i = 0; i < 4; ++i) message->data[i] = uint8_t(uint32_t(exit_code) >> (i * 8));
-    node->data = message;
-    node->next = NULL;
+    auto *node = message ? static_cast<lock_node *>(malloc(sizeof(lock_node))) : NULL;
+    if (message && node)
+    {
+        memset(message, 0, sizeof(*message));
+        message->type = IPC_MSG_TYPE_EPID;
+        for (unsigned i = 0; i < 4; ++i) message->data[i] = uint8_t(uint32_t(exit_code) >> (i * 8));
+        node->data = message;
+        node->next = NULL;
+    }
     bool published = false;
     spin_lock(&pcb_group_queue->lock);
     if (process_list_contains_locked(child))
     {
         pcb_t parent = child->parent_task;
         lock_queue *queue = parent ? parent->ipc_queue : NULL;
-        if (queue)
+        if (queue && message && node)
         {
             spin_lock(&queue->lock);
             if (queue->next_index != size_t(-1))
@@ -302,6 +303,11 @@ static bool notify_parent_exit(pcb_t child, int exit_code)
             }
             spin_unlock(&queue->lock);
         }
+        // Linux event loops reap children from a SIGCHLD handler. The child
+        // is already a zombie; pin the current parent through this bounded,
+        // allocation-free signal/wake publication. IPC allocation failure
+        // must not suppress the Linux notification.
+        if (parent && parent->linux_abi) signal_send_process(parent, SIGCHLD);
     }
     spin_unlock(&pcb_group_queue->lock);
     // A receiver may already have freed both objects after publication.
@@ -2314,13 +2320,6 @@ uint64_t process_execve(char *path, char **argv, char **envp)
     return (uint64_t)-(EAGAIN);
 }
 
-static void *file_copy(void *ptr)
-{
-    if (ptr == NULL) return NULL;
-    fd_file_handle *src = (fd_file_handle *)ptr;
-    return fd_dup(src);
-}
-
 static void close_exec_file_descriptors(pcb_t process)
 {
     while (fd_file_handle *handle = fd_detach_matching(process, 0, size_t(-1), true)) fd_retire_handle(handle);
@@ -2493,6 +2492,7 @@ uint64_t process_fork(struct X64_REGS *reg, bool is_vfork, uint64_t user_stack, 
 
     bool is_sti                = are_interrupts_enabled();
     uint64_t scheduler_depth = scheduler_disable_depth();
+    if (!(clone_flags & CLONE_FILES_FLAG) && (scheduler_depth != 0 || no_interrupt)) return (uint64_t)-EAGAIN;
     close_interrupt;
     disable_scheduler();
 
@@ -2520,6 +2520,27 @@ uint64_t process_fork(struct X64_REGS *reg, bool is_vfork, uint64_t user_stack, 
         return (uint64_t)-EFAULT;
     }
 
+    struct PreparedFiles
+    {
+        lock_queue *table = NULL;
+        ~PreparedFiles() { if (table) free_fd_handle_queue(table); }
+        lock_queue *take() { lock_queue *result = table; table = NULL; return result; }
+    } prepared_files;
+    if (!(clone_flags & CLONE_FILES_FLAG))
+    {
+        // Capture retained descriptors in one short table transaction. VFS
+        // duplication and shared-position allocation must run preemptibly,
+        // before the child is published and outside the creator spin lock.
+        restore_runtime_state(scheduler_depth, true);
+        prepared_files.table = fd_clone_process_table(current_pcb);
+        close_interrupt;
+        disable_scheduler();
+        if (!prepared_files.table)
+        {
+            restore_runtime_state(scheduler_depth, is_sti);
+            return (uint64_t)-ENOMEM;
+        }
+    }
     spin_lock(&create_thread_lock);
 
     pcb_t new_pcb = (pcb_t)malloc(sizeof(struct process_control_block));
@@ -2588,7 +2609,7 @@ uint64_t process_fork(struct X64_REGS *reg, bool is_vfork, uint64_t user_stack, 
     }
     else
     {
-        new_pcb->file_open = queue_copy(current_pcb->file_open, file_copy);
+        new_pcb->file_open = prepared_files.take();
         new_pcb->file_open_shared_refs = alloc_fd_table_ref();
     }
     new_pcb->ipc_queue    = queue_init();

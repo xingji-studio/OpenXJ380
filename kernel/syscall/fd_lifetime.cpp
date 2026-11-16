@@ -2,6 +2,7 @@
 // First-party operation pins and logical descriptor retirement. Registry
 // records live on the heap so a killed thread never leaves a stack pointer.
 #include <syscall/fd_lifetime.h>
+#include <syscall/fd_position.h>
 #include <fs/vfs/vfs.h>
 #include <task/scheduler.h>
 #include <errno.h>
@@ -26,6 +27,7 @@ unsigned bucket(fd_file_handle *handle)
 
 int finish_handle(fd_file_handle *handle)
 {
+    fd_position_forget(handle);
     int error = vfs_close(handle->node);
     free(handle);
     return error;
@@ -361,6 +363,90 @@ lock_queue *fd_detach_process_table(pcb_t process)
     return table;
 }
 
+lock_queue *fd_clone_process_table(pcb_t process)
+{
+    struct Entry { FdOperationRecord *record; lock_node *node; size_t number; };
+    lock_queue *copy = queue_init();
+    if (!copy) return NULL;
+    size_t capacity = 0;
+    fd_snapshot_numbers(process, NULL, 0, capacity);
+    for (;;)
+    {
+        size_t bytes = capacity ? capacity : 1;
+        if (bytes > size_t(-1) / sizeof(Entry)) { queue_destroy(copy); return NULL; }
+        auto *entries = static_cast<Entry *>(calloc(bytes, sizeof(Entry)));
+        if (!entries) { queue_destroy(copy); return NULL; }
+        bool prepared = true;
+        for (size_t i = 0; i < capacity; ++i)
+        {
+            entries[i].record = static_cast<FdOperationRecord *>(malloc(sizeof(FdOperationRecord)));
+            entries[i].node = static_cast<lock_node *>(malloc(sizeof(lock_node)));
+            if (!entries[i].record || !entries[i].node) { prepared = false; break; }
+        }
+        size_t count = 0;
+        bool captured = false;
+        tcb_t owner = get_current_task();
+        if (prepared)
+        {
+            spin_lock(&registry_lock);
+            lock_queue *table = process ? process->file_open : NULL;
+            if (table && owner && owner->status != DEATH && owner->status != OUT &&
+                process->status != DEATH && process->status != OUT && process->status != ZOMBIE)
+            {
+                spin_lock(&table->lock);
+                for (lock_node *node = table->head; node; node = node->next)
+                    if (node->data) ++count;
+                if (count <= capacity)
+                {
+                    size_t i = 0;
+                    for (lock_node *node = table->head; node; node = node->next)
+                    {
+                        auto *handle = static_cast<fd_file_handle *>(node->data);
+                        if (!handle) continue;
+                        entries[i].number = node->index;
+                        FdOperationRecord *record = entries[i++].record;
+                        *record = {handle, owner, operations[bucket(handle)], false};
+                        operations[bucket(handle)] = record;
+                    }
+                    captured = true;
+                }
+                spin_unlock(&table->lock);
+            }
+            spin_unlock(&registry_lock);
+        }
+        bool complete = captured;
+        for (size_t i = 0; i < capacity; ++i)
+        {
+            if (captured && i < count)
+            {
+                fd_file_handle *handle = complete ? fd_dup(entries[i].record->handle) : NULL;
+                if (!handle) complete = false;
+                if (handle)
+                {
+                    handle->fd = entries[i].number;
+                    lock_node *node = entries[i].node;
+                    *node = {handle, NULL, copy->tail, entries[i].number};
+                    if (copy->tail) copy->tail->next = node;
+                    else copy->head = node;
+                    copy->tail = node;
+                    ++copy->size;
+                    if (copy->next_index <= node->index) copy->next_index = node->index + 1;
+                    entries[i].node = NULL;
+                }
+                fd_operation_release(entries[i].record);
+            }
+            else free(entries[i].record);
+            free(entries[i].node);
+        }
+        free(entries);
+        if (complete) { copy->rr_cursor = copy->head; return copy; }
+        if (prepared && !captured && count > capacity) { capacity = count; continue; }
+        while (fd_file_handle *handle = fd_detach_first(copy)) fd_retire_handle(handle);
+        queue_destroy(copy);
+        return NULL;
+    }
+}
+
 namespace {
 bool owner_quiescent(tcb_t task)
 {
@@ -382,6 +468,7 @@ void fd_reap_abandoned_operations()
             for (FdOperationRecord *record = operations[index]; record; record = record->next)
                 if (owner_quiescent(record->owner)) { abandoned = record; break; }
         fd_file_handle *retired = abandoned ? remove_record_locked(abandoned) : NULL;
+        if (abandoned) fd_position_abandon(abandoned->owner);
         spin_unlock(&registry_lock);
         if (!abandoned) return;
         free(abandoned);
@@ -400,6 +487,7 @@ bool fd_operation_thread_exit(tcb_t task)
             for (FdOperationRecord *record = operations[index]; record; record = record->next)
                 if (record->owner == task) { abandoned = record; break; }
         fd_file_handle *retired = abandoned ? remove_record_locked(abandoned) : NULL;
+        if (abandoned) fd_position_abandon(abandoned->owner);
         spin_unlock(&registry_lock);
         if (!abandoned) break;
         free(abandoned);

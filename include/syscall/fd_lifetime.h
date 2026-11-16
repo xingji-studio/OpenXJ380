@@ -34,6 +34,8 @@ fd_file_handle *fd_detach_matching(pcb_t process, size_t first, size_t last, boo
 fd_file_handle *fd_detach_first(lock_queue *table);
 void fd_mark_cloexec(pcb_t process, size_t first, size_t last);
 lock_queue *fd_detach_process_table(pcb_t process);
+// Snapshot operation pins under table locks, then duplicate outside locks.
+lock_queue *fd_clone_process_table(pcb_t process);
 // Call only after a dead thread has no current/selected/previous-stack
 // scheduler references. False means its operation references must remain intact.
 bool fd_operation_thread_exit(tcb_t task);

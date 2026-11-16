@@ -23,6 +23,7 @@
 #include <task/ipc.h>
 #include <task/futex.h>
 #include <task/eventfd.h>
+#include <syscall/fd_position.h>
 #include <smp/smp.h>
 #include <mutex.h>
 #include <math.hpp>
@@ -867,6 +868,8 @@ sys_(write, int fd, uint8_t *buffer, size_t size)
     int operation_error = operation.acquire(fd);
     if (operation_error) return SYSCALL_FAULT_(-operation_error);
     fd_file_handle *handle = operation.get();
+    FdPositionScope position_scope(handle);
+    if (position_scope.error()) return SYSCALL_FAULT_(-position_scope.error());
     if (!handle) return SYSCALL_FAULT_(EBADF);
     if (handle->node->type & file_socket)
     {
@@ -938,6 +941,8 @@ sys_(read, int fd, uint8_t *buffer, size_t size)
     int operation_error = operation.acquire(fd);
     if (operation_error) return SYSCALL_FAULT_(-operation_error);
     fd_file_handle *handle = operation.get();
+    FdPositionScope position_scope(handle);
+    if (position_scope.error()) return SYSCALL_FAULT_(-position_scope.error());
     if (!handle) return SYSCALL_FAULT_(EBADF);
     return read_from_handle(handle, buffer, size);
 }
@@ -1659,13 +1664,17 @@ sys_(uname, struct utsname *utsname)
     if (unlikely(utsname == NULL)) return SYSCALL_FAULT_(EINVAL);
     struct utsname kname;
     memset(&kname, 0, sizeof(kname));
-    char sysname[] = KN_NAME;
+    tcb_t task = get_current_task();
+    bool linux_abi = task && task->parent_group && task->parent_group->linux_abi;
+    const char *sysname = linux_abi ? "Linux" : KN_NAME;
     char machine[] = "x86_64";
-    char release[] = "2.1.0";   // 太棒了 glibc 你终于觉醒了
+    // Static glibc checks the numeric Linux release before entering main.
+    // This is a compatibility identity, separate from the native OS version.
+    const char *release = linux_abi ? "3.2.0-xj380" : "2.1.0";
     char version[] = OS_VERSION;
-    memcpy(kname.sysname, sysname, sizeof(sysname));
+    strncpy(kname.sysname, sysname, sizeof(kname.sysname) - 1);
     memcpy(kname.nodename, "localhost", 10);
-    memcpy(kname.release, release, sizeof(release));
+    strncpy(kname.release, release, sizeof(kname.release) - 1);
     memcpy(kname.version, version, sizeof(version));
     memcpy(kname.machine, machine, sizeof(machine));
     if (!copy_to_user_pagedir(current_user_pagedir(), utsname, &kname, sizeof(kname))) return SYSCALL_FAULT_(EFAULT);
@@ -1834,6 +1843,8 @@ sys_(writev, int fd, struct iovec *iov, int iovcnt)
     int operation_error = operation.acquire(fd);
     if (operation_error) return SYSCALL_FAULT_(-operation_error);
     fd_file_handle *handle = operation.get();
+    FdPositionScope position_scope(handle);
+    if (position_scope.error()) return SYSCALL_FAULT_(-position_scope.error());
     if (handle == NULL) return SYSCALL_FAULT_(EBADF);
     if (handle->node->type & file_socket)
     {
@@ -1882,6 +1893,8 @@ sys_(readv, int fd, struct iovec *iov, int iovcnt0)
     int operation_error = operation.acquire(fd);
     if (operation_error) return SYSCALL_FAULT_(-operation_error);
     fd_file_handle *handle = operation.get();
+    FdPositionScope position_scope(handle);
+    if (position_scope.error()) return SYSCALL_FAULT_(-position_scope.error());
     if (handle == NULL) return SYSCALL_FAULT_(EBADF);
 
     size_t iov_bytes = 0;
@@ -3429,6 +3442,8 @@ sys_(lseek, int fd, int64_t offset, size_t whence)
     int descriptor_error = descriptor_pin.acquire(fd);
     if (descriptor_error) return SYSCALL_FAULT_(-descriptor_error);
     fd_file_handle *handle = descriptor_pin.get();
+    FdPositionScope position_scope(handle);
+    if (position_scope.error()) return SYSCALL_FAULT_(-position_scope.error());
     if (unlikely(handle == NULL)) return SYSCALL_FAULT_(EBADF);
     if (handle->node->type & (file_socket | file_pipe)) return SYSCALL_FAULT_(ESPIPE);
 
@@ -3692,6 +3707,8 @@ sys_(getdents, int fd, struct dirent *dents, size_t size)
     int descriptor_error = descriptor_pin.acquire(fd);
     if (descriptor_error) return SYSCALL_FAULT_(-descriptor_error);
     fd_file_handle *handle = descriptor_pin.get();
+    FdPositionScope position_scope(handle);
+    if (position_scope.error()) return SYSCALL_FAULT_(-position_scope.error());
     if (unlikely(handle == NULL)) { return SYSCALL_FAULT_(EBADF); }
     if (handle->node->type != file_dir) { return SYSCALL_FAULT_(ENOTDIR); }
     if (!vfs_check_access(handle->node, NULL, IME_FILE_LIST)) return SYSCALL_FAULT_(vfs_last_error());
@@ -3749,6 +3766,8 @@ sys_(getdents64, int fd, void *dents, size_t size)
     int descriptor_error = descriptor_pin.acquire(fd);
     if (descriptor_error) return SYSCALL_FAULT_(-descriptor_error);
     fd_file_handle *handle = descriptor_pin.get();
+    FdPositionScope position_scope(handle);
+    if (position_scope.error()) return SYSCALL_FAULT_(-position_scope.error());
     if (unlikely(handle == NULL)) { return SYSCALL_FAULT_(EBADF); }
     if (handle->node->type != file_dir) { return SYSCALL_FAULT_(ENOTDIR); }
     if (!vfs_check_access(handle->node, NULL, IME_FILE_LIST)) return SYSCALL_FAULT_(vfs_last_error());
@@ -4201,6 +4220,9 @@ sys_(copy_file_range, int fd_in, uint64_t *off_in, int fd_out, uint64_t *off_out
     if (src_handle->node->type & (file_socket | file_pipe) || dst_handle->node->type & (file_socket | file_pipe))
         return SYSCALL_FAULT_(EINVAL);
 
+    FdPositionScope position_scope(src_handle, off_in == NULL, dst_handle, off_out == NULL);
+    if (position_scope.error()) return SYSCALL_FAULT_(-position_scope.error());
+
     uint64_t src_offset = src_handle->offset;
     uint64_t dst_offset = dst_handle->offset;
     if (off_in != NULL && !copy_from_user_pagedir(pagedir, &src_offset, off_in, sizeof(src_offset)))
@@ -4300,6 +4322,8 @@ sys_(pwrite, int fd, uint8_t *buffer, size_t size, int64_t offset)
     int operation_error = operation.acquire(fd);
     if (operation_error) return SYSCALL_FAULT_(-operation_error);
     fd_file_handle *handle = operation.get();
+    FdPositionScope position_scope(handle, false);
+    if (position_scope.error()) return SYSCALL_FAULT_(-position_scope.error());
     if (handle == NULL || handle->node == NULL) return SYSCALL_FAULT_(EBADF);
     if (handle->node->type & file_socket) return SYSCALL_FAULT_(ESPIPE);
     if (handle->node->type & file_pipe) return SYSCALL_FAULT_(ESPIPE);
@@ -5712,6 +5736,9 @@ sys_(sendfile, int out_fd, int in_fd, uint64_t *offset_ptr, size_t count)
     fd_file_handle *out_handle = destination_pin.get();
     fd_file_handle *in_handle = source_pin.get();
     if (out_handle == NULL || in_handle == NULL) return SYSCALL_FAULT_(EBADF);
+
+    FdPositionScope position_scope(in_handle, offset_ptr == NULL, out_handle, true);
+    if (position_scope.error()) return SYSCALL_FAULT_(-position_scope.error());
 
     uint64_t current_offset = in_handle->offset;
     if (offset_ptr && !copy_from_user_pagedir(current_user_pagedir(), &current_offset, offset_ptr,

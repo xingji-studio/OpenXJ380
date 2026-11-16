@@ -1,4 +1,5 @@
 #include <user/permissions.h>
+#include <syscall/fd_position.h>
 #include <input_method.h>
 /**
  * Virtual File System Interface
@@ -1786,9 +1787,16 @@ fd_file_handle *fd_dup(fd_file_handle *src) {
     // not_null_assets(new, "fd_dup out of memory.");
     if (!nw) { permissions_set_file_error(ENOMEM); return NULL; }
     nw->node       = src->node;
-    nw->offset     = src->offset;
+    nw->offset     = 0;
     nw->flags      = src->flags;
     nw->fd         = src->fd;
+    int position_error = fd_position_share(src, nw);
+    if (position_error)
+    {
+        free(nw);
+        permissions_set_file_error(-position_error);
+        return NULL;
+    }
     vfs_node_t node = nw->node;
     if ((node->type & (file_ptmx | file_pts)) && fs_callbacks[node->fsid]->dup != (void *)empty_func) {
         fs_callbacks[node->fsid]->dup(node);
@@ -1816,6 +1824,7 @@ fd_file_handle *fd_dup(fd_file_handle *src) {
         if (node->refcount == uint32_t(-1))
         {
             vfs_child_unlock();
+            fd_position_forget(nw);
             free(nw);
             permissions_set_file_error(EOVERFLOW);
             return NULL;
