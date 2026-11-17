@@ -57,10 +57,30 @@ typedef struct FixedAcpiDescriptionTable
     GenericAddressStructure reset_reg;
     uint8_t                reset_value;
     uint8_t                reserved2[3];
-    uint64_t               x_firmware_ctrl;
-    uint64_t               x_dsdt;
+    uint64_t                x_firmware_ctrl;
+    uint64_t                x_dsdt;
+    // ACPI 5.0 FADT register tail, bytes 148..267. Existing fields above
+    // retain their offsets. Test Header.Length before reading any tail field.
+    GenericAddressStructure x_pm1a_evt_blk;
+    GenericAddressStructure x_pm1b_evt_blk;
+    GenericAddressStructure x_pm1a_cnt_blk;
+    GenericAddressStructure x_pm1b_cnt_blk;
+    GenericAddressStructure x_pm2_cnt_blk;
+    GenericAddressStructure x_pm_tmr_blk;
+    GenericAddressStructure x_gpe0_blk;
+    GenericAddressStructure x_gpe1_blk;
+    GenericAddressStructure sleep_control_reg;
+    GenericAddressStructure sleep_status_reg;
 } __attribute__((packed)) FixedAcpiDescriptionTable;
 
 #pragma pack(pop)
 
 #define ACPI_SLP_EN (1u << 13)
+
+#ifdef __cplusplus
+static_assert(__builtin_offsetof(FixedAcpiDescriptionTable, flags) == 112, "FADT legacy Flags offset");
+static_assert(__builtin_offsetof(FixedAcpiDescriptionTable, x_dsdt) == 140, "FADT existing X_DSDT offset");
+static_assert(__builtin_offsetof(FixedAcpiDescriptionTable, x_pm1a_evt_blk) == 148, "FADT extended PM1 offset");
+static_assert(__builtin_offsetof(FixedAcpiDescriptionTable, sleep_control_reg) == 244, "FADT sleep control offset");
+static_assert(__builtin_offsetof(FixedAcpiDescriptionTable, sleep_status_reg) == 256, "FADT sleep status offset");
+#endif

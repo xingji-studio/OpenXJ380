@@ -11,6 +11,9 @@
 #define ACPI_GAS_SYSTEM_MEMORY 0
 #define ACPI_GAS_SYSTEM_IO     1
 
+#include "power_acpi.h"
+#include "power_pci.h"
+
 static inline void reload_current_cr3()
 {
     uint64_t cr3 = get_cr3();
@@ -42,6 +45,50 @@ static void restore_efi_identity_map(uint64_t saved_entry)
     reload_current_cr3();
 }
 
+static void try_efi_reset(EFI_SYSTEM_TABLE *system_table, EFI_RESET_TYPE reset_type)
+{
+    uint64_t flags = get_rflags();
+    __asm__ volatile("cli" ::: "memory");
+
+    // The low firmware pointers are only valid while the identity map is in
+    // place. Keep timer preemption masked until both the map and FPU state
+    // have been restored if a broken runtime implementation returns.
+    uint64_t    saved_entry     = 0;
+    bool        identity_mapped = with_efi_identity_map(&saved_entry);
+    const char *failure         = "UEFI ResetSystem skipped: identity map unavailable.\n";
+
+    if (identity_mapped)
+    {
+        if (system_table == NULL || system_table->RuntimeServices == NULL)
+        {
+            failure = "UEFI ResetSystem skipped: RuntimeServices unavailable.\n";
+        }
+        else
+        {
+            EFI_RUNTIME_SERVICES *runtime = system_table->RuntimeServices;
+            constexpr size_t      required_size =
+                __builtin_offsetof(EFI_RUNTIME_SERVICES, ResetSystem) + sizeof(runtime->ResetSystem);
+            if (runtime->Hdr.Signature != EFI_RUNTIME_SERVICES_SIGNATURE || runtime->Hdr.HeaderSize < required_size)
+            {
+                failure = "UEFI ResetSystem skipped: invalid runtime services table.\n";
+            }
+            else if (runtime->ResetSystem == NULL) { failure = "UEFI ResetSystem skipped: entry point unavailable.\n"; }
+            else
+            {
+                alignas(16) uint8_t fpu_state[512];
+                __asm__ volatile("fxsave64 %0" : "=m"(fpu_state) : : "memory");
+                runtime->ResetSystem(reset_type, EFI_SUCCESS, 0, NULL);
+                __asm__ volatile("fxrstor64 %0" : : "m"(fpu_state) : "memory");
+                failure = "UEFI ResetSystem returned unexpectedly.\n";
+            }
+        }
+        restore_efi_identity_map(saved_entry);
+    }
+
+    __asm__ volatile("push %0; popfq" : : "r"(flags) : "memory", "cc");
+    write_serial_string(failure);
+}
+
 static bool aml_read_integer(const uint8_t **cursor, const uint8_t *end, uint8_t *value)
 {
     if (*cursor >= end) return false;
@@ -56,16 +103,16 @@ static bool aml_read_integer(const uint8_t **cursor, const uint8_t *end, uint8_t
         *value = *(*cursor)++;
         return true;
     case 0x0B:
-        if (end - *cursor < 2) return false;
-        *value = (*cursor)[0];
-        *cursor += 2;
-        return true;
     case 0x0C:
-    case 0x0E:
-        if (*cursor >= end) return false;
+    case 0x0E: {
+        unsigned bytes = opcode == 0x0B ? 2 : opcode == 0x0C ? 4 : 8;
+        if ((size_t)(end - *cursor) < bytes) return false;
         *value = (*cursor)[0];
-        *cursor += opcode == 0x0C ? 4 : 8;
+        for (unsigned i = 1; i < bytes; ++i)
+            if ((*cursor)[i]) return false;
+        *cursor += bytes;
         return true;
+    }
     default: return false;
     }
 }
@@ -74,11 +121,14 @@ static bool acpi_get_s5_sleep_types(const FixedAcpiDescriptionTable *fadt, uint1
 {
     if (fadt == NULL || slp_typa == NULL || slp_typb == NULL) return false;
 
-    const uint64_t dsdt_phys = fadt->x_dsdt ? fadt->x_dsdt : fadt->dsdt;
+    uint64_t dsdt_phys = fadt->dsdt;
+    if (acpi_fadt_has(fadt, __builtin_offsetof(FixedAcpiDescriptionTable, x_dsdt), sizeof(fadt->x_dsdt)) &&
+        fadt->x_dsdt)
+        dsdt_phys = fadt->x_dsdt;
     if (dsdt_phys == 0) return false;
 
     const ACPI_TABLE_HEADER *dsdt = (const ACPI_TABLE_HEADER *)phys_to_virt(dsdt_phys);
-    if (dsdt == NULL || memcmp(dsdt->sign, "DSDT", 4) != 0 || dsdt->length <= sizeof(ACPI_TABLE_HEADER)) return false;
+    if (!acpi_table_valid(dsdt, "DSDT", sizeof(ACPI_TABLE_HEADER) + 1, 1024 * 1024)) return false;
 
     const uint8_t *aml = (const uint8_t *)(dsdt + 1);
     const uint8_t *end = ((const uint8_t *)dsdt) + dsdt->length;
@@ -94,14 +144,22 @@ static bool acpi_get_s5_sleep_types(const FixedAcpiDescriptionTable *fadt, uint1
         ++pkg;
 
         if (pkg >= end) continue;
-        pkg += 1 + ((*pkg >> 6) & 0x3); // skip PkgLength
-        if (pkg >= end) continue;
-        ++pkg; // NumElements
+        unsigned following     = *pkg >> 6;
+        unsigned encoded_bytes = following + 1;
+        if ((size_t)(end - pkg) < encoded_bytes) continue;
+        uint32_t length = *pkg & (following ? 0x0F : 0x3F);
+        for (unsigned i = 0; i < following; ++i)
+            length |= (uint32_t)pkg[i + 1] << (4 + i * 8);
+        if (length < encoded_bytes + 1 || length > (size_t)(end - pkg)) continue;
+        const uint8_t *package_end  = pkg + length;
+        pkg                        += encoded_bytes;
+        if (*pkg++ < 2) continue;
 
         uint8_t a = 0;
         uint8_t b = 0;
-        if (!aml_read_integer(&pkg, end, &a)) continue;
-        if (!aml_read_integer(&pkg, end, &b)) continue;
+        if (!aml_read_integer(&pkg, package_end, &a)) continue;
+        if (!aml_read_integer(&pkg, package_end, &b)) continue;
+        if (a > 7 || b > 7) continue;
 
         *slp_typa = ((uint16_t)a) << 10;
         *slp_typb = ((uint16_t)b) << 10;
@@ -109,13 +167,6 @@ static bool acpi_get_s5_sleep_types(const FixedAcpiDescriptionTable *fadt, uint1
     }
 
     return false;
-}
-
-static void acpi_write_pm_control(uint32_t port, uint8_t width, uint16_t value)
-{
-    if (port == 0 || width == 0) return;
-    if (width >= 2) outw((uint16_t)port, value);
-    else outb((uint16_t)port, (uint8_t)value);
 }
 
 static void acpi_write_gas_u8(const GenericAddressStructure *gas, uint8_t value)
@@ -147,43 +198,82 @@ static void acpi_write_gas_u8(const GenericAddressStructure *gas, uint8_t value)
 
 bool acpi_poweroff(BOOT_CONFIG *boot_config)
 {
-    if (boot_config == NULL)
+    AcpiShutdownRegisters registers{};
+    if (!acpi_shutdown_registers(boot_config, &registers))
     {
-        write_serial_string("ACPI poweroff skipped: boot config unavailable.\n");
-        return false;
-    }
-
-    const FixedAcpiDescriptionTable *fadt = (const FixedAcpiDescriptionTable *)phys_to_virt(boot_config->FADT);
-    if (fadt == NULL)
-    {
-        write_serial_string("ACPI poweroff skipped: FADT unavailable.\n");
+        write_serial_string("ACPI poweroff skipped: invalid FADT/register description.\n");
         return false;
     }
 
     uint16_t slp_typa = 0;
     uint16_t slp_typb = 0;
-    if (!acpi_get_s5_sleep_types(fadt, &slp_typa, &slp_typb))
+    if (!acpi_get_s5_sleep_types(registers.fadt, &slp_typa, &slp_typb))
     {
         write_serial_string("ACPI poweroff skipped: _S5_ not found.\n");
         return false;
     }
 
-    write_serial_fmt("ACPI poweroff: PM1a=0x%x PM1b=0x%x SLP_TYPa=0x%x SLP_TYPb=0x%x\n", fadt->pm1a_cnt_blk,
-                     fadt->pm1b_cnt_blk, slp_typa, slp_typb);
-
-    if (fadt->smi_cmd != 0 && fadt->acpi_enable != 0)
+    if (!acpi_enter_power_mode(registers))
     {
-        outb((uint16_t)fadt->smi_cmd, fadt->acpi_enable);
-        delay_ms_hp(10);
+        write_serial_string("ACPI poweroff skipped: SCI_EN handshake failed.\n");
+        return false;
     }
+    acpi_disable_shutdown_wake(registers);
+    write_serial_fmt("ACPI poweroff: fixed-register S5 fallback, types=%u/%u (AML methods unavailable).\n",
+                     slp_typa >> 10, slp_typb >> 10);
 
-    acpi_write_pm_control(fadt->pm1a_cnt_blk, fadt->pm1_cnt_len, slp_typa | ACPI_SLP_EN);
-    if (fadt->pm1b_cnt_blk != 0) acpi_write_pm_control(fadt->pm1b_cnt_blk, fadt->pm1_cnt_len, slp_typb | ACPI_SLP_EN);
+    uint64_t flags = get_rflags();
+    __asm__ volatile("cli" ::: "memory");
+    if (registers.reduced)
+    {
+        acpi_power_write(registers.sleep_status, acpi_power_read(registers.sleep_status) & 0x80u);
+        uint32_t control = (acpi_power_read(registers.sleep_control) & ~0x3Cu) | ((slp_typa >> 10) << 2);
+        acpi_power_write(registers.sleep_control, control);
+        __asm__ volatile("wbinvd" ::: "memory");
+        acpi_power_write(registers.sleep_control, control | 0x20u);
+    }
+    else
+    {
+        uint32_t values[2]{};
+        for (unsigned i = 0; i != 2; ++i)
+        {
+            if (!registers.control[i].address) continue;
+            values[i] = (acpi_power_read(registers.control[i]) & ~(ACPI_SLP_TYP_MASK | ACPI_SLP_EN | ACPI_GBL_RLS)) |
+                        (i ? slp_typb : slp_typa);
+            acpi_power_write(registers.control[i], values[i]);
+        }
+        __asm__ volatile("wbinvd" ::: "memory");
+        for (unsigned i = 0; i != 2; ++i)
+            if (registers.control[i].address) acpi_power_write(registers.control[i], values[i] | ACPI_SLP_EN);
+    }
+    __asm__ volatile("push %0; popfq" : : "r"(flags) : "memory", "cc");
     return true;
+}
+
+static bool hypervisor_vendor_is(const char *expected)
+{
+    uint32_t eax, ebx, ecx, edx;
+    asm_cpuid(1, 0, &eax, &ebx, &ecx, &edx);
+    if (!(ecx & (1u << 31))) return false;
+
+    asm_cpuid(0x40000000, 0, &eax, &ebx, &ecx, &edx);
+    if (eax < 0x40000000) return false;
+    const uint32_t vendor[3] = {ebx, ecx, edx};
+    return memcmp(vendor, expected, sizeof(vendor)) == 0;
+}
+
+static bool qemu_hypervisor()
+{
+    return hypervisor_vendor_is("TCGTCGTCGTCG") || hypervisor_vendor_is("KVMKVMKVM\0\0\0");
 }
 
 void qemu_poweroff_fallback()
 {
+    if (!qemu_hypervisor())
+    {
+        write_serial_string("QEMU poweroff ports skipped: hypervisor not identified.\n");
+        return;
+    }
     write_serial_string("Falling back to QEMU poweroff ports.\n");
     outw(0x604, 0x2000);
     outw(0xB004, 0x2000);
@@ -191,20 +281,23 @@ void qemu_poweroff_fallback()
 
 void vmware_poweroff_fallback()
 {
-    // VMware / VirtualBox compatible ACPI shutdown port fallback.
-    // If ACPI _S5_ parsing fails, this path can still power off the VM.
-    write_serial_string("Falling back to VMware poweroff port.\n");
+    // Retain the historical public symbol, but this fixed PM1 control port
+    // belongs to VirtualBox. VMware and physical machines use EFI/ACPI.
+    if (!hypervisor_vendor_is("VBoxVBoxVBox"))
+    {
+        write_serial_string("VirtualBox poweroff port skipped: hypervisor not identified.\n");
+        return;
+    }
+    write_serial_string("Falling back to VirtualBox poweroff port.\n");
     outw(0x4004, 0x3400);
 }
 
 void poweroff_fallback(BOOT_CONFIG *boot_config)
 {
     acpi_poweroff(boot_config);
-    if (boot_config != NULL && boot_config->is_qemu == 1) {
-        qemu_poweroff_fallback();
-    } else {
-        vmware_poweroff_fallback();
-    }
+    if (boot_config != NULL && boot_config->is_qemu == 1) { qemu_poweroff_fallback(); }
+    else if (hypervisor_vendor_is("VBoxVBoxVBox")) { vmware_poweroff_fallback(); }
+    else { write_serial_string("VM poweroff ports skipped: no supported virtual platform.\n"); }
 }
 
 static bool acpi_reboot(BOOT_CONFIG *boot_config)
@@ -246,25 +339,18 @@ static void finish_filesystems_before_poweroff()
 [[noreturn]] void power_shutdown(EFI_SYSTEM_TABLE *system_table, BOOT_CONFIG *boot_config)
 {
     finish_filesystems_before_poweroff();
-    uint64_t saved_entry     = 0;
-    bool     identity_mapped = with_efi_identity_map(&saved_entry);
-
-    if (!identity_mapped) { write_serial_string("UEFI runtime identity map restore failed.\n"); }
-
-    if (system_table != NULL && system_table->RuntimeServices != NULL)
-    {
-        system_table->RuntimeServices->ResetSystem(EfiResetShutdown, EFI_SUCCESS, 0, NULL);
-        write_serial_string("UEFI ResetSystem returned unexpectedly.\n");
-    }
-    else
-    {
-        write_serial_string("UEFI ResetSystem skipped: RuntimeServices unavailable.\n");
-    }
-
-    if (identity_mapped) { restore_efi_identity_map(saved_entry); }
+    // ResetSystem normally never returns. Disarm validated fixed-register
+    // wake sources before entering firmware, not just on the ACPI fallback.
+    power_prepare_pci_wake();
+    AcpiShutdownRegisters registers{};
+    acpi_prepare_shutdown(boot_config, &registers);
+    write_serial_string("Power: trying UEFI ResetSystem(shutdown).\n");
+    try_efi_reset(system_table, EfiResetShutdown);
 
     poweroff_fallback(boot_config);
 
+    write_serial_string("Poweroff methods returned; system halted.\n");
+    __asm__ volatile("cli" ::: "memory");
     while (1)
         __asm__ volatile("hlt");
 }
@@ -305,24 +391,8 @@ static void reboot_fallback(BOOT_CONFIG *boot_config)
 [[noreturn]] void power_reboot(EFI_SYSTEM_TABLE *system_table, BOOT_CONFIG *boot_config)
 {
     finish_filesystems_before_poweroff();
-    (void)boot_config;
-
-    uint64_t saved_entry     = 0;
-    bool     identity_mapped = with_efi_identity_map(&saved_entry);
-
-    if (!identity_mapped) { write_serial_string("UEFI runtime identity map restore failed.\n"); }
-
-    if (system_table != NULL && system_table->RuntimeServices != NULL)
-    {
-        system_table->RuntimeServices->ResetSystem(EfiResetCold, EFI_SUCCESS, 0, NULL);
-        write_serial_string("UEFI ResetSystem(reboot) returned unexpectedly.\n");
-    }
-    else
-    {
-        write_serial_string("UEFI reboot skipped: RuntimeServices unavailable.\n");
-    }
-
-    if (identity_mapped) { restore_efi_identity_map(saved_entry); }
+    write_serial_string("Power: trying UEFI ResetSystem(reboot).\n");
+    try_efi_reset(system_table, EfiResetCold);
 
     reboot_fallback(boot_config);
 

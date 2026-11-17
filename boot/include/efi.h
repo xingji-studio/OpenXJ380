@@ -280,24 +280,56 @@ struct EFI_BOOT_SERVICES
     UINTN _buf12[3];
 };
 
+struct EFI_CAPSULE_HEADER;
+
+// UEFI 2.x section 4.5: every entry is a function pointer in this exact order.
 struct EFI_RUNTIME_SERVICES
 {
     EFI_TABLE_HEADER Hdr;
-    // Variable Services
-    UINTN _buf2[4];
 
     // Time Services
     EFIAPI EFI_STATUS (*GetTime)(EFI_TIME *Time, EFI_TIME_CAPABILITIES *Capabilities);
-    UINTN  _buf3[3];
+    EFIAPI EFI_STATUS (*SetTime)(EFI_TIME *Time);
+    EFIAPI EFI_STATUS (*GetWakeupTime)(BOOLEAN *Enabled, BOOLEAN *Pending, EFI_TIME *Time);
+    EFIAPI EFI_STATUS (*SetWakeupTime)(BOOLEAN Enable, EFI_TIME *Time);
 
     // Virtual Memory Services
-    UINTN _buf4[2];
+    EFIAPI EFI_STATUS (*SetVirtualAddressMap)(UINTN MemoryMapSize, UINTN DescriptorSize, UINT32 DescriptorVersion,
+                                              EFI_MEMORY_DESCRIPTOR *VirtualMap);
+    EFIAPI EFI_STATUS (*ConvertPointer)(UINTN DebugDisposition, VOID **Address);
 
+    // Variable Services
+    EFIAPI EFI_STATUS (*GetVariable)(CHAR16 *VariableName, EFI_GUID *VendorGuid, UINT32 *Attributes, UINTN *DataSize,
+                                     VOID *Data);
+    EFIAPI EFI_STATUS (*GetNextVariableName)(UINTN *VariableNameSize, CHAR16 *VariableName, EFI_GUID *VendorGuid);
+    EFIAPI EFI_STATUS (*SetVariable)(CHAR16 *VariableName, EFI_GUID *VendorGuid, UINT32 Attributes, UINTN DataSize,
+                                     VOID *Data);
+
+    // Miscellaneous Services
     EFIAPI EFI_STATUS (*GetNextHighMonotonicCount)(UINT32 *HighCount);
-
     EFIAPI VOID (*ResetSystem)(EFI_RESET_TYPE ResetType, EFI_STATUS ResetStatus, UINTN DataSize, VOID *ResetData);
-    UINTN  _buf5[3];
+
+    // Capsule Services and Variable Storage Information
+    EFIAPI EFI_STATUS (*UpdateCapsule)(struct EFI_CAPSULE_HEADER **CapsuleHeaderArray, UINTN CapsuleCount,
+                                       EFI_PHYSICAL_ADDRESS ScatterGatherList);
+    EFIAPI EFI_STATUS (*QueryCapsuleCapabilities)(struct EFI_CAPSULE_HEADER **CapsuleHeaderArray, UINTN CapsuleCount,
+                                                  UINT64 *MaximumCapsuleSize, EFI_RESET_TYPE *ResetType);
+    EFIAPI EFI_STATUS (*QueryVariableInfo)(UINT32 Attributes, UINT64 *MaximumVariableStorageSize,
+                                           UINT64 *RemainingVariableStorageSize, UINT64 *MaximumVariableSize);
 };
+
+#ifdef __cplusplus
+#    define EFI_RUNTIME_ABI_ASSERT static_assert
+#else
+#    define EFI_RUNTIME_ABI_ASSERT _Static_assert
+#endif
+EFI_RUNTIME_ABI_ASSERT(__builtin_offsetof(struct EFI_RUNTIME_SERVICES, GetTime) == 0x18, "UEFI GetTime offset");
+EFI_RUNTIME_ABI_ASSERT(__builtin_offsetof(struct EFI_RUNTIME_SERVICES, GetVariable) == 0x48, "UEFI GetVariable offset");
+EFI_RUNTIME_ABI_ASSERT(__builtin_offsetof(struct EFI_RUNTIME_SERVICES, ResetSystem) == 0x68, "UEFI ResetSystem offset");
+EFI_RUNTIME_ABI_ASSERT(__builtin_offsetof(struct EFI_RUNTIME_SERVICES, UpdateCapsule) == 0x70,
+                       "UEFI UpdateCapsule offset");
+EFI_RUNTIME_ABI_ASSERT(sizeof(struct EFI_RUNTIME_SERVICES) == 0x88, "UEFI runtime services size");
+#undef EFI_RUNTIME_ABI_ASSERT
 
 struct EFI_SYSTEM_TABLE
 {
@@ -325,7 +357,7 @@ struct EFI_SYSTEM_TABLE
     }                           *ConOut;
     EFI_HANDLE                   StandardErrorHandle;
     struct EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *StdErr;
-    struct EFI_RUNTIME_SERVICES *RuntimeServices; // 此有bug
+    struct EFI_RUNTIME_SERVICES *RuntimeServices;
     struct EFI_BOOT_SERVICES    *BootServices;
     UINTN                        NumberOfTableEntries;
     EFI_CONFIGURATION_TABLE     *ConfigurationTable;
