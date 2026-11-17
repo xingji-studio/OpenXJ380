@@ -1438,6 +1438,11 @@ static void switch_task_to_user_mode(tcb_t task)
      * and iret handoff.
      */
     close_interrupt;
+    // Successful exec abandons its dispatcher stack. Stack/stdio preparation
+    // and old-image cleanup are complete; finish that boundary before iret,
+    // including a protected exit requested while preparing the new image.
+    // Initial task entry has no syscall boundary, so leave is a no-op there.
+    kernel_boundary_leave(task);
     page_directory_t *current_dir = get_current_directory();
     if (target_dir != NULL && current_dir != target_dir)
     {

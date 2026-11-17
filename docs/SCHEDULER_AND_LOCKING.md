@@ -185,6 +185,12 @@ thread publishes death and parks without returning to user mode. Final parent
 notification runs with local IRQs masked after dropping the metadata gate, so
 a timer cannot strand a terminal current thread before publishing its exit.
 New state is appended to PCB/TCB tails; existing assembly offsets stay fixed.
+Successful exec explicitly finishes its syscall boundary after old image,
+descriptor and IPC reclamation and new stack/stdio preparation, with IRQs
+masked at the final user-mode handoff. That transfer abandons the dispatcher
+stack, so its C++ destructor does not run. Failed exec returns through the
+ordinary dispatcher cleanup.
+Leaving stale boundary depth strands a later protected owner's exit pin.
 This handles ordinary termination requests, not arbitrary interrupted corrupt
 kernel state. Never steal these mutexes or release DMA storage on terminal
 status alone. AHCI runtime diagnostics use nonwaiting serial publication.
