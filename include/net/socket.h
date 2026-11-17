@@ -16,6 +16,7 @@ typedef uint32_t socklen_t;
 #define AF_LOCAL  AF_UNIX
 #define AF_INET   2
 #define AF_INET6  10
+#define AF_NETLINK 16
 
 #define SOCK_STREAM 1
 #define SOCK_DGRAM  2
@@ -72,6 +73,13 @@ struct in6_addr {
 struct sockaddr {
     sa_family_t sa_family;
     char        sa_data[14];
+};
+
+struct sockaddr_nl {
+    sa_family_t nl_family;
+    uint16_t    nl_pad;
+    uint32_t    nl_pid;
+    uint32_t    nl_groups;
 };
 
 struct sockaddr_in {

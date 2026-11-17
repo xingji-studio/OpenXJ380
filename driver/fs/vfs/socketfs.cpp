@@ -7,6 +7,7 @@
 #include <fs/vfs/vfs.h>
 #include <krlibc.h>
 #include <net/socket.h>
+#include <net/rtnetlink.h>
 #include <syscall/syscall.h>
 #include <syscall/fd_lifetime.h>
 #include <task/pcb.h>
@@ -339,6 +340,7 @@ int socketfs_setup(void)
 
 int socket_open(int domain, int type, int protocol)
 {
+    if (domain == AF_NETLINK) return route_netlink_open(type, protocol);
     if (domain == AF_UNIX || domain == AF_LOCAL) {
         init_unix_provider();
         void *impl = NULL;
@@ -597,7 +599,11 @@ ssize_t socket_recvfrom(int fd, void *buffer, size_t size, uint64_t flags, struc
         return -EBADF;
     }
     socketfs_sync_flags(handle, fd_handle->node->flags);
-    return handle->provider.recvfrom(handle->socket, buffer, size, fd_handle->node->flags | flags, addr, addrlen);
+    uint64_t io_flags = fd_handle->node->flags;
+    // Linux MSG_PEEK shares bit 1 with O_RDWR. Keep the open-description access
+    // mode separate for route queries, which interpret Linux message flags.
+    if (handle->provider.create == route_netlink_provider.create) io_flags &= O_NONBLOCK;
+    return handle->provider.recvfrom(handle->socket, buffer, size, io_flags | flags, addr, addrlen);
 }
 
 ssize_t socket_sendto(int fd, const void *buffer, size_t size, uint64_t flags,

@@ -956,10 +956,18 @@ sys_(read, int fd, uint8_t *buffer, size_t size)
     return read_from_handle(handle, buffer, size);
 }
 
+static bool socket_address_length_valid(const struct sockaddr *address, socklen_t length)
+{
+    // sockaddr_nl is 12 bytes, shorter than the generic Internet sockaddr.
+    // Inspect the family only after the address has been copied from userspace.
+    size_t minimum = address->sa_family == AF_NETLINK ? sizeof(struct sockaddr_nl) : sizeof(struct sockaddr);
+    return length >= minimum && length <= sizeof(struct sockaddr_in6);
+}
+
 sys_(sendto, int fd, const void *buffer, size_t size, uint64_t flags, const struct sockaddr *addr, socklen_t addrlen)
 {
     if (fd < 0 || (buffer == NULL && size > 0)) return SYSCALL_FAULT_(EINVAL);
-    if (addr != NULL && (addrlen < sizeof(struct sockaddr) || addrlen > sizeof(struct sockaddr_in6)))
+    if (addr != NULL && (addrlen < sizeof(struct sockaddr_nl) || addrlen > sizeof(struct sockaddr_in6)))
         return SYSCALL_FAULT_(EINVAL);
 
     page_directory_t *pagedir = current_user_pagedir();
@@ -972,6 +980,7 @@ sys_(sendto, int fd, const void *buffer, size_t size, uint64_t flags, const stru
         memset(&kaddr, 0, sizeof(kaddr));
         if (!copy_from_user_pagedir(pagedir, &kaddr, addr, addrlen)) return SYSCALL_FAULT_(EFAULT);
         kaddr_ptr = (const struct sockaddr *)&kaddr;
+        if (!socket_address_length_valid(kaddr_ptr, addrlen)) return SYSCALL_FAULT_(EINVAL);
     }
 
     if (size == 0) return 0;
@@ -1065,7 +1074,7 @@ sys_(sendmsg, int fd, const struct msghdr *msg, uint64_t flags)
     if (kmsg.msg_iovlen > USER_IOV_MAX) return SYSCALL_FAULT_(EINVAL);
     if (kmsg.msg_iovlen > 0 && kmsg.msg_iov == NULL) return SYSCALL_FAULT_(EINVAL);
     if (kmsg.msg_name != NULL &&
-        (kmsg.msg_namelen < sizeof(struct sockaddr) || kmsg.msg_namelen > sizeof(struct sockaddr_in6)))
+        (kmsg.msg_namelen < sizeof(struct sockaddr_nl) || kmsg.msg_namelen > sizeof(struct sockaddr_in6)))
         return SYSCALL_FAULT_(EINVAL);
 
     struct sockaddr_in6 kaddr;
@@ -1076,6 +1085,7 @@ sys_(sendmsg, int fd, const struct msghdr *msg, uint64_t flags)
         if (!copy_from_user_pagedir(pagedir, &kaddr, kmsg.msg_name, kmsg.msg_namelen))
             return SYSCALL_FAULT_(EFAULT);
         kaddr_ptr = (const struct sockaddr *)&kaddr;
+        if (!socket_address_length_valid(kaddr_ptr, kmsg.msg_namelen)) return SYSCALL_FAULT_(EINVAL);
     }
 
     size_t iov_bytes = 0;
@@ -3507,10 +3517,11 @@ sys_(mkdir, char *name, uint64_t mode)
 sys_(bind, int fd, const struct sockaddr *addr, socklen_t addrlen)
 {
     if (addr == NULL) return SYSCALL_FAULT_(EINVAL);
-    if (addrlen < sizeof(struct sockaddr) || addrlen > sizeof(struct sockaddr_in6)) return SYSCALL_FAULT_(EINVAL);
+    if (addrlen < sizeof(struct sockaddr_nl) || addrlen > sizeof(struct sockaddr_in6)) return SYSCALL_FAULT_(EINVAL);
     struct sockaddr_in6 kaddr;
     memset(&kaddr, 0, sizeof(kaddr));
     if (!copy_from_user_pagedir(current_user_pagedir(), &kaddr, addr, addrlen)) return SYSCALL_FAULT_(EFAULT);
+    if (!socket_address_length_valid((const struct sockaddr *)&kaddr, addrlen)) return SYSCALL_FAULT_(EINVAL);
     int ret = socket_bind(fd, (const struct sockaddr *)&kaddr, addrlen);
     if (ret < 0) return SYSCALL_FAULT_(-ret);
     return ret;
