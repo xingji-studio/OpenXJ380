@@ -8,6 +8,7 @@ generates a distributable bundle at `out/compliance/third-party`.
 
 | Component | Selected license | Material |
 |---|---|---|
+| uACPI 7.0.0 | MIT | `third_party/uacpi/LICENSE`; unchanged sources and per-file hashes in `SOURCE.json` |
 | musl ELF definitions | MIT | `third_party/musl-elf` |
 | lwIP | BSD-style notices | compiled files under `kmod/netserver/lwip`; `licenses/lwip-notice-full.txt` |
 | FatFs | BSD-style permissive | `driver/fs/fatfs` |

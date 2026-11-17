@@ -32,6 +32,7 @@
 #include <rng.h>
 #include <pipe.h>
 #include <power.h>
+#include <acpi/runtime.h>
 #include <proto.hpp>
 #include <pty.h>
 #include <ps2/keyboard.h>
@@ -581,6 +582,10 @@ extern "C" void KernelMain(const FrameBufferConfig &fbc, EFI_SYSTEM_TABLE &Syste
         memcpy(&g_kernel_boot_config.installer_handoff,
                (const unsigned char *)BootConfigIn + __builtin_offsetof(BOOT_CONFIG, installer_handoff),
                sizeof(XJ_INSTALLER_HANDOFF));
+    if ((g_kernel_boot_config.boot_flags & BOOT_FLAG_ACPI_ROOT) != 0)
+        memcpy(&g_kernel_boot_config.acpi_rsdp,
+               (const unsigned char *)BootConfigIn + __builtin_offsetof(BOOT_CONFIG, acpi_rsdp),
+               sizeof(g_kernel_boot_config.acpi_rsdp));
     BOOT_CONFIG &BootConfig = g_kernel_boot_config;
     boot_debug::returned(fbc, BootStep::BootConfig);
 
@@ -978,6 +983,7 @@ extern "C" void KernelMain(const FrameBufferConfig &fbc, EFI_SYSTEM_TABLE &Syste
     boot_debug::begin(fbc, BootStep::SerialRuntime);
     if (!serial_runtime_start()) write_serial_string("Serial TX worker initialization failed.\n");
     boot_debug::returned(fbc, BootStep::SerialRuntime);
+    acpi_runtime_start(&BootConfig);
     write_serial_string("Process Reaper is ready\n");
 
     if (BootConfig.is_qemu == 1) pr_warn("XJ380 is running under the QEMU/BOCHS.\n");

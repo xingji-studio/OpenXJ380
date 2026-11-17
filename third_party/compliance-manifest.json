@@ -1,6 +1,7 @@
 {
   "schema_version": 1,
   "components": [
+    {"name":"uACPI 7.0.0","slug":"uacpi","license":"MIT","license_files":["third_party/uacpi/LICENSE","third_party/uacpi/SOURCE.json"],"source_files":["third_party/uacpi/source","third_party/uacpi/include"],"bundle_source":false},
     {"name":"musl ELF definitions","slug":"musl-elf","license":"MIT","license_files":["third_party/musl-elf/COPYRIGHT","third_party/musl-elf/SOURCE.md"],"source_files":["include/elf.h","third_party/musl-elf/SOURCE.md"],"bundle_source":false},
     {"name":"lwIP","slug":"lwip","license":"BSD-style","license_files":["licenses/lwip-notice-full.txt"],"source_files":["kmod/netserver/lwip"],"bundle_source":false},
     {"name":"FatFs","slug":"fatfs","license":"BSD-style","license_files":["licenses/fatfs.txt"],"source_files":["driver/fs/fatfs"],"bundle_source":false},

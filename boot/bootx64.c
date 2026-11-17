@@ -1742,6 +1742,8 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, struct EFI_SYSTEM_TABLE *SystemTable
             // 找到了ACPI表
             // 修订版 >= ACPI 2.0
             RSDP_TYPE *AcpiRsdp = (RSDP_TYPE *)(SystemConfigTable->VendorTable); // 指向存储RSDP的表的指针
+            BootConfig->acpi_rsdp = (UINT64)AcpiRsdp;
+            BootConfig->boot_flags |= BOOT_FLAG_ACPI_ROOT;
             // 修订版 >= ACPI 2.0
             if (AcpiRsdp->version >= 2)
             {

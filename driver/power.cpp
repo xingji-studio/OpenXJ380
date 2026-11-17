@@ -1,4 +1,5 @@
 #include <acpi/fadt.h>
+#include <acpi/runtime.h>
 #include <cpu/regio.h>
 #include <efi/boot.h>
 #include <krlibc.h>
@@ -207,7 +208,14 @@ bool acpi_poweroff(BOOT_CONFIG *boot_config)
 
     uint16_t slp_typa = 0;
     uint16_t slp_typb = 0;
-    if (!acpi_get_s5_sleep_types(registers.fadt, &slp_typa, &slp_typb))
+    auto preparation = acpi_runtime_prepare_s5(&slp_typa, &slp_typb);
+    if (preparation == AcpiSleepPreparation::Failed)
+    {
+        write_serial_string("ACPI poweroff skipped: AML/EC S5 preparation failed.\n");
+        return false;
+    }
+    if (preparation == AcpiSleepPreparation::Unavailable &&
+        !acpi_get_s5_sleep_types(registers.fadt, &slp_typa, &slp_typb))
     {
         write_serial_string("ACPI poweroff skipped: _S5_ not found.\n");
         return false;
@@ -219,8 +227,8 @@ bool acpi_poweroff(BOOT_CONFIG *boot_config)
         return false;
     }
     acpi_disable_shutdown_wake(registers);
-    write_serial_fmt("ACPI poweroff: fixed-register S5 fallback, types=%u/%u (AML methods unavailable).\n",
-                     slp_typa >> 10, slp_typb >> 10);
+    write_serial_fmt("ACPI poweroff: S5 fallback, types=%u/%u (%s).\n", slp_typa >> 10, slp_typb >> 10,
+                     preparation == AcpiSleepPreparation::Ready ? "AML prepared" : "legacy loader, AML unavailable");
 
     uint64_t flags = get_rflags();
     __asm__ volatile("cli" ::: "memory");
@@ -338,6 +346,11 @@ static void finish_filesystems_before_poweroff()
 
 [[noreturn]] void power_shutdown(EFI_SYSTEM_TABLE *system_table, BOOT_CONFIG *boot_config)
 {
+    // AML and EC can wait, allocate and service events. Complete _PTS(5)
+    // before filesystem cleanup and before entering the IRQ-masked firmware.
+    uint16_t sleep_a = 0, sleep_b = 0;
+    if (acpi_runtime_prepare_s5(&sleep_a, &sleep_b) == AcpiSleepPreparation::Failed)
+        write_serial_string("Power: AML S5 preparation failed; retaining firmware shutdown.\n");
     finish_filesystems_before_poweroff();
     // ResetSystem normally never returns. Disarm validated fixed-register
     // wake sources before entering firmware, not just on the ACPI fallback.

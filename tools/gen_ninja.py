@@ -353,11 +353,14 @@ def root_objects(
         objs.append(obj)
     for src in c_files:
         obj = Path("out") / src.relative_to(ROOT).with_suffix(".o")
-        n.build(obj, "root_cc", src, implicit=[settings, config])
+        acpi_flags = {"c_flags": "$C_FLAGS $UACPI_FLAGS"} if src.parent.as_posix().endswith(("/third_party/uacpi/source", "/driver/acpi")) else None
+        n.build(obj, "root_cc", src, implicit=[settings, config], variables=acpi_flags)
         objs.append(obj)
     for src in cpp_files:
         obj = Path("out") / src.relative_to(ROOT).with_suffix(".o")
         auth_flags = {"cpp_flags": "$CPP_FLAGS -I./include/auth_compat -I./third_party/mbedtls-src/include -DMBEDTLS_CONFIG_FILE='\"user/auth_mbedtls_config.h\"'"} if src.name == "auth_crypto.cpp" else None
+        if src.parent.as_posix().endswith("/driver/acpi"):
+            auth_flags = {"cpp_flags": "$CPP_FLAGS $UACPI_FLAGS"}
         n.build(obj, "root_cxx", src, implicit=[settings, config], variables=auth_flags)
         objs.append(obj)
     return objs
@@ -570,7 +573,7 @@ def main() -> None:
     n.comment("FILES - generated source and header discovery lists")
     # These root lists intentionally feed both the readable FILES section and
     # root_objects(); one scan owns both display and build behavior.
-    root_source_roots = ["kernel", "driver", "lib"]
+    root_source_roots = ["kernel", "driver", "lib", "third_party/uacpi/source"]
     nasm_files: list[Path] = []
     asm_files: list[Path] = []
     c_files: list[Path] = []
@@ -604,6 +607,8 @@ def main() -> None:
     # older generated rule bodies.  That makes the build options readable while
     # preserving compatibility with existing variable names.
     n.comment("FLAGS - canonical compile and link options")
+    n.var("UACPI_FLAGS", "-I./third_party/uacpi/include -I./driver/acpi "
+          "-DUACPI_OVERRIDE_TYPES -DUACPI_DEFAULT_LOOP_TIMEOUT_SECONDS=5")
     n.var("OPT_LEVEL", os.environ.get("OPT_LEVEL", "2"))
     n.var("OPT_FLAG", "-O$OPT_LEVEL")
     n.var("RUST_OPT_FLAG", "-C opt-level=$OPT_LEVEL")

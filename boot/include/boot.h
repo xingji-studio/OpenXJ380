@@ -19,6 +19,7 @@
 #define BOOT_FLAG_BOUND_ROOT       (1ULL << 8)
 #define BOOT_FLAG_INSTALLER_HANDOFF (1ULL << 9)
 #define BOOT_FLAG_ESP_KERNEL_VERIFIED (1ULL << 10)
+#define BOOT_FLAG_ACPI_ROOT (1ULL << 11)
 
 typedef struct
 {
@@ -45,6 +46,8 @@ typedef struct
     XJ_ROOT_BINDING root_binding;
     // Read this versioned tail only with BOOT_FLAG_INSTALLER_HANDOFF.
     XJ_INSTALLER_HANDOFF installer_handoff;
+    // Optional physical RSDP address. Read only with BOOT_FLAG_ACPI_ROOT.
+    UINT64 acpi_rsdp;
 } BOOT_CONFIG;
 
 #define BOOT_CONFIG_LEGACY_BYTES __builtin_offsetof(BOOT_CONFIG, root_binding)

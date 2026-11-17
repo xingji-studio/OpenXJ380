@@ -8,6 +8,7 @@ binary distribution. The command-line image installs the repository notices at
 
 | Component | License | Source location | Image location |
 | --- | --- | --- | --- |
+| uACPI 7.0.0 | MIT | `third_party/uacpi/LICENSE`; `third_party/uacpi/SOURCE.json` | `/system/licenses/third-party/uacpi/` |
 | XJ380 project | Apache-2.0 | `LICENSE` | `LICENSE` |
 | Native first-party ext4 driver, journaled mutation core, offline formatter and fresh-volume factory build/readback | Apache-2.0 | `driver/fs/ext4/PROVENANCE.md`; `driver/fs/ext4/SOURCE.json`; `kernel/installer/` | `/system/licenses/native-ext4/` |
 | FatFs | ChaN permissive license | `driver/fs/fatfs/ff.cpp` | `fatfs.txt` |
