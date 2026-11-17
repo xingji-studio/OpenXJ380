@@ -298,6 +298,17 @@ partitions are display-only; extended/logical editing, conversion, resizing and
 moving existing filesystem contents are outside this profile. Unsupported or
 damaged disks remain unavailable without hiding other usable disks.
 
+A single protective MBR may use either the exact disk-sector count minus one
+or a saturated `0xffffffff` size, including disks below 2 TiB. Its start LBA
+must still be one, and hybrid MBRs remain unsupported. This compatibility does
+not bypass either GPT header CRC, backup-array comparison, partition-array CRC,
+identity, placement, range or overlap checks. Existing MBR bytes remain intact
+during GPT edits. A successful compatibility scan logs `partition compat` with
+`pmbr-size=0xffffffff` and `GPT-verified`. Rejections log `partition reject`
+with a specific reason, followed by the metadata LBA/slot and actual/expected
+values; for example, `reason=backup-header-crc` identifies a failed backup GPT
+header rather than a generic `-22`.
+
 The review page identifies the selected partition and requires Apply/F8 before
 any queued change. F3 opens New, Delete opens Delete, F6 opens Format (and cycles
 formats on its review page), and F7 cycles eligible ESPs. Enter reviews an

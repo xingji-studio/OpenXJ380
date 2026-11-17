@@ -84,16 +84,48 @@ uint64_t fingerprint(const Table &t)
     return value ? value : 1;
 }
 
-bool header(const uint8_t *h, uint64_t sectors, bool backup)
+int reject(LoadDiagnostic *diagnostic, int error, const char *reason, uint64_t lba = 0, uint64_t actual = 0,
+           uint64_t expected = 0, unsigned slot = 0)
 {
-    if (!equal(h, "EFI PART", 8) || get32(h + 8) != 0x10000 || get32(h + 12) < 92 || get32(h + 12) > 512 ||
-        get32(h + 20) || get64(h + 24) != (backup ? sectors - 1 : 1) || get64(h + 32) != (backup ? 1 : sectors - 1) ||
-        empty(h + 56, 16))
+    if (diagnostic)
+    {
+        diagnostic->reason   = reason;
+        diagnostic->lba      = lba;
+        diagnostic->actual   = actual;
+        diagnostic->expected = expected;
+        diagnostic->slot     = slot;
+    }
+    return error;
+}
+
+bool header(const uint8_t *h, uint64_t sectors, bool backup, LoadDiagnostic *diagnostic = nullptr)
+{
+    uint64_t lba = backup ? sectors - 1 : 1;
+    auto failed = [&](const char *primary_reason, const char *backup_reason, uint64_t actual, uint64_t expected) {
+        reject(diagnostic, Invalid, backup ? backup_reason : primary_reason, lba, actual, expected);
         return false;
+    };
+    if (!equal(h, "EFI PART", 8))
+        return failed("primary-header-signature", "backup-header-signature", get64(h), 0x5452415020494645ULL);
+    if (get32(h + 8) != 0x10000)
+        return failed("primary-header-revision", "backup-header-revision", get32(h + 8), 0x10000);
+    if (get32(h + 12) < 92 || get32(h + 12) > 512)
+        return failed("primary-header-size", "backup-header-size", get32(h + 12), 92);
+    if (get32(h + 20))
+        return failed("primary-header-reserved", "backup-header-reserved", get32(h + 20), 0);
+    if (get64(h + 24) != lba)
+        return failed("primary-header-current-lba", "backup-header-current-lba", get64(h + 24), lba);
+    if (get64(h + 32) != (backup ? 1 : sectors - 1))
+        return failed("primary-header-alternate-lba", "backup-header-alternate-lba", get64(h + 32),
+                      backup ? 1 : sectors - 1);
+    if (empty(h + 56, 16)) return failed("primary-header-disk-guid", "backup-header-disk-guid", 0, 1);
     uint8_t saved[512];
     copy(saved, h, 512);
     zero(saved + 16, 4);
-    return crc32(saved, get32(h + 12)) == get32(h + 16);
+    uint32_t calculated = crc32(saved, get32(h + 12));
+    if (calculated != get32(h + 16))
+        return failed("primary-header-crc", "backup-header-crc", get32(h + 16), calculated);
+    return true;
 }
 
 void refresh(Table &t)
@@ -109,39 +141,76 @@ void refresh(Table &t)
     t.fingerprint = fingerprint(t);
 }
 
-bool valid_entries(const Table &t)
+bool valid_entries(const Table &t, LoadDiagnostic *diagnostic = nullptr)
 {
     for (unsigned i = 0; i < t.count; ++i)
     {
         const auto *a = t.entries + i * 128;
         if (empty(a, 16)) continue;
         uint64_t first = get64(a + 32), last = get64(a + 40);
-        if (empty(a + 16, 16) || first < t.first || last > t.last || first > last) return false;
+        uint64_t lba = t.primary_lba + i * 128 / 512;
+        if (empty(a + 16, 16))
+        {
+            reject(diagnostic, Invalid, "partition-guid-zero", lba, 0, 1, i + 1);
+            return false;
+        }
+        if (first < t.first || last > t.last || first > last)
+        {
+            reject(diagnostic, Invalid, "partition-range", lba, first, last, i + 1);
+            return false;
+        }
         for (unsigned j = 0; j < i; ++j)
         {
             const auto *b = t.entries + j * 128;
             if (empty(b, 16)) continue;
-            if (equal(a + 16, b + 16, 16) || (first <= get64(b + 40) && get64(b + 32) <= last)) return false;
+            if (equal(a + 16, b + 16, 16))
+            {
+                reject(diagnostic, Invalid, "partition-guid-duplicate", lba, j + 1, 0, i + 1);
+                return false;
+            }
+            if (first <= get64(b + 40) && get64(b + 32) <= last)
+            {
+                reject(diagnostic, Invalid, "partition-overlap", lba, j + 1, 0, i + 1);
+                return false;
+            }
         }
     }
     return true;
 }
 
-int check(const Table &t)
+int check(const Table &t, LoadDiagnostic *diagnostic = nullptr)
 {
     uint64_t sectors = t.bytes / 512;
     if (t.scheme != Scheme::Gpt || t.bytes % 512 || sectors < 4096 || !t.count || t.count > 128 ||
-        t.entry_bytes != 128 || !header(t.primary, sectors, false) || !header(t.backup, sectors, true))
-        return Invalid;
+        t.entry_bytes != 128)
+        return reject(diagnostic, Invalid, "gpt-table-geometry");
+    if (!header(t.primary, sectors, false, diagnostic) || !header(t.backup, sectors, true, diagnostic)) return Invalid;
     uint64_t blocks = (t.count * 128 + 511) / 512;
-    if (t.first != get64(t.primary + 40) || t.last != get64(t.primary + 48) || t.first > t.last ||
-        t.primary_lba != get64(t.primary + 72) || t.backup_lba != get64(t.backup + 72) || t.primary_lba < 2 ||
+    if (t.first != get64(t.primary + 40) || t.last != get64(t.primary + 48) || t.first > t.last)
+        return reject(diagnostic, Invalid, "gpt-usable-range", 1, t.first, t.last);
+    if (t.primary_lba != get64(t.primary + 72) || t.backup_lba != get64(t.backup + 72) || t.primary_lba < 2 ||
         t.primary_lba > t.first || blocks > t.first - t.primary_lba || t.backup_lba <= t.last ||
-        t.backup_lba >= sectors - 1 || blocks > sectors - 1 - t.backup_lba ||
-        !equal(t.primary + 40, t.backup + 40, 32) || !equal(t.primary + 80, t.backup + 80, 12) ||
-        get32(t.primary + 80) != t.count || get32(t.primary + 84) != 128 ||
-        get32(t.primary + 88) != crc32(t.entries, t.count * 128) || !valid_entries(t))
-        return Invalid;
+        t.backup_lba >= sectors - 1 || blocks > sectors - 1 - t.backup_lba)
+        return reject(diagnostic, Invalid, "gpt-array-placement", t.primary_lba, t.backup_lba, sectors - 1);
+    if (get64(t.primary + 40) != get64(t.backup + 40))
+        return reject(diagnostic, Invalid, "gpt-first-usable-mismatch", sectors - 1, get64(t.backup + 40),
+                      get64(t.primary + 40));
+    if (get64(t.primary + 48) != get64(t.backup + 48))
+        return reject(diagnostic, Invalid, "gpt-last-usable-mismatch", sectors - 1, get64(t.backup + 48),
+                      get64(t.primary + 48));
+    if (!equal(t.primary + 56, t.backup + 56, 16))
+        return reject(diagnostic, Invalid, "gpt-disk-guid-mismatch", sectors - 1);
+    if (get32(t.primary + 80) != get32(t.backup + 80) || get32(t.primary + 80) != t.count)
+        return reject(diagnostic, Invalid, "gpt-entry-count-mismatch", sectors - 1, get32(t.backup + 80), t.count);
+    if (get32(t.primary + 84) != get32(t.backup + 84) || get32(t.primary + 84) != 128)
+        return reject(diagnostic, Invalid, "gpt-entry-size-mismatch", sectors - 1, get32(t.backup + 84), 128);
+    if (get32(t.primary + 88) != get32(t.backup + 88))
+        return reject(diagnostic, Invalid, "gpt-array-crc-mismatch", sectors - 1, get32(t.backup + 88),
+                      get32(t.primary + 88));
+    uint32_t calculated = crc32(t.entries, t.count * 128);
+    if (get32(t.primary + 88) != calculated)
+        return reject(diagnostic, Invalid, "partition-array-crc", t.primary_lba, get32(t.primary + 88), calculated);
+    if (!valid_entries(t, diagnostic)) return Invalid;
     return 0;
 }
 } // namespace
@@ -166,17 +235,22 @@ bool same(const Table &a, const Table &b)
            equal(a.backup, b.backup, 512) && equal(a.entries, b.entries, sizeof(a.entries));
 }
 
-int load(const Device &d, Table &t)
+int load(const Device &d, Table &t, LoadDiagnostic *diagnostic)
 {
+    if (diagnostic) *diagnostic = {};
     zero(&t, sizeof(t));
-    if (!d.read || d.bytes % 512 || d.bytes < 4096 * 512) return Invalid;
+    if (!d.read) return reject(diagnostic, Invalid, "read-callback-missing");
+    if (d.bytes % 512) return reject(diagnostic, Invalid, "device-byte-alignment", 0, d.bytes, 512);
+    if (d.bytes < 4096 * 512) return reject(diagnostic, Invalid, "device-too-small", 0, d.bytes, 4096 * 512);
     t.bytes = d.bytes;
-    if (!d.read(d.context, 0, t.mbr, 512) || !d.read(d.context, 512, t.primary, 512) ||
-        !d.read(d.context, d.bytes - 512, t.backup, 512))
-        return Io;
+    if (!d.read(d.context, 0, t.mbr, 512)) return reject(diagnostic, Io, "mbr-read", 0);
+    if (!d.read(d.context, 512, t.primary, 512)) return reject(diagnostic, Io, "primary-header-read", 1);
+    if (!d.read(d.context, d.bytes - 512, t.backup, 512))
+        return reject(diagnostic, Io, "backup-header-read", d.bytes / 512 - 1);
     if (!equal(t.primary, "EFI PART", 8))
     {
-        if (equal(t.backup, "EFI PART", 8)) return Invalid;
+        if (equal(t.backup, "EFI PART", 8))
+            return reject(diagnostic, Invalid, "primary-header-missing", 1, get64(t.primary), 0x5452415020494645ULL);
         if (empty(t.mbr, 512) && empty(t.primary, 512) && empty(t.backup, 512))
         {
             t.scheme = Scheme::Empty;
@@ -189,35 +263,50 @@ int load(const Device &d, Table &t)
             t.count  = 4;
             // A protective/hybrid MBR with a missing GPT is damaged, not MBR.
             for (unsigned i = 0; i < 4; ++i)
-                if (t.mbr[446 + i * 16 + 4] == 0xee) return Invalid;
+                if (t.mbr[446 + i * 16 + 4] == 0xee)
+                    return reject(diagnostic, Invalid, "protective-mbr-without-gpt", 0, 0, 0, i + 1);
         }
         t.fingerprint = fingerprint(t);
         return 0;
     }
-    if (!header(t.primary, d.bytes / 512, false) || !header(t.backup, d.bytes / 512, true)) return Invalid;
-    if (t.mbr[510] != 0x55 || t.mbr[511] != 0xaa) return Invalid;
+    if (!header(t.primary, d.bytes / 512, false, diagnostic) || !header(t.backup, d.bytes / 512, true, diagnostic))
+        return Invalid;
+    if (t.mbr[510] != 0x55 || t.mbr[511] != 0xaa)
+        return reject(diagnostic, Invalid, "protective-mbr-signature", 0,
+                      uint32_t(t.mbr[510]) | uint32_t(t.mbr[511]) << 8, 0xaa55);
     unsigned protective = 0;
     for (unsigned i = 0; i < 4; ++i)
     {
         const auto *p = t.mbr + 446 + i * 16;
         if (!p[4])
         {
-            if (get32(p + 8) || get32(p + 12)) return Invalid;
+            if (get32(p + 8) || get32(p + 12))
+                return reject(diagnostic, Invalid, "unused-mbr-slot-range", 0, get32(p + 8), get32(p + 12), i + 1);
             continue;
         }
         // Hybrid MBR edits require coordinated legacy-table changes. Keep
         // them outside the writable GPT-only profile rather than stale them.
-        if (p[4] != 0xee) return Unsupported;
+        if (p[4] != 0xee) return reject(diagnostic, Unsupported, "hybrid-mbr", 0, p[4], 0xee, i + 1);
         uint64_t sectors = d.bytes / 512 - 1;
-        if (get32(p + 8) != 1 || get32(p + 12) != (sectors > 0xffffffffULL ? 0xffffffffU : uint32_t(sectors)))
-            return Invalid;
+        uint32_t expected = sectors > 0xffffffffULL ? 0xffffffffU : uint32_t(sectors);
+        if (get32(p + 8) != 1)
+            return reject(diagnostic, Invalid, "protective-mbr-start", 0, get32(p + 8), 1, i + 1);
+        // Some existing disks saturate this legacy protection field even below
+        // 2 TiB. GPT headers/arrays remain authoritative and fully validated.
+        // Preserve the original MBR bytes; accepting it never repairs the disk.
+        uint32_t actual = get32(p + 12);
+        if (actual != expected && actual != 0xffffffffU)
+            return reject(diagnostic, Invalid, "protective-mbr-size", 0, actual, expected, i + 1);
+        if (diagnostic && actual != expected) diagnostic->pmbr_size_saturated = true;
         ++protective;
     }
-    if (protective != 1) return Invalid;
+    if (protective != 1) return reject(diagnostic, Invalid, "protective-mbr-count", 0, protective, 1);
     t.scheme      = Scheme::Gpt;
     t.count       = get32(t.primary + 80);
     t.entry_bytes = get32(t.primary + 84);
-    if (!t.count || t.count > 128 || t.entry_bytes != 128) return Unsupported;
+    if (!t.count || t.count > 128)
+        return reject(diagnostic, Unsupported, "gpt-entry-count", 1, t.count, MaximumEntries);
+    if (t.entry_bytes != 128) return reject(diagnostic, Unsupported, "gpt-entry-size", 1, t.entry_bytes, 128);
     t.first         = get64(t.primary + 40);
     t.last          = get64(t.primary + 48);
     t.primary_lba   = get64(t.primary + 72);
@@ -225,15 +314,19 @@ int load(const Device &d, Table &t)
     uint64_t blocks = (t.count * 128 + 511) / 512;
     if (t.primary_lba >= d.bytes / 512 || blocks > d.bytes / 512 - t.primary_lba || t.backup_lba >= d.bytes / 512 ||
         blocks > d.bytes / 512 - t.backup_lba)
-        return Invalid;
-    if (!d.read(d.context, t.primary_lba * 512, t.entries, blocks * 512)) return Io;
+        return reject(diagnostic, Invalid, "partition-array-device-range", t.primary_lba, t.backup_lba, d.bytes / 512);
+    if (!d.read(d.context, t.primary_lba * 512, t.entries, blocks * 512))
+        return reject(diagnostic, Io, "primary-array-read", t.primary_lba);
     uint8_t sector[512];
     for (uint64_t i = 0; i < blocks; ++i)
     {
-        if (!d.read(d.context, (t.backup_lba + i) * 512, sector, 512)) return Io;
-        if (!equal(sector, t.entries + i * 512, 512)) return Invalid;
+        if (!d.read(d.context, (t.backup_lba + i) * 512, sector, 512))
+            return reject(diagnostic, Io, "backup-array-read", t.backup_lba + i);
+        if (!equal(sector, t.entries + i * 512, 512))
+            return reject(diagnostic, Invalid, "backup-array-mismatch", t.backup_lba + i, crc32(sector, 512),
+                          crc32(t.entries + i * 512, 512));
     }
-    int error = check(t);
+    int error = check(t, diagnostic);
     if (!error) t.fingerprint = fingerprint(t);
     return error;
 }

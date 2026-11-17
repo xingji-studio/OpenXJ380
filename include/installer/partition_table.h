@@ -54,9 +54,19 @@ struct Table
     uint8_t  mbr[512], primary[512], backup[512], entries[16384];
 };
 
+// Optional, allocation-free scan evidence. Reasons are static string literals;
+// lba/slot identify the rejected metadata and actual/expected describe its field.
+struct LoadDiagnostic
+{
+    const char *reason = nullptr;
+    uint64_t lba = 0, actual = 0, expected = 0;
+    unsigned slot = 0;
+    bool pmbr_size_saturated = false;
+};
+
 uint32_t   crc32(const void *, __SIZE_TYPE__);
 bool       same(const Table &, const Table &);
-int        load(const Device &, Table &);
+int        load(const Device &, Table &, LoadDiagnostic *diagnostic = nullptr);
 int        initialize(uint64_t bytes, const uint8_t disk_guid[16], Table &);
 int        entry(const Table &, unsigned number, Entry &);
 bool       free_range(const Table &, uint64_t first, uint64_t last);

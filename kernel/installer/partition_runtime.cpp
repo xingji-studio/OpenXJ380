@@ -127,6 +127,29 @@ int finish(installer::JobHandle handle, Access &a, int error)
     return result ? result : error;
 }
 
+int load_table(Access &access, Table &table, installer::JobHandle handle, const char *role)
+{
+    LoadDiagnostic diagnostic{};
+    int error = load(access.device(), table, &diagnostic);
+    if (error)
+    {
+        write_serial_fmt("installer: partition reject handle=%llu role=%s reason=%s error=%d\n",
+                         (unsigned long long)handle, role,
+                         diagnostic.reason ? diagnostic.reason : "table-validation", error);
+        write_serial_fmt("installer: partition field lba=%llu slot=%u actual=0x%llx expected=0x%llx bytes=%llu\n",
+                         (unsigned long long)diagnostic.lba, diagnostic.slot,
+                         (unsigned long long)diagnostic.actual, (unsigned long long)diagnostic.expected,
+                         (unsigned long long)access.whole.bytes);
+    }
+    else if (diagnostic.pmbr_size_saturated)
+    {
+        write_serial_fmt("installer: partition compat handle=%llu role=%s pmbr-size=0xffffffff disk-last-lba=%llu "
+                         "GPT-verified\n", (unsigned long long)handle, role,
+                         (unsigned long long)(access.whole.bytes / 512 - 1));
+    }
+    return error;
+}
+
 bool pin(vfs_node_t node)
 {
     vfs_child_lock();
@@ -201,17 +224,22 @@ int installer_partition_layout(const xj_inst_partition_request *request, xj_inst
     if (!request || !output || request->action || request->partition || request->esp_handle || request->esp_partition ||
         request->esp_fingerprint || request->first_lba || request->sectors || request->filesystem ||
         request->fingerprint)
+    {
+        write_serial_string("installer: partition reject reason=layout-request-fields error=-22\n");
         return -EINVAL;
+    }
     auto *table = static_cast<Table *>(calloc(1, sizeof(Table)));
     if (!table) return -ENOMEM;
     Access access;
     int    error = borrow(request->target_handle, request->session_epoch, access);
     if (error)
     {
+        write_serial_fmt("installer: partition reject handle=%llu reason=borrow-target error=%d\n",
+                         request->target_handle, error);
         free(table);
         return error;
     }
-    error = load(access.device(), *table);
+    error = load_table(access, *table, request->target_handle, "target");
     if (!error)
     {
         xj_inst_native_initialize(output, sizeof(*output));
@@ -288,7 +316,7 @@ int installer_partition_prepare(const xj_inst_partition_request *request, bool i
         free(plan);
         return error;
     }
-    error = load(access.device(), plan->before);
+    error = load_table(access, plan->before, request->target_handle, "target");
     if (!error && plan->before.fingerprint != request->fingerprint) error = -ESTALE;
     if (!error && plan->before.scheme != Scheme::Gpt && plan->before.scheme != Scheme::Empty) error = -EOPNOTSUPP;
     plan->after = plan->before;
@@ -355,7 +383,7 @@ int installer_partition_prepare(const xj_inst_partition_request *request, bool i
         error = borrow(request->esp_handle, request->session_epoch, other);
         if (!error)
         {
-            error = load(other.device(), plan->esp_before);
+            error = load_table(other, plan->esp_before, request->esp_handle, "esp");
             Entry esp{};
             if (!error && (other.whole.physical_device == access.whole.physical_device ||
                            plan->esp_before.fingerprint != request->esp_fingerprint ||
