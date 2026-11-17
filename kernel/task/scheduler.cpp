@@ -415,8 +415,12 @@ static inline bool wake_sleeping_task(tcb_t task, uint64_t now, uint64_t base_vr
     // Both callers already own this task's CPU queue lock. A remote kill
     // does not need that lock, so expiry must still preserve terminal state.
     if (task == NULL) return false;
-    if (__atomic_load_n(&task->status, __ATOMIC_ACQUIRE) == WAIT && task->wakeup_time != 0 &&
-        now >= task->wakeup_time) {
+    if (__atomic_load_n(&task->status, __ATOMIC_ACQUIRE) == WAIT &&
+        (__atomic_load_n(&task->kernel_exit_pending, __ATOMIC_ACQUIRE) ||
+         (task->wakeup_time != 0 && now >= task->wakeup_time))) {
+        // A protected owner may be in an indefinite futex/descriptor wait.
+        // Give it CPU time to observe cancellation and unwind its operation
+        // pin. The WAIT CAS below still preserves a concurrent terminal state.
         task->wakeup_time = 0;
         apply_eevdf_wakeup_credit(task, base_vruntime);
         TaskStatus waiting = WAIT;

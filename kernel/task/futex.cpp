@@ -71,7 +71,8 @@ int futex_wait_user(page_directory_t *directory, uint32_t *address, uint32_t exp
     if (!scheduler_is_enabled()) return -EWOULDBLOCK;
     Waiter *waiter = (Waiter *)calloc(1, sizeof(Waiter));
     if (!waiter) return -ENOMEM;
-    waiter->task = get_current_task();
+    tcb_t task = get_current_task();
+    waiter->task = task;
     waiter->bitset = bitset;
     uint32_t *word = NULL;
     mm_op_lock_acquire();
@@ -98,6 +99,8 @@ int futex_wait_user(page_directory_t *directory, uint32_t *address, uint32_t exp
     int result = 0;
     for (;;)
     {
+        TaskStatus status = __atomic_load_n(&task->status, __ATOMIC_ACQUIRE);
+        if (status == DEATH || status == OUT) { result = -EINTR; break; }
         if (__atomic_load_n(&waiter->notified, __ATOMIC_ACQUIRE)) break;
         if (signals_pending_quick(waiter->task)) { result = -EINTR; break; }
         uint64_t now = bootNanoTime();
@@ -109,6 +112,8 @@ int futex_wait_user(page_directory_t *directory, uint32_t *address, uint32_t exp
     remove_locked(bucket, waiter);
     spin_unlock(&bucket.lock);
     free(waiter);
+    // The syscall boundary retires a pending terminal task after this waiter
+    // and the caller's remaining protected resources have unwound.
     return result;
 }
 

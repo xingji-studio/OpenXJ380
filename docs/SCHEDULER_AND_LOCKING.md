@@ -436,6 +436,13 @@ must remain allocation-free and must not acquire the signal disposition lock:
 it is called inside this publication scope. Linux signal handler pointers are
 published atomically, while complete disposition snapshots use the PCB lock.
 
+Protected termination publishes `kernel_exit_pending` with release ordering.
+The quick wait-interruption check observes it even when no Linux signal is
+pending. A timer also wakes WAIT owners with that flag, including indefinite
+waits, so cancellation racing wait publication cannot strand an operation pin.
+Keep the owner live while it withdraws its wait record and unwinds caller
+resources; the outer syscall boundary drops the pin and publishes final death.
+
 `scheduler_wake_task()` must acquire the target queue lock even if an initial
 status observation would find RUNNING/START. The waiter can already own that
 lock after checking an unset event but before publishing WAIT. Returning before

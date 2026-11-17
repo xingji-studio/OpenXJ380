@@ -106,6 +106,9 @@ static bool signal_copy_from_user(page_directory_t *pagedir, void *dst, const vo
 
 bool signals_pending_quick(tcb_t task) {
     if (task == NULL) return false;
+    // Protected syscall owners remain live until their resources unwind.
+    // Their waits must observe cancellation even without a Linux signal.
+    if (__atomic_load_n(&task->kernel_exit_pending, __ATOMIC_ACQUIRE)) return true;
     sigset_t pending_list   = __atomic_load_n(&task->signal, __ATOMIC_ACQUIRE);
     sigset_t unblocked_list = pending_list & (~task->blocked);
     for (int i = MINSIG; i <= last_signal(task); i++) {

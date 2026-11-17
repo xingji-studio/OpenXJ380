@@ -26,7 +26,7 @@ static bool terminal(TaskStatus status)
 
 static void request_task_locked(tcb_t task)
 {
-    task->kernel_exit_pending = true;
+    __atomic_store_n(&task->kernel_exit_pending, true, __ATOMIC_RELEASE);
     if (!task->kernel_operation_pinned) __atomic_store_n(&task->status, DEATH, __ATOMIC_RELEASE);
 }
 
