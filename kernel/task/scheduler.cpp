@@ -903,7 +903,10 @@ static uint64_t wakeup_base_vruntime_locked(PROCESSOR_INFO *cpu)
 
 void scheduler_wake_task(tcb_t task)
 {
-    if (task == NULL || __atomic_load_n(&task->status, __ATOMIC_ACQUIRE) != WAIT) return;
+    if (task == NULL) return;
+    // A waiter can hold its queue lock after reading an unset notification,
+    // but before publishing WAIT. Even a currently runnable target requires
+    // this lock: an early status check would let that notification be lost.
     // Live published tasks do not migrate. cpu_id is their queue-array index;
     // remove_task's fallback correction happens only after terminal state.
     if (task->cpu_id >= get_cpu_num()) return;
