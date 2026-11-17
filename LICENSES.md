@@ -11,6 +11,7 @@ binary distribution. The command-line image installs the repository notices at
 | uACPI 7.0.0 | MIT | `third_party/uacpi/LICENSE`; `third_party/uacpi/SOURCE.json` | `/system/licenses/third-party/uacpi/` |
 | XJ380 project | Apache-2.0 | `LICENSE` | `LICENSE` |
 | Native first-party ext4 driver, journaled mutation core, offline formatter and fresh-volume factory build/readback | Apache-2.0 | `driver/fs/ext4/PROVENANCE.md`; `driver/fs/ext4/SOURCE.json`; `kernel/installer/` | `/system/licenses/native-ext4/` |
+| NTFS P3 reader and bounded native metadata writer with Uinxed/DiscUtils attribution | Apache-2.0 AND MIT | `driver/fs/ntfs/PROVENANCE.md`; `driver/fs/ntfs/SOURCE.json`; `driver/fs/ntfs/REFERENCES.json` | `/system/licenses/native-ntfs/` |
 | FatFs | ChaN permissive license | `driver/fs/fatfs/ff.cpp` | `fatfs.txt` |
 | lwIP | BSD-style | compiled files under `kmod/netserver/lwip/` | `lwip-notice-full.txt` |
 | musl ELF definitions | MIT | `include/elf.h`; `third_party/musl-elf` | `musl-elf.txt`; `third-party compliance bundle` |

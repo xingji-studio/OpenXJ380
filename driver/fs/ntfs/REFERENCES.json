@@ -1,0 +1,165 @@
+{
+  "schema_version": 1,
+  "review_date": "2026-11-17",
+  "use": "Format facts plus explicitly inventoried MIT DiscUtils journal layout/replay reference; no GPL implementation imported or linked",
+  "patent_license_inferred": false,
+  "format_documents": [
+    {
+      "id": "microsoft-ntfs-devnotes",
+      "publisher": "Microsoft",
+      "urls": [
+        "https://learn.microsoft.com/en-us/windows/win32/devnotes/master-file-table",
+        "https://learn.microsoft.com/en-us/windows/win32/devnotes/file-record-segment-header",
+        "https://learn.microsoft.com/en-us/windows/win32/devnotes/attribute-record-header",
+        "https://learn.microsoft.com/en-us/windows/win32/devnotes/attribute-list-entry",
+        "https://learn.microsoft.com/en-us/windows/win32/devnotes/multi-sector-header"
+      ],
+      "facts_used": "NTFS 3.x record/attribute/list fields, ordered MFT segment references, unique local instances, Low/High VCNs, first-extent-only sizes, and fixed 512-byte USA stride; rechecked for MFT list growth and 4Kn writes",
+      "redistributed_content": false
+    },
+    {
+      "id": "libyal-ntfs-format-document",
+      "author": "Joachim Metz",
+      "repository": "https://github.com/libyal/libfsntfs",
+      "commit": "2d22e7fe338bf7cc1718e1c94a8b44769dbb1aaa",
+      "path": "documentation/New Technologies File System (NTFS).asciidoc",
+      "url": "https://github.com/libyal/libfsntfs/blob/2d22e7fe338bf7cc1718e1c94a8b44769dbb1aaa/documentation/New%20Technologies%20File%20System%20(NTFS).asciidoc",
+      "sha256": "dad8bb279aeac0d0390f3e645ee6117a590bc86137e4aef9ef010ddae77d2d18",
+      "document_license": "GFDL-1.3-or-later; no invariant sections or cover texts",
+      "facts_used": "On-disk offsets for standard information, attribute lists, index records, mapping pairs and LFS restart-page header",
+      "redistributed_content": false,
+      "implementation_consulted_or_imported": false
+    },
+    {
+      "id": "linux-ntfs-format-pages",
+      "urls": [
+        "https://flatcap.github.io/linux-ntfs/ntfs/files/logfile.html"
+      ],
+      "facts_used": "LFS restart-area and client-record byte layout, clean flag and client-list sentinel",
+      "redistributed_content": false,
+      "driver_implementation_imported": false
+    },
+    {
+      "id": "suhanov-primary-research-articles",
+      "author": "Maxim Suhanov",
+      "urls": [
+        "https://dfir.ru/2019/01/19/ntfs-today/",
+        "https://dfir.ru/2019/02/16/how-the-logfile-works/",
+        "https://dfir.ru/2019/01/08/hibernation-and-ntfs/"
+      ],
+      "facts_used": "Extended file/volume flags, 48-bit MFT numbers, per-directory case-sensitive bit, LFS generations/LSNs and hibernation state",
+      "redistributed_content": false,
+      "linked_code_approved": false
+    },
+    {
+      "id": "microsoft-storage-flush",
+      "publisher": "Microsoft",
+      "urls": [
+        "https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/nf-ntifs-ntflushbuffersfileex",
+        "https://learn.microsoft.com/en-us/windows/win32/fileio/flushing-system-buffered-i-o-data-to-disk",
+        "https://learn.microsoft.com/en-us/windows-hardware/drivers/storage/querying-for-the-write-cache-property"
+      ],
+      "facts_used": "Durable completion requires synchronizing underlying device caches, not just an in-memory file buffer",
+      "redistributed_content": false
+    }
+  ],
+  "excluded_implementations": [
+    {
+      "repository": "https://github.com/msuhanov/dfir_ntfs",
+      "commit": "ec3ae0884048ade106c91a68dab7c9fb3af393bf",
+      "reason": "GPL-3.0 discovered during license screening; not an approved implementation input",
+      "screening_exposure": "License, header, constants and accessor names only; no function body used or translated",
+      "imported_or_linked": false
+    },
+    {
+      "names": [
+        "Linux NTFS",
+        "Linux ntfs3",
+        "NTFS-3G",
+        "ReactOS",
+        "libfsntfs"
+      ],
+      "imported_or_linked": false
+    },
+    {
+      "names": [
+        "ntfs-core Rust journal parser"
+      ],
+      "reason": "Documented derivation from GPL dfir_ntfs; excluded after license screening",
+      "imported_or_linked": false
+    },
+    {
+      "repository": "https://github.com/ZoloZiak/WinNT4",
+      "reason": "Search results surfaced private Windows source snippets; no page opened or implementation consulted/adapted",
+      "imported_or_linked": false
+    },
+    {
+      "names": [
+        "NTFS-3G logfile validation and Linux ntfs/ntfs3 excerpts in automatic search results"
+      ],
+      "screening_exposure": "A broad format query automatically expanded source excerpts; no source page opened and no implementation imported or translated. The sequence-width correction was independently identified through black-box host-tool validation before this search. A documentation-only query on 2026-11-17 also expanded a GPL source excerpt embedded in an unapproved research-blog article; that page was not opened and its implementation was not used or translated.",
+      "imported_or_linked": false
+    }
+  ],
+  "permissive_implementation_references": [
+    {
+      "repository": "https://github.com/LTRData/DiscUtils",
+      "commit": "b8c77f834ad0c43baf667b1fa7a8ff42c9e360b8",
+      "license": "MIT",
+      "use": "LFS/NTFS client layouts; adapted packed/tail/ring record reading, checkpoint table analysis, redo/undo and logical FILE/INDX actions in recovery.*; original bounded C++ snapshot publication and MFT growth",
+      "reviewed_files": {
+        "Library/DiscUtils.Ntfs/Journal/JournalUtilities.cs": "63630f841fae431945c1e7acd5a67d88bbb69445f8651871b4593ff2a2f99581",
+        "Library/DiscUtils.Ntfs/Journal/LfsLog.cs": "4c0b8c3f1177f35eca9f40dee6a3f4bea5b1daa1e38c8b23aed910b43404df5a",
+        "Library/DiscUtils.Ntfs/Journal/LogFileStorage.cs": "41802e1a4ba24e9e64546a770f40a7eaff96fa30213df925173296d8707b7872",
+        "Library/DiscUtils.Ntfs/Journal/NtfsHibernation.cs": "a6127316272a58f5ae989916d9e7cf3ea1988eca59c70a3d7e2a5093bf14c692",
+        "Library/DiscUtils.Ntfs/Journal/NtfsLogActions.cs": "c2602c81ad6ae0e422b2f8dbb32780b3a0a5a22b67a210fb4c604dd2e5bd3ab5",
+        "Library/DiscUtils.Ntfs/Journal/NtfsLogAnalysis.cs": "9e44dbb9c8fcd419767abdbf55b5868ad49c416d5392b08e1913685ab579596a",
+        "Library/DiscUtils.Ntfs/Journal/NtfsLogOperation.cs": "eb8a0be849b65143c921bb74d2436342550c78519e2322a5c69da015be44da82",
+        "Library/DiscUtils.Ntfs/Journal/NtfsLogPages.cs": "61fe928869784db20ece499d7859055fd719730d5a63faa3410a3dc93c06202f",
+        "Library/DiscUtils.Ntfs/Journal/NtfsLogRecord.cs": "99bee429514811f6c6002062d417ada796a10c9ccf396062f259df07310e52aa",
+        "Library/DiscUtils.Ntfs/Journal/NtfsLogReplayer.cs": "4ced9f9186bb803ac93248f7b38cd95677b6ad489a42f49de7a3662ef37fc355",
+        "Library/DiscUtils.Ntfs/NtfsJournal.cs": "9ef3fe855ccc3ce28163307dfcc09ed78993960a48eaca0f624eed756859da8f",
+        "Library/DiscUtils.Ntfs/NtfsTransaction.cs": "16ee376c8ddf22ae4d09159b39630e03dd53a600d992df3c609917544654134b"
+      },
+      "notices": [
+        "DISCUTILS_LICENSE.txt",
+        "DISCUTILS_NOTICE.txt"
+      ],
+      "new_link_archive": false
+    }
+  ],
+  "acceptance_documents": [
+    {
+      "publisher": "Microsoft",
+      "urls": [
+        "https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/chkdsk",
+        "https://learn.microsoft.com/en-us/windows-hardware/manufacture/desktop/winpe-intro?view=windows-11"
+      ],
+      "facts_used": "Readonly chkdsk without repair switches; scope of the WinPE deployment/recovery environment",
+      "redistributed_content": false
+    }
+  ],
+  "host_diagnostic_references": [
+    {
+      "publisher": "Microsoft",
+      "urls": [
+        "https://learn.microsoft.com/en-us/windows/win32/api/evntrace/nf-evntrace-starttracew",
+        "https://learn.microsoft.com/en-us/windows/win32/api/evntrace/nf-evntrace-enabletraceex2"
+      ],
+      "facts_used": "Bounded host-test ETW session start/enable/stop on an isolated WinPE guest before NTFS mount; no documentation sample code copied",
+      "redistributed_content": false,
+      "kernel_dependency": false
+    },
+    {
+      "publisher": "Microsoft",
+      "urls": [
+        "https://learn.microsoft.com/en-us/windows-hardware/drivers/debugger/microsoft-public-symbols",
+        "https://learn.microsoft.com/en-us/legal/windows-sdk/microsoft-symbol-server-license-terms"
+      ],
+      "use": "Local functional interoperability diagnosis only: PE/CodeView identity metadata and stripped public function names/addresses; no executable instructions, private types or source code/lines inspected",
+      "license_scope": "Microsoft Symbol Server terms, not an approved implementation source or patent clearance",
+      "redistributed_content": false,
+      "kernel_dependency": false
+    }
+  ]
+}

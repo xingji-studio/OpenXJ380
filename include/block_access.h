@@ -5,6 +5,8 @@
 
 struct vfs_node;
 using BlockAccessToken = uint64_t;
+// Native XJ380 block-cache synchronization request (existing device ABI).
+constexpr uint64_t BlockSyncRequest = 0x5461;
 
 struct BlockExtent
 {

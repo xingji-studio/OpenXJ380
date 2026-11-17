@@ -2,6 +2,8 @@
   "schema_version": 1,
   "components": [
     {"name":"uACPI 7.0.0","slug":"uacpi","license":"MIT","license_files":["third_party/uacpi/LICENSE","third_party/uacpi/SOURCE.json"],"source_files":["third_party/uacpi/source","third_party/uacpi/include"],"bundle_source":false},
+    {"name":"DiscUtils NTFS journal reference adaptations","slug":"ntfs-discutils","license":"MIT","license_files":["driver/fs/ntfs/DISCUTILS_LICENSE.txt","driver/fs/ntfs/DISCUTILS_NOTICE.txt","driver/fs/ntfs/PROVENANCE.md","driver/fs/ntfs/SOURCE.json","driver/fs/ntfs/REFERENCES.json"],"source_files":["driver/fs/ntfs/journal.cpp","driver/fs/ntfs/journal.h","driver/fs/ntfs/recovery.cpp","driver/fs/ntfs/recovery.h","driver/fs/ntfs/recovery_actions.cpp"],"bundle_source":false},
+    {"name":"Uinxed NTFS reader fragments","slug":"ntfs-uinxed","license":"Apache-2.0","license_files":["driver/fs/ntfs/UINXED_LICENSE.txt","driver/fs/ntfs/UINXED_NOTICE.txt","driver/fs/ntfs/PROVENANCE.md","driver/fs/ntfs/SOURCE.json","driver/fs/ntfs/REFERENCES.json"],"source_files":["driver/fs/ntfs/format.h"],"bundle_source":false},
     {"name":"musl ELF definitions","slug":"musl-elf","license":"MIT","license_files":["third_party/musl-elf/COPYRIGHT","third_party/musl-elf/SOURCE.md"],"source_files":["include/elf.h","third_party/musl-elf/SOURCE.md"],"bundle_source":false},
     {"name":"lwIP","slug":"lwip","license":"BSD-style","license_files":["licenses/lwip-notice-full.txt"],"source_files":["kmod/netserver/lwip"],"bundle_source":false},
     {"name":"FatFs","slug":"fatfs","license":"BSD-style","license_files":["licenses/fatfs.txt"],"source_files":["driver/fs/fatfs"],"bundle_source":false},

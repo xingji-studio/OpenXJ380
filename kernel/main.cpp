@@ -16,6 +16,7 @@
 #include <efi/fbc.h>
 #include <fs/fatfs/fatfs.h>
 #include <fs/ext4/ext4.h>
+#include <fs/ntfs/ntfs.h>
 #include <fs/partition.h>
 #include <fs/vfs/devfs.h>
 #include <fs/vfs/vfs.h>
@@ -645,6 +646,7 @@ extern "C" void KernelMain(const FrameBufferConfig &fbc, EFI_SYSTEM_TABLE &Syste
     boot_debug::returned(fbc, BootStep::FatFs);
     boot_debug::begin(fbc, BootStep::Ext4Fs);
     ext4fs_init();
+    ntfsfs_init();
     boot_debug::returned(fbc, BootStep::Ext4Fs);
     write_serial_string("BOOT: fatfs_init done\n");
     write_serial_string("BOOT: devfs_setup begin\n");

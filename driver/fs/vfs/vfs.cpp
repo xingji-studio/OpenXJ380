@@ -35,6 +35,7 @@ static vfs_prepare_unmount_t fs_prepare_unmount[256];
 static vfs_checked_unmount_t fs_checked_unmount[256];
 static vfs_link_node_t fs_link_node[256];
 static vfs_finalize_node_t fs_finalize_node[256];
+static vfs_name_lookup_t fs_name_lookup[256];
 static bool fs_unlinked_lifetime[256];
 static bool fs_reject_overmount[256];
 // Protected by vfs_child_list_lock; lookups cannot enter a retiring managed mount.
@@ -109,6 +110,11 @@ void vfs_set_link_node(int fsid, vfs_link_node_t callback)
 void vfs_set_finalize_node(int fsid, vfs_finalize_node_t callback)
 {
     if (fsid > 0 && fsid < 256) __atomic_store_n(&fs_finalize_node[fsid], callback, __ATOMIC_RELEASE);
+}
+
+void vfs_set_name_lookup(int fsid, vfs_name_lookup_t callback)
+{
+    if (fsid > 0 && fsid < 256) __atomic_store_n(&fs_name_lookup[fsid], callback, __ATOMIC_RELEASE);
 }
 
 void vfs_set_unlinked_lifetime(int fsid, bool enabled)
@@ -642,7 +648,7 @@ static bool legacy_cache_domain(vfs_node_t node)
                      __atomic_load_n(&fs_unmount_quiescence[node->fsid], __ATOMIC_ACQUIRE)));
 }
 
-static vfs_node_t vfs_child_find_for_open(vfs_node_t parent, const char *name, bool final,
+static vfs_node_t vfs_child_find_for_open_exact(vfs_node_t parent, const char *name, bool final,
                                          bool reject_endpoints, bool &endpoint_rejected)
 {
     if (parent == NULL || name == NULL) return NULL;
@@ -670,6 +676,32 @@ static vfs_node_t vfs_child_find_for_open(vfs_node_t parent, const char *name, b
     }
     if (child) ++child->refcount;
     vfs_child_unlock();
+    return child;
+}
+
+// Optional filesystem spelling resolution preserves the normal ref path.
+static vfs_node_t vfs_child_find_for_open(vfs_node_t parent, const char *name, bool final,
+                                         bool reject_endpoints, bool &endpoint_rejected)
+{
+    if (!parent || !name) return NULL;
+    vfs_name_lookup_t lookup = parent->fsid < 256 ?
+        __atomic_load_n(&fs_name_lookup[parent->fsid], __ATOMIC_ACQUIRE) : NULL;
+    if (!lookup) return vfs_child_find_for_open_exact(parent, name, final, reject_endpoints, endpoint_rejected);
+    // The caller retains its parent. Pin managed mounts over backend work and
+    // reference acquisition; decoding/I/O/allocation/backend mutexes stay
+    // outside the child lock. Existing callback ABI stays intact.
+    ReadonlyTraversalGuard traversal;
+    if (!traversal.ready()) { permissions_set_file_error(EBUSY); return NULL; }
+    char *canonical = static_cast<char *>(malloc(1024));
+    if (!canonical) { permissions_set_file_error(ENOMEM); return NULL; }
+    canonical[0] = canonical[1023] = 0;
+    int error = lookup(parent, name, canonical, 1024);
+    vfs_node_t child = NULL;
+    if (!error && canonical[0] && memchr(canonical, 0, 1024))
+        child = vfs_child_find_for_open_exact(parent, canonical, final, reject_endpoints, endpoint_rejected);
+    else if (!error) error = -EIO;
+    free(canonical);
+    if (error) permissions_set_file_error(error < 0 ? -error : error);
     return child;
 }
 

@@ -1,19 +1,95 @@
 {
   "schema_version": 1,
-  "implementation": "Original bounded empty-volume NTFS 3.1 formatter",
+  "implementation": "Bounded NTFS 3.1 reader, MFT attribute-list/extension growth, authenticated 512/4Kn metadata writes, and LFS 1.1/2.0 recovery; original bounded empty-volume NTFS 3.1 formatter",
   "license": "Apache-2.0",
-  "review_date": "2026-11-16",
+  "review_date": "2026-11-17",
+  "upstream": {
+    "repository": "https://github.com/ViudiraTech/Uinxed-Kernel",
+    "commit": "ba4c809852a357378ab6058da5f514cceb8819c3",
+    "reviewed_files": {
+      "fs/ntfs/ntfs_runlist.c": "f03224654f040aeed4ef63b758a1b129130a2414b10333d6e0029d52c84a4183",
+      "fs/ntfs/ntfs_mft.c": "9a8c8d6e9aa5c4b8272a7b25fd9d04296226fbdebdb8b92cf3e58258242c08c1"
+    },
+    "adapted_functions": {
+      "ntfs_runlist_parse": "format.h::decode_runs",
+      "ntfs_record_unpack/ntfs_record_layout": "format.h::unpack"
+    }
+  },
   "sources": {
+    "native.cpp": "e942ee89b48aae3d5f5030313ef7953438811807b4e120ca894ac464b9cc1d5d",
+    "native.h": "6b822f73b23d8c1f0ad95ab51e33c73210011585bb0db6c32ca33213b2ce7f97",
+    "names.cpp": "82c4e0e7915467fcd2b93f9b47e60a3012adfc9b8bb693b6b31b289b196cfd28",
+    "ntfs.cpp": "bb76112c8f19a05ee156f0402e72e85862809ea9583ca46baf0a48a342f9294e",
+    "format.h": "693588528832fcbf0b52283c1d42e962bfe53e0344824fb36453ec895ccc0419",
+    "journal.cpp": "b771a0aff0d6442f5c2caab83e2c9db5349b1085d19618bfaa4932971e74acb3",
+    "journal.h": "aaae894daf9a29dbe1c247eac64f87625fc9b48317f32f5305a2e7b3dbda381c",
+    "write.cpp": "64fbe97151b6b1cde7abc17b51399b24db6c46fff260f67cfc7805c3811c3308",
+    "write.h": "aab03bf0d2d1b0d490175b2ea288eb68b87d83ec773f06d75382f2d4f4899d19",
+    "recovery.cpp": "e667f1731fa53c3033ed3355770fe1fc644016d2c971615fbcaab25073274993",
+    "recovery.h": "022406d586566dbfea6631500500ce5d134444c8f87e7397cab4752eddf0088c",
+    "recovery_actions.cpp": "23778714e1faf72326b9007f61b48a13ec0df9c88946e3f75abe2ba43b7a4c0f",
     "mkfs.cpp": "b11f1950e4fe4144c97b870161c3ffbc4561d43d365134c2d488d1d0d8eec179",
     "mkfs.h": "40f00cbcfa9cf226ae10b1d848fa9c9da3a4e020ea9f5568d9f54849697ee310"
   },
+  "public_header_sha256": "bedf3f2f8c7b24a02e25d6d65b1526ee2957b378523b92dcd988577365f01f3f",
+  "notices": {
+    "UINXED_LICENSE.txt": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
+    "UINXED_NOTICE.txt": "4bfae7e6862087bc4ca3909167405d74997ac89c386191548804de16b7e3bc4e",
+    "DISCUTILS_LICENSE.txt": "7f62225e8d08b717f9e580e3768d64791df324dd1ff509a6b5d2a684b9e058c4",
+    "DISCUTILS_NOTICE.txt": "dd9128a0b5466b19233dd77e8a706309819f9786e3768dcec31796c96f3fb5a1"
+  },
   "new_link_archives": [],
-  "references": [
-    "https://learn.microsoft.com/en-us/windows/win32/devnotes/master-file-table",
-    "https://learn.microsoft.com/en-us/windows/win32/devnotes/file-record-segment-header",
-    "https://learn.microsoft.com/en-us/windows/win32/devnotes/attribute-record-header",
-    "https://learn.microsoft.com/en-us/windows/win32/devnotes/multi-sector-header"
+  "patent_clearance": "Not established; see PROVENANCE.md release review requirements",
+  "references_sha256": "c3278f41d9a2b942dce72ca63a26073504c59c3be10255d7bd6ada4649eae171",
+  "experimental_write_profile": {
+    "activation": "Explicit ntfsrw: source only; automatic mounts remain read-only",
+    "operations": "MFT ATTRIBUTE_LIST/extension growth, resident/nonresident list/bitmap relocation, 512/4Kn metadata transactions; bounded LFS 1.1/2.0 recovery and namespace/COW operations",
+    "metadata_mutation": true,
+    "journal_replay": true,
+    "allocation_and_directory_mutation": true,
+    "write_atomicity": "Native metadata old/new after committed recovery; foreign redo/undo is validated and durably sealed outside source history before home writes; legacy overwrite is nontransactional; uncertain I/O locks until reboot",
+    "profile_id": "bounded-lfs-windows-interop-v5",
+    "geometry": {
+      "logical_sector": [
+        512,
+        4096
+      ],
+      "cluster": 4096,
+      "mft_record": [
+        1024,
+        4096
+      ],
+      "index_buffer": 4096,
+      "record_must_cover_logical_sector": true,
+      "mirrored_records": 4,
+      "usa_stride": 512
+    },
+    "mft_attribute_list_mutation": true,
+    "backend_geometry": "Kernel authenticates native physical-device sector size; BPB mismatch rejects before all metadata writes and legacy fallback",
+    "passive_root_initializer": "Only the observed empty resident root $TXF_DATA initializer is retained byte for byte; active or unknown utility state remains unsupported",
+    "windows_control_records": {
+      "minimum_client_header": 40,
+      "empty_redo_flag": 2,
+      "empty_undo_flag": 4,
+      "compensation_undo_exempt": true,
+      "first_transaction_previous_lsn": 0,
+      "terminal_undo_next_lsn": 0,
+      "open_lsn": "preceding global LSN",
+      "metadata_hint_unit": 512
+    },
+    "native_profile_corruption_fallback": false
+  },
+  "device_control_abi": {
+    "request": "BlockSyncRequest",
+    "value": "0x5461",
+    "source": "Existing native XJ380 block-device ABI, independently declared in include/block_access.h",
+    "compatibility_check": "tests/ntfs_kernel_probe.cpp static assertion against the legacy ioctl alias"
+  },
+  "additional_licenses": [
+    "MIT"
   ],
-  "imported_implementations": [],
-  "patent_clearance": "Not established"
+  "patent_review_sources": [
+    "https://learn.microsoft.com/en-us/openspecs/dev_center/ms-devcentlp/1c24c7c8-28b0-4ce1-a47d-95fe1ff504bc",
+    "https://learn.microsoft.com/en-us/openspecs/dev_center/ms-devcentlp/13571077-e344-4e6f-a477-369894979798"
+  ]
 }

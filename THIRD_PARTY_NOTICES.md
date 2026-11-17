@@ -12,6 +12,8 @@ generates a distributable bundle at `out/compliance/third-party`.
 | musl ELF definitions | MIT | `third_party/musl-elf` |
 | lwIP | BSD-style notices | compiled files under `kmod/netserver/lwip`; `licenses/lwip-notice-full.txt` |
 | FatFs | BSD-style permissive | `driver/fs/fatfs` |
+| Uinxed NTFS reader fragments | Apache-2.0 | `driver/fs/ntfs/PROVENANCE.md`; `SOURCE.json`; `REFERENCES.json`; retained `UINXED_LICENSE.txt` and `UINXED_NOTICE.txt` |
+| DiscUtils NTFS journal and recovery adaptations | MIT | `driver/fs/ntfs/REFERENCES.json`; retained `DISCUTILS_LICENSE.txt` and `DISCUTILS_NOTICE.txt` |
 | dr_mp3 | MIT-0 OR Unlicense | `include/dr_mp3.h` |
 | libvterm | MIT | `third_party/libvterm/LICENSE` |
 | Mbed TLS | Apache-2.0 | `third_party/mbedtls-license-selection.json` |

@@ -21,6 +21,7 @@
 #include <errno.h>
 #include <fs/vfs/vfs.h>
 #include <fs/ext4/ext4.h>
+#include <fs/ntfs/ntfs.h>
 #include <fs/fatfs/fatfs.h>
 #if defined(XJ380)
 #include <graphics/window/window.h>
@@ -685,6 +686,7 @@ void reap_quiesced_file_descriptors()
     if (already_drained) { collect_quiesced_process(target); return; }
     abandon_quiesced_block_access(target);
     ext4fs_quiescent_exit();
+    ntfsfs_quiescent_exit();
     fatfs_quiescent_exit();
     close_process_file_table(target);
     if (target->thread_queue)
@@ -884,6 +886,7 @@ static void collect_quiesced_process(pcb_t pcb)
      */
     abandon_quiesced_block_access(pcb);
     ext4fs_quiescent_exit();
+    ntfsfs_quiescent_exit();
     fatfs_quiescent_exit();
     ime_process_exit(pcb);
 #if defined(XJ380)
@@ -1099,6 +1102,7 @@ void kill_thread0(tcb_t task)
     }
     abandon_process_preparations(task);
     ext4fs_quiescent_exit();
+    ntfsfs_quiescent_exit();
     fatfs_quiescent_exit();
     process_release_wait_claims(task);
     fd_operation_thread_exit(task);
