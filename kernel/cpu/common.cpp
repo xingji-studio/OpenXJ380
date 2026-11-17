@@ -51,7 +51,7 @@ void insw(uint16_t port, void *buf, unsigned long n)
 // 从内存批量地写入数据到I/O端口（16位）
 void outsw(uint16_t port, const void *buf, unsigned long n)
 {
-    asm volatile("cld; rep; outsw" : "+S"(buf), "+c"(n) : "d"(port));
+    asm volatile("cld; rep; outsw" : "+S"(buf), "+c"(n) : "d"(port) : "memory");
 }
 
 // 从I/O端口批量地读取数据到内存（32位）

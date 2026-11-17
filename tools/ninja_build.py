@@ -234,6 +234,8 @@ def copy_common_assets(root: Path) -> None:
     (root / "system/activept.cfk").write_text("OpenXJ380 system root\n", encoding="utf-8")
     cp(ROOT / "docs/EXT4.md", root / "system/docs")
     cp(ROOT / "docs/EXT4_LICENSE_AUDIT.md", root / "system/docs")
+    cp(ROOT / "docs/IDE.md", root / "system/docs")
+    cp(ROOT / "docs/IDE_LICENSE_AUDIT.md", root / "system/docs")
     ext4_notices = root / "system/licenses/native-ext4"
     mkdir(ext4_notices)
     cp(ROOT / "LICENSE", ext4_notices / "LICENSE")
@@ -241,6 +243,11 @@ def copy_common_assets(root: Path) -> None:
     cp(ROOT / "driver/fs/ext4/SOURCE.json", ext4_notices)
     cp(ROOT / "driver/fs/ext4/REFERENCES.json", ext4_notices)
     cp(ROOT / "driver/fs/ext4/LWEXT4_BSD_NOTICE.txt", ext4_notices)
+    ide_notices = root / "system/licenses/native-ide"
+    mkdir(ide_notices)
+    cp(ROOT / "LICENSE", ide_notices / "LICENSE")
+    cp(ROOT / "driver/ide/PROVENANCE.md", ide_notices)
+    cp(ROOT / "driver/ide/SOURCE.json", ide_notices)
     ntfs_notices = root / "system/licenses/native-ntfs"
     mkdir(ntfs_notices)
     for name in ("PROVENANCE.md", "SOURCE.json", "REFERENCES.json", "UINXED_LICENSE.txt", "UINXED_NOTICE.txt",

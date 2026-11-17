@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "implementation": "first-party-native-ide",
+  "license": "Apache-2.0",
+  "new_external_implementations": [],
+  "new_link_archives": [],
+  "sources": [
+    {
+      "path": "ide.cpp",
+      "sha256": "9c4594b3641365607a33169f472580b5cf403b9a678c22b48a7e7bd55cc3ec6c",
+      "spdx": "Apache-2.0"
+    }
+  ]
+}
