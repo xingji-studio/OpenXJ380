@@ -2,6 +2,7 @@
 // Original extent-tree and indirect-pointer mutation routines. Storage field
 // facts come from the ext4 format descriptions; no upstream driver is imported.
 #include "write.h"
+#include "crc32c.h"
 #include <errno.h>
 
 namespace xjext4 {
@@ -21,12 +22,7 @@ void copy(void *p, const void *q, Size n)
 }
 uint32_t checksum(uint32_t seed, const uint8_t *bytes, Size length)
 {
-    for (Size i = 0; i < length; ++i)
-    {
-        seed ^= bytes[i];
-        for (unsigned bit = 0; bit < 8; ++bit) seed = (seed >> 1) ^ ((seed & 1) ? 0x82f63b78U : 0);
-    }
-    return seed;
+    return detail::crc32c_update(seed, bytes, length);
 }
 uint64_t extent_block(const uint8_t *p) { return get32(p + 8) | uint64_t(get16(p + 6)) << 32; }
 uint64_t index_block(const uint8_t *p) { return get32(p + 4) | uint64_t(get16(p + 8)) << 32; }

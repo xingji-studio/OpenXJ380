@@ -3,6 +3,7 @@
 // e2fsprogs, lwext4, or other filesystem implementation code is incorporated.
 // Later block-I/O design references are recorded in REFERENCES.json.
 #include "journal.h"
+#include "crc32c.h"
 #include <errno.h>
 
 namespace xjext4 {
@@ -30,12 +31,7 @@ void put16(uint8_t *bytes, uint16_t value)
 
 uint32_t crc32c(uint32_t value, const uint8_t *bytes, uint32_t length)
 {
-    for (uint32_t i = 0; i < length; ++i)
-    {
-        value ^= bytes[i];
-        for (unsigned bit = 0; bit < 8; ++bit) value = (value >> 1) ^ ((value & 1) ? 0x82f63b78U : 0);
-    }
-    return value;
+    return detail::crc32c_update(value, bytes, length);
 }
 
 uint32_t bucket(uint64_t block)

@@ -16,13 +16,18 @@
       "spdx": "Apache-2.0"
     },
     {
+      "path": "crc32c.h",
+      "sha256": "8ba6e63b078d023e64fc7c2572412c0924baa24b1f5a8ede1e3d46049d2a59b7",
+      "spdx": "Apache-2.0"
+    },
+    {
       "path": "directory_hash.cpp",
       "sha256": "7f27cd159c5f37defbb0ab19b17937c34d2ef289fa79a0ca825f3983f7106bc0",
       "spdx": "Apache-2.0"
     },
     {
       "path": "directory_index.cpp",
-      "sha256": "7fb03722d327d54e451c70a68f38588bc08af7cf845db02e37d4a12ca20e61ad",
+      "sha256": "f1d58052e88396ec0c3cfbe03d84bb689bbc9ae82f876c8a642582e26f01a712",
       "spdx": "Apache-2.0"
     },
     {
@@ -37,7 +42,7 @@
     },
     {
       "path": "format.cpp",
-      "sha256": "a28b9f6bc5f85c4fe4fcd2990652b46b9d7b8a26bbe66f1aac9a70d6ca6c0ce6",
+      "sha256": "fa10651aae1d8915d03b50ced945b5db0c0d0c33f7a00de1356091389ee64303",
       "spdx": "Apache-2.0"
     },
     {
@@ -52,7 +57,7 @@
     },
     {
       "path": "journal.cpp",
-      "sha256": "0dc6984a2b88ee550ab3764c656d2a0c38037e4cee40aa6d79d442fc42e3db9d",
+      "sha256": "899e4cd45af5060407db9094ec65de0c95efa081b2db96dd83ecba6816d49c6a",
       "spdx": "Apache-2.0"
     },
     {
@@ -62,7 +67,7 @@
     },
     {
       "path": "mapping.cpp",
-      "sha256": "725f584caafcd77971f715ac9069763a49700438abf5db186d1a919e57de272a",
+      "sha256": "f7b70e5911af963ba2cba7e6abbd5cb8d1d4a9870421b2d76e84833537f8e10c",
       "spdx": "Apache-2.0"
     },
     {
@@ -72,7 +77,7 @@
     },
     {
       "path": "native.cpp",
-      "sha256": "c0a1e3b3aad20989a09fdbac21c101fa8e60e406ff5fa87e939739dffcc17ce6",
+      "sha256": "00597b148a6587757485c94495e3206e845d7a1513f47f510cb64e0d54a633a8",
       "spdx": "Apache-2.0"
     },
     {
@@ -87,7 +92,7 @@
     },
     {
       "path": "write.cpp",
-      "sha256": "0a77edc8e52128d80e0d28092b220612a6a67fdcf922ef5ac52b064f13daa021",
+      "sha256": "39110a24fcda6ff85ebdc70e448493e31c1bbc55aca7fd8f8644fef165b9ce14",
       "spdx": "Apache-2.0"
     },
     {
@@ -97,7 +102,7 @@
     },
     {
       "path": "xattr.cpp",
-      "sha256": "41c2ba6c3e9366873d931a123a6f86a8480ba15ce81f411685c42bfa0e85c2c4",
+      "sha256": "d13bf26decc6082bdf3c7e7153b3cf98ef6bd0b359a31c0de2a25d0fe7a0906f",
       "spdx": "Apache-2.0"
     }
   ]

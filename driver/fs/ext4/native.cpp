@@ -3,6 +3,7 @@
 // https://www.kernel.org/doc/html/latest/filesystems/ext4/
 // No implementation code from Linux, lwext4, or another filesystem is used.
 #include "native.h"
+#include "crc32c.h"
 #include <errno.h>
 
 namespace xjext4 {
@@ -55,16 +56,9 @@ bool power_of_two(uint32_t value)
 }
 
 // Reflected Castagnoli CRC, without a final complement, as stored by ext4.
-// A bitwise implementation keeps this small and independent of host runtimes.
 uint32_t crc32c(uint32_t crc, const uint8_t *data, Size length)
 {
-    for (Size i = 0; i < length; ++i)
-    {
-        crc ^= data[i];
-        for (unsigned bit = 0; bit < 8; ++bit)
-            crc = (crc >> 1) ^ ((crc & 1) ? 0x82f63b78U : 0);
-    }
-    return crc;
+    return detail::crc32c_update(crc, data, length);
 }
 
 uint16_t crc16(uint16_t crc, const uint8_t *data, Size length)

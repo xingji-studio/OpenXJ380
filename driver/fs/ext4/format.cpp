@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Original implementation from public ext4 on-disk facts, without imports.
 #include "format.h"
+#include "crc32c.h"
 #include <errno.h>
 
 namespace xjext4 {
@@ -32,14 +33,7 @@ void be32(uint8_t *bytes, uint32_t value)
 }
 uint32_t crc(uint32_t state, const void *input, Size count)
 {
-    const auto *bytes = static_cast<const uint8_t *>(input);
-    for (Size i = 0; i < count; ++i)
-    {
-        state ^= bytes[i];
-        for (unsigned bit = 0; bit < 8; ++bit)
-            state = (state >> 1) ^ ((0U - (state & 1U)) & 0x82f63b78U);
-    }
-    return state;
+    return detail::crc32c_update(state, static_cast<const uint8_t *>(input), count);
 }
 
 bool power(uint32_t value, uint32_t base)

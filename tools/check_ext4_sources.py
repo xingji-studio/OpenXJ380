@@ -25,7 +25,8 @@ UNREVIEWED_INPUT_EXTENSIONS = {
     ".cc", ".cxx", ".hh", ".hpp", ".inc", ".S", ".s", ".asm", ".rs", ".C",
 }
 NATIVE_SOURCES = {"native.cpp", "native.h"}
-NATIVE_INCLUDES = {"native.h", "stdint.h", "errno.h"}
+NATIVE_INCLUDE_SOURCES = NATIVE_SOURCES | {"crc32c.h"}
+NATIVE_INCLUDES = {"native.h", "crc32c.h", "stdint.h", "errno.h"}
 EXCLUDED_UPSTREAM_NAMES = {"ext4_extent.c", "ext4_extents.c", "ext4_xattr.c"}
 MANIFEST_KEYS = {
     "schema_version", "implementation", "license", "sources",
@@ -186,7 +187,7 @@ def audit(root: Path) -> list[str]:
         identifiers = [value.removesuffix("*/").strip() for value in SPDX.findall(source)]
         require(identifiers == ["Apache-2.0"], f"{name}: expected one Apache-2.0 SPDX source notice")
         require(not COPYLEFT_HEADER.search(source[:8192]), f"{name}: copyleft notice in source header")
-        if name in NATIVE_SOURCES:
+        if name in NATIVE_INCLUDE_SOURCES:
             check_native_includes(name, source)
     return sorted(actual)
 

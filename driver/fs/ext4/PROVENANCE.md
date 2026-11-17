@@ -35,6 +35,12 @@ files are recorded in the same source inventory. All bit extraction,
 CRC32C/CRC16, extent traversal, legacy indirect mapping, directory hashing and
 directory parsing/index updates were implemented here without an external
 algorithm implementation dependency.
+`crc32c.h` generates an immutable byte-transition table at compile time from
+the existing reflected Castagnoli polynomial. Read, mutation, formatter and
+JBD2 checksums retain their caller-provided seed, chained updates and lack of
+a final complement. No validation, journal write or flush is omitted. This
+first-party arithmetic optimization imports no implementation or dependency.
+
 Host mke2fs/debugfs/e2fsck programs run as independent verification processes;
 their implementations are neither linked into nor copied into this driver.
 

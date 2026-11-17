@@ -2,6 +2,7 @@
 // Original xattr codec and journaled mutations. Only on-disk format facts are
 // used: https://www.kernel.org/doc/html/latest/filesystems/ext4/attributes.html
 #include "write.h"
+#include "crc32c.h"
 #include <errno.h>
 
 namespace xjext4 {
@@ -43,12 +44,7 @@ bool equal(const void *first, const void *second, Size bytes)
 
 uint32_t checksum(uint32_t seed, const uint8_t *bytes, Size length)
 {
-    for (Size i = 0; i < length; ++i)
-    {
-        seed ^= bytes[i];
-        for (unsigned bit = 0; bit < 8; ++bit) seed = (seed >> 1) ^ ((seed & 1) ? 0x82f63b78U : 0);
-    }
-    return seed;
+    return detail::crc32c_update(seed, bytes, length);
 }
 
 uint32_t rounded(uint32_t bytes) { return (bytes + 3U) & ~3U; }

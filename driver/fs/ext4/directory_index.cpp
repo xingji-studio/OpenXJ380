@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Original transactional htree implementation using public storage-format facts.
 #include "write.h"
+#include "crc32c.h"
 #include <errno.h>
 
 namespace xjext4 {
@@ -43,12 +44,7 @@ void copy(void *output, const void *input, DirectorySize bytes)
 
 uint32_t crc(uint32_t seed, const uint8_t *bytes, DirectorySize length)
 {
-    for (DirectorySize i = 0; i < length; ++i)
-    {
-        seed ^= bytes[i];
-        for (unsigned bit = 0; bit < 8; ++bit) seed = (seed >> 1) ^ ((seed & 1) ? 0x82f63b78U : 0);
-    }
-    return seed;
+    return detail::crc32c_update(seed, bytes, length);
 }
 
 uint32_t leaf_limit(const DirectoryIndexIO &io)
