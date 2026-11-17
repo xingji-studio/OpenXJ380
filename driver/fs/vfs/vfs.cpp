@@ -25,6 +25,7 @@
 #include <device.h>
 #include <task/poll.h>
 #include <rng.h>
+#include <mutex.h>
 
 // Optional filesystem properties stay outside vfs_callback's module ABI.
 static bool fs_readonly[256];
@@ -753,9 +754,51 @@ static int finish_creation(vfs_node_t node, int status)
     return -error;
 }
 
+// Keep same-name creators behind the complete reserve/callback/publication
+// transaction. A pending hidden node is not a stable EBUSY result for mkdir.
+// Stripes avoid vnode ABI changes and allow unrelated paths to keep progressing.
+struct VfsCreationSlot
+{
+    mutex_t lock = {SPIN_INIT, MUTEX_UNLOCKED, NULL, NULL, 0, true};
+};
+
+static VfsCreationSlot vfs_creation_slots[64];
+
+class VfsCreationGuard
+{
+    mutex_t *lock = NULL;
+    int status = 0;
+
+public:
+    VfsCreationGuard(vfs_node_t parent, const char *name)
+    {
+        // Early boot has no current TCB and no concurrent namespace callers.
+        if (!get_current_task()) return;
+        uint64_t hash = (uint64_t)parent >> 4;
+        for (const unsigned char *p = (const unsigned char *)name; *p; ++p)
+            hash = (hash ^ *p) * 1099511628211ULL;
+        lock = &vfs_creation_slots[hash % 64].lock;
+        status = mutex_lock(lock);
+        if (status) lock = NULL;
+    }
+
+    ~VfsCreationGuard()
+    {
+        if (lock) mutex_unlock(lock);
+    }
+
+    int error() const { return status; }
+};
+
 static int create_child(vfs_node_t parent, const char *name, uint16_t type, vfs_mk_t callback,
                         bool explicit_mode, uint16_t mode, uint32_t uid, uint32_t gid, vfs_node_t *created)
 {
+    VfsCreationGuard creation(parent, name);
+    if (creation.error())
+    {
+        permissions_set_file_error(-creation.error());
+        return creation.error();
+    }
     vfs_node_t node = reserve_creation(parent, name, type, explicit_mode, mode, uid, gid);
     if (!node) return -vfs_last_error();
     permissions_clear_file_error();
@@ -881,6 +924,55 @@ errno_t vfs_mkdir(const char *name)
 errno_t vfs_mkdir_mode(const char *name, uint16_t mode, uint32_t uid, uint32_t gid)
 {
     return mkdir_with_metadata(name, true, mode, uid, gid);
+}
+
+errno_t vfs_mkdir_leaf_mode(const char *name, uint16_t mode, uint32_t uid, uint32_t gid)
+{
+    permissions_clear_file_error();
+    ReadonlyTraversalGuard traversal;
+    if (!traversal.ready()) { permissions_set_file_error(EBUSY); return VFS_STATUS_FAILED; }
+    if (!name || name[0] != '/') { permissions_set_file_error(EINVAL); return VFS_STATUS_FAILED; }
+    char *path = strdup(name);
+    if (!path) { permissions_set_file_error(ENOMEM); return VFS_STATUS_FAILED; }
+    size_t length = strlen(path);
+    while (length > 1 && path[length - 1] == '/') path[--length] = '\0';
+
+    // Check the entry itself, including dangling links, before asking for
+    // write permission. Existing directories are EEXIST, not successful mkdir.
+    vfs_node_t existing = vfs_open_no_follow(path);
+    if (existing)
+    {
+        vfs_close(existing);
+        free(path);
+        permissions_set_file_error(EEXIST);
+        return VFS_STATUS_FAILED;
+    }
+    char *parent_path = strdup(path);
+    if (!parent_path) { free(path); permissions_set_file_error(ENOMEM); return VFS_STATUS_FAILED; }
+    char *separator = strrchr(parent_path, '/');
+    const char *leaf = strrchr(path, '/') + 1;
+    if (separator == parent_path) parent_path[1] = '\0';
+    else *separator = '\0';
+
+    // A retained parent prevents cache retirement during the callback. Never
+    // create an intermediate directory on behalf of Linux's recursive libc
+    // helper: another worker may be creating that parent concurrently.
+    vfs_node_t parent = vfs_open(parent_path);
+    int error = parent ? 0 : permissions_file_error();
+    if (!parent && !error) error = ENOENT;
+    if (!error && !(parent->type & file_dir)) error = ENOTDIR;
+    if (!error && (!*leaf || streq(leaf, ".") || streq(leaf, ".."))) error = EEXIST;
+    if (!error && !check_child_creation(parent, leaf)) error = vfs_last_error();
+    if (!error)
+    {
+        int result = create_child(parent, leaf, file_dir, callbackof(parent, mkdir), true, mode, uid, gid, NULL);
+        if (result) error = -result;
+    }
+    if (parent) vfs_close(parent);
+    free(parent_path);
+    free(path);
+    permissions_set_file_error(error);
+    return error ? VFS_STATUS_FAILED : EOK;
 }
 
 errno_t vfs_link(const char *name, const char *target_name) {

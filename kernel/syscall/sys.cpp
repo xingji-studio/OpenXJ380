@@ -3385,7 +3385,10 @@ sys_(mkdir, char *name, uint64_t mode)
     }
     pcb_t process = get_current_task()->parent_group;
     uint16_t create_mode = (uint16_t)(mode & 07777 & ~(process ? process->umask : 0));
-    size_t ret = vfs_mkdir_mode(npath, create_mode, current_uid(), current_gid()) != 0 ?
+    errno_t created = process && process->linux_abi ?
+                      vfs_mkdir_leaf_mode(npath, create_mode, current_uid(), current_gid()) :
+                      vfs_mkdir_mode(npath, create_mode, current_uid(), current_gid());
+    size_t ret = created != 0 ?
                  SYSCALL_FAULT_(vfs_last_error()) : 0;
     if (ret == 0)
     {
@@ -4151,7 +4154,6 @@ sys_(openat)
 
 sys_(mkdirat, int dirfd, char *pathname, uint64_t mode)
 {
-    (void)mode;
     if (pathname == NULL) return SYSCALL_FAULT_(EINVAL);
 
     char *resolved = NULL;
@@ -4164,7 +4166,10 @@ sys_(mkdirat, int dirfd, char *pathname, uint64_t mode)
         return SYSCALL_FAULT_(EEXIST);
     }
 
-    errno_t ret = vfs_mkdir(resolved);
+    pcb_t process = get_current_task()->parent_group;
+    uint16_t create_mode = (uint16_t)(mode & 07777 & ~(process ? process->umask : 0));
+    errno_t ret = process && process->linux_abi ?
+                  vfs_mkdir_leaf_mode(resolved, create_mode, current_uid(), current_gid()) : vfs_mkdir(resolved);
     free(resolved);
     return ret == VFS_STATUS_SUCCESS ? 0 : SYSCALL_FAULT_(vfs_last_error());
 }
