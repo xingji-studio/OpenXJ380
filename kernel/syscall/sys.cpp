@@ -23,6 +23,8 @@
 #include <tty.h>
 #include <task/ipc.h>
 #include <task/futex.h>
+#include <task/eventfd.h>
+#include <task/inotify.h>
 #include <smp/smp.h>
 #include <mutex.h>
 #include <math.hpp>
@@ -331,9 +333,11 @@ static int resolve_user_path_at(int dirfd, char *pathname, char **resolved)
 static int64_t write_from_user_buffer(fd_file_handle *handle, const uint8_t *buffer, size_t size, bool socket_mode,
                                       size_t explicit_offset = 0, bool positioned = false)
 {
-    if (handle && eventfd_is_node(handle->node)) return eventfd_write_user(handle, buffer, size);
-    if (handle == NULL || buffer == NULL) return -EINVAL;
+    if (handle == NULL) return -EBADF;
+    if (eventfd_is_node(handle->node)) return eventfd_write_user(handle, buffer, size);
+    if (inotify_is_node(handle->node)) return -EBADF;
     if (size == 0) return 0;
+    if (buffer == NULL) return -EFAULT;
 
     pcb_t process = get_current_task()->parent_group;
     size_t bounce_bytes = MIN(size, USER_IO_BOUNCE_BYTES);
@@ -859,8 +863,7 @@ sys_(write, int fd, uint8_t *buffer, size_t size)
     {
         // write_serial_fmt("[busybox-debug] sys_write fd=%d size=%llu\n", fd, (unsigned long long)size);
     }
-    if (unlikely(fd < 0 || buffer == NULL)) return SYSCALL_FAULT_(EINVAL);
-    if (unlikely(size == 0)) return 0;
+    if (unlikely(fd < 0)) return SYSCALL_FAULT_(EBADF);
     // Readline writes prompts and individual key echoes to stderr. Mirroring
     // every write can wait for UART queue space before the PTY receives it.
     // Keep this diagnostic copy scoped to the traced package-manager tasks.
@@ -891,6 +894,7 @@ sys_(write, int fd, uint8_t *buffer, size_t size)
 static uint64_t read_from_handle(fd_file_handle *handle, uint8_t *buffer, size_t size)
 {
     if (eventfd_is_node(handle->node)) return eventfd_read_user(handle, buffer, size);
+    if (inotify_is_node(handle->node)) return inotify_read_user(handle, buffer, size);
     if (handle->node->type & file_socket)
     {
         int64_t ret = read_to_user_buffer(handle, buffer, size, true, 0, false);
@@ -955,10 +959,18 @@ sys_(read, int fd, uint8_t *buffer, size_t size)
     return read_from_handle(handle, buffer, size);
 }
 
+static bool socket_address_length_valid(const struct sockaddr *address, socklen_t length)
+{
+    // sockaddr_nl is 12 bytes, shorter than the generic Internet sockaddr.
+    // Inspect the family only after the address has been copied from userspace.
+    size_t minimum = address->sa_family == AF_NETLINK ? sizeof(struct sockaddr_nl) : sizeof(struct sockaddr);
+    return length >= minimum && length <= sizeof(struct sockaddr_in6);
+}
+
 sys_(sendto, int fd, const void *buffer, size_t size, uint64_t flags, const struct sockaddr *addr, socklen_t addrlen)
 {
     if (fd < 0 || (buffer == NULL && size > 0)) return SYSCALL_FAULT_(EINVAL);
-    if (addr != NULL && (addrlen < sizeof(struct sockaddr) || addrlen > sizeof(struct sockaddr_in6)))
+    if (addr != NULL && (addrlen < sizeof(struct sockaddr_nl) || addrlen > sizeof(struct sockaddr_in6)))
         return SYSCALL_FAULT_(EINVAL);
 
     page_directory_t *pagedir = current_user_pagedir();
@@ -971,6 +983,7 @@ sys_(sendto, int fd, const void *buffer, size_t size, uint64_t flags, const stru
         memset(&kaddr, 0, sizeof(kaddr));
         if (!copy_from_user_pagedir(pagedir, &kaddr, addr, addrlen)) return SYSCALL_FAULT_(EFAULT);
         kaddr_ptr = (const struct sockaddr *)&kaddr;
+        if (!socket_address_length_valid(kaddr_ptr, addrlen)) return SYSCALL_FAULT_(EINVAL);
     }
 
     if (size == 0) return 0;
@@ -1064,7 +1077,7 @@ sys_(sendmsg, int fd, const struct msghdr *msg, uint64_t flags)
     if (kmsg.msg_iovlen > USER_IOV_MAX) return SYSCALL_FAULT_(EINVAL);
     if (kmsg.msg_iovlen > 0 && kmsg.msg_iov == NULL) return SYSCALL_FAULT_(EINVAL);
     if (kmsg.msg_name != NULL &&
-        (kmsg.msg_namelen < sizeof(struct sockaddr) || kmsg.msg_namelen > sizeof(struct sockaddr_in6)))
+        (kmsg.msg_namelen < sizeof(struct sockaddr_nl) || kmsg.msg_namelen > sizeof(struct sockaddr_in6)))
         return SYSCALL_FAULT_(EINVAL);
 
     struct sockaddr_in6 kaddr;
@@ -1075,6 +1088,7 @@ sys_(sendmsg, int fd, const struct msghdr *msg, uint64_t flags)
         if (!copy_from_user_pagedir(pagedir, &kaddr, kmsg.msg_name, kmsg.msg_namelen))
             return SYSCALL_FAULT_(EFAULT);
         kaddr_ptr = (const struct sockaddr *)&kaddr;
+        if (!socket_address_length_valid(kaddr_ptr, kmsg.msg_namelen)) return SYSCALL_FAULT_(EINVAL);
     }
 
     size_t iov_bytes = 0;
@@ -1281,9 +1295,16 @@ sys_(setsockopt, int fd, int level, int optname, const void *optval, socklen_t o
     if (optlen > 4096) return SYSCALL_FAULT_(EINVAL);
     if (optlen != 0 && !user_range_mapped(current_user_pagedir(), optval, optlen)) return SYSCALL_FAULT_(EFAULT);
 
-    (void)level;
-    (void)optname;
-    return 0;
+    // Preserve the existing compatibility behavior for other options. In
+    // particular, glibc DNS uses advisory options absent from this provider.
+    if (level != SOL_SOCKET || optname != SO_REUSEADDR) return 0;
+    if (optlen < sizeof(int)) return SYSCALL_FAULT_(EINVAL);
+    // The implemented option receives a kernel copy, never a user pointer.
+    int value = 0;
+    if (!copy_from_user_pagedir(current_user_pagedir(), &value, optval, sizeof(value)))
+        return SYSCALL_FAULT_(EFAULT);
+    int result = socket_setsockopt(fd, level, optname, &value, sizeof(value));
+    return result < 0 ? SYSCALL_FAULT_(-result) : 0;
 }
 
 sys_(getsockopt, int fd, int level, int optname, void *optval, socklen_t *optlen)
@@ -1487,11 +1508,10 @@ sys_(socket, int domain, int type, int protocol)
 sys_(socketpair, int domain, int type, int protocol, int *sv)
 {
     if (sv == NULL) return SYSCALL_FAULT_(EFAULT);
-    int sock_type = type & SOCK_TYPE_MASK;
     if (domain == AF_UNIX || domain == AF_LOCAL)
     {
         int fds[2] = {-1, -1};
-        int ret = unix_socketpair(sock_type, protocol, fds);
+        int ret = unix_socketpair(type, protocol, fds);
         if (ret < 0) return SYSCALL_FAULT_(-ret);
         page_directory_t *pagedir = current_user_pagedir();
         if (!copy_to_user_pagedir(pagedir, sv, fds, sizeof(fds))) return SYSCALL_FAULT_(EFAULT);
@@ -1529,6 +1549,56 @@ sys_(accept, int fd, struct sockaddr *addr, socklen_t *addrlen)
     if (addrlen != NULL && !copy_to_user_pagedir(current_user_pagedir(), addrlen, &kaddrlen, sizeof(kaddrlen)))
         return SYSCALL_FAULT_(EFAULT);
     return ret;
+}
+
+sys_(accept4, int fd, struct sockaddr *addr, socklen_t *addrlen, int flags)
+{
+    if (flags & ~(SOCK_NONBLOCK | SOCK_CLOEXEC)) return SYSCALL_FAULT_(EINVAL);
+    socklen_t length = sizeof(struct sockaddr_in6);
+    if (addr && !addrlen) return SYSCALL_FAULT_(EFAULT);
+    if (addrlen && !copy_from_user_pagedir(current_user_pagedir(), &length, addrlen, sizeof(length)))
+        return SYSCALL_FAULT_(EFAULT);
+    if (length > sizeof(struct sockaddr_in6)) length = sizeof(struct sockaddr_in6);
+    size_t capacity = length;
+    struct sockaddr_in6 address = {};
+    int result = socket_accept4(fd, addr ? (struct sockaddr *)&address : NULL, addr ? &length : NULL, flags);
+    if (result < 0) return SYSCALL_FAULT_(-result);
+    if (addr)
+    {
+        FdOperation accepted;
+        int error = accepted.acquire(result);
+        if (error) return SYSCALL_FAULT_(-error);
+        if (!copy_to_user_pagedir(current_user_pagedir(), addr, &address, MIN(capacity, MIN(length, sizeof(address)))) ||
+            !copy_to_user_pagedir(current_user_pagedir(), addrlen, &length, sizeof(length)))
+        {
+            fd_file_handle *retired = fd_detach_descriptor_if(get_current_task()->parent_group, result, accepted.get());
+            if (retired) fd_retire_handle(retired);
+            return SYSCALL_FAULT_(EFAULT);
+        }
+    }
+    return result;
+}
+
+static bool scheduler_query_is_current(int pid)
+{
+    tcb_t task = get_current_task();
+    return task && (pid == 0 || pid == (int)task->tid || pid == (int)task->parent_group->pid);
+}
+
+sys_(sched_getparam, int pid, int *priority)
+{
+    if (pid < 0) return SYSCALL_FAULT_(EINVAL);
+    if (!scheduler_query_is_current(pid)) return SYSCALL_FAULT_(ESRCH);
+    int normal_priority = 0;
+    if (!copy_to_user_pagedir(current_user_pagedir(), priority, &normal_priority, sizeof(normal_priority)))
+        return SYSCALL_FAULT_(EFAULT);
+    return 0;
+}
+
+sys_(sched_getscheduler, int pid)
+{
+    if (pid < 0) return SYSCALL_FAULT_(EINVAL);
+    return scheduler_query_is_current(pid) ? 0 : SYSCALL_FAULT_(ESRCH); // SCHED_OTHER.
 }
 
 
@@ -1791,19 +1861,19 @@ sys_(ioctl, int fd, int options, void *arg2)
 
 sys_(writev, int fd, struct iovec *iov, int iovcnt)
 {
-    if (unlikely(fd < 0 || iov == NULL)) return SYSCALL_FAULT_(EINVAL);
+    if (unlikely(fd < 0)) return SYSCALL_FAULT_(EBADF);
     if (unlikely(iovcnt < 0 || (size_t)iovcnt > USER_IOV_MAX)) return SYSCALL_FAULT_(EINVAL);
-    if (iovcnt == 0) return 0;
-    size_t iov_bytes = 0;
-    if (!checked_mul_size((size_t)iovcnt, sizeof(struct iovec), &iov_bytes) ||
-        !user_range_mapped(current_user_pagedir(), iov, iov_bytes))
-    {
-        return SYSCALL_FAULT_(EFAULT);
-    }
     page_directory_t *pagedir = get_current_task()->parent_group->pagedir;
     FdOperation operation;
     int operation_error = operation.acquire(fd);
     if (operation_error) return SYSCALL_FAULT_(-operation_error);
+    if (iovcnt == 0) return 0;
+    size_t iov_bytes = 0;
+    if (iov == NULL || !checked_mul_size((size_t)iovcnt, sizeof(struct iovec), &iov_bytes) ||
+        !user_range_mapped(current_user_pagedir(), iov, iov_bytes))
+    {
+        return SYSCALL_FAULT_(EFAULT);
+    }
     FdPositionScope position;
     operation_error = position.acquire(operation);
     if (operation_error) return SYSCALL_FAULT_(-operation_error);
@@ -1932,12 +2002,20 @@ static uint64_t find_user_mmap_range(pcb_t process, uint64_t hint, uint64_t leng
 {
     if (process == NULL || length == 0) return 0;
 
-    uint64_t start_addr = hint >= USER_MMAP_START ? (hint & PAGE_MASK) : USER_MMAP_START;
+    uint64_t start_addr = hint >= PAGE_SIZE ? (hint & PAGE_MASK) : USER_MMAP_START;
     if (start_addr >= USER_BRK_START || length > USER_BRK_START - start_addr) return 0;
 
     uint64_t limit = USER_BRK_START - length;
     while (start_addr <= limit)
     {
+        // ELF segments are also VMAs. Skip an occupied interval as a whole;
+        // V8 asks for a large code reservation near its executable image.
+        vma_t *overlap = vma_find_intersection(&process->vma_manager, start_addr, start_addr + length);
+        if (overlap)
+        {
+            if (!align_up_u64(overlap->vm_end, PAGE_SIZE, &start_addr)) return 0;
+            continue;
+        }
         if (user_range_available(process, start_addr, length)) return start_addr;
         if (start_addr > limit - PAGE_SIZE) return 0;
         start_addr += PAGE_SIZE;
@@ -2151,12 +2229,11 @@ uint64_t sys_brk(uint64_t brk) {
 sys_(mmap, uint64_t addr, size_t length, uint64_t prot, uint64_t flags, int fd,
          uint64_t offset) {
 
+    if ((flags & MAP_FIXED) && (addr & (PAGE_SIZE - 1))) return SYSCALL_FAULT_(EINVAL);
     addr = addr & (~(PAGE_SIZE - 1));
 
     uint64_t aligned_len = 0;
     if (!align_up_u64(length, PAGE_SIZE, &aligned_len)) { return SYSCALL_FAULT_(EINVAL); }
-
-    if (check_user_overflow(addr, aligned_len)) { return -EFAULT; }
 
     if (aligned_len == 0) { return SYSCALL_FAULT_(EINVAL); }
     pcb_t process = get_current_task()->parent_group;
@@ -2172,8 +2249,10 @@ sys_(mmap, uint64_t addr, size_t length, uint64_t prot, uint64_t flags, int fd,
         if (check_user_overflow(start_addr, aligned_len)) return SYSCALL_FAULT_(EINVAL);
         end_addr = start_addr + aligned_len;
     } else if (addr) {
-        if (addr < USER_MMAP_START || addr >= USER_BRK_START || aligned_len > USER_BRK_START - addr)
-            return SYSCALL_FAULT_(ENOMEM);
+        // A non-fixed address is a placement hint, not a mandatory range.
+        // Low executable-adjacent hints are valid; unusable hints fall back.
+        if (addr >= USER_BRK_START || aligned_len > USER_BRK_START - addr ||
+            check_user_overflow(addr, aligned_len)) addr = 0;
     }
 
     FdOperation mapping_descriptor;
@@ -2194,20 +2273,12 @@ sys_(mmap, uint64_t addr, size_t length, uint64_t prot, uint64_t flags, int fd,
         if (process->mmap_start < USER_MMAP_START || process->mmap_start >= USER_BRK_START)
             process->mmap_start = USER_MMAP_START;
         uint64_t search_start = addr ? addr : process->mmap_start;
-        if (addr) {
-            start_addr = addr;
-            if (!user_range_available(process, start_addr, aligned_len)) {
-                mm_op_lock_release();
-                return SYSCALL_FAULT_(ENOMEM);
-            }
-        } else {
-            start_addr = find_user_mmap_range(process, search_start, aligned_len);
-            if (!start_addr && search_start != USER_MMAP_START)
-                start_addr = find_user_mmap_range(process, USER_MMAP_START, aligned_len);
-            if (!start_addr) {
-                mm_op_lock_release();
-                return SYSCALL_FAULT_(ENOMEM);
-            }
+        start_addr = find_user_mmap_range(process, search_start, aligned_len);
+        if (!start_addr && search_start != USER_MMAP_START)
+            start_addr = find_user_mmap_range(process, USER_MMAP_START, aligned_len);
+        if (!start_addr) {
+            mm_op_lock_release();
+            return SYSCALL_FAULT_(ENOMEM);
         }
         end_addr = start_addr + aligned_len;
     }
@@ -2269,7 +2340,9 @@ sys_(mmap, uint64_t addr, size_t length, uint64_t prot, uint64_t flags, int fd,
 
     uint64_t pt_flags = prot_to_pte_flags(prot);
 
-    if (!lazy_infoalloc(process, start_addr, aligned_len, pt_flags, flags)) {
+    // MAP_FIXED replacement was already removed above. Keep anonymous
+    // reservations lazy, including PROT_NONE code/guard reservations.
+    if (!lazy_infoalloc(process, start_addr, aligned_len, pt_flags, flags & ~MAP_FIXED)) {
         vma_unmap_range(mgr, start_addr, end_addr);
         mm_op_lock_release();
         return SYSCALL_FAULT_(ENOMEM);
@@ -2702,6 +2775,8 @@ static epoll_file_t *epoll_from_handle(fd_file_handle *handle)
     return (epoll_file_t *)handle->node->handle;
 }
 
+
+
 static int epoll_poll_fd(int fd, uint32_t events, uint32_t *revents)
 {
     if (revents == NULL) return -EINVAL;
@@ -2812,6 +2887,41 @@ sys_(epoll_create, int size)
 {
     if (size <= 0) return SYSCALL_FAULT_(EINVAL);
     return epoll_create_common(0);
+}
+
+sys_(inotify_init)
+{
+    return inotify_create(0);
+}
+
+sys_(inotify_init1, int flags)
+{
+    return inotify_create(flags);
+}
+
+sys_(inotify_add_watch, int fd, char *pathname, uint32_t mask)
+{
+    FdOperation operation;
+    int error = operation.acquire(fd);
+    if (error) return SYSCALL_FAULT_(-error);
+    if (!inotify_is_node(operation.get()->node)) return SYSCALL_FAULT_(EINVAL);
+    char *path = NULL;
+    error = resolve_user_path_at(AT_FDCWD, pathname, &path);
+    if (error) return SYSCALL_FAULT_(-error);
+    vfs_node_t node = mask & IN_DONT_FOLLOW ? vfs_open_no_follow(path) : vfs_open(path);
+    free(path);
+    if (!node) return SYSCALL_FAULT_(vfs_last_error());
+    int result = inotify_add(operation.get(), node, mask);
+    vfs_close(node);
+    return result;
+}
+
+sys_(inotify_rm_watch, int fd, int wd)
+{
+    FdOperation operation;
+    int error = operation.acquire(fd);
+    if (error) return SYSCALL_FAULT_(-error);
+    return inotify_remove(operation.get(), wd);
 }
 
 sys_(eventfd, uint32_t initial)
@@ -3410,10 +3520,11 @@ sys_(mkdir, char *name, uint64_t mode)
 sys_(bind, int fd, const struct sockaddr *addr, socklen_t addrlen)
 {
     if (addr == NULL) return SYSCALL_FAULT_(EINVAL);
-    if (addrlen < sizeof(struct sockaddr) || addrlen > sizeof(struct sockaddr_in6)) return SYSCALL_FAULT_(EINVAL);
+    if (addrlen < sizeof(struct sockaddr_nl) || addrlen > sizeof(struct sockaddr_in6)) return SYSCALL_FAULT_(EINVAL);
     struct sockaddr_in6 kaddr;
     memset(&kaddr, 0, sizeof(kaddr));
     if (!copy_from_user_pagedir(current_user_pagedir(), &kaddr, addr, addrlen)) return SYSCALL_FAULT_(EFAULT);
+    if (!socket_address_length_valid((const struct sockaddr *)&kaddr, addrlen)) return SYSCALL_FAULT_(EINVAL);
     int ret = socket_bind(fd, (const struct sockaddr *)&kaddr, addrlen);
     if (ret < 0) return SYSCALL_FAULT_(-ret);
     return ret;
@@ -3868,20 +3979,52 @@ sys_(newfstatat, int dirfd, char *pathname, struct stat *buf, uint64_t flags)
 
 sys_(statx, int dirfd, char *pathname, uint64_t flags, uint64_t mask, struct statx *buff)
 {
-    if (pathname == NULL || buff == NULL) return SYSCALL_FAULT_(EINVAL);
+    constexpr uint64_t no_automount = 0x800, sync_type = 0x6000;
+    if ((flags & ~(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH | no_automount | sync_type)) ||
+        (flags & sync_type) == sync_type || (mask & 0x80000000)) return SYSCALL_FAULT_(EINVAL);
+    if (buff == NULL || (pathname == NULL && !(flags & AT_EMPTY_PATH))) return SYSCALL_FAULT_(EFAULT);
 
     struct stat simple;
-    char *resolved = NULL;
-    int path_ret = resolve_user_path_at(dirfd, pathname, &resolved);
-    if (path_ret < 0) return SYSCALL_FAULT_((int)-path_ret);
+    char *path = NULL;
+    if (pathname)
+    {
+        int error = copy_string_from_user(&path, pathname, USER_PATH_MAX);
+        if (error < 0) return SYSCALL_FAULT_(-error);
+    }
+    bool empty = path == NULL || path[0] == '\0';
+    if (empty && !(flags & AT_EMPTY_PATH))
+    {
+        free(path);
+        return SYSCALL_FAULT_(ENOENT);
+    }
 
-    uint64_t ret = stat_kernel_path(resolved, &simple);
-    free(resolved);
+    uint64_t ret;
+    if (empty && dirfd != AT_FDCWD)
+    {
+        free(path);
+        FdOperation descriptor;
+        int error = descriptor.acquire(dirfd);
+        if (error) return SYSCALL_FAULT_(-error);
+        fd_file_handle *handle = descriptor.get();
+        if (!handle || !handle->node) return SYSCALL_FAULT_(EBADF);
+        // libuv implements fstat with statx(fd, "", AT_EMPTY_PATH). An open
+        // descriptor remains authoritative after unlink or rename.
+        ret = fill_stat_from_node(handle->node, &simple);
+    }
+    else
+    {
+        char *resolved = at_resolve_pathname(dirfd, path ? path : (char *)"");
+        free(path);
+        if (!resolved) return SYSCALL_FAULT_(vfs_last_error() ? vfs_last_error() : ENOENT);
+        ret = flags & AT_SYMLINK_NOFOLLOW ? lstat_kernel_path(resolved, &simple) :
+                                          stat_kernel_path(resolved, &simple);
+        free(resolved);
+    }
     if ((int64_t)ret < 0) return ret;
 
     struct statx kstatx;
     memset(&kstatx, 0, sizeof(kstatx));
-    kstatx.stx_mask            = mask;
+    kstatx.stx_mask            = 0x7ff; // STATX_BASIC_STATS; no synthetic birth time.
     kstatx.stx_blksize         = simple.st_blksize;
     kstatx.stx_attributes      = 0;
     kstatx.stx_nlink           = simple.st_nlink;
@@ -3895,9 +4038,6 @@ sys_(statx, int dirfd, char *pathname, uint64_t flags, uint64_t mask, struct sta
 
     kstatx.stx_atime.tv_sec  = (long)simple.st_atim.tv_sec;
     kstatx.stx_atime.tv_nsec = simple.st_atim.tv_nsec;
-
-    kstatx.stx_btime.tv_sec  = (long)simple.st_ctim.tv_sec;
-    kstatx.stx_btime.tv_nsec = simple.st_ctim.tv_nsec;
 
     kstatx.stx_ctime.tv_sec  = (long)simple.st_ctim.tv_sec;
     kstatx.stx_ctime.tv_nsec = simple.st_ctim.tv_nsec;
@@ -4194,6 +4334,7 @@ sys_(copy_file_range, int fd_in, uint64_t *off_in, int fd_out, uint64_t *off_out
     if (src_handle->node == NULL || dst_handle->node == NULL) return SYSCALL_FAULT_(EBADF);
     if (src_handle->node->type & (file_socket | file_pipe) || dst_handle->node->type & (file_socket | file_pipe))
         return SYSCALL_FAULT_(EINVAL);
+
 
     uint64_t src_offset = src_handle->offset;
     uint64_t dst_offset = dst_handle->offset;
@@ -5711,6 +5852,7 @@ sys_(sendfile, int out_fd, int in_fd, uint64_t *offset_ptr, size_t count)
     fd_file_handle *out_handle = destination_pin.get();
     fd_file_handle *in_handle = source_pin.get();
     if (out_handle == NULL || in_handle == NULL) return SYSCALL_FAULT_(EBADF);
+
 
     uint64_t current_offset = in_handle->offset;
     if (offset_ptr && !copy_from_user_pagedir(current_user_pagedir(), &current_offset, offset_ptr,

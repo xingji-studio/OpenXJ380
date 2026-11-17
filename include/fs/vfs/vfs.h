@@ -256,6 +256,7 @@ void vfs_child_unlock();
  */
 errno_t vfs_mkdir(const char *name);
 errno_t vfs_mkdir_mode(const char *name, uint16_t mode, uint32_t uid, uint32_t gid);
+// POSIX mkdir creates only the final component; its parent must already exist.
 errno_t vfs_mkdir_leaf_mode(const char *name, uint16_t mode, uint32_t uid, uint32_t gid);
 
 /**

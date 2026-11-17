@@ -403,6 +403,13 @@
 #define SYS_SYNC_FILE_RANGE 277
 #define SYS_UTIMENSAT 280
 #define SYS_EPOLL_PWAIT 281
+#define SYS_SCHED_GETPARAM 143
+#define SYS_SCHED_GETSCHEDULER 145
+#define SYS_ACCEPT4 288
+#define SYS_INOTIFY_INIT 253
+#define SYS_INOTIFY_ADD_WATCH 254
+#define SYS_INOTIFY_RM_WATCH 255
+#define SYS_INOTIFY_INIT1 294
 #define SYS_EVENTFD 284
 #define SYS_EVENTFD2 290
 #define SYS_EPOLL_CREATE1 291
@@ -817,3 +824,17 @@ sys_(umask, uint64_t mask);
 sys_(shutdown, int fd, int how);
 sys_(bind, int fd, const struct sockaddr *addr, socklen_t addrlen);
 sys_(listen, int fd, int backlog);
+
+// Linux filesystem event descriptors.
+sys_(inotify_init);
+sys_(inotify_init1, int flags);
+sys_(inotify_add_watch, int fd, char *pathname, uint32_t mask);
+sys_(inotify_rm_watch, int fd, int wd);
+
+// Linux anonymous event counters.
+sys_(eventfd, uint32_t initial);
+sys_(eventfd2, uint32_t initial, int flags);
+
+sys_(accept4, int fd, struct sockaddr *addr, socklen_t *addrlen, int flags);
+sys_(sched_getparam, int pid, int *priority);
+sys_(sched_getscheduler, int pid);

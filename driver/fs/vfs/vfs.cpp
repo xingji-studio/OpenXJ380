@@ -24,6 +24,7 @@
 #include <syscall/fd_lifetime.h>
 #include <device.h>
 #include <task/poll.h>
+#include <task/inotify.h>
 #include <rng.h>
 #include <mutex.h>
 
@@ -762,6 +763,7 @@ static int finish_creation(vfs_node_t node, int status)
     {
         vfs_child_lock();
         node->type &= (uint16_t)~file_delete;
+        inotify_vfs_child_locked(node->parent, node, node->name, IN_CREATE);
         vfs_child_unlock();
         return 0;
     }
@@ -1375,6 +1377,7 @@ static errno_t delete_impl(vfs_node_t node, bool *consumed)
         else parent->child = retired->next;
         if (retired->next) retired->next->prev = retired->prev;
     }
+    inotify_vfs_unlink_locked(node, parent, node->name);
     bool keep_parent = vfs_uses_unlinked_lifetime(node);
     if (keep_parent) node->type |= file_unlinked;
     else node->parent = NULL;
@@ -1538,6 +1541,7 @@ errno_t vfs_rename(vfs_node_t node, const char *nw) {
                 old_name = node->name;
                 node->name = copy;
                 copy = NULL;
+                inotify_vfs_move_locked(node, original_parent.node, old_name);
             }
             retiring_subtrees[slot] = NULL;
             vfs_child_unlock();
@@ -1570,7 +1574,11 @@ errno_t vfs_resize(vfs_node_t node, uint64_t size) {
     do_update(node);
     if (!error) error = permissions_file_error();
     if (error) { permissions_set_file_error(error); return -error; }
-    if (size != previous_size) permissions_file_changed(change);
+    if (size != previous_size)
+    {
+        permissions_file_changed(change);
+        inotify_vfs_event(node, IN_MODIFY);
+    }
     return VFS_STATUS_SUCCESS;
 }
 
@@ -1584,7 +1592,11 @@ errno_t vfs_resize_fast(vfs_node_t node, uint64_t size) {
     callbackof(node, resize)(node->handle, size);
     int error = permissions_file_error();
     if (error) return -error;
-    if (size != previous_size) permissions_file_changed(change);
+    if (size != previous_size)
+    {
+        permissions_file_changed(change);
+        inotify_vfs_event(node, IN_MODIFY);
+    }
     return VFS_STATUS_SUCCESS;
 }
 
@@ -2475,7 +2487,11 @@ size_t vfs_write(vfs_node_t file, void *addr, size_t offset, size_t size) {
     if (ret == (size_t)-1 && !error) error = EIO;
     do_update(file);
     if (error) permissions_set_file_error(error);
-    if (ret && ret <= size) permissions_file_changed(change);
+    if (ret && ret <= size)
+    {
+        permissions_file_changed(change);
+        inotify_vfs_event(file, IN_MODIFY);
+    }
     return ret;
 }
 
@@ -2486,7 +2502,11 @@ size_t vfs_write_fast(vfs_node_t file, void *addr, size_t offset, size_t size) {
     if (file->type == file_dir) return VFS_STATUS_FAILED;
     PermissionFileChange change = size ? permissions_file_change_begin(file) : PermissionFileChange{};
     size_t result = callbackof(file, write)(file->handle, addr, offset, size);
-    if (result && result <= size) permissions_file_changed(change);
+    if (result && result <= size)
+    {
+        permissions_file_changed(change);
+        inotify_vfs_event(file, IN_MODIFY);
+    }
     return result;
 }
 

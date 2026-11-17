@@ -1527,6 +1527,11 @@ static vfs_node_t procfs_private_process_node(vfs_node_t parent, const char *nam
     node->mode = mode;
     node->owner = uid;
     node->group = gid;
+    // Older Linux libc readdir skips inode zero as an unused directory slot.
+    // Give each published proc entry a stable identity before tree publication;
+    // BusyBox ps must see numeric PID directories and their stat files.
+    static uint64_t next_process_inode = 0;
+    node->inode = __atomic_add_fetch(&next_process_inode, uint64_t(1), __ATOMIC_RELAXED);
     node->fsid = procfs_id;
     node->root = procfs_root->root;
     node->dev = procfs_root->dev;

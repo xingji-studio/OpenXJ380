@@ -16,6 +16,7 @@ typedef uint32_t socklen_t;
 #define AF_LOCAL  AF_UNIX
 #define AF_INET   2
 #define AF_INET6  10
+#define AF_NETLINK 16
 
 #define SOCK_STREAM 1
 #define SOCK_DGRAM  2
@@ -72,6 +73,13 @@ struct in6_addr {
 struct sockaddr {
     sa_family_t sa_family;
     char        sa_data[14];
+};
+
+struct sockaddr_nl {
+    sa_family_t nl_family;
+    uint16_t    nl_pad;
+    uint32_t    nl_pid;
+    uint32_t    nl_groups;
 };
 
 struct sockaddr_in {
@@ -151,8 +159,12 @@ typedef struct socket_provider {
     int     (*get_netinfo)(socket_netinfo_t *out_info);
 } socket_provider_t;
 
+// Optional extension registered separately to preserve the module provider ABI.
+typedef int (*socket_setsockopt_fn)(void *socket, int level, int optname, const void *optval, socklen_t optlen);
+int     socket_provider_register_with_options(const socket_provider_t *provider, socket_setsockopt_fn setter);
 int     socket_provider_register(const socket_provider_t *provider);
 int     socketfs_setup(void);
+// Consumes a valid provider implementation on success and failure.
 int     socketfs_alloc_fd_with_provider(void *impl, uint64_t flags, const socket_provider_t *provider);
 int     socket_open(int domain, int type, int protocol);
 int     socket_bind(int fd, const struct sockaddr *addr, socklen_t addrlen);
@@ -160,8 +172,10 @@ int     socket_connect(int fd, const struct sockaddr *addr, socklen_t addrlen);
 int     socket_getsockname(int fd, struct sockaddr *addr, socklen_t *addrlen);
 int     socket_getpeername(int fd, struct sockaddr *addr, socklen_t *addrlen);
 int     socket_getsockopt(int fd, int level, int optname, void *optval, socklen_t *optlen);
+int     socket_setsockopt(int fd, int level, int optname, const void *optval, socklen_t optlen);
 int     socket_listen(int fd, int backlog);
 int     socket_accept(int fd, struct sockaddr *addr, socklen_t *addrlen);
+int     socket_accept4(int fd, struct sockaddr *addr, socklen_t *addrlen, int flags);
 int     socket_shutdown(int fd, int how);
 ssize_t socket_read(vfs_node_t node, void *buffer, size_t size);
 ssize_t socket_write(vfs_node_t node, const void *buffer, size_t size);

@@ -7,12 +7,15 @@
 #include <fs/vfs/vfs.h>
 #include <krlibc.h>
 #include <net/socket.h>
+#include <net/rtnetlink.h>
 #include <syscall/syscall.h>
+#include <syscall/fd_lifetime.h>
 #include <task/pcb.h>
 
 typedef struct socketfs_handle {
     socket_provider_t provider;
     void             *socket;
+    socket_setsockopt_fn setsockopt;
 } socketfs_handle_t;
 
 static int        socketfs_id      = 0;
@@ -22,6 +25,17 @@ static vfs_node_t socketfs_root    = NULL;
 static spin_t           g_socket_provider_lock  = SPIN_INIT;
 static socket_provider_t g_socket_provider_data = {};
 static bool              g_socket_provider_ready = false;
+static socket_setsockopt_fn g_socket_provider_setter = NULL;
+
+static socket_setsockopt_fn socketfs_snapshot_setter(const socket_provider_t *provider)
+{
+    spin_lock(&g_socket_provider_lock);
+    // Each socket keeps this extension with the provider that created it.
+    socket_setsockopt_fn setter = provider->create == g_socket_provider_data.create &&
+                                 provider->close == g_socket_provider_data.close ? g_socket_provider_setter : NULL;
+    spin_unlock(&g_socket_provider_lock);
+    return setter;
+}
 
 static inline bool socketfs_provider_valid(const socket_provider_t *provider)
 {
@@ -116,14 +130,14 @@ static void socketfs_open(void *parent, const char *name, vfs_node_t node)
         node->type = file_dir;
         return;
     }
-    node->type = file_socket;
+    node->type = (node->type & file_delete) | file_socket;
     node->size = (uint64_t)-1;
 }
 
 static errno_t socketfs_stat(void *file, vfs_node_t node)
 {
     (void)file;
-    node->type = file_socket;
+    node->type = (node->type & file_delete) | file_socket;
     node->size = (uint64_t)-1;
     node->fsid = socketfs_id;
     return EOK;
@@ -173,7 +187,10 @@ static errno_t socketfs_del(void *parent, vfs_node_t node)
     (void)parent;
     socketfs_handle_t *handle = socketfs_get_handle(node);
     if (handle != NULL) {
-        if (socketfs_provider_valid(&handle->provider)) {
+        // Local Unix transports intentionally omit network configuration/DNS
+        // callbacks. Retirement needs their close callback, not registration's
+        // full Internet-provider validation; otherwise peers never receive EOF.
+        if (handle->provider.close != NULL) {
             handle->provider.close(handle->socket);
         }
         free(handle);
@@ -212,14 +229,19 @@ static struct vfs_callback socketfs_callbacks = {
 int socketfs_alloc_fd_with_provider(void *impl, uint64_t flags, const socket_provider_t *provider)
 {
     if (socketfs_root == NULL || impl == NULL || provider == NULL) {
+        if (impl && provider && provider->close) provider->close(impl);
         return -ENOSYS;
     }
 
+    // Sockets are bidirectional open descriptions. libuv's uv_pipe_open
+    // derives IPC writability from F_GETFL/O_ACCMODE, not from socket type.
+    flags |= O_RDWR;
     char name[32];
     snprintf(name, sizeof(name), "sock%d", socketfs_next_id++);
 
     vfs_node_t node = vfs_node_alloc(socketfs_root, name);
     if (node == NULL) {
+        provider->close(impl);
         return -ENOMEM;
     }
 
@@ -228,11 +250,13 @@ int socketfs_alloc_fd_with_provider(void *impl, uint64_t flags, const socket_pro
         socketfs_root->child = list_delete(socketfs_root->child, node);
         free(node->name);
         free(node);
+        provider->close(impl);
         return -ENOMEM;
     }
 
     socket_handle->provider = *provider;
     socket_handle->socket   = impl;
+    socket_handle->setsockopt = socketfs_snapshot_setter(provider);
 
     node->type   = file_socket | file_delete;
     node->fsid   = socketfs_id;
@@ -279,7 +303,7 @@ static int socketfs_alloc_fd(void *impl, uint64_t flags)
 extern socket_provider_t g_unix_provider;
 extern void init_unix_provider(void);
 
-int socket_provider_register(const socket_provider_t *provider)
+int socket_provider_register_with_options(const socket_provider_t *provider, socket_setsockopt_fn setter)
 {
     if (!socketfs_provider_valid(provider)) {
         return -EINVAL;
@@ -287,9 +311,16 @@ int socket_provider_register(const socket_provider_t *provider)
 
     spin_lock(&g_socket_provider_lock);
     g_socket_provider_data  = *provider;
+    g_socket_provider_setter = setter;
     g_socket_provider_ready = true;
     spin_unlock(&g_socket_provider_lock);
     return 0;
+}
+EXPORT_SYMBOL(socket_provider_register_with_options);
+
+int socket_provider_register(const socket_provider_t *provider)
+{
+    return socket_provider_register_with_options(provider, NULL);
 }
 EXPORT_SYMBOL(socket_provider_register);
 
@@ -309,6 +340,7 @@ int socketfs_setup(void)
 
 int socket_open(int domain, int type, int protocol)
 {
+    if (domain == AF_NETLINK) return route_netlink_open(type, protocol);
     if (domain == AF_UNIX || domain == AF_LOCAL) {
         init_unix_provider();
         void *impl = NULL;
@@ -416,6 +448,18 @@ int socket_getsockopt(int fd, int level, int optname, void *optval, socklen_t *o
     return handle->provider.getsockopt(handle->socket, level, optname, optval, optlen);
 }
 
+int socket_setsockopt(int fd, int level, int optname, const void *optval, socklen_t optlen)
+{
+    FdOperation descriptor;
+    int error = descriptor.acquire(fd);
+    if (error) return error;
+    fd_file_handle *file = descriptor.get();
+    if (!file || !file->node || !(file->node->type & file_socket)) return -ENOTSOCK;
+    socketfs_handle_t *handle = socketfs_get_handle(file->node);
+    if (!handle || !handle->setsockopt) return -ENOPROTOOPT;
+    return handle->setsockopt(handle->socket, level, optname, optval, optlen);
+}
+
 int socket_listen(int fd, int backlog)
 {
     fd_file_handle *fd_handle = NULL;
@@ -456,6 +500,56 @@ int socket_accept(int fd, struct sockaddr *addr, socklen_t *addrlen)
         return new_fd;
     }
     return new_fd;
+}
+
+int socket_accept4(int fd, struct sockaddr *addr, socklen_t *addrlen, int flags)
+{
+    if (flags & ~(SOCK_NONBLOCK | SOCK_CLOEXEC)) return -EINVAL;
+    FdOperation listener;
+    int error = listener.acquire(fd);
+    if (error) return error;
+    fd_file_handle *source = listener.get();
+    if (!source || !(source->node->type & file_socket)) return -ENOTSOCK;
+    socketfs_handle_t *provider_handle = socketfs_get_handle(source->node);
+    if (!provider_handle || !provider_handle->provider.accept) return -EBADF;
+    const socket_provider_t &provider = provider_handle->provider;
+    void *socket = NULL;
+    error = provider.accept(provider_handle->socket, &socket, addr, addrlen);
+    if (error < 0) return error;
+
+    uint64_t open_flags = O_RDWR;
+    if (flags & SOCK_NONBLOCK) open_flags |= O_NONBLOCK;
+    if (flags & SOCK_CLOEXEC) open_flags |= O_CLOEXEC;
+    if (provider.set_flags && (error = provider.set_flags(socket, open_flags)) < 0)
+    {
+        provider.close(socket);
+        return error;
+    }
+    // Accepted endpoints have no pathname. Configure their provider and FD
+    // flags before publication, so another thread's exec sees CLOEXEC at once.
+    vfs_node_t node = vfs_node_alloc(NULL, "anon_socket");
+    auto *object = static_cast<socketfs_handle_t *>(calloc(1, sizeof(socketfs_handle_t)));
+    auto *handle = static_cast<fd_file_handle *>(calloc(1, sizeof(fd_file_handle)));
+    if (!node || !object || !handle)
+    {
+        if (node) { free(node->name); free(node); }
+        free(object);
+        free(handle);
+        provider.close(socket);
+        return -ENOMEM;
+    }
+    object->provider = provider;
+    object->socket = socket;
+    object->setsockopt = provider_handle->setsockopt;
+    node->type = file_socket | file_delete;
+    node->fsid = socketfs_id;
+    node->handle = object;
+    node->size = (uint64_t)-1;
+    node->flags = handle->flags = open_flags;
+    handle->node = node;
+    int result = fd_install_handle(get_current_task()->parent_group, handle, 0, false);
+    if (result < 0) fd_retire_handle(handle);
+    return result;
 }
 
 int socket_shutdown(int fd, int how)
@@ -505,7 +599,11 @@ ssize_t socket_recvfrom(int fd, void *buffer, size_t size, uint64_t flags, struc
         return -EBADF;
     }
     socketfs_sync_flags(handle, fd_handle->node->flags);
-    return handle->provider.recvfrom(handle->socket, buffer, size, fd_handle->node->flags | flags, addr, addrlen);
+    uint64_t io_flags = fd_handle->node->flags;
+    // Linux MSG_PEEK shares bit 1 with O_RDWR. Keep the open-description access
+    // mode separate for route queries, which interpret Linux message flags.
+    if (handle->provider.create == route_netlink_provider.create) io_flags &= O_NONBLOCK;
+    return handle->provider.recvfrom(handle->socket, buffer, size, io_flags | flags, addr, addrlen);
 }
 
 ssize_t socket_sendto(int fd, const void *buffer, size_t size, uint64_t flags,

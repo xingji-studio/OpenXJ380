@@ -21,6 +21,7 @@
 #include <syscall/syscall.h>
 #include <syscall/file_io_scope.h>
 #include <task/termination.h>
+#include <user/linux_trace.h>
 #include <task/poll.h>
 
 // MSR寄存器地址定义
@@ -286,6 +287,29 @@ extern "C" uint64_t c_syscall_handler(struct X64_REGS *regs, uint64_t user_rsp)
     case SYS_CLOSE_RANGE: regs->rax = (uint64_t)sys_close_range(regs->rdi, regs->rsi, regs->rdx, 0, 0, 0, regs); break;
     case SYS_POLL:
         regs->rax = (uint64_t)sys_poll((struct pollfd *)regs->rdi, regs->rsi, regs->rdx, 0, 0, 0, regs);
+        break;
+    case SYS_ACCEPT4:
+        regs->rax = (uint64_t)sys_accept4((int)regs->rdi, (struct sockaddr *)regs->rsi,
+                                         (socklen_t *)regs->rdx, (int)regs->r10, 0, 0, regs);
+        break;
+    case SYS_SCHED_GETPARAM:
+        regs->rax = (uint64_t)sys_sched_getparam((int)regs->rdi, (int *)regs->rsi, 0, 0, 0, 0, regs);
+        break;
+    case SYS_SCHED_GETSCHEDULER:
+        regs->rax = (uint64_t)sys_sched_getscheduler((int)regs->rdi, 0, 0, 0, 0, 0, regs);
+        break;
+    case SYS_INOTIFY_INIT:
+        regs->rax = (uint64_t)sys_inotify_init(0, 0, 0, 0, 0, 0, regs);
+        break;
+    case SYS_INOTIFY_INIT1:
+        regs->rax = (uint64_t)sys_inotify_init1((int)regs->rdi, 0, 0, 0, 0, 0, regs);
+        break;
+    case SYS_INOTIFY_ADD_WATCH:
+        regs->rax = (uint64_t)sys_inotify_add_watch((int)regs->rdi, (char *)regs->rsi,
+                                                  (uint32_t)regs->rdx, 0, 0, 0, regs);
+        break;
+    case SYS_INOTIFY_RM_WATCH:
+        regs->rax = (uint64_t)sys_inotify_rm_watch((int)regs->rdi, (int)regs->rsi, 0, 0, 0, 0, regs);
         break;
     case SYS_EVENTFD:
         regs->rax = (uint64_t)sys_eventfd((uint32_t)regs->rdi, 0, 0, 0, 0, 0, regs);
@@ -827,6 +851,15 @@ extern "C" uint64_t c_syscall_handler(struct X64_REGS *regs, uint64_t user_rsp)
         write_serial_string("\n");
         break;
     }
+#if CONFIG_TRACE_LINUX_VM
+    if ((int64_t)regs->rax < 0 && (syscall_number == SYS_MMAP || syscall_number == SYS_MPROTECT || syscall_number == SYS_MADVISE ||
+        syscall_number == SYS_MUNMAP || syscall_number == SYS_STATX ||
+        (syscall_number >= 142 && syscall_number <= 148)))
+    {
+        write_serial_fmt("[linux-vm] nr=%llu args=%llx,%llx,%llx,%llx,%llx,%llx result=%llx\n",
+                         syscall_number, regs->rdi, regs->rsi, regs->rdx, regs->r10, regs->r8, regs->r9, regs->rax);
+    }
+#endif
     // Restore the syscall entry IRQ state before signal/TLS return bookkeeping.
     file_io.finish();
     if (debug_trace_xbps_task() && (int64_t)regs->rax < 0)

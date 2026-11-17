@@ -93,6 +93,17 @@ static inline bool syscall_file_io_may_block(uint64_t number)
     case SYS_POLL:
     case SYS_SELECT:
     case SYS_PSELECT6:
+    case SYS_SOCKETPAIR:
+    case SYS_SENDMSG:
+    case SYS_SENDMMSG:
+    case SYS_RECVMSG:
+    case SYS_ACCEPT4:
+    case SYS_SETSOCKOPT:
+    case SYS_SCHED_GETPARAM:
+    case SYS_INOTIFY_INIT:
+    case SYS_INOTIFY_INIT1:
+    case SYS_INOTIFY_ADD_WATCH:
+    case SYS_INOTIFY_RM_WATCH:
     case SYS_EVENTFD:
     case SYS_EVENTFD2:
     case SYS_EPOLL_CREATE:

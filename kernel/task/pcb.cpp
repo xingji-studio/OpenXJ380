@@ -274,21 +274,22 @@ static bool notify_parent_exit(pcb_t child, int exit_code)
     // Parent collection changes parent_task under the process-list lock. Both
     // allocations precede that lock; publication transfers ownership at unlock.
     auto *message = static_cast<ipc_message_t>(malloc(sizeof(struct ipc_message)));
-    if (!message) return false;
-    auto *node = static_cast<lock_node *>(malloc(sizeof(lock_node)));
-    if (!node) { free(message); return false; }
-    memset(message, 0, sizeof(*message));
-    message->type = IPC_MSG_TYPE_EPID;
-    for (unsigned i = 0; i < 4; ++i) message->data[i] = uint8_t(uint32_t(exit_code) >> (i * 8));
-    node->data = message;
-    node->next = NULL;
+    auto *node = message ? static_cast<lock_node *>(malloc(sizeof(lock_node))) : NULL;
+    if (message && node)
+    {
+        memset(message, 0, sizeof(*message));
+        message->type = IPC_MSG_TYPE_EPID;
+        for (unsigned i = 0; i < 4; ++i) message->data[i] = uint8_t(uint32_t(exit_code) >> (i * 8));
+        node->data = message;
+        node->next = NULL;
+    }
     bool published = false;
     spin_lock(&pcb_group_queue->lock);
     if (process_list_contains_locked(child))
     {
         pcb_t parent = child->parent_task;
         lock_queue *queue = parent ? parent->ipc_queue : NULL;
-        if (queue)
+        if (queue && message && node)
         {
             spin_lock(&queue->lock);
             if (queue->next_index != size_t(-1))
@@ -305,6 +306,11 @@ static bool notify_parent_exit(pcb_t child, int exit_code)
             }
             spin_unlock(&queue->lock);
         }
+        // Linux event loops reap children from a SIGCHLD handler. The child
+        // is already a zombie; pin the current parent through this bounded,
+        // allocation-free signal/wake publication. IPC allocation failure
+        // must not suppress the Linux notification.
+        if (parent && parent->linux_abi) signal_send_process(parent, SIGCHLD);
     }
     spin_unlock(&pcb_group_queue->lock);
     // A receiver may already have freed both objects after publication.
@@ -1147,6 +1153,24 @@ static uint64_t push_slice(tcb_t task, uint64_t ustack, const uint8_t *slice, ui
     return tmp_stack;
 }
 
+static bool push_user_strings(tcb_t task, uint64_t &stack, char *const *strings, size_t count, uint64_t *addresses)
+{
+    // Linux programs may reuse the complete argv string range for their
+    // process title. Store strings in ascending argv/envp order, without
+    // per-string padding, so that range ends before the environment begins.
+    for (size_t index = count; index != 0;)
+    {
+        --index;
+        if (!strings[index]) return false;
+        size_t length = strlen(strings[index]) + 1;
+        if (stack < length) return false;
+        stack -= length;
+        if (!copy_to_user_pagedir(task->parent_group->pagedir, (void *)stack, strings[index], length)) return false;
+        addresses[index] = stack;
+    }
+    return true;
+}
+
 static void fill_aux_random(uint8_t random_bytes[16], tcb_t task, uint64_t sp)
 {
     (void)task;
@@ -1235,25 +1259,10 @@ static uint64_t build_user_stack(tcb_t task, uint64_t sp, uint64_t entry_point, 
         return 0;
     }
 
-    if (envp != NULL)
-    {
-        for (size_t i = 0; ok && i < env_limit; i++)
-        {
-            if (envp[i] != NULL)
-            {
-                tmp_stack       = push_slice(task, tmp_stack, (const uint8_t *)envp[i], strlen(envp[i]) + 1);
-                ok              = tmp_stack != 0;
-                envps[env_i++] = tmp_stack;
-            }
-        }
-    }
-
-    for (argv_i = 0; ok && argv_i < argc; argv_i++)
-    {
-        tmp_stack      = push_slice(task, tmp_stack, (const uint8_t *)argv[argv_i], strlen(argv[argv_i]) + 1);
-        ok             = tmp_stack != 0;
-        argvps[argv_i] = tmp_stack;
-    }
+    if (ok && envp != NULL) ok = push_user_strings(task, tmp_stack, envp, env_limit, envps);
+    if (ok) env_i = env_limit;
+    if (ok) ok = push_user_strings(task, tmp_stack, argv, (size_t)argc, argvps);
+    if (ok) argv_i = argc;
     uint8_t aux_random[16];
     fill_aux_random(aux_random, task, sp);
     if (ok) tmp_stack = push_slice(task, tmp_stack, aux_random, sizeof(aux_random));
