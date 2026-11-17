@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import importlib.util
 import os
 import shlex
 import shutil
@@ -259,14 +260,22 @@ def copy_common_assets(root: Path) -> None:
     cp(ROOT / "resources/licenses/es1371.txt", root / "system/licenses/es1371.txt")
 
 
+_module_spec = importlib.util.spec_from_file_location("kernel_modules", ROOT / "tools/kernel_modules.py")
+KERNEL_MODULES = importlib.util.module_from_spec(_module_spec)
+_module_spec.loader.exec_module(KERNEL_MODULES)
+
+
 def copy_modules(root: Path) -> None:
     builtin_xhci = env_bool("BUILTIN_XHCI", "1")
-    for sys_file in sorted((ROOT / "out").glob("*.sys")):
-        rm_rf(root / "system/mod" / f"{sys_file.stem}.km")
-        if builtin_xhci and sys_file.name == "xhci.sys":
-            rm_rf(root / "system/mod" / sys_file.name)
-            continue
-        cp(sys_file, root / "system/mod")
+    module_names = KERNEL_MODULES.module_artifacts(builtin_xhci)
+    destination = root / "system/mod"
+    mkdir(destination)
+    for name in KERNEL_MODULES.MODULE_NAMES:
+        rm_rf(destination / f"{name}.km")
+    if builtin_xhci:
+        rm_rf(destination / "xhci.sys")
+    for module_name in module_names:
+        cp(ROOT / "out" / module_name, destination)
 
 
 def copy_license_material(root: Path, *, complete: bool) -> None:
@@ -572,7 +581,7 @@ def size_report() -> None:
             Path("out/shell.elf"),
         ],
     )
-    print_size_group("内核模块", [Path("out/e1000.sys"), Path("out/netserver.sys"), Path("out/xhci.sys")])
+    print_size_group("内核模块", [Path("out") / f"{name}.sys" for name in KERNEL_MODULES.MODULE_NAMES])
     print_size_group(
         "镜像 / 安装介质",
         [

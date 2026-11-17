@@ -421,85 +421,6 @@ def user_apps(n: Ninja, core_objs: list[Path], constart_obj: Path) -> list[Path]
     return [target]
 
 
-def kmods(n: Ninja) -> list[Path]:
-    """Emit loadable kernel module artifacts."""
-    # Kmods are shared objects with dlmain entrypoints.  Keep module compile
-    # flags separate from root kernel flags because visibility/PIC differ.
-    n.comment("KERNEL MODULES - loadable .sys outputs with dlmain entrypoints")
-    targets: list[Path] = []
-    # e1000 is first-party C++, so a shallow directory scan is enough and keeps
-    # nested helper experiments from silently becoming part of the module ABI.
-    n.comment("KMOD: e1000 PCI network driver")
-    e1000_objs: list[Path] = []
-    for src in find_files("kmod/e1000", (".cpp",), max_depth=1):
-        obj = Path("out/kmod/e1000") / src.name.replace(".cpp", ".o")
-        n.build(obj, "kmod_e1000_cxx", src)
-        e1000_objs.append(obj)
-    n.build("out/e1000.sys", "kmod_link", e1000_objs, variables={"ldflags": "-nostdlib -Wl,-e,dlmain"})
-    targets.append(Path("out/e1000.sys"))
-
-    # Netserver vendors lwIP, but this OS glue supports only the subset below.
-    # Avoid enabling extra lwIP files accidentally because some depend on PPP or
-    # platform hooks that are intentionally not wired in this tree.
-    n.comment("KMOD: netserver lwIP subset and XJ380 arch glue")
-    lwip_c = [
-        "lwip/core/def.c",
-        "lwip/core/dns.c",
-        "lwip/core/init.c",
-        "lwip/core/inet_chksum.c",
-        "lwip/core/ip.c",
-        "lwip/core/mem.c",
-        "lwip/core/memp.c",
-        "lwip/core/netif.c",
-        "lwip/core/pbuf.c",
-        "lwip/core/stats.c",
-        "lwip/core/sys.c",
-        "lwip/core/tcp.c",
-        "lwip/core/tcp_in.c",
-        "lwip/core/tcp_out.c",
-        "lwip/core/udp.c",
-        "lwip/core/timeouts.c",
-        "lwip/core/ipv4/dhcp.c",
-        "lwip/core/ipv4/etharp.c",
-        "lwip/core/ipv4/icmp.c",
-        "lwip/core/ipv4/ip4.c",
-        "lwip/core/ipv4/ip4_addr.c",
-        "lwip/netif/ethernet.c",
-        "lwip/api/api_lib.c",
-        "lwip/api/api_msg.c",
-        "lwip/api/err.c",
-        "lwip/api/netbuf.c",
-        "lwip/api/netifapi.c",
-        "lwip/api/tcpip.c",
-    ]
-    net_objs: list[Path] = []
-    for item in lwip_c:
-        src = Path("kmod/netserver") / item
-        obj = Path("out/kmod/netserver") / item.replace(".c", ".o")
-        n.build(obj, "netserver_cc", src)
-        net_objs.append(obj)
-    for item in ("netserver.cpp", "arch/sys_arch.cpp"):
-        src = Path("kmod/netserver") / item
-        obj = Path("out/kmod/netserver") / item.replace(".cpp", ".o")
-        n.build(obj, "netserver_cxx", src)
-        net_objs.append(obj)
-    n.build("out/netserver.sys", "kmod_link", net_objs, variables={"ldflags": "-nostdlib -Wl,-e,dlmain -Wl,-z,muldefs"})
-    targets.append(Path("out/netserver.sys"))
-
-    # xhci can be linked into the kernel when BUILTIN_XHCI=1, but the module
-    # artifact is still generated for staging/testing parity.
-    n.comment("KMOD: xhci USB stack module artifact")
-    xhci_objs: list[Path] = []
-    for name in ("usb_core.cpp", "usb_hub.cpp", "usb_msc.cpp", "xhci.cpp"):
-        src = Path("kmod/xhci") / name
-        obj = Path("out/kmod_module/xhci") / name.replace(".cpp", ".o")
-        n.build(obj, "kmod_xhci_cxx", src)
-        xhci_objs.append(obj)
-    n.build("out/xhci.sys", "kmod_link", xhci_objs, variables={"ldflags": "-nostdlib -Wl,-e,dlmain -Wl,-Bsymbolic -Wl,-z,muldefs"})
-    targets.append(Path("out/xhci.sys"))
-    return targets
-
-
 def phony(n: Ninja, name: str, deps: list[Path | str]) -> None:
     """Emit compatibility targets such as `all`, `kmods`, and `build_xapi`."""
     n.build(name, "phony", deps)
@@ -574,6 +495,9 @@ def main() -> None:
     # These root lists intentionally feed both the readable FILES section and
     # root_objects(); one scan owns both display and build behavior.
     root_source_roots = ["kernel", "driver", "lib", "third_party/uacpi/source"]
+    module_spec = importlib.util.spec_from_file_location("kernel_modules", ROOT / "." / "tools/kernel_modules.py")
+    kernel_modules = importlib.util.module_from_spec(module_spec)
+    module_spec.loader.exec_module(kernel_modules)
     nasm_files: list[Path] = []
     asm_files: list[Path] = []
     c_files: list[Path] = []
@@ -585,7 +509,7 @@ def main() -> None:
         cpp_files.extend(find_files(base, (".cpp",)))
     cpp_files = [p for p in cpp_files if p != ROOT / "kernel/stress.cpp"]
     if builtin_xhci:
-        cpp_files.extend(find_files("kmod/xhci", (".cpp",)))
+        cpp_files.extend(ROOT / "kmod/xhci" / name for name in kernel_modules.XHCI_SOURCES)
     xapi_sources = [
         ROOT / "user/xapi/arch/x86_64/crt0.S",
         ROOT / "user/xapi/libsys.cpp",
@@ -602,6 +526,8 @@ def main() -> None:
     n.var_list("XAPI_HEADERS", headers("user/xapi/include"))
     n.var_list("BOOT_HEADERS", find_files("boot/include", (".h", ".hpp")) + [Path("include/efi/root_binding.h")])
     n.var_list("KMOD_E1000_SOURCES", find_files("kmod/e1000", (".cpp",), max_depth=1))
+    n.var_list("KMOD_RTL8139_SOURCES", find_files("kmod/rtl8139", (".cpp",), max_depth=1))
+    n.var_list("KMOD_VIRTIO_NET_SOURCES", find_files("kmod/virtio-net", (".cpp",), max_depth=1))
     n.line()
     # Emit uppercase canonical flag variables first, then lowercase aliases for
     # older generated rule bodies.  That makes the build options readable while
@@ -621,9 +547,7 @@ def main() -> None:
     n.var("BOOT_C_FLAGS", "$DIAGNOSTIC_COLOR -g -I ./boot/include -Wextra -e efi_main -nostdinc -nostdlib -fno-builtin -Wl,--subsystem,10 -fshort-wchar")
     n.var("USER_CFLAGS", "$DIAGNOSTIC_COLOR $OPT_FLAG -Wall -g -ffreestanding -fno-builtin -m64 -mstackrealign -std=c++11 -fno-stack-protector -fno-exceptions -fno-strict-aliasing -fshort-wchar -nostdinc -I ./user/xapi/include -I ./include -Wno-write-strings -MMD -MP")
     n.var("RUST_FLAGS", "$RUST_DIAGNOSTIC_COLOR --edition=2024 --target $rust_target --emit=obj --crate-type lib -C panic=abort -C no-redzone=yes $RUST_OPT_FLAG -C debuginfo=2 -C overflow-checks=off")
-    n.var("KMOD_CXXFLAGS", "$DIAGNOSTIC_COLOR $OPT_FLAG -g -mno-red-zone -mstackrealign -nostdlib -ffreestanding -fno-builtin -m64 -fno-stack-protector -fno-exceptions -fno-strict-aliasing -fno-rtti -std=gnu++17 -fshort-wchar -nostdinc -fno-use-cxa-atexit -fno-threadsafe-statics -mno-80387 -Wno-int-to-pointer-cast -Wno-macro-redefined -Wno-c11-extensions -Wno-c99-extensions -Wno-gnu-statement-expression-from-macro-expansion -Wno-writable-strings -Wno-c++11-narrowing -fPIC -fvisibility=hidden -MMD -MP")
-    n.var("NETSERVER_CFLAGS", "$DIAGNOSTIC_COLOR $OPT_FLAG -g -mno-red-zone -mstackrealign -nostdlib -ffreestanding -fno-builtin -m64 -fno-stack-protector -fno-exceptions -fno-strict-aliasing -std=gnu11 -fshort-wchar -nostdinc -mno-80387 -fPIC -fvisibility=hidden -MMD -MP -I./include -I./kmod/netserver -I./kmod/netserver/lwip/include")
-    n.var("NETSERVER_CXXFLAGS", "$KMOD_CXXFLAGS -MMD -MP -I./include -I./kmod/netserver -I./kmod/netserver/lwip/include")
+    kernel_modules.emit_rules(n, ".", log_desc)
     n.var("opt", "$OPT_FLAG")
     n.var("rust_opt", "$RUST_OPT_FLAG")
     n.var("diagnostic_color", "$DIAGNOSTIC_COLOR")
@@ -635,9 +559,6 @@ def main() -> None:
     n.var("boot_c_flags", "$BOOT_C_FLAGS")
     n.var("user_cflags", "$USER_CFLAGS")
     n.var("rust_user_flags", "$RUST_FLAGS")
-    n.var("kmod_cxxflags", "$KMOD_CXXFLAGS")
-    n.var("netserver_cflags", "$NETSERVER_CFLAGS")
-    n.var("netserver_cxxflags", "$NETSERVER_CXXFLAGS")
     n.comment("Lowercase aliases above keep rule bodies compatible with older generated graphs.")
     n.var("host_gcc_triple", host_gcc_triple)
     n.line()
@@ -664,7 +585,7 @@ def main() -> None:
     n.rule("root_as", "mkdir -p $$(dirname $out) && $cc -mcmodel=large $asm_flags -MF $out.d -c $in -o $out", log_desc("ASM", "$in -> $out"), depfile="$out.d")
     n.rule("root_cc", "mkdir -p $$(dirname $out) && $cc -fno-pic -fno-pie -mcmodel=large $c_flags -MF $out.d -c $in -o $out", log_desc("CC", "$in -> $out"), depfile="$out.d")
     n.rule("root_cxx", "mkdir -p $$(dirname $out) && $cxx -fno-pic -fno-pie -mcmodel=large $cpp_flags -MF $out.d -c $in -o $out", log_desc("CXX", "$in -> $out"), depfile="$out.d")
-    n.rule("gen_config", "tmp=$out.tmp; { echo '#pragma once'; echo '#define CONFIG_KERNEL_BUSYBOX_ALIASES '$${KERNEL_BUSYBOX_ALIASES:-1}; echo '#define CONFIG_KERNEL_BUILTIN_XHCI '$${BUILTIN_XHCI:-1}; } > $$tmp; if ! cmp -s $$tmp $out; then mv $$tmp $out; else rm -f $$tmp; fi", log_desc("GEN", "$out"))
+    n.rule("gen_config", "tmp=$out.tmp; { echo '#pragma once'; echo '#define CONFIG_KERNEL_BUSYBOX_ALIASES '$${KERNEL_BUSYBOX_ALIASES:-1}; echo '#define CONFIG_KERNEL_BUILTIN_XHCI '$BUILTIN_XHCI; } > $$tmp; if ! cmp -s $$tmp $out; then mv $$tmp $out; else rm -f $$tmp; fi", log_desc("GEN", "$out"))
     n.rule("boot", "mkdir -p $$(dirname $out) && x86_64-w64-mingw32-gcc $boot_c_flags -o $out boot/bootx64.c boot/bootlib.c", log_desc("BOOT", "$out"))
     n.rule("objcopy_bin", "mkdir -p $$(dirname $out) && $objc -I binary -O elf64-x86-64 $bin_input $out", log_desc("OBJCOPY", "$bin_input"))
     n.rule(
@@ -683,22 +604,18 @@ def main() -> None:
     n.rule("xapi_headcon", "mkdir -p $$(dirname $out) && $user_cc $diagnostic_color $opt -Wall -g -ffreestanding -fno-builtin -m64 -mstackrealign -std=c++11 -fno-stack-protector -fno-strict-aliasing -fshort-wchar -nostdinc -I ./user/xapi/include -Wno-write-strings -MMD -MP -MF $out.d -c $in -o $out", log_desc("CXX", "constart.cpp"), depfile="$out.d")
     n.rule("user_ld", "$user_ld -Ttext=0x200000 $in -o $out", log_desc("LD", "$out"))
     n.rule("host_cc", "mkdir -p $$(dirname $out) && $user_cc $diagnostic_color -O0 -g -Wall -Wextra $in -o $out", log_desc("HOSTLD", "$in"))
-    n.rule("kmod_e1000_cxx", "mkdir -p $$(dirname $out) && $cxx $kmod_cxxflags -I./include -MF $out.d -c $in -o $out", log_desc("CXX", "$in"), depfile="$out.d")
-    n.rule("kmod_xhci_cxx", "mkdir -p $$(dirname $out) && $cxx $kmod_cxxflags -I./include -I./kmod/xhci -MF $out.d -c $in -o $out", log_desc("CXX", "$in"), depfile="$out.d")
-    n.rule("netserver_cc", "mkdir -p $$(dirname $out) && $cc $netserver_cflags -MF $out.d -c $in -o $out", log_desc("CC", "$in"), depfile="$out.d")
-    n.rule("netserver_cxx", "mkdir -p $$(dirname $out) && $cxx $netserver_cxxflags -MF $out.d -c $in -o $out", log_desc("CXX", "$in"), depfile="$out.d")
     n.rule(
         "package_compliance",
         "python3 tools/package_third_party.py --output out/compliance/third-party",
         log_desc("STAGE", "third-party compliance"),
         restat=True,
     )
-    n.rule("kmod_link", "$cxx -shared $in $ldflags -o $out", log_desc("LD", "$out"))
     n.rule("python_cmd", "python3 tools/ninja_build.py $cmd", "$desc")
     n.rule("shell_cmd", "$cmd", "$desc")
 
     n.comment("MANIFEST - regenerate build.ninja before every normal Ninja execution")
     manifest_inputs = [
+        "tools/kernel_modules.py",
         "tools/native_rtld.py",
         "tools/epf_rtld.py",
         "LICENSES.md",
@@ -711,7 +628,7 @@ def main() -> None:
     n.build(
         "build.ninja",
         "regen",
-        ["tools/gen_ninja.py", "tools/ninja_build.py", "tools/native_rtld.py", "tools/epf_rtld.py"],
+        ["tools/gen_ninja.py", "tools/ninja_build.py", "tools/native_rtld.py", "tools/epf_rtld.py", "tools/kernel_modules.py"],
         use_default_order_only=False,
     )
     # Ninja cannot safely force the build.ninja self-edge every run: that causes
@@ -746,6 +663,7 @@ def main() -> None:
     compliance_inputs = [
         Path("tools/package_third_party.py"),
         Path("tools/generate_lwip_notice.py"),
+        Path("tools/kernel_modules.py"),
         compliance_manifest_path,
         Path("LICENSE"),
         Path("THIRD_PARTY_NOTICES.md"),
@@ -776,7 +694,7 @@ def main() -> None:
     epf_rtld_module = importlib.util.module_from_spec(epf_rtld_spec)
     epf_rtld_spec.loader.exec_module(epf_rtld_module)
     epf_rtld_targets = epf_rtld_module.emit(n, ".")
-    kmod_targets = kmods(n)
+    kmod_targets = kernel_modules.emit(n)
 
     n.comment("EPF - explicit native companion outputs; normal all/image targets retain their ELF paths")
     epf_converter = Path("tools/elf_to_epf.py")

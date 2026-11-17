@@ -1,79 +1,89 @@
 extern "C" {
 #include "../../../include/proto.hpp"
+#include "../../../include/rtc.h"
 #include "../../../include/task/pcb.h"
 #include "../../../include/task/scheduler.h"
-#include "lwip/err.h"
-#include "lwip/opt.h"
-#include "lwip/sio.h"
-#include "lwip/sys.h"
+#include "lwip/arch.h"
+#include "lwipopts.h"
+#include "sys_arch.h"
+#include <lwip/arch.h>
+#include <lwip/debug.h>
+#include <lwip/opt.h>
+#include <lwip/stats.h>
+#include <lwip/sys.h>
 }
 
 int errno_ = 0;
 
 namespace {
 
-volatile int g_core_guard = 0;
-void        *g_core_owner = nullptr;
-u32_t        g_core_depth = 0;
-sys_prot_t   g_core_flags = 0;
+static volatile long g_protect_lock = 0;
+static void *g_protect_owner = nullptr;
+static u32_t g_protect_depth = 0;
+static sys_prot_t g_protect_flags = 0;
 
-static inline void *current_thread()
+static inline void *sys_current_task()
 {
     return reinterpret_cast<void *>(get_current_task());
 }
 
-static inline sys_prot_t read_flags()
+static inline sys_prot_t sys_read_rflags()
 {
-    sys_prot_t flags;
-    asm volatile("pushfq; pop %0" : "=r"(flags) : : "memory");
+    sys_prot_t flags = 0;
+    asm volatile("pushfq\n\t"
+                 "pop %0"
+                 : "=r"(flags)
+                 :
+                 : "memory");
     return flags;
 }
 
-static inline void restore_flags(sys_prot_t flags)
+static inline void sys_restore_rflags(sys_prot_t flags)
 {
-    asm volatile("push %0; popfq" : : "r"(flags) : "memory", "cc");
+    asm volatile("push %0\n\t"
+                 "popfq"
+                 :
+                 : "r"(flags)
+                 : "memory", "cc");
 }
 
-static inline void acquire(volatile int *guard)
+static inline void sys_cpu_relax()
 {
-    while (!__sync_bool_compare_and_swap(guard, 0, 1)) {
-        scheduler_yield();
-        asm volatile("pause" ::: "memory");
-    }
+    __asm__ volatile("pause" ::: "memory");
 }
 
-static inline bool try_acquire(volatile int *guard)
+static inline u32_t sys_elapsed_since(u32_t start)
 {
-    return __sync_bool_compare_and_swap(guard, 0, 1);
+    return static_cast<u32_t>(sys_now() - start);
 }
 
-static inline void release(volatile int *guard)
+static inline bool sys_timeout_expired(u32_t start, u32_t timeout)
 {
-    __sync_lock_release(guard);
+    return timeout != 0 && sys_elapsed_since(start) >= timeout;
 }
 
-static inline u32_t elapsed(u32_t since)
+static inline bool sys_mbox_is_empty(const sys_mbox_t *mbox)
 {
-    return static_cast<u32_t>(sys_now() - since);
+    return mbox->ptrRead == mbox->ptrWrite;
 }
 
-static bool take_message(sys_mbox_t *mbox, void **message)
+static inline bool sys_mbox_is_full(const sys_mbox_t *mbox)
 {
-    bool available = false;
-    acquire(&mbox->guard);
-    if (mbox->valid && mbox->count != 0) {
-        if (message != nullptr) {
-            *message = mbox->entries[mbox->head];
-        }
-        mbox->head = (mbox->head + 1U) % mbox->capacity;
-        mbox->count--;
-        available = true;
-    }
-    release(&mbox->guard);
-    return available;
+    return ((mbox->ptrWrite + 1U) % static_cast<u32_t>(mbox->size)) == mbox->ptrRead;
 }
 
+static inline void sys_mbox_post_locked(sys_mbox_t *mbox, void *msg)
+{
+    mbox->msges[mbox->ptrWrite] = msg;
+    mbox->ptrWrite = (mbox->ptrWrite + 1U) % static_cast<u32_t>(mbox->size);
 }
+
+static inline bool sys_object_is_alive(bool invalid_flag)
+{
+    return !invalid_flag;
+}
+
+} // namespace
 
 extern "C" {
 
@@ -83,36 +93,48 @@ void sys_init(void)
 
 sys_prot_t sys_arch_protect(void)
 {
-    void *owner = current_thread();
-    if (g_core_owner == owner && g_core_depth != 0) {
-        g_core_depth++;
-        return g_core_flags;
+    void *owner = sys_current_task();
+    if (g_protect_owner == owner && g_protect_depth != 0) {
+        g_protect_depth++;
+        return g_protect_flags;
     }
+
     for (;;) {
-        sys_prot_t flags = read_flags();
-        asm volatile("cli" ::: "memory");
-        if (try_acquire(&g_core_guard)) {
-            g_core_owner = owner;
-            g_core_depth = 1;
-            g_core_flags = flags;
+        sys_prot_t flags = sys_read_rflags();
+        __asm__ volatile("cli" ::: "memory");
+
+        if (__sync_bool_compare_and_swap(&g_protect_lock, 0, 1)) {
+            g_protect_owner = owner;
+            g_protect_depth = 1;
+            g_protect_flags = flags;
             return flags;
         }
-        restore_flags(flags);
+
+        sys_restore_rflags(flags);
         scheduler_yield();
+        sys_cpu_relax();
     }
 }
 
-void sys_arch_unprotect(sys_prot_t value)
+void sys_arch_unprotect(sys_prot_t pval)
 {
-    if (g_core_owner != current_thread() || g_core_depth == 0) {
+    (void)pval;
+
+    void *owner = sys_current_task();
+    if (g_protect_owner != owner || g_protect_depth == 0) {
         return;
     }
-    if (--g_core_depth == 0) {
-        g_core_owner = nullptr;
-        g_core_flags = 0;
-        release(&g_core_guard);
-        restore_flags(value);
+
+    g_protect_depth--;
+    if (g_protect_depth != 0) {
+        return;
     }
+
+    sys_prot_t flags = g_protect_flags;
+    g_protect_owner = nullptr;
+    g_protect_flags = 0;
+    __sync_lock_release(&g_protect_lock);
+    sys_restore_rflags(flags);
 }
 
 err_t sys_mutex_new(sys_mutex_t *mutex)
@@ -120,49 +142,78 @@ err_t sys_mutex_new(sys_mutex_t *mutex)
     if (mutex == nullptr) {
         return ERR_ARG;
     }
-    *mutex = {};
+
+    mutex->state = 0;
+    mutex->owner = nullptr;
+    mutex->depth = 0;
     mutex->valid = true;
     return ERR_OK;
 }
 
 void sys_mutex_lock(sys_mutex_t *mutex)
 {
-    if (mutex == nullptr || !mutex->valid) {
+    if (mutex == nullptr) {
         return;
     }
-    void *owner = current_thread();
-    if (mutex->owner == owner) {
-        mutex->depth++;
-        return;
-    }
-    acquire(&mutex->held);
-    if (mutex->valid) {
-        mutex->owner = owner;
-        mutex->depth = 1;
-    } else {
-        release(&mutex->held);
+
+    void *current = sys_current_task();
+    u32_t start = sys_now();
+    bool waiting_logged = false;
+    for (;;) {
+        if (!mutex->valid) {
+            return;
+        }
+
+        if (mutex->owner == current) {
+            mutex->depth++;
+            return;
+        }
+
+        if (__sync_bool_compare_and_swap(&mutex->state, 0, 1)) {
+            mutex->owner = current;
+            mutex->depth = 1;
+            return;
+        }
+
+        if (!waiting_logged && sys_elapsed_since(start) >= 1000) {
+            waiting_logged = true;
+            printk("netserver: sys_mutex_lock waiting mutex=%p owner=%p current=%p state=%ld depth=%u\n",
+                   mutex, mutex->owner, current, mutex->state, (unsigned int)mutex->depth);
+        }
+        scheduler_yield();
+        sys_cpu_relax();
     }
 }
 
 void sys_mutex_unlock(sys_mutex_t *mutex)
 {
-    if (mutex == nullptr || !mutex->valid || mutex->owner != current_thread() || mutex->depth == 0) {
+    if (mutex == nullptr || !mutex->valid) {
         return;
     }
-    if (--mutex->depth == 0) {
-        mutex->owner = nullptr;
-        release(&mutex->held);
+
+    if (mutex->owner != sys_current_task() || mutex->depth == 0) {
+        return;
     }
+
+    mutex->depth--;
+    if (mutex->depth != 0) {
+        return;
+    }
+
+    mutex->owner = nullptr;
+    __sync_lock_release(&mutex->state);
 }
 
 void sys_mutex_free(sys_mutex_t *mutex)
 {
-    if (mutex != nullptr) {
-        mutex->valid = false;
-        mutex->owner = nullptr;
-        mutex->depth = 0;
-        release(&mutex->held);
+    if (mutex == nullptr) {
+        return;
     }
+
+    mutex->valid = false;
+    mutex->owner = nullptr;
+    mutex->depth = 0;
+    __sync_lock_release(&mutex->state);
 }
 
 int sys_mutex_valid(sys_mutex_t *mutex)
@@ -172,52 +223,53 @@ int sys_mutex_valid(sys_mutex_t *mutex)
 
 void sys_mutex_set_invalid(sys_mutex_t *mutex)
 {
-    if (mutex != nullptr) {
-        *mutex = {};
-    }
+    sys_mutex_free(mutex);
 }
 
-err_t sys_sem_new(sys_sem_t *sem, u8_t count)
+err_t sys_sem_new(sys_sem_t *sem, uint8_t cnt)
 {
     if (sem == nullptr) {
         return ERR_ARG;
     }
-    *sem = {};
-    sem->count = count;
-    sem->valid = true;
+
+    sem->invalid = false;
+    sem->lock = SPIN_INIT;
+    sem->cnt = cnt;
     return ERR_OK;
 }
 
 void sys_sem_signal(sys_sem_t *sem)
 {
-    if (sem == nullptr || !sem->valid) {
+    if (sem == nullptr || sem->invalid) {
         return;
     }
-    acquire(&sem->guard);
-    sem->count++;
-    release(&sem->guard);
+
+    spin_lock(&sem->lock);
+    sem->cnt++;
+    spin_unlock(&sem->lock);
 }
 
-u32_t sys_arch_sem_wait(sys_sem_t *sem, u32_t timeout)
+uint32_t sys_arch_sem_wait(sys_sem_t *sem, uint32_t timeout)
 {
     if (sem == nullptr) {
         return SYS_ARCH_TIMEOUT;
     }
+
     u32_t start = sys_now();
     for (;;) {
-        acquire(&sem->guard);
-        bool taken = sem->valid && sem->count != 0;
-        if (taken) {
-            sem->count--;
+        spin_lock(&sem->lock);
+        if (!sem->invalid && sem->cnt > 0) {
+            sem->cnt--;
+            spin_unlock(&sem->lock);
+            return sys_elapsed_since(start);
         }
-        bool valid = sem->valid;
-        release(&sem->guard);
-        if (taken) {
-            return elapsed(start);
-        }
-        if (!valid || (timeout != 0 && elapsed(start) >= timeout)) {
+
+        bool invalid = sem->invalid;
+        spin_unlock(&sem->lock);
+        if (invalid || sys_timeout_expired(start, timeout)) {
             return SYS_ARCH_TIMEOUT;
         }
+
         // Empty blocking wait: the object guard and TCP/IP core lock
         // are released before polling again; timeout==0 still means forever.
         scheduler_sleep_ns(1000000ULL);
@@ -226,36 +278,45 @@ u32_t sys_arch_sem_wait(sys_sem_t *sem, u32_t timeout)
 
 void sys_sem_free(sys_sem_t *sem)
 {
-    if (sem != nullptr) {
-        acquire(&sem->guard);
-        sem->valid = false;
-        sem->count = 0;
-        release(&sem->guard);
+    if (sem == nullptr) {
+        return;
     }
+
+    spin_lock(&sem->lock);
+    sem->invalid = true;
+    sem->cnt = 0;
+    spin_unlock(&sem->lock);
 }
 
 void sys_sem_set_invalid(sys_sem_t *sem)
 {
-    if (sem != nullptr) {
-        *sem = {};
+    if (sem == nullptr) {
+        return;
     }
+
+    sem->lock = SPIN_INIT;
+    sem->cnt = 0;
+    sem->invalid = true;
 }
 
 int sys_sem_valid(sys_sem_t *sem)
 {
-    return sem != nullptr && sem->valid;
+    return sem != nullptr && sys_object_is_alive(sem->invalid);
 }
 
-u32_t sys_now(void)
+uint32_t sys_now(void)
 {
     return static_cast<u32_t>(nanoTime() / 1000000ULL);
 }
 
-sys_thread_t sys_thread_new(const char *name, void (*entry)(void *), void *argument, int stack_size, int priority)
+sys_thread_t sys_thread_new(const char *pcName,
+                            void (*pxThread)(void *pvParameters), void *pvArg,
+                            int iStackSize, int iPriority)
 {
-    (void)stack_size;
-    (void)priority;
-    return create_kernel_thread(reinterpret_cast<void *>(entry), argument, const_cast<char *>(name), nullptr);
+    (void)iStackSize;
+    (void)iPriority;
+    return create_kernel_thread(reinterpret_cast<void *>(pxThread), pvArg,
+                                const_cast<char *>(pcName), nullptr);
 }
 
 err_t sys_mbox_new(sys_mbox_t *mbox, int size)
@@ -263,14 +324,18 @@ err_t sys_mbox_new(sys_mbox_t *mbox, int size)
     if (mbox == nullptr) {
         return ERR_ARG;
     }
-    *mbox = {};
-    mbox->capacity = static_cast<u32_t>(size > 0 ? size : TCPIP_MBOX_SIZE);
-    mbox->entries = static_cast<void **>(calloc(mbox->capacity, sizeof(void *)));
-    if (mbox->entries == nullptr) {
-        return ERR_MEM;
+
+    if (size <= 0) {
+        size = TCPIP_MBOX_SIZE;
     }
-    mbox->valid = true;
-    return ERR_OK;
+
+    memset(mbox, 0, sizeof(*mbox));
+    mbox->invalid = false;
+    mbox->lock = SPIN_INIT;
+    mbox->size = size + 1;
+    mbox->msges = static_cast<void **>(calloc(static_cast<size_t>(mbox->size),
+                                              sizeof(mbox->msges[0])));
+    return mbox->msges != nullptr ? ERR_OK : ERR_MEM;
 }
 
 void sys_mbox_free(sys_mbox_t *mbox)
@@ -278,121 +343,205 @@ void sys_mbox_free(sys_mbox_t *mbox)
     if (mbox == nullptr) {
         return;
     }
-    acquire(&mbox->guard);
-    mbox->valid = false;
-    void **entries = mbox->entries;
-    mbox->entries = nullptr;
-    mbox->count = 0;
-    release(&mbox->guard);
-    free(entries);
+
+    spin_lock(&mbox->lock);
+    mbox->invalid = true;
+    void **messages = mbox->msges;
+    mbox->msges = nullptr;
+    mbox->ptrRead = 0;
+    mbox->ptrWrite = 0;
+    spin_unlock(&mbox->lock);
+    free(messages);
 }
 
 void sys_mbox_set_invalid(sys_mbox_t *mbox)
 {
-    if (mbox != nullptr) {
-        *mbox = {};
+    if (mbox == nullptr) {
+        return;
     }
+
+    mbox->lock = SPIN_INIT;
+    mbox->msges = nullptr;
+    mbox->size = 0;
+    mbox->ptrRead = 0;
+    mbox->ptrWrite = 0;
+    mbox->invalid = true;
 }
 
 int sys_mbox_valid(sys_mbox_t *mbox)
 {
-    return mbox != nullptr && mbox->valid;
-}
-
-err_t sys_mbox_trypost(sys_mbox_t *mbox, void *message)
-{
-    if (mbox == nullptr || !mbox->valid || !try_acquire(&mbox->guard)) {
-        return ERR_MEM;
+    if (mbox == nullptr) {
+        return 0;
     }
-    if (!mbox->valid || mbox->count == mbox->capacity) {
-        release(&mbox->guard);
-        return ERR_MEM;
+
+    spin_lock(&mbox->lock);
+    int valid = !mbox->invalid && mbox->msges != nullptr;
+    spin_unlock(&mbox->lock);
+    return valid;
+}
+
+void sys_mbox_post_unsafe(sys_mbox_t *mbox, void *msg)
+{
+    if (mbox == nullptr || mbox->msges == nullptr) {
+        return;
     }
-    mbox->entries[mbox->tail] = message;
-    mbox->tail = (mbox->tail + 1U) % mbox->capacity;
-    mbox->count++;
-    release(&mbox->guard);
-    return ERR_OK;
+
+    sys_mbox_post_locked(mbox, msg);
 }
 
-err_t sys_mbox_trypost_fromisr(sys_mbox_t *mbox, void *message)
+void sys_mbox_post(sys_mbox_t *mbox, void *msg)
 {
-    return sys_mbox_trypost(mbox, message);
-}
+    if (mbox == nullptr) {
+        return;
+    }
 
-void sys_mbox_post(sys_mbox_t *mbox, void *message)
-{
-    while (sys_mbox_trypost(mbox, message) != ERR_OK) {
+    for (;;) {
+        spin_lock(&mbox->lock);
+        if (mbox->invalid || mbox->msges == nullptr) {
+            spin_unlock(&mbox->lock);
+            return;
+        }
+
+        if (!sys_mbox_is_full(mbox)) {
+            sys_mbox_post_locked(mbox, msg);
+            spin_unlock(&mbox->lock);
+            return;
+        }
+
+        spin_unlock(&mbox->lock);
         scheduler_yield();
     }
 }
 
-void sys_mbox_post_unsafe(sys_mbox_t *mbox, void *message)
-{
-    sys_mbox_post(mbox, message);
-}
-
-u32_t sys_arch_mbox_fetch(sys_mbox_t *mbox, void **message, u32_t timeout)
+err_t sys_mbox_trypost(sys_mbox_t *mbox, void *msg)
 {
     if (mbox == nullptr) {
+        return ERR_ARG;
+    }
+
+    spin_lock(&mbox->lock);
+    if (mbox->invalid || mbox->msges == nullptr) {
+        spin_unlock(&mbox->lock);
+        return ERR_ARG;
+    }
+
+    if (sys_mbox_is_full(mbox)) {
+        spin_unlock(&mbox->lock);
+        return ERR_MEM;
+    }
+
+    sys_mbox_post_locked(mbox, msg);
+    spin_unlock(&mbox->lock);
+    return ERR_OK;
+}
+
+err_t sys_mbox_trypost_fromisr(sys_mbox_t *mbox, void *msg)
+{
+    return sys_mbox_trypost(mbox, msg);
+}
+
+u32_t sys_arch_mbox_fetch(sys_mbox_t *mbox, void **msg, u32_t timeout)
+{
+    if (mbox == nullptr) {
+        if (msg != nullptr) {
+            *msg = nullptr;
+        }
         return SYS_ARCH_TIMEOUT;
     }
+
     u32_t start = sys_now();
-    while (mbox->valid) {
-        if (take_message(mbox, message)) {
-            return elapsed(start);
+    for (;;) {
+        spin_lock(&mbox->lock);
+        if (!sys_mbox_is_empty(mbox)) {
+            if (msg != nullptr) {
+                *msg = mbox->msges[mbox->ptrRead];
+            }
+            mbox->ptrRead = (mbox->ptrRead + 1U) % static_cast<u32_t>(mbox->size);
+            spin_unlock(&mbox->lock);
+            return sys_elapsed_since(start);
         }
-        if (timeout != 0 && elapsed(start) >= timeout) {
+
+        bool invalid = mbox->invalid || mbox->msges == nullptr;
+        spin_unlock(&mbox->lock);
+        if (invalid || sys_timeout_expired(start, timeout)) {
+            if (msg != nullptr) {
+                *msg = nullptr;
+            }
             return SYS_ARCH_TIMEOUT;
         }
+
         // Empty blocking wait: the object guard and TCP/IP core lock
         // are released before polling again; timeout==0 still means forever.
         scheduler_sleep_ns(1000000ULL);
     }
-    return SYS_ARCH_TIMEOUT;
 }
 
-u32_t sys_arch_mbox_tryfetch(sys_mbox_t *mbox, void **message)
+u32_t sys_arch_mbox_tryfetch(sys_mbox_t *mbox, void **msg)
 {
-    return mbox != nullptr && take_message(mbox, message) ? 0 : SYS_MBOX_EMPTY;
+    if (mbox == nullptr) {
+        if (msg != nullptr) {
+            *msg = nullptr;
+        }
+        return SYS_MBOX_EMPTY;
+    }
+
+    spin_lock(&mbox->lock);
+    if (mbox->invalid || mbox->msges == nullptr || sys_mbox_is_empty(mbox)) {
+        spin_unlock(&mbox->lock);
+        if (msg != nullptr) {
+            *msg = nullptr;
+        }
+        return SYS_MBOX_EMPTY;
+    }
+
+    if (msg != nullptr) {
+        *msg = mbox->msges[mbox->ptrRead];
+    }
+    mbox->ptrRead = (mbox->ptrRead + 1U) % static_cast<u32_t>(mbox->size);
+    spin_unlock(&mbox->lock);
+    return ERR_OK;
 }
 
-sio_fd_t sio_open(u8_t device)
+void *sio_open(u8_t devnum)
 {
-    (void)device;
+    (void)devnum;
     return nullptr;
 }
 
-u32_t sio_write(sio_fd_t fd, const u8_t *data, u32_t size)
+u32_t sio_write(void *fd, const u8_t *data, u32_t len)
 {
     (void)fd;
     (void)data;
-    return size;
-}
-
-u32_t sio_read(sio_fd_t fd, u8_t *data, u32_t size)
-{
-    (void)fd;
-    (void)data;
-    (void)size;
+    (void)len;
     return 0;
 }
 
-void sio_send(u8_t byte, sio_fd_t fd)
+void sio_send(u8_t c, void *fd)
 {
-    (void)byte;
+    (void)c;
     (void)fd;
 }
 
-u8_t sio_recv(sio_fd_t fd)
+u8_t sio_recv(void *fd)
 {
     (void)fd;
     return 0;
 }
 
-u32_t sio_tryread(sio_fd_t fd, u8_t *data, u32_t size)
+u32_t sio_read(void *fd, u8_t *data, u32_t len)
 {
-    return sio_read(fd, data, size);
+    (void)fd;
+    (void)data;
+    (void)len;
+    return 0;
+}
+
+u32_t sio_tryread(void *fd, u8_t *data, u32_t len)
+{
+    (void)fd;
+    (void)data;
+    (void)len;
+    return 0;
 }
 
 }

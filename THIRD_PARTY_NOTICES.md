@@ -35,7 +35,7 @@ remain byte-identical.
 
 `include/elf.h` is the MIT-licensed musl header. `include/dma.h`,
 `driver/dma.cpp`, `driver/dma_plan.h`, `kmod/netserver/netserver.cpp`, and
-`kmod/netserver/arch/sys_arch.*` are project-local implementations. The
+`kmod/netserver/arch/sys_arch.*` and `kmod/netserver/arch/utils.*` are project-local implementations. The
 netserver continues to link the separately licensed BSD-3-Clause lwIP source.
 
 `include/efi/fbc.h` contains portions derived from MikanOS and retains the

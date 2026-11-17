@@ -62,6 +62,23 @@ class GenNinjaDependencyTests(unittest.TestCase):
         self.assertNotIn("font/ttf/", source_section)
         self.assertIn("font/hankaku.bin", self.text)
 
+    def test_common_modules_include_all_nics_and_the_ipv6_os_port(self) -> None:
+        for name in ("e1000", "rtl8139", "virtio-net", "netserver", "xhci"):
+            self.assertEqual(self.text.count(f"build out/{name}.sys: kmod_link "), 1)
+        self.assertIn("netserver_cc kmod/netserver/lwip/core/ipv6/nd6.c", self.text)
+        self.assertIn("netserver_cxx kmod/netserver/arch/utils.cpp", self.text)
+        self.assertNotIn("graphics.sys", self.text)
+
+    def test_common_manifest_participates_in_regeneration_and_preflight(self) -> None:
+        for edge in ("build build.ninja:", "build out/.ninja-preflight:"):
+            inputs = self.text.split(edge, 1)[1].splitlines()[0]
+            self.assertIn("tools/kernel_modules.py", inputs)
+
+    def test_xhci_module_uses_separate_pic_objects(self) -> None:
+        module = self.text.split("build out/xhci.sys:", 1)[1].splitlines()[0]
+        self.assertIn("out/kmod_module/xhci/xhci.o", module)
+        self.assertNotIn(" out/kmod/xhci/", module)
+
 
 class GenNinjaLogTests(unittest.TestCase):
     @classmethod

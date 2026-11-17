@@ -1,4 +1,5 @@
 #include <cpu/regio.h>
+#include <dlinker.h>
 #include <openxj380/config.h>
 #include <openxj380/socket.h>
 #include <proto.hpp>
@@ -142,6 +143,8 @@ extern "C" void mouse_inject_report(int dx, int dy, uint8_t buttons, int wheel)
     OpenXJ380Socket_MouseInterrupte(&event);
 #endif
 }
+// The shared xHCI module delivers HID reports through the kernel input bridge.
+EXPORT_SYMBOL(mouse_inject_report);
 
 extern "C" void c_mouse_handler(void *regs_ptr, uint64_t error_code)
 {

@@ -16,7 +16,7 @@ XJ380/
 ├── graphics/, font/      # Historical graphics/font code; not in the current build
 ├── include/              # Shared kernel/module ABI headers
 ├── lib/                  # Small built-in support code
-├── kmod/                 # Loadable kernel modules -> out/*.sys -> image /mod
+├── kmod/                 # Loadable kernel modules -> out/*.sys -> image /system/mod
 ├── user/                 # XAPI runtime/API plus one CLI example
 ├── third_party/          # Vendored upstream source drops; avoid local edits
 ├── Bf/                   # Host-independent staging resources for image/xbps
@@ -33,7 +33,7 @@ XJ380/
 | Built-in drivers | `driver/` | Linked into `kernel.krl`; do not move loadable module code here. |
 | Filesystem/VFS | `driver/fs/`, `include/fs/` | FATFS port, VFS, proc/dev/tmp/pipe/pty filesystems. |
 | User API/example | `user/xapi/`, `user/cli_shell.cpp` | Runtime/API headers and the sole CLI example. |
-| Loadable modules | `kmod/`, `kernel/dlinker.cpp`, `include/dlinker.h` | Module entry is `dlmain`; output is `.sys`. |
+| Loadable modules | `tools/kernel_modules.py`, `kmod/`, `kernel/dlinker.cpp`, `include/dlinker.h` | Module entry is `dlmain`; output is `.sys`. |
 | Networking stack | `kmod/netserver/`, `include/net/` | First-party glue around vendored lwIP. |
 | User example | `tools/gen_ninja.py`, `user/cli_shell.cpp` | Links against `out/xapi/*.o`. |
 | User runtime/API | `user/xapi/`, `user/xapi/include/` | Startup shims, libc/POSIX-like wrappers. |

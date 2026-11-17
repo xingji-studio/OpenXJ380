@@ -6,7 +6,7 @@ Loadable networking module that integrates first-party socket/netdev glue with v
 ## STRUCTURE
 ```
 kmod/netserver/
-├── netserver.cpp   # Module orchestration, sockets, DHCP/manual IPv4, DNS
+├── netserver.cpp   # Module orchestration, sockets, IPv4/IPv6, DNS, native network provider
 ├── arch/           # lwIP OS-port glue for scheduler/mutex/time
 └── lwip/           # Vendored lwIP stack; avoid local feature edits
 ```
@@ -14,7 +14,7 @@ kmod/netserver/
 ## WHERE TO LOOK
 | Task | Location | Notes |
 |------|----------|-------|
-| Module build | `tools/gen_ninja.py` kmod section | Produces `out/netserver.sys`. |
+| Module build | `tools/kernel_modules.py` | Produces `out/netserver.sys`. |
 | Socket/provider glue | `netserver.cpp` | Main first-party networking behavior. |
 | lwIP OS port | `arch/sys_arch.cpp`, `arch/utils.cpp` | Scheduler/mutex/timer bridge. |
 | Network ABI | `include/net/`, `include/netdev.h` | Shared with kernel/user callers. |
@@ -27,6 +27,7 @@ kmod/netserver/
 - The network device path depends on `netdev_t` callbacks and E1000/module registration order.
 - `arch/sys_arch.cpp` is the correct layer for lwIP mutex/protect/scheduler semantics; do not scatter OS-port behavior through lwIP core files.
 - Document lwIP integration boundaries here, not inside `lwip/` child docs.
+- Routine socket/lwIP tracing is disabled by default. Define `CONFIG_NETSERVER_DEBUG_TRACE=1` in module compiler flags to enable the shared one-event-per-second trace gate and retry summaries. Genuine failures retain bounded diagnostics; logging never waits for UART/queue capacity. Policy lives in `log_policy.h`, `netserver.cpp`, and the first-party `lwipopts.h` override.
 
 ## ANTI-PATTERNS
 - Do not edit `lwip/**` for project policy when `netserver.cpp`, `arch/`, or config can carry the change.
@@ -35,4 +36,4 @@ kmod/netserver/
 - Do not assume chained pbuf support where lwIP ZEP code asserts `p->next == NULL`.
 
 ## VERIFY
-Build `python3 tools/gen_ninja.py --out build.ninja && ninja -f build.ninja out/netserver.sys` or `ninja -f build.ninja all`. Runtime changes require booting with modules enabled and exercising a socket-using test workload.
+Build `python3 tools/gen_ninja.py --out build.ninja` then build `out/netserver.sys` (use the parent's guarded `./ninja -C OpenXJ380` when embedded). Runtime changes require booting with modules enabled and exercising socket-using test workloads (or `netcfg`, `httpget`, and `browser` in the parent product).

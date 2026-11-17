@@ -7,14 +7,17 @@ import argparse
 import re
 from pathlib import Path
 
+try:
+    from tools.kernel_modules import LWIP_C_SOURCES
+except ModuleNotFoundError:
+    from kernel_modules import LWIP_C_SOURCES
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 def compiled_sources() -> list[str]:
-    generator = (ROOT / "tools/gen_ninja.py").read_text(encoding="utf-8")
-    block = generator.split("lwip_c = [", 1)[1].split("]", 1)[0]
-    return [line.strip().strip('\",') for line in block.splitlines() if '"lwip/' in line]
+    return list(LWIP_C_SOURCES)
 
 
 def license_blocks(source: str) -> list[str]:

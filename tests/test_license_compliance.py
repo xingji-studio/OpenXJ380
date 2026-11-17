@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 import importlib
+import os
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -25,10 +27,9 @@ class LicenseComplianceTests(unittest.TestCase):
         self.assertIn('cp(ROOT / "LICENSE", destination / "LICENSE")', staging)
 
     def test_lwip_notice_indexes_every_compiled_source(self) -> None:
-        generator = (ROOT / "tools/gen_ninja.py").read_text(encoding="utf-8")
+        from tools.kernel_modules import LWIP_C_SOURCES
         notice = (ROOT / "licenses/lwip-notice-full.txt").read_text(encoding="utf-8")
-        items = generator.split("lwip_c = [", 1)[1].split("]", 1)[0]
-        compiled = [line.strip().strip('\",') for line in items.splitlines() if '"lwip/' in line]
+        compiled = LWIP_C_SOURCES
         self.assertTrue(compiled)
         for item in compiled:
             self.assertIn(f"kmod/netserver/{item}", notice)
@@ -209,16 +210,20 @@ class LicenseComplianceTests(unittest.TestCase):
             modules = stage / "system/mod"
             (project / "out").mkdir(parents=True)
             modules.mkdir(parents=True)
-            (project / "out/netserver.sys").write_bytes(b"current")
+            for name in ninja_build.KERNEL_MODULES.MODULE_NAMES:
+                (project / "out" / f"{name}.sys").write_bytes(b"current")
+            (modules / "xhci.sys").write_bytes(b"stale builtin module")
             (modules / "netserver.km").write_bytes(b"legacy")
 
             try:
                 ninja_build.ROOT = project
-                ninja_build.copy_modules(stage)
+                with mock.patch.dict(os.environ, BUILTIN_XHCI="1"):
+                    ninja_build.copy_modules(stage)
             finally:
                 ninja_build.ROOT = original_root
 
             self.assertFalse((modules / "netserver.km").exists())
+            self.assertFalse((modules / "xhci.sys").exists())
             self.assertEqual(b"current", (modules / "netserver.sys").read_bytes())
 
 

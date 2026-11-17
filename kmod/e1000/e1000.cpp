@@ -120,7 +120,9 @@ static int e1000_init_rx(e1000_device_t *dev) {
 
     // Configure RX control
     uint32_t rctl = e1000_read32(dev, E1000_RCTL);
-    rctl |= E1000_RCTL_EN | E1000_RCTL_BAM | E1000_RCTL_SECRC | E1000_RCTL_LPE;
+    // IPv6 ND, router advertisements and MLD use multicast MAC addresses.
+    // The current netdev ABI has no multicast-filter programming callback.
+    rctl |= E1000_RCTL_EN | E1000_RCTL_BAM | E1000_RCTL_MPE | E1000_RCTL_SECRC | E1000_RCTL_LPE;
     e1000_write32(dev, E1000_RCTL, rctl);
 
     return 0;

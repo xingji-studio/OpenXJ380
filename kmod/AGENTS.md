@@ -1,12 +1,14 @@
 # KMOD KNOWLEDGE BASE
 
 ## OVERVIEW
-Loadable kernel module subtree. Modules build as shared `.sys` artifacts, load through the kernel dynamic linker, and are copied into the disk image `/mod`.
+Loadable kernel module subtree. Modules build as shared `.sys` artifacts, load through the kernel dynamic linker, and are copied into the disk image `/system/mod`.
 
 ## STRUCTURE
 ```
 kmod/
 ├── e1000/           # Intel E1000 network driver module
+├── rtl8139/         # Realtek RTL8139 network driver module
+├── virtio-net/      # Legacy/transitional VirtIO network driver module
 ├── netserver/       # lwIP-backed networking module
 ├── xhci/            # USB xHCI module
 └── dlinker_test/    # Module dependency/linker test, not built by default
@@ -17,9 +19,9 @@ kmod/
 |------|----------|-------|
 | Module policy | `README.md` | Boundary rule for `kmod/` vs `kernel/` vs `driver/`. |
 | Module loader | `kernel/dlinker.cpp`, `include/dlinker.h` | Loads `.sys`, resolves symbols/deps. |
-| Top-level build | `tools/gen_ninja.py` kmod section | Builds e1000, netserver, and xhci artifacts. |
+| Top-level build | `tools/kernel_modules.py` | Shared sources, compiler/linker rules, and image artifact list. |
 | Module entry | `*/*.cpp` | Linker entry symbol is `dlmain`. |
-| Image copy | `tools/ninja_build.py` | Copies `out/*.sys` into image `/mod`. |
+| Image copy | `tools/ninja_build.py` | Copies `out/*.sys` into image `/system/mod`. |
 
 ## CONVENTIONS
 - Put code here only if it is intended to be linked as a shared loadable kernel module.
@@ -32,8 +34,9 @@ kmod/
 ## ANTI-PATTERNS
 - Do not put mandatory boot drivers in `kmod/`; safe mode/boot flags can disable module loading.
 - Do not create Linux-style `init_module` expectations; this repo uses `dlmain`.
-- Do not assume `.sys` files land under `/system`; root image copy places `out/*.sys` into `/mod`.
+- Do not load `xhci.sys` when `BUILTIN_XHCI=1`; staging excludes the artifact in this mode.
+- Do not duplicate common module sources or rules in the parent product.
 - Do not edit module object order casually where the generated graph hardcodes link order.
 
 ## VERIFY
-Use `python3 tools/gen_ninja.py --out build.ninja && ninja -f build.ninja kmods` for module-only builds; `ninja -f build.ninja all` and `ninja -f build.ninja vdisk` verify image staging.
+Generate this repository's Ninja graph with `python3 tools/gen_ninja.py --out build.ninja`. In the parent checkout, use its guarded `./ninja -C OpenXJ380 -f build.ninja kmods` from the parent root. Verify both `BUILTIN_XHCI` modes and preserve the five allocator wrap flags in both generators.
