@@ -1437,8 +1437,12 @@ sys_(wait4, unsigned long pid_value, int *status, int options, void *rusage)
                                  (unsigned long long)spins);
             }
             spins++;
-            __asm__ volatile("pause");
-            scheduler_yield();
+            if (signals_pending_quick(get_current_task())) return SYSCALL_FAULT_(EINTR);
+            // No child or IPC pointer is retained here. Polling with a runnable
+            // parent consumes a single CPU while its child is loading Node/V8.
+            // Sleep outside all lifetime locks and recheck the claimed-child
+            // protocol after the bounded deadline, including exit-before-sleep.
+            scheduler_sleep_ns(1000000ULL);
             continue;
         }
 

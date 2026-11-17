@@ -275,6 +275,18 @@ from task context in the reaper, outside spin locks and scheduler-disabled
 sections. PCB collection and waitpid claims must retain their private lifetime
 pins while any cleanup or user-memory copy is in progress.
 
+Blocking Linux `wait4` releases the CPU through a bounded scheduler sleep when
+no matching exit is ready. It retains no child/message pointer across that wait;
+the next iteration repeats the existing lifetime-pinned claim. The syscall IRQ
+scope makes this wait preemptible and restores the entry state before return.
+Keep WNOHANG immediate, check pending signals outside locks, and never replace
+this sleep with a runnable yield loop that competes with the child on one CPU.
+
+An adopted Linux child may still be running when its original parent is
+collected. If it exits later as ZOMBIE, the permanent kernel parent's reaper
+must claim it using the same operation-pin, CPU-reference and wait-owner checks
+as DEATH children. Zombies of ordinary parents remain available to waitpid.
+
 Kernel-private bindings associate duplicated/forked descriptors with one open
 file description. Independent opens have separate descriptions, even when they
 reference the same VFS node. Keep the public 32-byte `fd_file_handle` prefix

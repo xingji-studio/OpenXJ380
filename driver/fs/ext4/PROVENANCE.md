@@ -225,3 +225,10 @@ Its checked host test runs the production queue with ASan/UBSan, including
 concurrent readers, overflow, failed user copies and watch retirement. The
 ext4.cpp inventory hash tracks this reviewed glue change; policy checks and
 the empty external-input lists remain enabled.
+
+Ordinary regular-file reads opt into the existing mapping-checked contiguous
+transfer path, bounded to 32 filesystem blocks (at most 128 KiB). Directory and
+symlink reads retain single-block transfers. Each block mapping is validated;
+holes, unwritten extents and discontinuities stop a physical run. This changes
+read submission size without adding read-ahead, dirty writeback or dependencies.
+The VFS adapter retains its existing error return and operation-mutex boundary.

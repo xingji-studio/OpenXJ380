@@ -638,7 +638,11 @@ static size_t read_node(void *context, void *buffer, size_t offset, size_t lengt
         return (size_t)-1;
     }
     xjext4::Size completed = 0;
-    int error = view(handle->mount).read(handle->inode, offset, buffer, length, completed);
+    // Validate contiguous regular-file mappings and submit bounded reads.
+    // ELF and shared-library loaders otherwise issue one device command per
+    // filesystem block even when the caller supplies a large read buffer.
+    unsigned transfer_blocks = (handle->inode.mode & 0170000) == 0100000 ? 32 : 1;
+    int error = view(handle->mount).read(handle->inode, offset, buffer, length, completed, transfer_blocks);
     if (error) { failure(error); return (size_t)-1; }
     return completed;
 }

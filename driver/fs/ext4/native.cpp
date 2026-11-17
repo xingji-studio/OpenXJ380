@@ -522,8 +522,8 @@ int Volume::read(const Inode &inode, uint64_t offset, void *output, Size length,
         {
             // Explicit read-only opt-in. Validate every logical mapping before
             // joining adjacent physical blocks. Holes, unwritten extents, EOF
-            // and discontinuities end the run; ordinary VFS reads keep their
-            // original single-block contract and partial-progress behavior.
+            // and discontinuities end the run. The caller bounds each transfer;
+            // callers using the default retain single-block failure progress.
             for (unsigned run = 1; run < maximum_transfer_blocks &&
                  take < length - completed && logical + run <= 0xffffffffULL; ++run)
             {

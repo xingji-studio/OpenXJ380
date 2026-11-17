@@ -32,7 +32,11 @@ static pcb_t find_reapable_child(pcb_t parent)
     for (lock_node *node = parent->child_pcb->head; node != NULL; node = node->next)
     {
         pcb_t child = (pcb_t)node->data;
-        if (child != NULL && child->status == DEATH && !child->wait_owner &&
+        // A Linux child adopted while alive can become a zombie only after
+        // its original parent has been collected. The kernel is its reaper;
+        // leave zombies belonging to ordinary parents available to waitpid.
+        if (child != NULL && (child->status == DEATH || (parent == kernel_group && child->status == ZOMBIE)) &&
+            !child->wait_owner &&
             child->fd_cleanup_state != 3 && child->fd_cleanup_state != 4 && !process_is_current_on_any_cpu(child))
         {
             __atomic_store_n(&child->wait_owner, get_current_task(), __ATOMIC_RELEASE);
