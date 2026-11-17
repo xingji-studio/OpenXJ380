@@ -22,7 +22,7 @@ static void sata_log_io_context(const char *reason, struct hba_port *port, struc
 {
     uint64_t buf_phys  = page_virt_to_phys(buf);
     uint64_t prdt_phys = ((uint64_t)table->entries[0].data_base_upper << 32) | table->entries[0].data_base;
-    write_serial_fmt(
+    try_write_serial_fmt(
         "AHCI IO: %s op=%s lba=%llu sectors=%u bytes=%u slot=%d buf=0x%llx phys=0x%llx "
         "prdt=0x%llx dbc=0x%x prdbc=%u CI=0x%x SACT=0x%x IS=0x%x TFD=0x%x SERR=0x%x SSTS=0x%x CMD=0x%x\n",
         reason, write ? "write" : "read", lba, count, len, slot, buf, buf_phys, prdt_phys,
@@ -33,7 +33,7 @@ static void sata_log_io_context(const char *reason, struct hba_port *port, struc
 
 void sata_read_error(struct hba_port *port)
 {
-    write_serial_fmt("SATA read error\n");
+    try_write_serial_fmt("SATA read error\n");
     uint32_t tfd                        = port->regs[HBA_RPxTFD];
     port->device->last_result.sense_key = (tfd & 0xf000) >> 12;
     port->device->last_result.error     = (tfd & 0x0f00) >> 8;
@@ -48,12 +48,12 @@ static void sata_submit_safe(struct hba_device *dev, struct blkio_req *io_req)
     int              write = !!(io_req->flags & BLKIO_WRITE);
     int              slot  = hba_prepare_cmd(port, &table, &header);
     if (slot < 0) {
-        write_serial_fmt("AHCI: No free command slot for %s lba=%llu len=%llu\n", write ? "write" : "read",
+        try_write_serial_fmt("AHCI: No free command slot for %s lba=%llu len=%llu\n", write ? "write" : "read",
                          io_req->lba, io_req->len);
         return;
     }
     if (hba_bind_sbuf(header, table, (void *)io_req->buf, io_req->len) != 0) {
-        write_serial_fmt("AHCI: Failed to bind %s buffer lba=%llu len=%llu\n", write ? "write" : "read", io_req->lba,
+        try_write_serial_fmt("AHCI: Failed to bind %s buffer lba=%llu len=%llu\n", write ? "write" : "read", io_req->lba,
                          io_req->len);
         return;
     }
@@ -120,12 +120,12 @@ static void sata_submit_fast(struct hba_device *dev, struct blkio_req *io_req)
         uint32_t         chunk = remaining > max_bytes ? max_bytes : remaining;
         int              slot  = hba_prepare_cmd(port, &table, &header);
         if (slot < 0) {
-            write_serial_fmt("AHCI: No free command slot for %s lba=%llu len=%llu\n", write ? "write" : "read", lba,
+            try_write_serial_fmt("AHCI: No free command slot for %s lba=%llu len=%llu\n", write ? "write" : "read", lba,
                              chunk);
             return;
         }
         if (hba_bind_sbuf(header, table, (void *)(io_req->buf + offset), chunk) != 0) {
-            write_serial_fmt("AHCI: Failed to bind %s buffer lba=%llu len=%u\n", write ? "write" : "read", lba,
+            try_write_serial_fmt("AHCI: Failed to bind %s buffer lba=%llu len=%u\n", write ? "write" : "read", lba,
                              chunk);
             return;
         }

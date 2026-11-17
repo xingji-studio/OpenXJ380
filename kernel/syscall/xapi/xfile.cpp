@@ -10,6 +10,7 @@
 #include <fs/vfs/vfs.h>
 #include <krlibc.h>
 #include <mm/frame.h>
+#include <mm/lazyalloc.h>
 #include <mm/uaccess.h>
 #include <pci/pci.h>
 #include <pctable/gdt.h>
@@ -20,6 +21,13 @@
 #include <syscall/syscall.h>
 #include <syscall/xapi_user.h>
 #include <task/pcb.h>
+
+// Keep failed-open rollback in the same VM transaction as native and POSIX allocators.
+static void xfile_unmap_user_range(page_directory_t *directory, uint64_t address, size_t bytes)
+{
+    MmOperationScope operation;
+    unmap_page_range(directory, address, bytes);
+}
 
 static ssize_t xfile_write_from_user(vfs_node_t node, const void *buffer, size_t offset, size_t size)
 {
@@ -129,7 +137,7 @@ uint64_t do_xapi_OpenFile(uint64_t path)
     if (fpath == NULL) return 0;
 
     uint64_t fsptr_addr = page_alloc_random(pagedir, sizeof(XFILE), PTE_PRESENT | PTE_WRITEABLE | PTE_USER);
-    if ((int64_t)fsptr_addr == -1)
+    if (fsptr_addr == 0)
     {
         free(fpath);
         return 0;
@@ -144,7 +152,7 @@ uint64_t do_xapi_OpenFile(uint64_t path)
     {
         if (f) vfs_close(f);
         free(fpath);
-        unmap_page_range(pagedir, fsptr_addr, sizeof(XFILE));
+        xfile_unmap_user_range(pagedir, fsptr_addr, sizeof(XFILE));
         return 0;
     }
 
@@ -156,24 +164,24 @@ uint64_t do_xapi_OpenFile(uint64_t path)
         {
             vfs_close(f);
             free(fpath);
-            unmap_page_range(pagedir, fsptr_addr, sizeof(XFILE));
+            xfile_unmap_user_range(pagedir, fsptr_addr, sizeof(XFILE));
             return 0;
         }
 
         local.buffer = (void *)page_alloc_random(pagedir, (size_t)length, PTE_PRESENT | PTE_WRITEABLE | PTE_USER);
-        if ((int64_t)local.buffer == -1)
+        if (local.buffer == NULL)
         {
             vfs_close(f);
             free(fpath);
-            unmap_page_range(pagedir, fsptr_addr, sizeof(XFILE));
+            xfile_unmap_user_range(pagedir, fsptr_addr, sizeof(XFILE));
             return 0;
         }
         if (xfile_read_to_user(f, local.buffer, 0, (size_t)length) < 0)
         {
             vfs_close(f);
             free(fpath);
-            unmap_page_range(pagedir, (uint64_t)local.buffer, (size_t)length);
-            unmap_page_range(pagedir, fsptr_addr, sizeof(XFILE));
+            xfile_unmap_user_range(pagedir, (uint64_t)local.buffer, (size_t)length);
+            xfile_unmap_user_range(pagedir, fsptr_addr, sizeof(XFILE));
             return 0;
         }
     }
@@ -183,8 +191,8 @@ uint64_t do_xapi_OpenFile(uint64_t path)
     if (!copy_to_user_pagedir(pagedir, (void *)fsptr_addr, &local, sizeof(local)))
     {
         if (local.length > 0 && local.buffer != NULL)
-            unmap_page_range(pagedir, (uint64_t)local.buffer, (size_t)local.length);
-        unmap_page_range(pagedir, fsptr_addr, sizeof(XFILE));
+            xfile_unmap_user_range(pagedir, (uint64_t)local.buffer, (size_t)local.length);
+        xfile_unmap_user_range(pagedir, fsptr_addr, sizeof(XFILE));
         return 0;
     }
 
@@ -228,6 +236,7 @@ void do_xapi_CloseFile(uint64_t ptr)
     vfs_close(f);
 
 unmap_only:
+    MmOperationScope operation;
     if (local.length > 0 && local.buffer != NULL && user_range_mapped(pagedir, local.buffer, local.length))
     {
         unmap_page_range(pagedir, (uint64_t)local.buffer, local.length);
@@ -336,7 +345,7 @@ void do_xapi_SearchFile(uint64_t path, uint64_t count, XAPIT_DirNode **dir)
         !copy_to_user_pagedir(pagedir, dir, &fdir, sizeof(fdir)) ||
         !copy_to_user_pagedir(pagedir, (void *)count, &fcount, sizeof(fcount)))
     {
-        unmap_page_range(pagedir, (uint64_t)fdir, entries_bytes);
+        xfile_unmap_user_range(pagedir, (uint64_t)fdir, entries_bytes);
         fdir = NULL;
         fcount = 0;
         copy_to_user_pagedir(pagedir, dir, &fdir, sizeof(fdir));
@@ -355,6 +364,7 @@ void do_xapi_SearchFile_freem(XAPIT_DirNode *dir, int32_t count)
         ((uint64_t)dir & (PAGE_SIZE - 1)) != 0 || check_user_overflow((uint64_t)dir, bytes))
         return;
 
+    MmOperationScope operation;
     for (uint64_t address = (uint64_t)dir; address < (uint64_t)dir + bytes; address += PAGE_SIZE)
     {
         uint64_t flags = 0;

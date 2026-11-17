@@ -6,7 +6,7 @@
 
 static void ahci_log_cmd_failure(struct hba_port *port, int slot, const char *reason)
 {
-    write_serial_fmt(
+    try_write_serial_fmt(
         "AHCI: %s slot=%d CI=0x%x SACT=0x%x IS=0x%x TFD=0x%x SERR=0x%x SSTS=0x%x CMD=0x%x\n", reason, slot,
         port->regs[HBA_RPxCI], port->regs[HBA_RPxSACT], port->regs[HBA_RPxIS], port->regs[HBA_RPxTFD],
         port->regs[HBA_RPxSERR], port->regs[HBA_RPxSSTS], port->regs[HBA_RPxCMD]);
@@ -17,7 +17,7 @@ static void ahci_log_timeout(struct hba_port *port, int slot, const char *reason
 {
     ahci_log_cmd_failure(port, slot, reason);
     uint8_t opcode = port->cmd_tables[slot] ? port->cmd_tables[slot]->command_fis[2] : 0;
-    write_serial_fmt(
+    try_write_serial_fmt(
         "AHCI deadline: opcode=0x%x elapsed_ns=%llu budget_ns=%llu polls=%llu start_ns=%llu "
         "sample_ns=%llu clock_available=%u clock_progress=%u stagnant_polls=%llu\n",
         opcode, deadline.elapsed_ns(), timeout_ns, deadline.poll_count(), deadline.start_ns(), deadline.sample_ns(),
@@ -111,7 +111,7 @@ int ahci_send_command(struct hba_port *port, int slot, uint64_t timeout_ns)
         if (!error && active) error = -EIO;
         if (error)
         {
-            write_serial_fmt("AHCI: rejected final status slot=%d error=%d TFD=0x%x SACT=0x%x\n",
+            try_write_serial_fmt("AHCI: rejected final status slot=%d error=%d TFD=0x%x SACT=0x%x\n",
                              slot, error, tfd, active);
             if (port->device) sata_read_error(port);
             ahci_log_cmd_failure(port, slot, "invalid final completion state");
@@ -124,7 +124,7 @@ int ahci_send_command(struct hba_port *port, int slot, uint64_t timeout_ns)
             // the actual sampled status rather than a later settled value.
             static uint32_t reports;
             if (__atomic_fetch_add(&reports, 1u, __ATOMIC_RELAXED) < 8)
-                write_serial_fmt("AHCI: waiting for final task-file slot=%d sampled TFD=0x%x\n", slot, tfd);
+                try_write_serial_fmt("AHCI: waiting for final task-file slot=%d sampled TFD=0x%x\n", slot, tfd);
             reported_pending = true;
         }
         if (deadline.expired(nanoTime(), timeout_ns))
@@ -151,7 +151,7 @@ void ahci_post(struct hba_port *port, struct hba_cmd_state *state, int slot)
     uint32_t bitmask = 1u << slot;
     port->cmdctx.issued[slot] = state;
     port->cmdctx.tracked_ci |= bitmask;
-    if (!ahci_try_send(port, slot)) write_serial_fmt("AHCI: async post failed for slot=%d\n", slot);
+    if (!ahci_try_send(port, slot)) try_write_serial_fmt("AHCI: async post failed for slot=%d\n", slot);
     port->cmdctx.tracked_ci &= ~bitmask;
     port->cmdctx.issued[slot] = NULL;
 }

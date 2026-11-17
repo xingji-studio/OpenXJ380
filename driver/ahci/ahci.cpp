@@ -7,6 +7,7 @@
 #include <ioctl.h>
 #include <errno.h>
 #include <mutex.h>
+#include <task/termination.h>
 #include "deadline.h"
 #include <wsod_storage.h>
 
@@ -63,14 +64,14 @@ int ahci_fail_port(struct hba_port *port, int error)
             io_mfence();
             if (!(pci_read_command(device, PCI_CONF_COMMAND) & PCI_COMMAND_MASTER))
             {
-                write_serial_string("AHCI: controller bus mastering disabled; in-flight DMA drain unconfirmed\n");
+                try_write_serial_fmt("AHCI: controller bus mastering disabled; in-flight DMA drain unconfirmed\n");
             }
         }
     }
     // Bus-master disable prevents new transactions but does not establish that
     // already-issued DMA has drained. With CR/FR still active, never return the
     // caller's buffer, even if PCI command readback confirms bus mastering off.
-    write_serial_string("AHCI: cannot confirm DMA quiescence; halting to preserve buffer ownership\n");
+    try_write_serial_fmt("AHCI: cannot confirm DMA quiescence; halting to preserve buffer ownership\n");
     for (;;) asm volatile("cli; hlt");
 }
 
@@ -299,7 +300,7 @@ int hba_bind_vbuf(struct hba_cmdh *cmdh, struct hba_cmdt *cmdt, struct vecbuf *v
 
 int hba_bind_sbuf(struct hba_cmdh *cmdh, struct hba_cmdt *cmdt, void *buf, uint32_t len) {
     if (!buf || len == 0 || len > 0x400000UL) {
-        write_serial_fmt("AHCI buffer too large\n");
+        try_write_serial_fmt("AHCI buffer too large\n");
         return -1;
     }
 
@@ -308,7 +309,7 @@ int hba_bind_sbuf(struct hba_cmdh *cmdh, struct hba_cmdt *cmdt, void *buf, uint3
     uint64_t buf_phys      = page_virt_to_phys((uint64_t)buf);
     uint64_t cmdt_phys     = page_virt_to_phys((uint64_t)cmdt);
     if (buf_phys == 0) {
-        write_serial_fmt("AHCI buffer not mapped buf=0x%llx buf_drv=0x%llx cmdt=0x%llx cmdt_drv=0x%llx\n",
+        try_write_serial_fmt("AHCI buffer not mapped buf=0x%llx buf_drv=0x%llx cmdt=0x%llx cmdt_drv=0x%llx\n",
                          (uint64_t)buf, buf_phys_drv, (uint64_t)cmdt, cmdt_phys_drv);
         return -1;
     }
@@ -319,7 +320,7 @@ int hba_bind_sbuf(struct hba_cmdh *cmdh, struct hba_cmdt *cmdt, void *buf, uint3
     }
 
     if (buf_phys == cmdt_phys) {
-        write_serial_fmt("AHCI: buffer/cmd_table physical collision buf=0x%llx phys=0x%llx len=0x%x\n",
+        try_write_serial_fmt("AHCI: buffer/cmd_table physical collision buf=0x%llx phys=0x%llx len=0x%x\n",
                          (uint64_t)buf, buf_phys, len);
     }
 
@@ -494,6 +495,7 @@ static mutex_t ahci_operate_lock;
 
 class AhciOperationGuard
 {
+    KernelOperationScope operation;
     bool locked;
 
 public:
@@ -519,7 +521,7 @@ size_t ahci_read(int drive, uint8_t *buffer, size_t size, size_t lba) {
     if (!guard.ready()) return 0;
     struct hba_device *dev = (struct hba_device *)hbaDevice[drive];
     if (dev == NULL) {
-        write_serial_fmt("AHCI: read on missing device drive=%d lba=%llu sectors=%llu\n", drive, lba, size);
+        try_write_serial_fmt("AHCI: read on missing device drive=%d lba=%llu sectors=%llu\n", drive, lba, size);
         return 0;
     }
     if (!dev->block_size || lba > dev->max_lba || size > dev->max_lba - lba ||
@@ -528,7 +530,7 @@ size_t ahci_read(int drive, uint8_t *buffer, size_t size, size_t lba) {
           .buf = (uint64_t)buffer, .lba = lba, .len = size * dev->block_size, .flags = 0, .status = -1};
     dev->ops.submit(dev, &req);
     if (req.status != 0) {
-        write_serial_fmt("AHCI: read failed drive=%d lba=%llu sectors=%llu bytes=%llu\n", drive, lba, size, req.len);
+        try_write_serial_fmt("AHCI: read failed drive=%d lba=%llu sectors=%llu bytes=%llu\n", drive, lba, size, req.len);
         return 0;
     }
     return size;
@@ -540,7 +542,7 @@ size_t ahci_write(int drive, uint8_t *buffer, size_t size, size_t lba) {
     if (!guard.ready()) return 0;
     struct hba_device *dev = (struct hba_device *)hbaDevice[drive];
     if (dev == NULL) {
-        write_serial_fmt("AHCI: write on missing device drive=%d lba=%llu sectors=%llu\n", drive, lba, size);
+        try_write_serial_fmt("AHCI: write on missing device drive=%d lba=%llu sectors=%llu\n", drive, lba, size);
         return 0;
     }
     if (!dev->block_size || lba > dev->max_lba || size > dev->max_lba - lba ||
@@ -549,7 +551,7 @@ size_t ahci_write(int drive, uint8_t *buffer, size_t size, size_t lba) {
           .buf = (uint64_t)buffer, .lba = lba, .len = size * dev->block_size, .flags = BLKIO_WRITE, .status = -1};
     dev->ops.submit(dev, &req);
     if (req.status != 0) {
-        write_serial_fmt("AHCI: write failed drive=%d lba=%llu sectors=%llu bytes=%llu\n", drive, lba, size, req.len);
+        try_write_serial_fmt("AHCI: write failed drive=%d lba=%llu sectors=%llu bytes=%llu\n", drive, lba, size, req.len);
         return 0;
     }
     return size;

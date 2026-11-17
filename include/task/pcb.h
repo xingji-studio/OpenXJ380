@@ -154,6 +154,10 @@ struct process_control_block
     // Linux CLONE_SIGHAND threads share dispositions; masks remain per TCB.
     spin_t linux_signal_lock;
     sigaction_t linux_actions[64];
+    // Protected kernel operations keep this process alive until their callers unwind.
+    uint32_t kernel_operation_pins;
+    uint8_t kernel_exit_request; // 0 none, 1 zombie exit, 2 deferred collection.
+    int kernel_exit_code;
 };
 #ifndef CONFIG_USER_ELF_HEADER_START
 #define CONFIG_USER_ELF_HEADER_START 0x0000300000000000UL
@@ -241,6 +245,11 @@ struct thread_control_block
     uint32_t ime_config_depth; // Kernel-only settings transaction scope.
     uint64_t ime_launch_generation;
     uint32_t ime_launch_role; // Consumed by a controlled loader invocation.
+    // Append only: syscall_stack/user_rsp offsets are consumed by handler.S.
+    uint32_t kernel_operation_depth;
+    uint32_t kernel_boundary_depth;
+    bool kernel_operation_pinned;
+    bool kernel_exit_pending;
 };
 
 extern pcb_t kernel_group;

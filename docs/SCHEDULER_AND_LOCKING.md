@@ -162,6 +162,34 @@ must remain intact across scheduling. Initialize a new frame through HHDM
 before publishing a present user PTE, and recheck pages another CPU already
 faulted in. Protection faults must not enter this allocation path.
 
+## Termination during protected kernel operations
+
+User-memory operations and AHCI admission enter a shared termination protocol
+before acquiring their sleeping mutexes. Kill requests and admission serialize
+under a short metadata lock. A protected owner or waiter remains schedulable;
+whole-process exit keeps the parent nonterminal until those operations drain.
+Pending exit rejects new operation admission and new user-thread preparation.
+The reaper also checks the process operation pins, including off-CPU owners.
+
+Syscall and page-fault boundaries retain a pending owner's pin after the final
+mutex release while caller-owned resources unwind. At the outer boundary the
+thread publishes death and parks without returning to user mode. Final parent
+notification runs with local IRQs masked after dropping the metadata gate, so
+a timer cannot strand a terminal current thread before publishing its exit.
+New state is appended to PCB/TCB tails; existing assembly offsets stay fixed.
+This handles ordinary termination requests, not arbitrary interrupted corrupt
+kernel state. Never steal these mutexes or release DMA storage on terminal
+status alone. AHCI runtime diagnostics use nonwaiting serial publication.
+
+Native XFILE and stack-reservation allocation use the same recursive VM gate
+as mmap: select an address, update the cursor, and publish PTEs or reservations
+inside one scope. XFILE teardown and failed-open rollback share that gate; VFS
+I/O remains outside the XFILE mapping scopes. This does not provide concurrent
+same-XFILE close semantics or protect a buffer explicitly unmapped by its user.
+`tests/test_kernel_operation_exit.py` executes the actual mutex/termination/kill
+paths; `tests/test_xfile_mapping.py` reproduces the unlocked allocation race as
+a control and checks production open/close isolation and allocation rollback.
+
 ## Runtime serial transport
 
 Normal serial output formats into a private per-call writer and publishes

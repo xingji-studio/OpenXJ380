@@ -50,3 +50,21 @@ bool lazy_infoalloc(pcb_t process, uint64_t vaddr, size_t length, uint64_t page_
  * @param process 释放进程
  */
 void lazy_free(pcb_t process);
+
+// Serialize user address selection/publication and teardown without disabling preemption.
+class MmOperationScope
+{
+    bool active;
+
+public:
+    explicit MmOperationScope(bool enabled = true) : active(enabled)
+    {
+        if (active) mm_op_lock_acquire();
+    }
+    ~MmOperationScope()
+    {
+        if (active) mm_op_lock_release();
+    }
+    MmOperationScope(const MmOperationScope &) = delete;
+    MmOperationScope &operator=(const MmOperationScope &) = delete;
+};

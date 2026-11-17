@@ -13,12 +13,14 @@
 #include <block_access.h>
 #include <installer/jobs.h>
 #include <procfs.h>
+#include <task/termination.h>
 
 extern bool no_interrupt; // 涓簍rue鏃朵唬琛ㄤ弗绂佸紑鍚腑鏂?
 
 static bool process_is_current_on_any_cpu(pcb_t process)
 {
-    return scheduler_process_referenced(process);
+    return process_has_kernel_operations(process) ||
+           scheduler_process_referenced(process);
 }
 
 static pcb_t find_reapable_child(pcb_t parent)

@@ -3,6 +3,7 @@
 #include <errno.h>
 #include <mutex.h>
 #include <task/scheduler.h>
+#include <task/termination.h>
 
 // Faulting in a user buffer can recurse from an existing mmap/VFS operation.
 // Keep the gate preemptible and recursive; queue spin locks protect metadata
@@ -11,12 +12,14 @@ static mutex_t user_memory_lock = {SPIN_INIT, MUTEX_UNLOCKED, NULL, NULL, 0, tru
 
 void mm_op_lock_acquire()
 {
+    kernel_operation_enter();
     mutex_lock(&user_memory_lock);
 }
 
 void mm_op_lock_release()
 {
     mutex_unlock(&user_memory_lock);
+    kernel_operation_leave(get_current_task());
 }
 
 struct LazyMemoryOperation

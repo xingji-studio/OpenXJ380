@@ -38,6 +38,7 @@
 #include <installer/jobs.h>
 #include <task/ipc.h>
 #include <task/process_preparation.h>
+#include <task/termination.h>
 #include <smp/smp.h>
 
 // Product audio resources are revoked at successful image publication.
@@ -320,23 +321,12 @@ void kill_proc(pcb_t pcb, int exit_code, bool is_zombie)
         return;
     }
 
-    pcb->exit_code = exit_code;
+    if (!process_request_termination(pcb, exit_code, is_zombie)) return;
 
     if (is_zombie)
     {
         // Exit may run with interrupts or scheduling disabled. The reaper
         // drains descriptors only after every exiting thread leaves all CPUs.
-        pcb->status = DEATH;
-        if (pcb->thread_queue->size > 0)
-        {
-            spin_lock(&pcb->thread_queue->lock);
-            queue_foreach(pcb->thread_queue, node)
-            {
-                tcb_t tcb = (tcb_t)node->data;
-                if (tcb) tcb->status = DEATH;
-            }
-            spin_unlock(&pcb->thread_queue->lock);
-        }
         __atomic_store_n(&pcb->status, ZOMBIE, __ATOMIC_RELEASE);
         if (!notify_parent_exit(pcb, exit_code))
         {
@@ -412,18 +402,7 @@ bool kill_proc_deferred(pcb_t pcb, int exit_code)
         spin_unlock(&siblings->lock);
     }
 
-    pcb->exit_code = exit_code;
-    if (pcb->thread_queue != NULL)
-    {
-        spin_lock(&pcb->thread_queue->lock);
-        queue_foreach(pcb->thread_queue, node)
-        {
-            tcb_t tcb = (tcb_t)node->data;
-            if (tcb) tcb->status = DEATH;
-        }
-        spin_unlock(&pcb->thread_queue->lock);
-    }
-    __atomic_store_n(&pcb->status, DEATH, __ATOMIC_RELEASE);
+    process_request_termination(pcb, exit_code, false);
     spin_unlock(&pcb_group_queue->lock);
     // Reaper collection may free pcb immediately after the unlock.
     return true;
@@ -524,6 +503,7 @@ ProcessPreparation *process_preparation_acquire(pcb_t process)
         spin_lock(&pcb_group_queue->lock);
         valid = process_list_contains_locked(process) && process->pagedir && process->thread_queue &&
                 process->status != DEATH && process->status != OUT && process->status != ZOMBIE &&
+                !process_termination_requested(process) &&
                 __atomic_load_n(&process->fd_cleanup_state, __ATOMIC_ACQUIRE) == 0 && owner &&
                 owner->status != DEATH && owner->status != OUT;
         if (valid)
@@ -532,7 +512,8 @@ ProcessPreparation *process_preparation_acquire(pcb_t process)
             // A collector may have claimed state 4 since the list check.
             // Its final lifetime query takes this same metadata lock.
             valid = __atomic_load_n(&process->fd_cleanup_state, __ATOMIC_ACQUIRE) == 0 &&
-                    process->status != DEATH && process->status != OUT && process->status != ZOMBIE;
+                    process->status != DEATH && process->status != OUT && process->status != ZOMBIE &&
+                    !process_termination_requested(process);
             for (ProcessPreparation *pin = valid ? process_preparations : NULL; pin; pin = pin->next)
             {
                 if (pin->process != process) continue;
@@ -607,7 +588,8 @@ static void abandon_process_preparations(tcb_t owner)
 
 static bool process_current_on_cpu(pcb_t process)
 {
-    return process_has_preparation(process) || scheduler_process_referenced(process);
+    return process_has_kernel_operations(process) ||
+           process_has_preparation(process) || scheduler_process_referenced(process);
 }
 
 static bool wait_owner_quiescent(tcb_t owner)
@@ -1025,6 +1007,7 @@ static void free_user_stack_mapping(tcb_t task)
         task->user_stack == 0 || task->user_stack_top <= task->user_stack)
         return;
 
+    MmOperationScope operation;
     unmap_virtual_page(task->parent_group, task->user_stack, task->user_stack_top - task->user_stack);
     unmap_page_range(task->parent_group->pagedir, task->user_stack, task->user_stack_top - task->user_stack);
     task->user_stack = 0;
@@ -1039,7 +1022,7 @@ void kill_thread(tcb_t task)
         write_serial_fmt("Cannot stop kernel thread.");
         return;
     }
-    __atomic_store_n(&task->status, DEATH, __ATOMIC_RELEASE);
+    task_request_termination(task);
     // kill_thread0(task); 瑕佺敤鐨勮В鎺?浣嗗彲鑳借鍔犻攣
 }
 
@@ -3056,7 +3039,8 @@ static size_t prepare_application_thread(void *entry, void *arguments, int argc,
     {
         spin_lock(&create_thread_lock);
         if (process->pagedir != pin->directory || process->status == DEATH || process->status == OUT ||
-            process->status == ZOMBIE || __atomic_load_n(&process->fd_cleanup_state, __ATOMIC_ACQUIRE) != 0)
+            process->status == ZOMBIE || process_termination_requested(process) ||
+            __atomic_load_n(&process->fd_cleanup_state, __ATOMIC_ACQUIRE) != 0)
             error = -ESRCH;
         else
         {

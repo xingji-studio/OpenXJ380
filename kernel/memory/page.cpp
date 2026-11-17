@@ -10,6 +10,7 @@
 #include <proto.hpp>
 #include <task/pcb.h>
 #include <task/scheduler.h>
+#include <task/termination.h>
 #include <stdint.h>
 #include <wsod.h>
 
@@ -338,6 +339,7 @@ static void dump_user_mapping_probe(page_directory_t *pagedir, const char *tag, 
 
 extern "C" void handle_page_fault(struct X64_REGS *frame, uint64_t error_code)
 {
+    KernelBoundaryScope kernel_boundary;
     uint64_t scheduler_depth = scheduler_disable_depth();
     close_interrupt;
     disable_scheduler();
@@ -376,6 +378,9 @@ extern "C" void handle_page_fault(struct X64_REGS *frame, uint64_t error_code)
                 // The exception return restores the faulting context's IF.
                 return;
             }
+            // Fatal fault delivery may never return. A pending user-fault
+            // owner must finish after VM cleanup, while still preemptible.
+            kernel_boundary.finish();
             disable_scheduler();
             goto err;
         }
@@ -1029,6 +1034,7 @@ uint64_t page_alloc_random(page_directory_t *directory, uint64_t length, uint64_
     uint64_t aligned_length = page_align_up(length);
     if (aligned_length == 0) return 0;
 
+    MmOperationScope operation((flags & PTE_USER) != 0);
     size_t frame_count = aligned_length / PAGE_SIZE;
     uint64_t frame = alloc_frames(frame_count);
     if (frame == 0) return 0;
@@ -1073,6 +1079,7 @@ uint64_t page_reserve_process_user_range(pcb_t owner, uint64_t length)
     uint64_t aligned_length = page_align_up(length);
     if (aligned_length == 0) return 0;
 
+    MmOperationScope operation;
     uint64_t start = owner->mmap_start >= USER_MMAP_START ? owner->mmap_start : USER_MMAP_START;
     uint64_t addr = find_free_user_range(directory, start, aligned_length, owner);
     if (addr == 0 && start != USER_MMAP_START)

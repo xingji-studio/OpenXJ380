@@ -20,6 +20,7 @@
 #include <syscall/pxapi.h>
 #include <syscall/syscall.h>
 #include <syscall/file_io_scope.h>
+#include <task/termination.h>
 #include <task/poll.h>
 
 // MSR寄存器地址定义
@@ -235,6 +236,7 @@ void init_syscall()
 // regs->rdi, regs->rsi, regs->rdx, regs->r10, regs->r8, regs->r9
 extern "C" uint64_t c_syscall_handler(struct X64_REGS *regs, uint64_t user_rsp)
 {
+    KernelBoundaryScope kernel_boundary;
     regs->rip    = regs->rcx;
     regs->cs     = SELECTOR_USER_CS;
     regs->rflags = regs->r11;
@@ -850,6 +852,7 @@ extern "C" uint64_t c_syscall_handler(struct X64_REGS *regs, uint64_t user_rsp)
                          debug_syscall_name(syscall_number),
                          (long long)regs->rax);
     }
+    kernel_boundary.finish();
     signal_deliver_pending(regs);
     tcb_t return_task = get_current_task();
     if (return_task != NULL && return_task->task_level == TASK_APPLICATION_LEVEL)
