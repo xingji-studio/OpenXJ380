@@ -2723,7 +2723,7 @@ static uint64_t poll_kernel_fds(struct pollfd *fds_user, size_t nfds, size_t tim
 
     extern vfs_callback_t fs_callbacks[256];
 
-    do
+    while (true)
     {
         ready = 0;
         for (size_t i = 0; i < nfds; i++)
@@ -2760,12 +2760,16 @@ static uint64_t poll_kernel_fds(struct pollfd *fds_user, size_t nfds, size_t tim
 
         sigexit = signals_pending_quick(get_current_task());
 
-        if (ready > 0 || sigexit) break;
+        if (ready > 0 || sigexit || timeout == 0) break;
 
+        uint64_t elapsed = nanoTime() - start_time;
+        if (timeout != (size_t)-1 && elapsed >= timeout_ns) break;
+        // Callback-only VFS readiness cannot register a common event waiter.
+        // Release the CPU between level checks, with no FD/VFS pointer held;
+        // keep finite deadlines and recheck readiness after the final sleep.
         open_interrupt;
-        scheduler_yield();
-        __asm__ volatile("pause");
-    } while (timeout != 0 && ((int)timeout == -1 || (nanoTime() - start_time) < timeout_ns));
+        scheduler_sleep_ns(timeout == (size_t)-1 ? 1000000ULL : MIN(1000000ULL, timeout_ns - elapsed));
+    }
 
     close_interrupt;
 
@@ -3086,7 +3090,10 @@ sys_(epoll_pwait, int epfd, struct epoll_event *events, int maxevents, int timeo
 
 sys_(poll, struct pollfd *fds_user, size_t nfds, size_t timeout)
 {
-    if (nfds == 0) return 0;
+    // Linux poll takes a signed 32-bit millisecond timeout; all negatives mean
+    // an indefinite wait. Empty descriptor sets still wait for time or signal.
+    size_t wait = (int32_t)timeout < 0 ? (size_t)-1 : (size_t)(uint32_t)timeout;
+    if (nfds == 0) return poll_kernel_fds(NULL, 0, wait);
     if (fds_user == NULL) return SYSCALL_FAULT_(EINVAL);
     if (nfds > USER_POLL_MAX) return SYSCALL_FAULT_(EINVAL);
 
@@ -3100,7 +3107,7 @@ sys_(poll, struct pollfd *fds_user, size_t nfds, size_t timeout)
         return SYSCALL_FAULT_(EFAULT);
     }
 
-    uint64_t ret = poll_kernel_fds(fds, nfds, timeout);
+    uint64_t ret = poll_kernel_fds(fds, nfds, wait);
     if ((int64_t)ret >= 0 && !copy_to_user_pagedir(current_user_pagedir(), fds_user, fds, fds_bytes))
     {
         free(fds);
