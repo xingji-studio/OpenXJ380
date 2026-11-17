@@ -143,7 +143,8 @@ uint8_t bcd_to_bin(uint8_t value) { return (value & 0xf) + (value >> 4) * 10; }
 
 extern int clock_hour_offset;
 
-void time_read(tm *time) {
+static void time_read_offset(tm *time, int hour_offset)
+{
     time_read_bcd(time);
     uint8_t rb = cmos_read(0x0b);
     bool need_convert = !(rb & 0x04);
@@ -153,7 +154,7 @@ void time_read(tm *time) {
     if (need_convert) {
         time->tm_sec = bcd_to_bin(time->tm_sec);
         time->tm_min = bcd_to_bin(time->tm_min);
-        time->tm_hour = (bcd_to_bin(time->tm_hour) + clock_hour_offset) % 24;
+        time->tm_hour = (bcd_to_bin(time->tm_hour) + hour_offset) % 24;
         time->tm_mday = bcd_to_bin(time->tm_mday);
         time->tm_mon = bcd_to_bin(time->tm_mon);
         time->tm_year = bcd_to_bin(time->tm_year);
@@ -174,10 +175,40 @@ void time_read(tm *time) {
         time->tm_hour = ((time->tm_hour & 0x7F) + 12) % 24;
 }
 
-uint64_t realtime_ns() {
-    tm time;
-    time_read(&time);
-    int64_t seconds = mktime(&time);
-    if (seconds < 0) seconds = 0;
-    return (uint64_t)seconds * 1000000000ULL + (nanoTime() % 1000000000ULL);
+void time_read(tm *time)
+{
+    time_read_offset(time, clock_hour_offset);
+}
+
+uint64_t realtime_ns()
+{
+    static spin_t anchor_lock = SPIN_INIT;
+    static bool anchored;
+    static uint64_t epoch_ns, monotonic_ns;
+    if (!__atomic_load_n(&anchored, __ATOMIC_ACQUIRE))
+    {
+        tm time;
+        // CMOS stores UTC. The native desktop's display offset must not alter
+        // POSIX timestamps or absolute pthread/futex deadlines.
+        time_read_offset(&time, 0);
+        int64_t seconds = mktime(&time);
+        uint64_t epoch = seconds < 0 ? 0 : (uint64_t)seconds * 1000000000ULL;
+        uint64_t sample = nanoTime();
+        if (!sample) return epoch; // Do not anchor before HPET is available.
+
+        // CMOS seconds and HPET's modulo-second phase are unrelated. Sample
+        // one epoch and advance it using elapsed HPET time; concatenating the
+        // two clocks made currentTimeMillis jump backwards every second.
+        // Slow CMOS I/O is outside the publication lock, including at boot.
+        spin_lock(&anchor_lock);
+        if (!anchored)
+        {
+            epoch_ns = epoch;
+            monotonic_ns = sample;
+            __atomic_store_n(&anchored, true, __ATOMIC_RELEASE);
+        }
+        spin_unlock(&anchor_lock);
+    }
+    uint64_t now = nanoTime();
+    return epoch_ns + (now >= monotonic_ns ? now - monotonic_ns : 0);
 }
