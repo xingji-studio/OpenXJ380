@@ -23,6 +23,7 @@
 #include <task/ipc.h>
 #include <task/futex.h>
 #include <task/eventfd.h>
+#include <task/inotify.h>
 #include <smp/smp.h>
 #include <mutex.h>
 #include <math.hpp>
@@ -333,6 +334,7 @@ static int64_t write_from_user_buffer(fd_file_handle *handle, const uint8_t *buf
 {
     if (handle == NULL) return -EBADF;
     if (eventfd_is_node(handle->node)) return eventfd_write_user(handle, buffer, size);
+    if (inotify_is_node(handle->node)) return -EBADF;
     if (size == 0) return 0;
     if (buffer == NULL) return -EFAULT;
 
@@ -889,6 +891,7 @@ sys_(write, int fd, uint8_t *buffer, size_t size)
 static uint64_t read_from_handle(fd_file_handle *handle, uint8_t *buffer, size_t size)
 {
     if (eventfd_is_node(handle->node)) return eventfd_read_user(handle, buffer, size);
+    if (inotify_is_node(handle->node)) return inotify_read_user(handle, buffer, size);
     if (handle->node->type & file_socket)
     {
         int64_t ret = read_to_user_buffer(handle, buffer, size, true, 0, false);
@@ -1492,11 +1495,10 @@ sys_(socket, int domain, int type, int protocol)
 sys_(socketpair, int domain, int type, int protocol, int *sv)
 {
     if (sv == NULL) return SYSCALL_FAULT_(EFAULT);
-    int sock_type = type & SOCK_TYPE_MASK;
     if (domain == AF_UNIX || domain == AF_LOCAL)
     {
         int fds[2] = {-1, -1};
-        int ret = unix_socketpair(sock_type, protocol, fds);
+        int ret = unix_socketpair(type, protocol, fds);
         if (ret < 0) return SYSCALL_FAULT_(-ret);
         page_directory_t *pagedir = current_user_pagedir();
         if (!copy_to_user_pagedir(pagedir, sv, fds, sizeof(fds))) return SYSCALL_FAULT_(EFAULT);
@@ -2872,6 +2874,41 @@ sys_(epoll_create, int size)
 {
     if (size <= 0) return SYSCALL_FAULT_(EINVAL);
     return epoll_create_common(0);
+}
+
+sys_(inotify_init)
+{
+    return inotify_create(0);
+}
+
+sys_(inotify_init1, int flags)
+{
+    return inotify_create(flags);
+}
+
+sys_(inotify_add_watch, int fd, char *pathname, uint32_t mask)
+{
+    FdOperation operation;
+    int error = operation.acquire(fd);
+    if (error) return SYSCALL_FAULT_(-error);
+    if (!inotify_is_node(operation.get()->node)) return SYSCALL_FAULT_(EINVAL);
+    char *path = NULL;
+    error = resolve_user_path_at(AT_FDCWD, pathname, &path);
+    if (error) return SYSCALL_FAULT_(-error);
+    vfs_node_t node = mask & IN_DONT_FOLLOW ? vfs_open_no_follow(path) : vfs_open(path);
+    free(path);
+    if (!node) return SYSCALL_FAULT_(vfs_last_error());
+    int result = inotify_add(operation.get(), node, mask);
+    vfs_close(node);
+    return result;
+}
+
+sys_(inotify_rm_watch, int fd, int wd)
+{
+    FdOperation operation;
+    int error = operation.acquire(fd);
+    if (error) return SYSCALL_FAULT_(-error);
+    return inotify_remove(operation.get(), wd);
 }
 
 sys_(eventfd, uint32_t initial)

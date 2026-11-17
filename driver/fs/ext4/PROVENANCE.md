@@ -212,3 +212,16 @@ on-disk mutation algorithm. Fatal writes use the captured data-sector map outsid
 the filesystem only after permanent CPU quiescence; normal boot performs report
 recovery through existing VFS writes. Updated first-party source hashes remain
 recorded in SOURCE.json.
+
+### Native inotify namespace publication (2026-11-17)
+
+The VFS glue adds two calls at the existing locked rename commit: retire watches
+for an overwritten vnode and publish the paired move after the namespace swap.
+The exact change imports only the new first-party kernel task/inotify.h API.
+No external implementation, archive, license exception or callback ABI is added.
+The backend was written from documented Linux ABI facts and existing VFS/FD
+lifetime interfaces; no Linux kernel implementation was copied or translated.
+Its checked host test runs the production queue with ASan/UBSan, including
+concurrent readers, overflow, failed user copies and watch retirement. The
+ext4.cpp inventory hash tracks this reviewed glue change; policy checks and
+the empty external-input lists remain enabled.

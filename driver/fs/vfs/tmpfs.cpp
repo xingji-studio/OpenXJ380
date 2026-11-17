@@ -1,3 +1,4 @@
+#include <task/inotify.h>
 #define ALL_IMPLEMENTATION
 #include <cpu/lock.h>
 #include <errno.h>
@@ -990,6 +991,7 @@ errno_t ram_rename(void *handle, const char *destination)
             retired_name = node->name;
             node->name = copy;
             copy = NULL;
+            inotify_vfs_move_locked(node, old_parent, retired_name);
         }
         vfs_child_unlock();
     }

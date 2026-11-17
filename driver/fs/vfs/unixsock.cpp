@@ -6,6 +6,7 @@
 #include <mm/heap.h>
 #include <task/pcb.h>
 #include <task/poll.h>
+#include <syscall/fd_lifetime.h>
 
 socket_provider_t g_unix_provider;
 
@@ -54,39 +55,44 @@ static void unix_sock_init(struct unix_sock *sk, int type, int protocol)
     memset(&sk->peer_addr, 0, sizeof(sk->peer_addr));
 }
 
+static void unix_sock_retain(struct unix_sock *sk)
+{
+    __atomic_add_fetch(&sk->refcount, size_t(1), __ATOMIC_RELAXED);
+}
+
 static void unix_sock_free(struct unix_sock *sk)
 {
-    if (sk == NULL) return;
-    if (sk->in_buf) { free(sk->in_buf); sk->in_buf = NULL; }
-    if (sk->conn_queue) {
-        while (sk->conn_queue->head) {
-            struct unix_sock *cs = (struct unix_sock *)sk->conn_queue->head->data;
-            if (cs) {
-                spin_lock(&cs->lock);
-                if (cs->peer != NULL) {
-                    spin_lock(&cs->peer->lock);
-                    cs->peer->peer = NULL;
-                    cs->peer->closed = true;
-                    spin_unlock(&cs->peer->lock);
-                }
-                cs->peer = NULL;
-                cs->state = UNIX_FREE;
-                spin_unlock(&cs->lock);
-                unix_sock_free(cs);
-            }
-            queue_remove_node(sk->conn_queue, sk->conn_queue->head);
-        }
-        free(sk->conn_queue);
+    if (sk->in_buf) free(sk->in_buf);
+    if (sk->conn_queue)
+    {
+        // Unaccepted endpoints own their original reference through the queue.
+        // Detach/close their peer links outside every endpoint/namespace lock.
+        while (auto *pending = static_cast<unix_sock *>(queue_dequeue(sk->conn_queue))) unix_close(pending);
+        queue_destroy(sk->conn_queue);
     }
-    if (sk->dg_queue) {
-        while (sk->dg_queue->head) {
-            struct unix_dgram *dg = (struct unix_dgram *)sk->dg_queue->head->data;
-            queue_remove_node(sk->dg_queue, sk->dg_queue->head);
-            free(dg);
-        }
-        free(sk->dg_queue);
+    if (sk->dg_queue)
+    {
+        while (void *datagram = queue_dequeue(sk->dg_queue)) free(datagram);
+        queue_destroy(sk->dg_queue);
     }
     free(sk);
+}
+
+static void unix_sock_release(struct unix_sock *sk)
+{
+    if (__atomic_sub_fetch(&sk->refcount, size_t(1), __ATOMIC_ACQ_REL) == 0) unix_sock_free(sk);
+}
+
+// The link owns a reference. Pin it while its endpoint lock still protects the
+// pointer, then inspect the peer separately. Never nest the two endpoint locks:
+// simultaneous epoll waits on opposite socketpair ends previously deadlocked.
+static struct unix_sock *unix_peer_acquire(struct unix_sock *sk)
+{
+    spin_lock(&sk->lock);
+    struct unix_sock *peer = sk->peer;
+    if (peer) unix_sock_retain(peer);
+    spin_unlock(&sk->lock);
+    return peer;
 }
 
 static void unix_ns_register(struct unix_sock *sk)
@@ -125,7 +131,7 @@ static struct unix_sock *unix_ns_lookup(const char *path)
         if (sk != NULL && sk->state >= UNIX_BOUND &&
             sk->local_addr.sun_path[0] != '\0' &&
             !strcmp(sk->local_addr.sun_path, path)) {
-            sk->refcount++;
+            unix_sock_retain(sk);
             spin_unlock(&g_unix_ns_lock);
             return sk;
         }
@@ -181,6 +187,7 @@ int unix_create(int domain, int type, int protocol, void **out_impl)
     struct unix_sock *sk = (struct unix_sock *)malloc(sizeof(struct unix_sock));
     if (sk == NULL) return -ENOMEM;
     unix_sock_init(sk, type, protocol);
+    if (!sk->in_buf) { free(sk); return -ENOMEM; }
     *out_impl = sk;
     return 0;
 }
@@ -206,8 +213,8 @@ int unix_bind(void *impl, const struct sockaddr *addr, socklen_t addrlen)
     if (max_path > 0 && sunaddr->sun_path[0] != '\0') {
         struct unix_sock *existing = unix_ns_lookup(sunaddr->sun_path);
         if (existing != NULL) {
-            existing->refcount--;
             spin_unlock(&sk->lock);
+            unix_sock_release(existing);
             return -EADDRINUSE;
         }
     }
@@ -256,16 +263,16 @@ int unix_connect(void *impl, const struct sockaddr *addr, socklen_t addrlen)
     spin_lock(&listener->lock);
     if (listener->state != UNIX_LISTENING || listener->conn_queue == NULL) {
         spin_unlock(&listener->lock);
-        listener->refcount--;
         spin_unlock(&sk->lock);
+        unix_sock_release(listener);
         return -ECONNREFUSED;
     }
 
     struct unix_sock *server_sk = (struct unix_sock *)malloc(sizeof(struct unix_sock));
     if (server_sk == NULL) {
         spin_unlock(&listener->lock);
-        listener->refcount--;
         spin_unlock(&sk->lock);
+        unix_sock_release(listener);
         return -ENOMEM;
     }
     unix_sock_init(server_sk, SOCK_STREAM, 0);
@@ -274,12 +281,15 @@ int unix_connect(void *impl, const struct sockaddr *addr, socklen_t addrlen)
     server_sk->peer_addr  = sk->local_addr;
     server_sk->peer = sk;
 
+    // Both published peer links own independent endpoint references.
+    unix_sock_retain(sk);
+    unix_sock_retain(server_sk);
     sk->state = UNIX_CONNECTED;
     sk->peer  = server_sk;
     queue_enqueue(listener->conn_queue, server_sk);
-    listener->refcount--;
     spin_unlock(&listener->lock);
     spin_unlock(&sk->lock);
+    unix_sock_release(listener);
     return 0;
 }
 
@@ -396,7 +406,6 @@ int unix_shutdown(void *impl, int how)
 
 ssize_t unix_read(void *impl, void *buf, size_t size, uint64_t flags)
 {
-    (void)flags;
     struct unix_sock *sk = (struct unix_sock *)impl;
     if (sk == NULL || buf == NULL) return -EINVAL;
 
@@ -405,6 +414,7 @@ ssize_t unix_read(void *impl, void *buf, size_t size, uint64_t flags)
         if (sk->dg_queue == NULL) sk->dg_queue = queue_init();
         while (sk->dg_queue->head == NULL) {
             if (sk->closed) { spin_unlock(&sk->lock); return 0; }
+            if (flags & O_NONBLOCK) { spin_unlock(&sk->lock); return -EAGAIN; }
             spin_unlock(&sk->lock);
             scheduler_yield();
             spin_lock(&sk->lock);
@@ -424,6 +434,7 @@ ssize_t unix_read(void *impl, void *buf, size_t size, uint64_t flags)
             spin_unlock(&sk->lock);
             return 0;
         }
+        if (flags & O_NONBLOCK) { spin_unlock(&sk->lock); return -EAGAIN; }
         spin_unlock(&sk->lock);
         scheduler_yield();
         spin_lock(&sk->lock);
@@ -435,7 +446,6 @@ ssize_t unix_read(void *impl, void *buf, size_t size, uint64_t flags)
 
 ssize_t unix_write(void *impl, const void *buf, size_t size, uint64_t flags)
 {
-    (void)flags;
     struct unix_sock *sk = (struct unix_sock *)impl;
     if (sk == NULL || buf == NULL) return -EINVAL;
 
@@ -450,27 +460,30 @@ ssize_t unix_write(void *impl, const void *buf, size_t size, uint64_t flags)
             spin_unlock(&peer->lock);
         }
         struct unix_dgram *dg = (struct unix_dgram *)malloc(sizeof(struct unix_dgram) + size);
-        if (dg == NULL) { peer->refcount--; return -ENOMEM; }
+        if (dg == NULL) { unix_sock_release(peer); return -ENOMEM; }
         memcpy(&dg->addr, &sk->local_addr, sizeof(dg->addr));
         dg->len = size;
         memcpy(dg->data, buf, size);
         spin_lock(&peer->lock);
         queue_enqueue(peer->dg_queue, dg);
         spin_unlock(&peer->lock);
-        peer->refcount--;
+        unix_sock_release(peer);
         return (ssize_t)size;
     }
 
-    struct unix_sock *peer = sk->peer;
+    struct unix_sock *peer = unix_peer_acquire(sk);
     if (peer == NULL) return -EPIPE;
 
     const uint8_t *src = (const uint8_t *)buf;
     spin_lock(&peer->lock);
     size_t total = 0;
-    while (total < size) {
+    while (total < size)
+    {
+        if (peer->closed) break;
         size_t n = ring_write(peer, src + total, size - total);
-        if (n == 0) {
-            if (peer->closed) { spin_unlock(&peer->lock); return -EPIPE; }
+        if (n == 0)
+        {
+            if (flags & O_NONBLOCK) break;
             spin_unlock(&peer->lock);
             scheduler_yield();
             spin_lock(&peer->lock);
@@ -478,8 +491,10 @@ ssize_t unix_write(void *impl, const void *buf, size_t size, uint64_t flags)
         }
         total += n;
     }
+    bool closed = peer->closed;
     spin_unlock(&peer->lock);
-    return (ssize_t)total;
+    unix_sock_release(peer);
+    return total ? (ssize_t)total : !size ? 0 : closed ? -EPIPE : -EAGAIN;
 }
 
 ssize_t unix_sendto(void *impl, const void *buf, size_t size, uint64_t flags,
@@ -488,6 +503,10 @@ ssize_t unix_sendto(void *impl, const void *buf, size_t size, uint64_t flags,
     (void)flags;
     struct unix_sock *sk = (struct unix_sock *)impl;
     if (sk == NULL || buf == NULL) return -EINVAL;
+
+    // Anonymous connected streams (socketpair / Node IPC) have no pathname
+    // peer address. Sending without an explicit destination uses their link.
+    if (sk->type == SOCK_STREAM) return unix_write(impl, buf, size, flags);
 
     if (addr != NULL && addrlen >= (socklen_t)sizeof(sa_family_t)) {
         const struct sockaddr_un *sunaddr = (const struct sockaddr_un *)addr;
@@ -503,7 +522,7 @@ ssize_t unix_sendto(void *impl, const void *buf, size_t size, uint64_t flags,
             spin_unlock(&peer->lock);
         }
         struct unix_dgram *dg = (struct unix_dgram *)malloc(sizeof(struct unix_dgram) + size);
-        if (dg == NULL) { peer->refcount--; return -ENOMEM; }
+        if (dg == NULL) { unix_sock_release(peer); return -ENOMEM; }
         if (sk->local_addr.sun_family == AF_UNIX)
             memcpy(&dg->addr, &sk->local_addr, sizeof(dg->addr));
         else
@@ -514,7 +533,7 @@ ssize_t unix_sendto(void *impl, const void *buf, size_t size, uint64_t flags,
         spin_lock(&peer->lock);
         queue_enqueue(peer->dg_queue, dg);
         spin_unlock(&peer->lock);
-        peer->refcount--;
+        unix_sock_release(peer);
         return (ssize_t)size;
     }
 
@@ -528,6 +547,15 @@ ssize_t unix_recvfrom(void *impl, void *buf, size_t size, uint64_t flags,
     (void)flags;
     struct unix_sock *sk = (struct unix_sock *)impl;
     if (sk == NULL || buf == NULL) return -EINVAL;
+
+    // recvmsg uses the provider's recvfrom entry even for connected streams.
+    // Receive stream bytes from the ring; the datagram queue cannot satisfy it.
+    if (sk->type == SOCK_STREAM)
+    {
+        ssize_t result = unix_read(impl, buf, size, flags);
+        if (result >= 0 && addrlen) *addrlen = 0;
+        return result;
+    }
 
     spin_lock(&sk->lock);
     if (sk->dg_queue == NULL) sk->dg_queue = queue_init();
@@ -555,63 +583,62 @@ ssize_t unix_recvfrom(void *impl, void *buf, size_t size, uint64_t flags,
 
 int unix_poll(void *impl, size_t events)
 {
-    struct unix_sock *sk = (struct unix_sock *)impl;
-    if (sk == NULL) return -EINVAL;
-
+    auto *sk = static_cast<unix_sock *>(impl);
+    if (!sk) return -EINVAL;
     int revents = 0;
     spin_lock(&sk->lock);
-
-    if (sk->type == SOCK_DGRAM) {
-        if (sk->dg_queue != NULL && sk->dg_queue->head != NULL)
-            revents |= POLLIN;
-    } else {
-        if (ring_readable(sk) > 0)
-            revents |= POLLIN;
+    if (sk->type == SOCK_DGRAM)
+    {
+        if (sk->dg_queue && sk->dg_queue->head) revents |= POLLIN;
     }
-
-    if (sk->peer != NULL) {
-        spin_lock(&sk->peer->lock);
-        if (ring_writable(sk->peer) > 0)
-            revents |= POLLOUT;
-        spin_unlock(&sk->peer->lock);
-    } else if (sk->type == SOCK_DGRAM) {
-        revents |= POLLOUT;
-    }
-
-    if (sk->closed)
-        revents |= POLLHUP;
-
-    if (sk->state == UNIX_LISTENING && sk->conn_queue != NULL && sk->conn_queue->head != NULL)
-        revents |= POLLIN;
-
+    else if (ring_readable(sk)) revents |= POLLIN;
+    if (sk->closed) revents |= POLLHUP;
+    if (sk->state == UNIX_LISTENING && sk->conn_queue && sk->conn_queue->head) revents |= POLLIN;
+    unix_sock *peer = sk->peer;
+    if (peer) unix_sock_retain(peer);
+    else if (sk->type == SOCK_DGRAM) revents |= POLLOUT;
     spin_unlock(&sk->lock);
-    return revents & (int)events;
+
+    if (peer)
+    {
+        spin_lock(&peer->lock);
+        if (!peer->closed && ring_writable(peer)) revents |= POLLOUT;
+        spin_unlock(&peer->lock);
+        unix_sock_release(peer);
+    }
+    // EOF/hangup must reach epoll even when its caller requested only input.
+    return revents & (int(events) | POLLHUP | POLLERR);
 }
 
 int unix_close(void *impl)
 {
-    struct unix_sock *sk = (struct unix_sock *)impl;
-    if (sk == NULL) return 0;
-
+    auto *sk = static_cast<unix_sock *>(impl);
+    if (!sk) return 0;
     spin_lock(&sk->lock);
     sk->closed = true;
-
-    if (sk->peer != NULL) {
-        spin_lock(&sk->peer->lock);
-        sk->peer->closed = true;
-        sk->peer->peer   = NULL;
-        spin_unlock(&sk->peer->lock);
-        sk->peer = NULL;
-    }
-
-    if (sk->state >= UNIX_BOUND)
-        unix_ns_unregister(sk);
-
+    unix_sock *peer = sk->peer;
+    sk->peer = NULL;
+    bool bound = sk->state >= UNIX_BOUND;
+    sk->state = UNIX_FREE;
     spin_unlock(&sk->lock);
 
-    sk->refcount--;
-    if (sk->refcount == 0)
-        unix_sock_free(sk);
+    if (peer)
+    {
+        // Transfer the link's reference to this local until detachment ends.
+        // Concurrent opposite-end close may already own the other backlink.
+        spin_lock(&peer->lock);
+        bool backlink = peer->peer == sk;
+        if (backlink)
+        {
+            peer->closed = true;
+            peer->peer = NULL;
+        }
+        spin_unlock(&peer->lock);
+        if (backlink) unix_sock_release(sk);
+        unix_sock_release(peer);
+    }
+    if (bound) unix_ns_unregister(sk);
+    unix_sock_release(sk); // The provider's original open-endpoint reference.
     return 0;
 }
 
@@ -624,6 +651,9 @@ int unix_set_flags(void *impl, uint64_t flags)
 int unix_socketpair(int type, int protocol, int sv[2])
 {
     if (sv == NULL) return -EINVAL;
+    if (type & ~(SOCK_TYPE_MASK | SOCK_NONBLOCK | SOCK_CLOEXEC)) return -EINVAL;
+    uint64_t flags = O_RDWR | (type & (SOCK_NONBLOCK | SOCK_CLOEXEC));
+    type &= SOCK_TYPE_MASK;
     if (type != SOCK_STREAM && type != SOCK_DGRAM) return -EPROTONOSUPPORT;
 
     init_unix_provider();
@@ -643,15 +673,18 @@ int unix_socketpair(int type, int protocol, int sv[2])
     sk2->local_addr.sun_family = AF_UNIX;
     sk1->peer = sk2;
     sk2->peer = sk1;
-    sk2->refcount++;
-    sk1->refcount++;
+    unix_sock_retain(sk2);
+    unix_sock_retain(sk1);
 
-    sv[0] = socketfs_alloc_fd_with_provider(s1, 0, &g_unix_provider);
-    sv[1] = socketfs_alloc_fd_with_provider(s2, 0, &g_unix_provider);
-    if (sv[0] < 0 || sv[1] < 0) {
-        unix_close(s1);
-        unix_close(s2);
-        return -EMFILE;
+    // The allocator consumes each supplied implementation on every path.
+    sv[0] = socketfs_alloc_fd_with_provider(s1, flags, &g_unix_provider);
+    if (sv[0] < 0) { unix_close(s2); return sv[0]; }
+    sv[1] = socketfs_alloc_fd_with_provider(s2, flags, &g_unix_provider);
+    if (sv[1] < 0)
+    {
+        fd_file_handle *handle = fd_detach_descriptor(get_current_task()->parent_group, size_t(sv[0]));
+        if (handle) fd_retire_handle(handle);
+        return sv[1];
     }
     return 0;
 }

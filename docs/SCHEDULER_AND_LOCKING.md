@@ -489,3 +489,30 @@ page fault, panic, assertion or recovery tripwire. Evidence is in
 `/tmp/xj380-ext4-gui-regression-1k4_872v/result.json`, with serial logs, screenshots
 and staged artifact hashes beside it. This is GUI liveness evidence, not a
 claim that arbitrary interrupted kernel cleanup is resumable.
+
+## Unix socketpair polling and retirement
+
+Opposite AF_UNIX endpoints must never hold both endpoint spin locks. Nodemon's
+fork IPC puts the parent and child in concurrent epoll waits; the old poll path
+held its endpoint lock while acquiring its peer's lock and deadlocked both CPUs.
+Capture/pin a peer under the local lock, release that lock, inspect the peer
+under its own lock, then dispose the temporary pin outside all spin locks.
+
+Each published stream peer link owns one independent endpoint reference, in
+addition to the provider's original open-endpoint reference. Close clears its
+local link while locked and transfers that reference to a local until peer
+backlink detachment finishes. A simultaneous opposite-end close may already
+own the other backlink: only the thread that actually clears it drops that
+reference. Atomically decrement/reclaim after unlock. Accepted and pending
+connections use the same reference ownership; a listener disposes pending
+endpoints in ordinary task context. The existing vnode/FD lifetime contract
+keeps the provider implementation alive through an individual FD operation.
+
+Socket descriptor allocation consumes a valid provider implementation on both
+success and failure. Socketpair construction must retire an already installed
+first descriptor if the second install fails, and must not close an
+implementation twice after allocator cleanup. The production host adapters in
+`tests/test_unix_socketpair.py` and `tests/test_socket_ownership.py` cover opposite
+polls, poll versus peer close, simultaneous final closes, EOF/EPIPE, allocation
+failures, and partial installation with ASan/UBSan and exact endpoint disposal.
+This does not establish complete Unix datagram/pathname/nonblocking semantics.

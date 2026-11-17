@@ -186,7 +186,10 @@ static errno_t socketfs_del(void *parent, vfs_node_t node)
     (void)parent;
     socketfs_handle_t *handle = socketfs_get_handle(node);
     if (handle != NULL) {
-        if (socketfs_provider_valid(&handle->provider)) {
+        // Local Unix transports intentionally omit network configuration/DNS
+        // callbacks. Retirement needs their close callback, not registration's
+        // full Internet-provider validation; otherwise peers never receive EOF.
+        if (handle->provider.close != NULL) {
             handle->provider.close(handle->socket);
         }
         free(handle);
@@ -225,14 +228,19 @@ static struct vfs_callback socketfs_callbacks = {
 int socketfs_alloc_fd_with_provider(void *impl, uint64_t flags, const socket_provider_t *provider)
 {
     if (socketfs_root == NULL || impl == NULL || provider == NULL) {
+        if (impl && provider && provider->close) provider->close(impl);
         return -ENOSYS;
     }
 
+    // Sockets are bidirectional open descriptions. libuv's uv_pipe_open
+    // derives IPC writability from F_GETFL/O_ACCMODE, not from socket type.
+    flags |= O_RDWR;
     char name[32];
     snprintf(name, sizeof(name), "sock%d", socketfs_next_id++);
 
     vfs_node_t node = vfs_node_alloc(socketfs_root, name);
     if (node == NULL) {
+        provider->close(impl);
         return -ENOMEM;
     }
 
@@ -241,6 +249,7 @@ int socketfs_alloc_fd_with_provider(void *impl, uint64_t flags, const socket_pro
         socketfs_root->child = list_delete(socketfs_root->child, node);
         free(node->name);
         free(node);
+        provider->close(impl);
         return -ENOMEM;
     }
 

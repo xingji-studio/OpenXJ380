@@ -18,6 +18,7 @@
 #include <rtc.h>
 #include <syscall/syscall.h>
 #include <task/scheduler.h>
+#include <task/inotify.h>
 #include <user/permissions.h>
 
 namespace {
@@ -926,6 +927,8 @@ static int rename_node(void *context, const char *destination)
         node->type &= ~file_delete;
         reserved_source = false;
         copy = NULL;
+        if (target) inotify_vfs_unlink_locked(target, NULL, target->name);
+        inotify_vfs_move_locked(node, old_parent, old_name);
         vfs_child_unlock();
         if (target) { free(replaced); error = vfs_close(target); }
         free(old_name);

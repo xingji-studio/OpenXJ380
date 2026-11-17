@@ -156,6 +156,7 @@ typedef int (*socket_setsockopt_fn)(void *socket, int level, int optname, const 
 int     socket_provider_register_with_options(const socket_provider_t *provider, socket_setsockopt_fn setter);
 int     socket_provider_register(const socket_provider_t *provider);
 int     socketfs_setup(void);
+// Consumes a valid provider implementation on success and failure.
 int     socketfs_alloc_fd_with_provider(void *impl, uint64_t flags, const socket_provider_t *provider);
 int     socket_open(int domain, int type, int protocol);
 int     socket_bind(int fd, const struct sockaddr *addr, socklen_t addrlen);
