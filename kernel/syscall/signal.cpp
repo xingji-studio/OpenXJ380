@@ -321,7 +321,7 @@ static int find_deliverable_signal(tcb_t task)
 }
 
 static bool deliver_linux_signal(X64_REGS *regs, int sig, const sigaction_t &action, int code,
-                                  uint64_t address, uint64_t trap, uint64_t error)
+                                  uint64_t address, uint64_t trap, uint64_t error, const void *saved_fpu)
 {
     tcb_t task = get_current_task();
     if (!action.sa_restorer || action.sa_handler == SIG_DFL || action.sa_handler == SIG_IGN) return false;
@@ -350,7 +350,7 @@ static bool deliver_linux_signal(X64_REGS *regs, int sig, const sigaction_t &act
     m.fpstate = (struct fpstate *)fp;
     uint8_t fpstate[512] __attribute__((aligned(16))) = {};
     // FXSAVE leaves reserved bytes untouched; never expose stack padding.
-    memcpy(fpstate, entry_fpstate(regs), 416);
+    memcpy(fpstate, saved_fpu, 416);
     fpstate[5] = 0; // Reserved FXSAVE header byte is not written by the CPU.
     page_directory_t *directory = task->parent_group->pagedir;
     if (!signal_copy_to_user(directory, (void *)base, &frame, sizeof(frame)) ||
@@ -379,10 +379,10 @@ bool signal_deliver_fault(X64_REGS *regs, int sig, int code, uint64_t address, u
     if (!regs || (regs->cs & 3) != 3 || !linux_task(task) ||
         (task->blocked & signal_bit(task, sig))) return false;
     sigaction_t action = action_for(task, sig);
-    return deliver_linux_signal(regs, sig, action, code, address, trap, error);
+    return deliver_linux_signal(regs, sig, action, code, address, trap, error, entry_fpstate(regs));
 }
 
-bool signal_deliver_pending(struct X64_REGS *regs)
+static bool deliver_pending(X64_REGS *regs, const void *saved_fpu)
 {
     tcb_t task = get_current_task();
     if (task == NULL || task->parent_group == NULL || regs == NULL) return false;
@@ -409,7 +409,7 @@ bool signal_deliver_pending(struct X64_REGS *regs)
         while (true) __asm__ volatile("hlt");
     }
 
-    if (linux_task(task)) return deliver_linux_signal(regs, sig, *action, 0, 0, 0, 0);
+    if (linux_task(task)) return deliver_linux_signal(regs, sig, *action, 0, 0, 0, 0, saved_fpu);
 
     if (action->sa_restorer == NULL) {
         write_serial_fmt("signal: task %s signal %d has no restorer\n", task->name, sig);
@@ -451,6 +451,50 @@ bool signal_deliver_pending(struct X64_REGS *regs)
     regs->rsi = 0;
     regs->rdx = 0;
     return true;
+}
+
+bool signal_deliver_pending(X64_REGS *regs)
+{
+    return deliver_pending(regs, entry_fpstate(regs));
+}
+
+template <typename Destination, typename Source>
+static void copy_signal_registers(Destination *to, const Source *from)
+{
+    to->r15 = from->r15;
+    to->r14 = from->r14;
+    to->r13 = from->r13;
+    to->r12 = from->r12;
+    to->r11 = from->r11;
+    to->r10 = from->r10;
+    to->r9 = from->r9;
+    to->r8 = from->r8;
+    to->rbx = from->rbx;
+    to->rcx = from->rcx;
+    to->rdx = from->rdx;
+    to->rsi = from->rsi;
+    to->rdi = from->rdi;
+    to->rbp = from->rbp;
+    to->ds = from->ds;
+    to->es = from->es;
+    to->rax = from->rax;
+    to->rip = from->rip;
+    to->cs = from->cs;
+    to->rflags = from->rflags;
+    to->rsp = from->rsp;
+    to->ss = from->ss;
+}
+
+void signal_deliver_interrupt(struct registers *regs, const void *saved_fpu)
+{
+    if (!regs || (regs->cs & 3) != 3 || !saved_fpu || !signals_pending_quick(get_current_task())) return;
+    // The timer has a different GPR layout from exception/syscall entry. Keep
+    // both assembly ABIs unchanged, and use its private entry FXSAVE image;
+    // memory adjacent to this temporary frame is not an FPU save area.
+    X64_REGS frame = {};
+    copy_signal_registers(&frame, regs);
+    deliver_pending(&frame, saved_fpu);
+    copy_signal_registers(regs, &frame);
 }
 
 uint64_t signal_return(struct X64_REGS *regs)

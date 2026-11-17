@@ -4,6 +4,7 @@
 #include <task/poll.h>
 #include <fs/vfs/vfs.h>
 #include <errno.h>
+#include <ioctl.h>
 
 vfs_node_t pipefs_root = NULL;
 int        pipefs_id   = 0;
@@ -289,10 +290,19 @@ size_t pipefs_write(void *file, const void *addr, size_t offset, size_t size) {
     return ret;
 }
 
-int pipefs_ioctl(void *file, ssize_t cmd, ssize_t arg) {
-    switch (cmd) {
-    default: return -ENOSYS;
-    }
+int pipefs_ioctl(void *file, size_t cmd, void *arg)
+{
+    if (cmd != FIONREAD) return -ENOSYS;
+    auto *spec = static_cast<pipe_specific_t *>(file);
+    if (!spec || !spec->info) return -EBADF;
+    if (!arg) return -EFAULT;
+    // ioctl's caller supplies a kernel bounce buffer. Only capture metadata
+    // under the pipe lock; user-memory copying remains in the syscall layer.
+    spin_lock(&spec->info->lock);
+    int available = static_cast<int>(spec->info->ptr);
+    spin_unlock(&spec->info->lock);
+    *static_cast<int *>(arg) = available;
+    return 0;
 }
 
 bool pipefs_close(void *current) {
@@ -420,7 +430,7 @@ static struct vfs_callback pipefs_callbacks = {
     .rename   = (vfs_rename_t)empty,
     .map      = (vfs_mapfile_t)empty,
     .stat     = pipefs_stat,
-    .ioctl    = (vfs_ioctl_t)pipefs_ioctl,
+    .ioctl    = pipefs_ioctl,
     .poll     = pipefs_poll,
     .dup      = (vfs_dup_t)empty,
     .resize   = (vfs_resize_t)dummy,

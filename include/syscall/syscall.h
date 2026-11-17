@@ -403,6 +403,8 @@
 #define SYS_SYNC_FILE_RANGE 277
 #define SYS_UTIMENSAT 280
 #define SYS_EPOLL_PWAIT 281
+#define SYS_EVENTFD 284
+#define SYS_EVENTFD2 290
 #define SYS_EPOLL_CREATE1 291
 #define SYS_PIPE2 293
 #define SYS_PRLIMIT64 302
@@ -695,6 +697,8 @@ sys_(fchdir, int fd);
 sys_(wait4, unsigned long pid, int *status, int options, void *rusage);
 sys_(exit_group, int exit_code);
 sys_(poll, struct pollfd *fds_user, size_t nfds, size_t timeout);
+sys_(eventfd, uint32_t initial);
+sys_(eventfd2, uint32_t initial, int flags);
 sys_(epoll_create, int size);
 sys_(epoll_create1, int flags);
 sys_(epoll_ctl, int epfd, int op, int fd, struct epoll_event *event);

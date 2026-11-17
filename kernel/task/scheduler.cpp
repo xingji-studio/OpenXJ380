@@ -791,6 +791,12 @@ extern "C" registers_t *timer_handle_fpu(registers_t *reg, fpu_context_t *entry_
     // boot or a nested scheduler-disabled section, rather than a stale TCB.
     if (selected_task != NULL && selected_task != entry_task)
         memcpy(entry_fpu, &selected_task->fpu_context, sizeof(*entry_fpu));
+    // Deliver only while still on the interrupted task's own kernel stack and
+    // address space. A cross-task handoff still uses the previous stack until
+    // IRET; defer that selected task's signal to its next hardware tick.
+    // timer_handle has acknowledged the IRQ and released every queue lock.
+    if (selected_task != NULL && selected_task == entry_task && scheduler_is_enabled())
+        signal_deliver_interrupt(result, entry_fpu);
     // Restore in assembly after all C code, not in change_proccess: later C
     // helpers may use SSE and would otherwise corrupt the selected context.
     return result;

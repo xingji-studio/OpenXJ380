@@ -197,6 +197,7 @@ int  signal_send_process(pcb_t process, int sig);
 int  signal_send_thread(pcb_t process, int tid, int sig);
 int  signal_send_group(int pgid, int sig);
 bool signal_deliver_pending(struct X64_REGS *regs);
+void signal_deliver_interrupt(struct registers *regs, const void *saved_fpu);
 uint64_t signal_return(struct X64_REGS *regs);
 bool signal_deliver_fault(struct X64_REGS *regs, int sig, int code, uint64_t address,
                            uint64_t trap, uint64_t error);

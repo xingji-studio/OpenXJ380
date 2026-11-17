@@ -285,6 +285,12 @@ extern "C" uint64_t c_syscall_handler(struct X64_REGS *regs, uint64_t user_rsp)
     case SYS_POLL:
         regs->rax = (uint64_t)sys_poll((struct pollfd *)regs->rdi, regs->rsi, regs->rdx, 0, 0, 0, regs);
         break;
+    case SYS_EVENTFD:
+        regs->rax = (uint64_t)sys_eventfd((uint32_t)regs->rdi, 0, 0, 0, 0, 0, regs);
+        break;
+    case SYS_EVENTFD2:
+        regs->rax = (uint64_t)sys_eventfd2((uint32_t)regs->rdi, (int)regs->rsi, 0, 0, 0, 0, regs);
+        break;
     case SYS_EPOLL_CREATE:
         regs->rax = (uint64_t)sys_epoll_create(regs->rdi, 0, 0, 0, 0, 0, regs);
         break;

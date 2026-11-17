@@ -10,6 +10,7 @@
 #include <ioctl.h>
 #include <cpu/fsgsbase.h>
 #include <task/poll.h>
+#include <task/eventfd.h>
 #include <mm/lazyalloc.h>
 #include <mm/frame.h>
 #include <mm/uaccess.h>
@@ -330,6 +331,7 @@ static int resolve_user_path_at(int dirfd, char *pathname, char **resolved)
 static int64_t write_from_user_buffer(fd_file_handle *handle, const uint8_t *buffer, size_t size, bool socket_mode,
                                       size_t explicit_offset = 0, bool positioned = false)
 {
+    if (handle && eventfd_is_node(handle->node)) return eventfd_write_user(handle, buffer, size);
     if (handle == NULL || buffer == NULL) return -EINVAL;
     if (size == 0) return 0;
 
@@ -432,6 +434,7 @@ static size_t ioctl_arg_size(int request)
     case TIOCGPGRP:
     case TIOCSPGRP:
     case FIONBIO:
+    case FIONREAD:
     case KDGETMODE:
     case KDSETMODE:
     case KDGKBMODE:
@@ -457,6 +460,7 @@ static bool ioctl_writes_user(int request)
     switch (request)
     {
     case TCGETS:
+    case FIONREAD:
     case TIOCGWINSZ:
     case TIOCGPTN:
     case TIOCGPTLCK:
@@ -886,6 +890,7 @@ sys_(write, int fd, uint8_t *buffer, size_t size)
 
 static uint64_t read_from_handle(fd_file_handle *handle, uint8_t *buffer, size_t size)
 {
+    if (eventfd_is_node(handle->node)) return eventfd_read_user(handle, buffer, size);
     if (handle->node->type & file_socket)
     {
         int64_t ret = read_to_user_buffer(handle, buffer, size, true, 0, false);
@@ -2691,34 +2696,10 @@ static uint64_t poll_kernel_fds(struct pollfd *fds_user, size_t nfds, size_t tim
     return ready;
 }
 
-static epoll_file_t *epoll_from_fd(int epfd)
+static epoll_file_t *epoll_from_handle(fd_file_handle *handle)
 {
-    if (epfd < 0) return NULL;
-    pcb_t process = get_current_task()->parent_group;
-    if (process == NULL || process->file_open == NULL) return NULL;
-
-    fd_file_handle *handle = (fd_file_handle *)queue_get(process->file_open, epfd);
-    if (handle == NULL || handle->node == NULL || !(handle->node->type & file_epoll)) return NULL;
+    if (!handle || !handle->node || !(handle->node->type & file_epoll)) return NULL;
     return (epoll_file_t *)handle->node->handle;
-}
-
-static epoll_watch_t *epoll_find_watch(epoll_file_t *ep, int fd)
-{
-    if (ep == NULL || ep->watches == NULL) return NULL;
-
-    epoll_watch_t *found = NULL;
-    spin_lock(&ep->watches->lock);
-    queue_foreach(ep->watches, node)
-    {
-        epoll_watch_t *watch = (epoll_watch_t *)node->data;
-        if (watch != NULL && watch->fd == fd)
-        {
-            found = watch;
-            break;
-        }
-    }
-    spin_unlock(&ep->watches->lock);
-    return found;
 }
 
 static int epoll_poll_fd(int fd, uint32_t events, uint32_t *revents)
@@ -2730,7 +2711,10 @@ static int epoll_poll_fd(int fd, uint32_t events, uint32_t *revents)
     pcb_t process = get_current_task()->parent_group;
     if (process == NULL || process->file_open == NULL) return -EBADF;
 
-    fd_file_handle *handle = (fd_file_handle *)queue_get(process->file_open, fd);
+    FdOperation descriptor;
+    int error = descriptor.acquire(fd);
+    if (error) return error;
+    fd_file_handle *handle = descriptor.get();
     if (handle == NULL || handle->node == NULL) return -EBADF;
 
     extern vfs_callback_t fs_callbacks[256];
@@ -2830,6 +2814,16 @@ sys_(epoll_create, int size)
     return epoll_create_common(0);
 }
 
+sys_(eventfd, uint32_t initial)
+{
+    return eventfd_create(initial, 0);
+}
+
+sys_(eventfd2, uint32_t initial, int flags)
+{
+    return eventfd_create(initial, flags);
+}
+
 sys_(epoll_create1, int flags)
 {
     return epoll_create_common(flags);
@@ -2837,111 +2831,136 @@ sys_(epoll_create1, int flags)
 
 sys_(epoll_ctl, int epfd, int op, int fd, struct epoll_event *event)
 {
-    epoll_file_t *ep = epoll_from_fd(epfd);
-    if (ep == NULL) return SYSCALL_FAULT_(EBADF);
+    FdOperation operation;
+    int error = operation.acquire(epfd);
+    if (error) return SYSCALL_FAULT_(-error);
+    epoll_file_t *ep = epoll_from_handle(operation.get());
+    if (!ep) return SYSCALL_FAULT_(EINVAL);
     if (fd < 0 || fd == epfd) return SYSCALL_FAULT_(EINVAL);
+    if (op != EPOLL_CTL_ADD && op != EPOLL_CTL_MOD && op != EPOLL_CTL_DEL) return SYSCALL_FAULT_(EINVAL);
+    FdOperation target;
+    error = target.acquire(fd);
+    if (error) return SYSCALL_FAULT_(-error);
+    struct epoll_event requested = {};
+    if (op != EPOLL_CTL_DEL &&
+        (!event || !copy_from_user_pagedir(current_user_pagedir(), &requested, event, sizeof(requested))))
+        return SYSCALL_FAULT_(EFAULT);
 
-    pcb_t process = get_current_task()->parent_group;
-    fd_file_handle *target = (fd_file_handle *)queue_get(process->file_open, fd);
-    if (target == NULL || target->node == NULL) return SYSCALL_FAULT_(EBADF);
-
-    struct epoll_event kev = {};
-    if (op != EPOLL_CTL_DEL)
+    auto *prepared = op == EPOLL_CTL_ADD ? (epoll_watch_t *)calloc(1, sizeof(epoll_watch_t)) : NULL;
+    auto *entry = op == EPOLL_CTL_ADD ? (lock_node *)calloc(1, sizeof(lock_node)) : NULL;
+    if (op == EPOLL_CTL_ADD && (!prepared || !entry))
     {
-        if (event == NULL) return SYSCALL_FAULT_(EFAULT);
-        if (!copy_from_user_pagedir(current_user_pagedir(), &kev, event, sizeof(kev)))
-            return SYSCALL_FAULT_(EFAULT);
+        free(prepared);
+        free(entry);
+        return SYSCALL_FAULT_(ENOMEM);
     }
-
-    epoll_watch_t *watch = epoll_find_watch(ep, fd);
-    switch (op)
+    lock_queue *queue = ep->watches;
+    lock_node *removed = NULL;
+    spin_lock(&queue->lock);
+    lock_node *found = NULL;
+    for (lock_node *node = queue->head; node; node = node->next)
     {
-    case EPOLL_CTL_ADD:
-        if (watch != NULL) return SYSCALL_FAULT_(EEXIST);
-        watch = (epoll_watch_t *)calloc(1, sizeof(epoll_watch_t));
-        if (watch == NULL) return SYSCALL_FAULT_(ENOMEM);
-        watch->fd = fd;
-        watch->event = kev;
-        if (lock_queue_enqueue(ep->watches, watch) == (size_t)-1)
-        {
-            free(watch);
-            return SYSCALL_FAULT_(ENOMEM);
-        }
-        return 0;
-    case EPOLL_CTL_MOD:
-        if (watch == NULL) return SYSCALL_FAULT_(ENOENT);
-        watch->event = kev;
-        return 0;
-    case EPOLL_CTL_DEL:
-        if (watch == NULL) return SYSCALL_FAULT_(ENOENT);
-        {
-            spin_lock(&ep->watches->lock);
-            lock_node *found_node = NULL;
-            queue_foreach(ep->watches, node)
-            {
-                epoll_watch_t *candidate = (epoll_watch_t *)node->data;
-                if (candidate != NULL && candidate->fd == fd)
-                {
-                    found_node = node;
-                    break;
-                }
-            }
-            spin_unlock(&ep->watches->lock);
-            epoll_watch_t *removed = (epoll_watch_t *)queue_remove_node(ep->watches, found_node);
-            free(removed);
-        }
-        return 0;
-    default:
-        return SYSCALL_FAULT_(EINVAL);
+        auto *watch = (epoll_watch_t *)node->data;
+        if (watch && watch->fd == fd) { found = node; break; }
     }
+    error = 0;
+    if (op == EPOLL_CTL_ADD)
+    {
+        if (found) error = EEXIST;
+        else if (queue->next_index == (size_t)-1) error = ENOMEM;
+        else
+        {
+            prepared->fd = fd;
+            prepared->event = requested;
+            entry->data = prepared;
+            entry->index = queue->next_index++;
+            entry->prev = queue->tail;
+            if (queue->tail) queue->tail->next = entry;
+            else queue->head = entry;
+            queue->tail = entry;
+            if (!queue->rr_cursor) queue->rr_cursor = entry;
+            ++queue->size;
+            entry = NULL;
+            prepared = NULL;
+        }
+    }
+    else if (!found) error = ENOENT;
+    else if (op == EPOLL_CTL_MOD) ((epoll_watch_t *)found->data)->event = requested;
+    else
+    {
+        if (found->prev) found->prev->next = found->next;
+        else queue->head = found->next;
+        if (found->next) found->next->prev = found->prev;
+        else queue->tail = found->prev;
+        if (queue->rr_cursor == found) queue->rr_cursor = found->next ? found->next : queue->head;
+        --queue->size;
+        removed = found;
+    }
+    spin_unlock(&queue->lock);
+    if (removed) { free(removed->data); free(removed); }
+    free(prepared);
+    free(entry);
+    return error ? SYSCALL_FAULT_(error) : 0;
 }
 
 sys_(epoll_wait, int epfd, struct epoll_event *events, int maxevents, int timeout)
 {
-    epoll_file_t *ep = epoll_from_fd(epfd);
-    if (ep == NULL) return SYSCALL_FAULT_(EBADF);
-    if (events == NULL || maxevents <= 0) return SYSCALL_FAULT_(EINVAL);
-
-    uint64_t start_time = nanoTime();
-    uint64_t timeout_ns = timeout < 0 ? (uint64_t)-1 : (uint64_t)timeout * 1000000ULL;
-    int ready = 0;
-
-    do
+    FdOperation operation;
+    int error = operation.acquire(epfd);
+    if (error) return SYSCALL_FAULT_(-error);
+    epoll_file_t *ep = epoll_from_handle(operation.get());
+    if (!ep) return SYSCALL_FAULT_(EINVAL);
+    if (!events) return SYSCALL_FAULT_(EFAULT);
+    if (maxevents <= 0 || maxevents > 0x7fffffff / (int)sizeof(struct epoll_event)) return SYSCALL_FAULT_(EINVAL);
+    uint64_t start = nanoTime();
+    uint64_t duration = timeout < 0 ? (uint64_t)-1 : (uint64_t)timeout * 1000000ULL;
+    while (true)
     {
-        ready = 0;
         spin_lock(&ep->watches->lock);
-        queue_foreach(ep->watches, node)
+        size_t capacity = ep->watches->size;
+        spin_unlock(&ep->watches->lock);
+        if (capacity > (size_t)-1 / sizeof(epoll_watch_t)) return SYSCALL_FAULT_(ENOMEM);
+        auto *snapshot = capacity ? (epoll_watch_t *)malloc(capacity * sizeof(epoll_watch_t)) : NULL;
+        if (capacity && !snapshot) return SYSCALL_FAULT_(ENOMEM);
+        size_t count = 0;
+        // Keep only values across unlock. VFS callbacks, FD acquisition and
+        // user copies may allocate, fault or wait and must not hold this lock.
+        spin_lock(&ep->watches->lock);
+        queue_foreach(ep->watches, entry)
         {
-            if (ready >= maxevents) break;
-            epoll_watch_t *watch = (epoll_watch_t *)node->data;
-            if (watch == NULL) continue;
-
+            if (count == capacity) break;
+            auto *watch = (epoll_watch_t *)entry->data;
+            if (watch) snapshot[count++] = *watch;
+        }
+        spin_unlock(&ep->watches->lock);
+        int ready = 0;
+        for (size_t index = 0; index < count && ready < maxevents; ++index)
+        {
             uint32_t revents = 0;
-            int poll_ret = epoll_poll_fd(watch->fd, watch->event.events, &revents);
-            if (poll_ret < 0) revents = EPOLLERR;
-            revents &= watch->event.events | EPOLLERR | EPOLLHUP | EPOLLRDHUP;
-            if (revents == 0) continue;
-
-            struct epoll_event out = watch->event;
+            epoll_watch_t &watch = snapshot[index];
+            int result = epoll_poll_fd(watch.fd, watch.event.events, &revents);
+            if (result == -EBADF) continue;
+            if (result < 0) revents = EPOLLERR;
+            revents &= watch.event.events | EPOLLERR | EPOLLHUP | EPOLLRDHUP;
+            if (!revents) continue;
+            struct epoll_event out = watch.event;
             out.events = revents;
             if (!copy_to_user_pagedir(current_user_pagedir(), &events[ready], &out, sizeof(out)))
             {
-                spin_unlock(&ep->watches->lock);
-                return SYSCALL_FAULT_(EFAULT);
+                free(snapshot);
+                return ready ? (uint64_t)ready : SYSCALL_FAULT_(EFAULT);
             }
-            ready++;
+            ++ready;
         }
-        spin_unlock(&ep->watches->lock);
-
-        if (ready > 0 || timeout == 0) break;
-
-        open_interrupt;
-        scheduler_yield();
-        __asm__ volatile("pause");
-        close_interrupt;
-    } while (timeout < 0 || (nanoTime() - start_time) < timeout_ns);
-
-    return ready;
+        free(snapshot);
+        if (ready || timeout == 0) return ready;
+        if (signals_pending_quick(get_current_task())) return SYSCALL_FAULT_(EINTR);
+        uint64_t elapsed = nanoTime() - start;
+        if (timeout >= 0 && elapsed >= duration) return 0;
+        // Existing VFS providers expose readiness polling. A bounded sleep
+        // avoids spinning a CPU while retaining their current callback ABI.
+        scheduler_sleep_ns(timeout < 0 ? 1000000ULL : MIN(1000000ULL, duration - elapsed));
+    }
 }
 
 sys_(epoll_pwait, int epfd, struct epoll_event *events, int maxevents, int timeout, sigset_t *sigmask, size_t sigsetsize)
