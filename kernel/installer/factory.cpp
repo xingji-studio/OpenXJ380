@@ -2,6 +2,7 @@
 // Original synchronous fresh-disk coordinator. No external installer library.
 #include "../../driver/fs/ext4/write.h"
 #include <installer/factory.h>
+#include <installer/partition_install.h>
 #include <installer/ext4_import.h>
 #include <installer/ext4_verify.h>
 #include <installer/esp.h>
@@ -18,6 +19,8 @@
 #include <task/scheduler.h>
 #include "../../driver/fs/ext4/format.h"
 #include "../../driver/fs/ext4/native.h"
+
+extern int installer_register_boot_entry(const xjinstaller::PartitionInstall *) __attribute__((weak));
 
 namespace {
 using namespace xjinstaller;
@@ -45,10 +48,14 @@ struct FactoryContext
     XJ_ROOT_BINDING binding;
     EspPayload payload;
     const xjpak2::Record *loader_record, *kernel_record;
+    xjpak2::Plan boot_plan;
+    xjpak2::Record boot_records[8];
     uint8_t *loader_storage, *kernel_storage;
     uint8_t source_buffer[131072];
     Fat32Name *fat_names;
     WindowReader root_reader, esp_reader;
+    FactoryContext *esp_context;
+    partition::Table *partition_scratch;
     bool published, pinned;
 };
 
@@ -191,13 +198,38 @@ int preflight(FactoryContext *context, const uint8_t *package, size_t bytes)
 {
     if (context->options.esp_bytes < EspMinimumBytes || context->options.esp_bytes % 512 ||
         context->options.esp_bytes / 512 > EspMaximumSectors) return -EINVAL;
-    DiskLayoutOptions layout_options{};
-    layout_options.disk_bytes = context->whole.bytes;
-    layout_options.esp_bytes = context->options.esp_bytes;
-    layout_options.identities = context->options.identities;
-    layout_options.filesystem = context->options.filesystem;
-    int error = disk_layout_plan(layout_options, context->layout);
-    if (error) return error;
+    int error = 0;
+    const auto *selected = context->options.partition;
+    if (selected)
+    {
+        if (!installer_register_boot_entry) return -EOPNOTSUPP;
+        partition::Entry root{}, esp{};
+        const auto &esp_table = selected->separate_disk ? selected->esp_before : selected->after;
+        if (selected->before.bytes != context->whole.bytes ||
+            partition::entry(selected->after, selected->root_number, root) || !root.occupied || root.esp ||
+            partition::entry(esp_table, selected->esp_number, esp) || !esp.occupied || !esp.esp ||
+            (!selected->separate_disk && root.first <= esp.last && esp.first <= root.last)) return -EINVAL;
+        context->layout.disk_bytes = context->whole.bytes;
+        context->layout.total_sectors = context->whole.bytes / 512;
+        context->layout.root_first_lba = root.first; context->layout.root_last_lba = root.last;
+        context->layout.esp_first_lba = esp.first; context->layout.esp_last_lba = esp.last;
+        memcpy(context->options.identities.disk, selected->after.primary + 56, 16);
+        memcpy(context->options.identities.root, root.guid, 16);
+        memcpy(context->options.identities.esp, esp.guid, 16);
+        context->options.esp_bytes = (esp.last - esp.first + 1) * 512;
+        context->partition_scratch = allocate<partition::Table>();
+        if (!context->partition_scratch) return -ENOMEM;
+    }
+    else
+    {
+        DiskLayoutOptions layout_options{};
+        layout_options.disk_bytes = context->whole.bytes;
+        layout_options.esp_bytes = context->options.esp_bytes;
+        layout_options.identities = context->options.identities;
+        layout_options.filesystem = context->options.filesystem;
+        error = disk_layout_plan(layout_options, context->layout);
+        if (error) return error;
+    }
     xjpak2::Limits limits;
     const bool fat32 = context->options.filesystem == 1;
     if (fat32) { limits.max_path = 511; limits.max_file_bytes = 0xffffffffULL; }
@@ -242,8 +274,22 @@ int preflight(FactoryContext *context, const uint8_t *package, size_t bytes)
     else error = ext4_import_prepare(package, bytes, limits, plan, requirements,
                                      indexed ? &context->options.source_reader : nullptr);
     if (error) return error;
-    const auto *kernel = required_file(plan.plan, "/system/kernel.krl");
-    const auto *loader = required_file(plan.plan, fat32 ? "/system/boot/BOOTX64.EFI" : "/EFI/BOOT/BOOTX64.EFI");
+    const xjpak2::Plan *boot = &plan.plan;
+    if (context->options.boot_package)
+    {
+        if (!indexed || !context->options.boot_package_bytes) return -EINVAL;
+        xjpak2::Limits boot_limits;
+        boot_limits.max_entries = 8;
+        error = xjpak2::validate_indexed(static_cast<const uint8_t *>(context->options.boot_package),
+            context->options.boot_package_bytes, boot_limits, {context->boot_records, 8},
+            context->boot_plan, context->options.source_reader);
+        if (error) return error;
+        boot = &context->boot_plan;
+    }
+    const auto *kernel = required_file(*boot, context->options.boot_package ?
+        "/EFI/XJ380/kernel.krl" : "/system/kernel.krl");
+    const auto *loader = required_file(*boot, context->options.boot_package ? "/EFI/XJ380/BOOTX64.EFI" :
+        fat32 ? "/system/boot/BOOTX64.EFI" : "/EFI/BOOT/BOOTX64.EFI");
     if (!kernel || !loader || !required_file(plan.plan, "/config/README.md") ||
         kernel->payload.size < 64 || loader->payload.size < 64)
         return -ENOEXEC;
@@ -271,11 +317,12 @@ int preflight(FactoryContext *context, const uint8_t *package, size_t bytes)
     context->esp_verify->cluster_bits_bytes = esp_verify_bitmap_bytes(context->options.esp_bytes);
     context->esp_verify->cluster_bits = static_cast<uint8_t *>(malloc(context->esp_verify->cluster_bits_bytes));
     if (!context->esp_verify->cluster_bits) return -ENOMEM;
-    error = disk_layout_build(context->layout, *context->gpt);
+    error = selected ? 0 : disk_layout_build(context->layout, *context->gpt);
     if (error) return error;
     context->root_reader = {context, context->layout.root_first_lba * 512,
                             (context->layout.root_last_lba - context->layout.root_first_lba + 1) * 512};
-    context->esp_reader = {context, context->layout.esp_first_lba * 512, context->options.esp_bytes};
+    context->esp_reader = {context->esp_context ? context->esp_context : context,
+                            context->layout.esp_first_lba * 512, context->options.esp_bytes};
     if (!fat32)
     {
         xjext4::FormatOptions format_options{};
@@ -339,6 +386,12 @@ void free_context(FactoryContext *context)
     free(context->fat_names);
     free(context->loader_storage); free(context->kernel_storage);
     free(context->format); free(context->backup_entries); free(context->readback); free(context->gpt);
+    free(context->partition_scratch);
+    if (context->esp_context)
+    {
+        if (context->esp_context->lease) block_access_release(context->esp_context->lease);
+        free(context->esp_context);
+    }
     free(context);
 }
 
@@ -347,12 +400,14 @@ int execute(FactoryContext *context, const uint8_t *package, size_t bytes)
     auto &status = context->status;
     if (context->options.source_reader.read)
     {
-        const auto &plan = context->preflight->plan;
         uint64_t verified = 0;
-        report_progress(context->options.progress, InstallStage::Preflight, 0, plan.data_bytes);
-        // The full selected manifest/data is checked before target I/O. This
-        // runs only after context publication and pins, so worker death retains
-        // every source/target lifetime without leaving an untracked request.
+        const uint64_t total = context->preflight->plan.data_bytes + context->boot_plan.data_bytes;
+        report_progress(context->options.progress, InstallStage::Preflight, 0, total);
+        // Verify both sources before target writes; retain only the bounded
+        // EFI loader and installed kernel, not the multi-gigabyte root data.
+        for (unsigned catalog = 0; catalog < (context->options.boot_package ? 2U : 1U); ++catalog)
+        {
+            const auto &plan = catalog ? context->boot_plan : context->preflight->plan;
         for (size_t i = 0; i < plan.count; ++i)
         {
             const auto &record = plan.records[i];
@@ -370,9 +425,10 @@ int execute(FactoryContext *context, const uint8_t *package, size_t bytes)
                 if (&record == context->loader_record)
                     memcpy(context->loader_storage + done, context->source_buffer, amount);
                 done += amount; verified += amount;
-                report_progress(context->options.progress, InstallStage::Preflight, verified, plan.data_bytes);
+                report_progress(context->options.progress, InstallStage::Preflight, verified, total);
             }
             if (~crc != record.payload_crc32c) return -EUCLEAN;
+        }
         }
         const auto *kernel = context->kernel_storage;
         const auto *loader = context->loader_storage;
@@ -383,11 +439,42 @@ int execute(FactoryContext *context, const uint8_t *package, size_t bytes)
         crc = xj_root_binding_crc32c(context->binding.bytes, 92);
         for (unsigned i = 0; i < 4; ++i) context->binding.bytes[92 + i] = uint8_t(crc >> (8 * i));
     }
+    if (context->options.partition && context->options.partition->reuse_esp)
+    {
+        EspReadDevice device{window_read, &context->esp_reader, context->esp_reader.bytes};
+        EspExpectedFiles files{static_cast<const uint8_t *>(context->payload.loader), context->payload.loader_bytes,
+            static_cast<const uint8_t *>(context->payload.kernel), context->payload.kernel_bytes};
+        int error = esp_check_existing_capacity(device, files, *context->esp_verify);
+        if (error) return error;
+    }
     report_progress(context->options.progress, InstallStage::Partitioning, 0, context->esp_reader.bytes);
     phase(context, FactoryPhase::InitialFlush);
     if (!flush(context)) return -EIO;
     const auto &layout = context->layout;
     const auto &gpt = *context->gpt;
+    int error = 0;
+    if (context->options.partition)
+    {
+        const auto &selected = *context->options.partition;
+        partition::Device io{context, context->whole.bytes, read, write, flush};
+        if (selected.separate_disk)
+        {
+            auto *other = context->esp_context;
+            partition::Device esp_io{other, other->whole.bytes, read, write, flush};
+            error = partition::load(esp_io, *context->partition_scratch);
+            if (!error && !partition::same(selected.esp_before, *context->partition_scratch)) error = -ESTALE;
+            if (error) return error;
+        }
+        if (partition::same(selected.before, selected.after))
+        {
+            error = partition::load(io, *context->partition_scratch);
+            if (!error && !partition::same(selected.before, *context->partition_scratch)) error = -ESTALE;
+        }
+        else error = partition::commit(io, selected.before, selected.after, *context->partition_scratch);
+        if (error) return error;
+    }
+    else
+    {
     // Withdraw old boot discovery before modifying payload ranges. Then clear
     // the complete new ESP before publishing a new GPT: a formatter may write
     // its BPB before every directory/FAT block. Reused caller GUIDs must never
@@ -424,8 +511,9 @@ int execute(FactoryContext *context, const uint8_t *package, size_t bytes)
         !read(context, layout.backup_entries_lba * 512, context->backup_entries, DiskTableBytes)) return -EIO;
     DiskLayoutReadback disk_back{{back.mbr, 512}, {back.primary_header, 512}, {back.entries, DiskTableBytes},
                                  {back.backup_header, 512}, {context->backup_entries, DiskTableBytes}};
-    int error = disk_layout_validate(layout, disk_back);
+    error = disk_layout_validate(layout, disk_back);
     if (error) return error;
+    }
     phase(context, FactoryPhase::GptVerified);
     BlockAccessWindow root{context->target, context->whole, context->lease,
                             context->root_reader.offset, context->root_reader.bytes};
@@ -451,11 +539,14 @@ int execute(FactoryContext *context, const uint8_t *package, size_t bytes)
             root_status.format.io_failed) return error ? error : -EIO;
     }
     phase(context, FactoryPhase::RootBuilt);
-    BlockAccessWindow esp{context->target, context->whole, context->lease,
+    auto *esp_owner = context->esp_reader.context;
+    BlockAccessWindow esp{esp_owner->target, esp_owner->whole, esp_owner->lease,
                            context->esp_reader.offset, context->esp_reader.bytes};
     EspBuildStatus esp_status{};
     report_progress(context->options.progress, InstallStage::BuildingEsp, 0, 1);
-    error = fatfs_build_esp_window(&esp, &context->payload, &esp_status);
+    error = context->options.partition ?
+        fatfs_install_esp_window(&esp, &context->payload, context->options.partition->reuse_esp, &esp_status) :
+        fatfs_build_esp_window(&esp, &context->payload, &esp_status);
     if (esp_status.io_failed) status.io_failed = true;
     if (error || !esp_status.complete || esp_status.quarantined || esp_status.io_failed)
         return error ? error : -EIO;
@@ -487,8 +578,16 @@ int execute(FactoryContext *context, const uint8_t *package, size_t bytes)
     EspExpectedFiles files{static_cast<const uint8_t *>(context->payload.loader), context->payload.loader_bytes,
                             static_cast<const uint8_t *>(context->payload.kernel), context->payload.kernel_bytes};
     report_progress(context->options.progress, InstallStage::VerifyingEsp, 0, 1);
-    error = esp_verify_prepare_publication(esp_device, files, context->binding,
-                                            *context->esp_verify, context->publication);
+    if (context->options.partition)
+    {
+        EspBuildStatus verified{};
+        error = fatfs_verify_installed_esp(&esp, &context->payload, context->options.partition->reuse_esp,
+                                           &context->binding, &context->publication, &verified);
+        context->esp_verify->io_failed = verified.io_failed;
+        context->esp_verify->complete = verified.complete;
+    }
+    else error = esp_verify_prepare_publication(esp_device, files, context->binding,
+                                                *context->esp_verify, context->publication);
     if (context->esp_verify->io_failed) status.io_failed = true;
     if (error || !context->esp_verify->complete || !context->publication.ready) return error ? error : -EIO;
     if (context->publication.sector_offset % 512 || context->publication.sector_offset > context->esp_reader.bytes ||
@@ -499,15 +598,20 @@ int execute(FactoryContext *context, const uint8_t *package, size_t bytes)
     // No filesystem writer/session remains. The proposed sector was read back
     // from an allocated fixed-size placeholder. Flush every prerequisite before
     // the first request capable of making the binding valid.
-    if (!flush(context)) return -EIO;
+    if (!flush(context) || (esp_owner != context && !flush(esp_owner))) return -EIO;
     report_progress(context->options.progress, InstallStage::Activating, 1, 3);
     phase(context, FactoryPhase::ActivationAttempted); status.activation_attempted = true;
     uint64_t activation = context->esp_reader.offset + context->publication.sector_offset;
-    if (!write(context, activation, context->publication.sector, 512) || !flush(context)) return -EIO;
+    if (!write(esp_owner, activation, context->publication.sector, 512) || !flush(esp_owner)) return -EIO;
     report_progress(context->options.progress, InstallStage::Activating, 2, 3);
-    if (!read(context, activation, context->esp_verify->data, 512) ||
+    if (!read(esp_owner, activation, context->esp_verify->data, 512) ||
         memcmp(context->esp_verify->data, context->publication.sector, 512)) return -EIO;
     phase(context, FactoryPhase::ActivationDurable); status.activation_durable = true;
+    if (context->options.partition)
+    {
+        status.boot_registration_error = installer_register_boot_entry(context->options.partition);
+        if (status.boot_registration_error) return status.boot_registration_error;
+    }
     report_progress(context->options.progress, InstallStage::Activating, 3, 3);
     return 0;
 }
@@ -562,6 +666,23 @@ int installer_build_ext4_disk(vfs_node_t target, vfs_node_t source, const xjinst
         if (!physical || physical->type != DEVICE_BLOCK || physical->vdiskid != context->whole.physical_device ||
             physical->sector_size != 512 || physical->size != context->whole.bytes) error = -EOPNOTSUPP;
     }
+    if (!error && snapshot.partition && snapshot.partition->separate_disk)
+    {
+        auto *other = allocate<FactoryContext>();
+        if (!other) error = -ENOMEM;
+        else
+        {
+            context->esp_context = other;
+            other->target = snapshot.partition->esp_node;
+            error = block_access_resolve_node(other->target, &other->whole);
+            if (!error && (other->whole.device != other->whole.physical_device || other->whole.start ||
+                other->whole.physical_device == context->whole.physical_device ||
+                other->whole.physical_device == source_extent.physical_device)) error = -EINVAL;
+            if (!error) error = block_access_require_flush(other->whole);
+            if (!error) error = block_access_claim(other->whole, true, &other->lease);
+            if (!error && !ready(other)) error = -EIO;
+        }
+    }
     if (!error) error = preflight(context, static_cast<const uint8_t *>(package), bytes);
     if (!error)
     {
@@ -579,10 +700,17 @@ int installer_build_ext4_disk(vfs_node_t target, vfs_node_t source, const xjinst
         context->status.phase = FactoryPhase::Published;
         error = execute(context, static_cast<const uint8_t *>(package), bytes);
     }
+    if (context->esp_context)
+    {
+        context->status.read_bytes += context->esp_context->status.read_bytes;
+        context->status.written_bytes += context->esp_context->status.written_bytes;
+        context->status.io_failed |= context->esp_context->status.io_failed;
+    }
     context->status.error = error;
     if (error && context->published)
     {
         block_access_poison(context->lease);
+        if (context->esp_context && context->esp_context->lease) block_access_poison(context->esp_context->lease);
         context->status.quarantined = true;
         if (status) *status = context->status;
         return error;

@@ -147,7 +147,10 @@ static void partition_scan_single_device(size_t vdisk_id, bool auto_mount)
 
     for (size_t j = first_partition; j < partition_num; j++)
     {
-        partition_register_device_node(j);
+        // Installer operations edit tables while these volumes stay offline.
+        // Publishing aliases here would leave stale ranges after New/Delete.
+        // The native installer uses retained whole-device handles and windows.
+        if (!EFI_BC || !(EFI_BC->boot_flags & BOOT_FLAG_INSTALLER)) partition_register_device_node(j);
     }
     access.finish(); // A mounted extent must not overlap the discovery lease.
     if (auto_mount)
@@ -852,9 +855,10 @@ static int partition_select_bound_root(const XJ_ROOT_BINDING &binding, size_t &r
                                         0x87, 0xc0, 0x68, 0xb6, 0xb7, 0x26, 0x99, 0xc7};
     const uint8_t *root_type = xj_root_binding_filesystem(&binding) == XJ_ROOT_FILESYSTEM_FAT32 ? fat_type : linux_type;
     const partition_t &root = partitions[root_index], &esp = partitions[esp_index];
-    if (root_index == esp_index || root.vdisk_id != disk_id || esp.vdisk_id != disk_id ||
+    if (root_index == esp_index || root.vdisk_id != disk_id ||
+        esp.vdisk_id >= 256 || !partition_gpt_disks[esp.vdisk_id].complete ||
         memcmp(root.disk_guid, xj_root_binding_disk_guid(&binding), 16) ||
-        memcmp(esp.disk_guid, xj_root_binding_disk_guid(&binding), 16) ||
+        memcmp(esp.disk_guid, partition_gpt_disks[esp.vdisk_id].disk_guid, 16) ||
         memcmp(root.partition_type_guid, root_type, 16) || memcmp(esp.partition_type_guid, esp_type, 16))
         return -EUCLEAN;
     return 0;
@@ -870,10 +874,13 @@ static int partition_mount_bound_root(const XJ_ROOT_BINDING &binding)
     char path[64];
     int length = snprintf(path, sizeof(path), "/dev/%sp%zu", device->drive_name, index);
     if (length < 0 || size_t(length) >= sizeof(path)) return -ENAMETOOLONG;
-    // The adapter verifies UUID and kernel contents against the initial clean
-    // or recovered overlay before its first flush/RECOVER/replay home write.
-    return xj_root_binding_filesystem(&binding) == XJ_ROOT_FILESYSTEM_FAT32 ?
-        fatfs_mount_bound_root(path, &binding) : ext4fs_mount_bound_root(path, &binding);
+    // UUID/structure validation still precedes the first replay/home write.
+    // New vendor boots already authenticated the ESP kernel in the loader;
+    // legacy boots retain the root-resident kernel content comparison.
+    if (xj_root_binding_filesystem(&binding) == XJ_ROOT_FILESYSTEM_FAT32)
+        return fatfs_mount_bound_root(path, &binding);
+    return EFI_BC && (EFI_BC->boot_flags & BOOT_FLAG_ESP_KERNEL_VERIFIED) ?
+        ext4fs_mount_bound_root_from_esp(path, &binding) : ext4fs_mount_bound_root(path, &binding);
 }
 
 [[noreturn]] static void root_mount_halt()

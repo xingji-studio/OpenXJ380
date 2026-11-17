@@ -1,25 +1,26 @@
 // SPDX-License-Identifier: Apache-2.0
 // Original package lifetime staging and explicit native-service admission.
 
+#include "../build_settings.h"
 #include <block_source.h>
+#include <cpu/msr.h>
+#include <cpu/regio.h>
 #include <installer/boot_proof.h>
-#include <installer/package.h>
-#include <installer/session.h>
 #include <installer/context.h>
-#include <installer/source_lifetime.h>
 #include <installer/jobs.h>
+#include <installer/package.h>
 #include <installer/payloads.h>
-#include <installer/stream_index.h>
+#include <installer/root_limits.h>
+#include <installer/session.h>
+#include <installer/source_lifetime.h>
 #include <installer/source_reader.h>
+#include <installer/stream_index.h>
 #include <installer_mode.h>
 #include <installer_protocol.h>
-#include <task/pcb.h>
-#include <task/scheduler.h>
-#include <cpu/regio.h>
-#include <cpu/msr.h>
 #include <krlibc.h>
 #include <proto.hpp>
-#include "../build_settings.h"
+#include <task/pcb.h>
+#include <task/scheduler.h>
 
 extern char _kernel_start[], __ksymtab_end[];
 
@@ -34,7 +35,7 @@ unsigned native_admission;
 BOOT_CONFIG saved_config;
 BootPackageProof package_proof;
 TableWorkspace table_workspace;
-uint64_t arena_budget;
+uint64_t                  arena_budget, root_budget;
 xjpak2::Record *root_records, *system_records;
 xjpak2::Plan root_plan, system_plan;
 XJ_INSTALLER_PACKAGE_SPAN ext4_span;
@@ -293,11 +294,13 @@ int session_boot_prepare(const BOOT_CONFIG &config, const void *original_config)
     asm_cpuid(0x80000000, 0, &eax, &ebx, &ecx, &edx);
     uint32_t maximum_leaf = eax;
     reader.physical_bits = 36; // Architectural fallback before CPUID address widths.
+    reader.physical_bits_known = false;
     reader.gigabyte_pages = false;
     if (maximum_leaf >= 0x80000008)
     {
         asm_cpuid(0x80000008, 0, &eax, &ebx, &ecx, &edx);
         reader.physical_bits = eax & 255;
+        reader.physical_bits_known = true;
     }
     if (maximum_leaf >= 0x80000001)
     {
@@ -307,10 +310,10 @@ int session_boot_prepare(const BOOT_CONFIG &config, const void *original_config)
     reader.nx_enabled = (rdmsr(0xc0000080) & (1ULL << 11)) != 0;
     uint64_t table = get_cr3() & 0x000ffffffffff000ULL;
     write_serial_fmt_heapless("installer: memory proof CPU cr3=0x%llx max_extended_leaf=0x%x "
-                              "physical_bits=%u nx_enabled=%u gigabyte_pages=%u table_capacity=%llu\n",
+                              "physical_bits=%u width_source=%s nx_enabled=%u gigabyte_pages=%u table_capacity=%llu\n",
                               (unsigned long long)table, maximum_leaf, unsigned(reader.physical_bits),
-                              unsigned(reader.nx_enabled), unsigned(reader.gigabyte_pages),
-                              (unsigned long long)table_workspace_capacity);
+                              reader.physical_bits_known ? "cpuid" : "fallback", unsigned(reader.nx_enabled),
+                              unsigned(reader.gigabyte_pages), (unsigned long long)table_workspace_capacity);
     BootPackageProof proof = {};
     int result = prove_boot_packages(handoff, map, map_physical, reader, table, &proof);
     if (result < 0) return boot_refuse("package-ownership-and-mapping", result, &map, &diagnostic);
@@ -360,15 +363,24 @@ int session_boot_prepare(const BOOT_CONFIG &config, const void *original_config)
     // table hidden in another PML4 branch must never alias a package page.
     if (!verify_table_closure(reader, table, &table_workspace))
         return boot_refuse("table-closure", -14, &map, &diagnostic);
+    const auto &closure_report = table_workspace.report;
+    if (closure_report.high_leaf_count)
+        write_serial_fmt_heapless("installer: memory proof fallback high leaves count=%llu first_table=0x%llx "
+                                  "level=%u index=%u entry=0x%llx; ownership only, translations remain strict\n",
+                                  (unsigned long long)closure_report.high_leaf_count,
+                                  (unsigned long long)closure_report.first_table, closure_report.first_level,
+                                  closure_report.first_index, (unsigned long long)closure_report.first_entry);
     saved_config = config;
     package_proof = proof;
-    // Both arenas combined are capped by currently free conventional RAM and a
-    // fixed ceiling. This is a pre-allocation budget, not a later disk guarantee.
-    arena_budget = summary.allocatable_pages * 4096 / 8;
+    // Keep the existing combined record-arena limit independent of the larger
+    // copied-root profile. Both retain the free-RAM share, not a reservation.
+    root_budget  = root_memory_budget(summary.allocatable_pages);
+    arena_budget = root_budget;
     if (arena_budget > (64ULL << 20)) arena_budget = 64ULL << 20;
     __atomic_store_n(&state, memory_proven, __ATOMIC_RELEASE);
-    write_serial_fmt_heapless("installer: memory proof passed tables=%llu arena_budget=0x%llx\n",
-                              (unsigned long long)table_workspace.count, (unsigned long long)arena_budget);
+    write_serial_fmt_heapless("installer: memory proof passed tables=%llu arena_budget=0x%llx root_budget=0x%llx\n",
+                              (unsigned long long)table_workspace.count, (unsigned long long)arena_budget,
+                              (unsigned long long)root_budget);
     return 0;
 }
 
@@ -492,10 +504,15 @@ int session_root_package_view(xjpak2::Plan *plan, uint64_t *epoch)
     if (result < 0) return result;
     // Match the private-root builder's conservative metadata admission budget.
     // This is not an allocator reservation: every later allocation still has
-    // a rollback path. The same RAM bound already limits the retained arenas.
-    if (root_plan.inode_count > (__UINT64_MAX__ - 4096) / 1024) return -12;
-    uint64_t overhead = root_plan.inode_count * 1024 + 4096;
-    if (overhead > arena_budget || root_plan.data_bytes > arena_budget - overhead) return -12;
+    // a rollback path. The retained record arenas have their own smaller cap.
+    if (!root_memory_fits(root_plan.inode_count, root_plan.data_bytes, root_budget))
+    {
+        write_serial_fmt_heapless("installer: root memory budget failed entries=%llu data_bytes=%llu "
+                                  "budget_bytes=%llu error=-12\n",
+                                  (unsigned long long)root_plan.inode_count, (unsigned long long)root_plan.data_bytes,
+                                  (unsigned long long)root_budget);
+        return -12;
+    }
     *plan = root_plan;
     *epoch = 1;
     return 0;
@@ -518,6 +535,11 @@ bool session_job_view(JobSessionView *output)
     output->package = reinterpret_cast<const void *>(direct_map_base + ext4_span.physical);
     output->package_bytes = ext4_span.bytes;
     output->source_reader = source_reader;
+    if (source_index.version == 2)
+    {
+        output->boot_package = source_index.fat32.data;
+        output->boot_package_bytes = source_index.fat32.size;
+    }
     output->ready = __atomic_load_n(&native_admission, __ATOMIC_ACQUIRE) == 1 &&
                     (package_proof.profile == XJ_INSTALLER_PROFILE_EXT4_PAK2 ||
                      package_proof.profile == XJ_INSTALLER_PROFILE_DUAL ||
@@ -558,6 +580,7 @@ int session_validate_job_view(const JobSessionView &view)
         view.fat32_package != current.fat32_package || view.fat32_package_bytes != current.fat32_package_bytes ||
         view.source_reader.read != current.source_reader.read || view.source_reader.context != current.source_reader.context ||
         view.source_reader.bytes != current.source_reader.bytes ||
+        view.boot_package != current.boot_package || view.boot_package_bytes != current.boot_package_bytes ||
         view.source_extent.device != current.source_extent.device ||
         view.source_extent.physical_device != current.source_extent.physical_device ||
         view.source_extent.generation != current.source_extent.generation ||

@@ -54,17 +54,22 @@ bool reader_root_valid(TableReader reader, uint64_t root_table, uint64_t *physic
     return true;
 }
 
-bool present_entry_valid(TableReader reader, uint64_t physical_mask, uint64_t table, unsigned level, unsigned index,
-                         uint64_t entry, bool *leaf)
+bool entry_is_leaf(unsigned level, uint64_t entry)
 {
-    if (entry & address_mask & ~physical_mask)
+    return level == 1 || ((level == 2 || level == 3) && (entry & huge));
+}
+
+bool present_entry_valid(TableReader reader, uint64_t physical_mask, uint64_t table, unsigned level, unsigned index,
+                         uint64_t entry, bool *leaf, bool allow_high_leaf = false)
+{
+    if ((entry & address_mask & ~physical_mask) && !(allow_high_leaf && entry_is_leaf(level, entry)))
         return table_failed(reader, "entry-physical-width", table, level, index, entry);
     if (!reader.nx_enabled && (entry >> 63))
         return table_failed(reader, "entry-nx-without-nxe", table, level, index, entry);
     if (level == 4 && (entry & huge)) return table_failed(reader, "pml4-huge-bit", table, level, index, entry);
     if (level == 3 && (entry & huge) && !reader.gigabyte_pages)
         return table_failed(reader, "gigabyte-pages-unsupported", table, level, index, entry);
-    *leaf = level == 1 || (entry & huge);
+    *leaf = entry_is_leaf(level, entry);
     if (*leaf && level != 1)
     {
         uint64_t mask = (1ULL << (12 + 9 * (level - 1))) - 1;
@@ -100,7 +105,25 @@ bool visit_table(TableReader reader, uint64_t physical_mask, uint64_t physical, 
             return table_failed(reader, "table-read-failed", physical, level, index);
         if (!(entry & present)) continue;
         bool leaf = false;
-        if (!present_entry_valid(reader, physical_mask, physical, level, index, entry, &leaf)) return false;
+        // Ownership closure follows table pointers, not leaf target addresses.
+        // Firmware can retain a wider flat mapping when CPUID omits its width.
+        // Permit that leaf's width alone; non-leaf pointers and every actual
+        // translation still use the conservative mask before any target read.
+        bool allow_high_leaf = !reader.physical_bits_known && reader.physical_bits == 36;
+        if (!present_entry_valid(reader, physical_mask, physical, level, index, entry, &leaf, allow_high_leaf))
+            return false;
+        if (leaf && (entry & address_mask & ~physical_mask))
+        {
+            auto &report = workspace->report;
+            if (!report.high_leaf_count)
+            {
+                report.first_table = physical;
+                report.first_entry = entry;
+                report.first_level = level;
+                report.first_index = index;
+            }
+            ++report.high_leaf_count;
+        }
         if (!leaf && !visit_table(reader, physical_mask, entry & address_mask, level - 1, workspace)) return false;
     }
     return true;
@@ -179,11 +202,13 @@ bool verify_table_closure(TableReader reader, uint64_t root_table, TableWorkspac
 {
     if (!workspace) return table_failed(reader, "table-workspace-missing", root_table);
     workspace->count = 0;
+    workspace->report      = {};
     uint64_t physical_mask = 0;
     if (!reader_root_valid(reader, root_table, &physical_mask) ||
         !visit_table(reader, physical_mask, root_table, 4, workspace))
     {
         workspace->count = 0;
+        workspace->report = {};
         return false;
     }
     return true;

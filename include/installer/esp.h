@@ -3,6 +3,7 @@
 
 #include <block_access.h>
 #include <stdint.h>
+#include <efi/root_binding.h>
 
 namespace xjinstaller {
 
@@ -15,6 +16,8 @@ struct EspPayload
     const void *kernel;
     EspSize kernel_bytes;
 };
+
+struct EspPublication;
 
 constexpr uint64_t EspMinimumBytes = 64ULL * 1048576;
 constexpr uint64_t EspMaximumSectors = 0x0ffffff0ULL;
@@ -94,3 +97,16 @@ int fatfs_factory_ready();
 // private session after checked close/unmount, physical flush, and readback.
 int fatfs_build_esp_window(const BlockAccessWindow *window, const xjinstaller::EspPayload *payload,
                            xjinstaller::EspBuildStatus *status = nullptr);
+
+// Partition installer: shared ESPs retain their filesystem and foreign files.
+// Only EFI/XJ380 is managed. A fresh ESP also receives the fallback loader.
+// Verification reopens a fresh private session, checks our files, and proposes
+// the existing placeholder sector. Publishing the binding is the coordinator's
+// final raw-sector operation after root and ESP verification and flush.
+int fatfs_install_esp_window(const BlockAccessWindow *, const xjinstaller::EspPayload *, bool reuse,
+                             xjinstaller::EspBuildStatus *);
+int fatfs_verify_installed_esp(const BlockAccessWindow *, const xjinstaller::EspPayload *, bool reuse,
+                               const XJ_ROOT_BINDING *, xjinstaller::EspPublication *,
+                               xjinstaller::EspBuildStatus *);
+// filesystem: 1 FAT32, 3 exFAT. The borrowed whole-device lease is never released.
+int fatfs_format_window(const BlockAccessWindow *, unsigned filesystem, xjinstaller::EspBuildStatus *);

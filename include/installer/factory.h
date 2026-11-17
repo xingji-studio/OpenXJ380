@@ -9,6 +9,8 @@ struct vfs_node;
 
 namespace xjinstaller {
 
+struct PartitionInstall;
+
 struct FactoryOptions
 {
     DiskIdentities identities;
@@ -19,6 +21,9 @@ struct FactoryOptions
     uint32_t filesystem = 2;
     ProgressObserver progress = {};
     xjpak2::DataReader source_reader = {};
+    const PartitionInstall *partition = nullptr;
+    const void *boot_package = nullptr;
+    __SIZE_TYPE__ boot_package_bytes = 0;
 };
 
 enum class FactoryPhase : uint32_t
@@ -32,6 +37,7 @@ struct FactoryStatus
 {
     FactoryPhase phase;
     int error;
+    int boot_registration_error = 0;
     uint64_t read_bytes, written_bytes; // Coordinator raw I/O; excludes child session I/O.
     uint64_t package_records, package_data_bytes;
     bool io_started, io_failed, quarantined;

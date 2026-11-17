@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "implementation": "Original bounded empty-volume NTFS 3.1 formatter",
+  "license": "Apache-2.0",
+  "review_date": "2026-11-16",
+  "sources": {
+    "mkfs.cpp": "b11f1950e4fe4144c97b870161c3ffbc4561d43d365134c2d488d1d0d8eec179",
+    "mkfs.h": "40f00cbcfa9cf226ae10b1d848fa9c9da3a4e020ea9f5568d9f54849697ee310"
+  },
+  "new_link_archives": [],
+  "references": [
+    "https://learn.microsoft.com/en-us/windows/win32/devnotes/master-file-table",
+    "https://learn.microsoft.com/en-us/windows/win32/devnotes/file-record-segment-header",
+    "https://learn.microsoft.com/en-us/windows/win32/devnotes/attribute-record-header",
+    "https://learn.microsoft.com/en-us/windows/win32/devnotes/multi-sector-header"
+  ],
+  "imported_implementations": [],
+  "patent_clearance": "Not established"
+}

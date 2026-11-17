@@ -531,8 +531,10 @@ def main() -> None:
     installer_fs = os.environ.get("INSTALLER_FS", "ext4")
     if installer_fs != "ext4":
         parser.error("INSTALLER_FS must be ext4")
-    # No newly linked third-party filesystem implementation is approved.
+    # Check the reviewed filesystem implementation inputs before linking.
     subprocess.run([sys.executable, str(ROOT / "tools/check_ext4_sources.py"), "--root", str(ROOT)],
+                   check=True, stdout=subprocess.DEVNULL)
+    subprocess.run([sys.executable, str(ROOT / "tools/check_ntfs_sources.py"), "--root", str(ROOT)],
                    check=True, stdout=subprocess.DEVNULL)
 
     # Environment knobs keep the same defaults as the historical build.

@@ -12,6 +12,7 @@
 #include <device.h>
 #include <fs/fatfs/private.h>
 #include <installer/esp.h>
+#include <installer/esp_verify.h>
 #include <installer/fat32.h>
 #include <efi/root_binding.h>
 #include <task/scheduler.h>
@@ -1715,16 +1716,96 @@ static int fatfs_root_contents(EspContext *context, uint32_t volume_id, bool ver
     return 0;
 }
 
+// A shared ESP is a normal FAT32 volume. Do not apply the fresh-volume
+// exact-directory census to it, and never format it or touch foreign paths.
+static int esp_vendor_contents(EspContext *context, const xjinstaller::EspPayload &source,
+                               bool reuse, bool verify, const XJ_ROOT_BINDING *binding,
+                               xjinstaller::EspPublication *publication, unsigned format_only)
+{
+    esp_path(context, "");
+    if (fatfs_esp_disk_sync(context->drive)) return context->error;
+    if (!verify && (!reuse || format_only))
+    {
+        context->mkfs.fmt = (format_only == 3 ? FM_EXFAT : FM_FAT32) | FM_SFD;
+        context->mkfs.n_fat = format_only == 3 ? 1 : 2;
+        context->mkfs.align = 1;
+        context->mkfs.au_size = format_only ? 0 : 512;
+        if (esp_fresult(context, f_mkfs(context->path, &context->mkfs, context->mkfs_work,
+                                       sizeof(context->mkfs_work)))) return context->error;
+        if (fatfs_esp_disk_sync(context->drive)) return context->error;
+    }
+    if (esp_fresult(context, f_mount(&context->filesystem, context->path, 1))) return context->error;
+    if (context->filesystem.fs_type != (format_only == 3 ? FS_EXFAT : FS_FAT32))
+        return esp_stop(context, -EUCLEAN);
+    if (format_only)
+    {
+        if (esp_fresult(context, f_unmount(context->path)) || fatfs_esp_disk_sync(context->drive))
+            return context->error;
+        return 0;
+    }
+    if (!verify)
+    {
+        u32 available = 0;
+        FATFS *filesystem = nullptr;
+        if (esp_fresult(context, f_getfree(context->path, &available, &filesystem))) return context->error;
+        // Reserve fresh chains for all owned files; do not count reclaimable
+        // old XJ380 files or depend on overwriting a foreign allocation.
+        uint64_t required = (source.loader_bytes + 511) / 512 + (source.kernel_bytes + 511) / 512 + 32;
+        if (!reuse) required += (source.loader_bytes + 511) / 512;
+        if (uint64_t(available) * context->filesystem.csize < required) return esp_stop(context, -ENOSPC);
+        const char *directories[] = {"/EFI", "/EFI/XJ380", "/EFI/BOOT"};
+        for (unsigned i = 0; i < (reuse ? 2U : 3U); ++i)
+        {
+            esp_path(context, directories[i]);
+            FRESULT result = f_mkdir(context->path);
+            if (result == FR_EXIST)
+            {
+                if (esp_fresult(context, f_stat(context->path, &context->information))) return context->error;
+                if (!(context->information.fattrib & AM_DIR)) return esp_stop(context, -EUCLEAN);
+            }
+            else if (esp_fresult(context, result)) return context->error;
+        }
+    }
+    if (esp_file(context, "/EFI/XJ380/root.bin", context->placeholder, 96, !verify) ||
+        esp_file(context, "/EFI/XJ380/BOOTX64.EFI", source.loader, source.loader_bytes, !verify) ||
+        esp_file(context, "/EFI/XJ380/kernel.krl", source.kernel, source.kernel_bytes, !verify) ||
+        (!reuse && esp_file(context, "/EFI/BOOT/BOOTX64.EFI", source.loader, source.loader_bytes, !verify)))
+        return context->error;
+    if (verify)
+    {
+        esp_path(context, "/EFI/XJ380/root.bin");
+        if (!binding || !publication || esp_fresult(context, f_open(&context->file, context->path, FA_READ)))
+            return esp_stop(context, -EINVAL);
+        uint32_t cluster = context->file.obj.sclust;
+        uint64_t sector = context->filesystem.database + uint64_t(cluster - 2) * context->filesystem.csize;
+        if (cluster < 2 || sector >= context->window.bytes / 512 ||
+            esp_fresult(context, f_close(&context->file)) ||
+            fatfs_esp_disk_read(context->drive, publication->sector, sector, 1)) return esp_stop(context, -EIO);
+        if (memcmp(publication->sector, context->placeholder, 96)) return esp_stop(context, -EUCLEAN);
+        memcpy(publication->sector, binding->bytes, 96);
+        publication->sector_offset = sector * 512;
+        publication->ready = true;
+    }
+    esp_path(context, "");
+    if (esp_fresult(context, f_unmount(context->path)) || fatfs_esp_disk_sync(context->drive)) return context->error;
+    return 0;
+}
+
 static int fatfs_factory_window(const BlockAccessWindow *window, const xjinstaller::EspPayload *payload,
                                 const xjpak2::Plan *root_plan, uint32_t volume_id,
                                 xjinstaller::EspBuildStatus *status,
-                                const xjinstaller::ProgressObserver &observer, bool verify_only)
+                                const xjinstaller::ProgressObserver &observer, bool verify_only,
+                                bool vendor = false, bool reuse = false, unsigned format_only = 0,
+                                const XJ_ROOT_BINDING *binding = nullptr,
+                                xjinstaller::EspPublication *publication = nullptr)
 {
-    if (!window || (!payload && !root_plan)) return -EINVAL;
+    if (!window || (!payload && !root_plan && !format_only)) return -EINVAL;
     BlockAccessWindow selected = *window;
     xjinstaller::EspPayload source = payload ? *payload : xjinstaller::EspPayload{};
     xjinstaller::EspRequirements requirements;
-    int error = root_plan ?
+    int error = format_only ?
+        ((format_only != 1 && format_only != 3) || selected.bytes < (format_only == 1 ? 64ULL << 20 : 1ULL << 20) ||
+         selected.bytes % 512 || selected.bytes / 512 >= 0x100000000ULL ? -EINVAL : 0) : root_plan ?
         (!root_plan->validated || (!root_plan->legacy_v1 && !root_plan->reader.read) ||
          !root_plan->count || !root_plan->records ||
          !volume_id || selected.bytes < 64ULL * 1048576 || selected.bytes % 512 ||
@@ -1800,6 +1881,13 @@ static int fatfs_factory_window(const BlockAccessWindow *window, const xjinstall
     context->status.phase = xjinstaller::EspBuildPhase::Published;
     do
     {
+        if (vendor || format_only)
+        {
+            if (esp_vendor_contents(context, source, reuse, verify_only, binding, publication, format_only)) break;
+            context->status.complete = true;
+            context->status.phase = xjinstaller::EspBuildPhase::Complete;
+            break;
+        }
         if (root_plan)
         {
             if (fatfs_root_contents(context, volume_id, verify_only)) break;
@@ -1881,6 +1969,26 @@ int fatfs_build_esp_window(const BlockAccessWindow *window, const xjinstaller::E
                            xjinstaller::EspBuildStatus *status)
 {
     return fatfs_factory_window(window, payload, nullptr, 0, status, {}, false);
+}
+
+int fatfs_install_esp_window(const BlockAccessWindow *window, const xjinstaller::EspPayload *payload,
+                             bool reuse, xjinstaller::EspBuildStatus *status)
+{
+    return fatfs_factory_window(window, payload, nullptr, 0, status, {}, false, true, reuse);
+}
+
+int fatfs_verify_installed_esp(const BlockAccessWindow *window, const xjinstaller::EspPayload *payload,
+                               bool reuse, const XJ_ROOT_BINDING *binding,
+                               xjinstaller::EspPublication *publication, xjinstaller::EspBuildStatus *status)
+{
+    if (!binding || !publication || !xj_root_binding_valid(binding)) return -EINVAL;
+    *publication = {};
+    return fatfs_factory_window(window, payload, nullptr, 0, status, {}, true, true, reuse, 0, binding, publication);
+}
+
+int fatfs_format_window(const BlockAccessWindow *window, unsigned filesystem, xjinstaller::EspBuildStatus *status)
+{
+    return fatfs_factory_window(window, nullptr, nullptr, 0, status, {}, false, false, false, filesystem);
 }
 
 int xjinstaller::fatfs_build_root_window(const BlockAccessWindow *window, const xjpak2::Plan *plan,

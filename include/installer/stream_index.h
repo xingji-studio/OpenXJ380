@@ -13,6 +13,7 @@ struct StreamIndex
     xjpak2::Span ext4, fat32, extents;
     uint64_t data_bytes = 0;
     uint64_t extent_count = 0;
+    uint32_t version = 1;
 };
 
 // Original bounded source catalog. Extents describe the on-media system PAK

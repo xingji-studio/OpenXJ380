@@ -2,9 +2,10 @@
 // Original bounded private installer-root preparation; no root is published.
 #include <errno.h>
 #include <fs/vfs/tmpfs.h>
-#include <installer_mode.h>
 #include <installer/context.h>
 #include <installer/package.h>
+#include <installer/root_limits.h>
+#include <installer_mode.h>
 #include <krlibc.h>
 #include <proto.hpp>
 #include <task/pcb.h>
@@ -89,8 +90,6 @@ namespace installer
 {
 namespace
 {
-constexpr uint64_t root_entry_limit = 32768;
-constexpr uint64_t root_memory_limit = 64ULL << 20;
 TmpfsPrivateTree private_root;
 RootStageSnapshot root_snapshot;
 const void *root_owner;
@@ -186,8 +185,8 @@ int root_prepare_private()
     // budget before yielding the view. Refuse the supported fixed profile here
     // before allocating a vnode, entry, path or copied file byte.
     if (plan.inode_count > root_entry_limit || plan.count > root_entry_limit ||
-        plan.data_bytes > root_memory_limit - 4096 ||
-        plan.inode_count > (root_memory_limit - 4096 - plan.data_bytes) / 1024) return stage_failed(-E2BIG);
+        !root_memory_fits(plan.inode_count, plan.data_bytes))
+        return stage_failed(-E2BIG);
     for (size_t index = 0; index < plan.count; ++index)
     {
         const auto &record = plan.records[index];

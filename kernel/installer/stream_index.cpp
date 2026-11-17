@@ -23,7 +23,7 @@ int stream_index_validate(const uint8_t *data, xjpak2::Size bytes, uint64_t volu
         uintptr_t(data) > uintptr_t(-1) - bytes) return -22;
     const char magic[] = "XJSTRM01";
     for (unsigned i = 0; i < 8; ++i) if (data[i] != uint8_t(magic[i])) return -22;
-    if (le32(data + 8) != 1 || le32(data + 12) != StreamIndexHeaderBytes || le64(data + 16) != bytes ||
+    if ((le32(data + 8) != 1 && le32(data + 8) != 2) || le32(data + 12) != StreamIndexHeaderBytes || le64(data + 16) != bytes ||
         xjpak2::crc32c(data, 124) != le32(data + 124) ||
         xjpak2::crc32c(data + 128, bytes - 128) != le32(data + 120)) return -22;
     for (unsigned i = 80; i < 120; ++i) if (data[i]) return -22;
@@ -47,7 +47,7 @@ int stream_index_validate(const uint8_t *data, xjpak2::Size bytes, uint64_t volu
     }
     if (logical != total) return -22;
     output = {{data + ext4, xjpak2::Size(ext4_bytes)}, {fat_bytes ? data + fat : nullptr, xjpak2::Size(fat_bytes)},
-              {data + extents, xjpak2::Size(count * 24)}, total, count};
+              {data + extents, xjpak2::Size(count * 24)}, total, count, le32(data + 8)};
     return 0;
 }
 

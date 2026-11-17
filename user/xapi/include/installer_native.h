@@ -17,6 +17,10 @@ xj_inst_native_i64 xapi_InstallerNativeQuery(const xj_inst_native_handle *handle
 xj_inst_native_i64 xapi_InstallerNativeCancel(const xj_inst_native_handle *handle);
 xj_inst_native_i64 xapi_InstallerNativeReleaseJob(const xj_inst_native_handle *handle);
 
+xj_inst_native_i64 xapi_InstallerPartitionLayout(const xj_inst_partition_request *, xj_inst_partition_layout *);
+xj_inst_native_i64 xapi_InstallerPartitionApply(const xj_inst_partition_request *, xj_inst_native_handle *);
+xj_inst_native_i64 xapi_InstallerPartitionInstall(const xj_inst_partition_request *, xj_inst_native_handle *);
+
 #ifdef __cplusplus
 }
 #endif

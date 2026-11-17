@@ -128,3 +128,31 @@ extern "C" xj_inst_native_i64 xapi_InstallerNativeReleaseJob(const xj_inst_nativ
 {
     return handle_operation(XJ_INST_NATIVE_RELEASE_JOB, handle);
 }
+
+extern "C" xj_inst_native_i64 xapi_InstallerPartitionLayout(const xj_inst_partition_request *request,
+                                                           xj_inst_partition_layout *output)
+{
+    if (!request || !output || !valid_header(request->header, sizeof(*request))) return -22;
+    xj_inst_native_i64 result = read(XJ_INST_NATIVE_PARTITION_LAYOUT, request, sizeof(*request), output);
+    if (result < 0) return result;
+    if (output->session_epoch != request->session_epoch || output->count > XJ_INST_NATIVE_PARTITION_ROWS)
+    {
+        xj_inst_native_initialize(output, sizeof(*output));
+        return -5;
+    }
+    return 0;
+}
+
+extern "C" xj_inst_native_i64 xapi_InstallerPartitionApply(const xj_inst_partition_request *request,
+                                                          xj_inst_native_handle *output)
+{
+    if (!request || !output || !valid_header(request->header, sizeof(*request))) return -22;
+    return read(XJ_INST_NATIVE_PARTITION_APPLY, request, sizeof(*request), output);
+}
+
+extern "C" xj_inst_native_i64 xapi_InstallerPartitionInstall(const xj_inst_partition_request *request,
+                                                            xj_inst_native_handle *output)
+{
+    if (!request || !output || !valid_header(request->header, sizeof(*request))) return -22;
+    return read(XJ_INST_NATIVE_PARTITION_INSTALL, request, sizeof(*request), output);
+}

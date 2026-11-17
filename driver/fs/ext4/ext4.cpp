@@ -384,6 +384,7 @@ struct RootValidation
 {
     const XJ_ROOT_BINDING *binding;
     uint8_t buffer[4096];
+    bool kernel_on_esp = false;
 };
 
 static int validate_bound_root(void *context, const xjext4::Volume &volume)
@@ -395,6 +396,10 @@ static int validate_bound_root(void *context, const xjext4::Volume &volume)
     int error = volume.read_inode(2, root);
     if (!error) error = volume.lookup(root, "system", system);
     if (!error && (system.mode & 0170000) != 0040000) error = -EUCLEAN;
+    // The new boot layout keeps its kernel solely on the ESP. This trusted
+    // mode is selected only after the EFI loader verified that exact kernel
+    // against the binding; UUID and root structure still gate replay writes.
+    if (error || check->kernel_on_esp) return error;
     if (!error) error = volume.lookup(system, "kernel.krl", kernel);
     if (error) return error;
     if ((kernel.mode & 0170000) != 0100000 || kernel.size != xj_root_binding_kernel_bytes(binding) ||
@@ -425,7 +430,7 @@ static vfs_node_t open_mount_device(const char *source)
 }
 
 static int mount_volume(const char *source, vfs_node_t node, bool writable,
-                        const XJ_ROOT_BINDING *binding = nullptr)
+                        const XJ_ROOT_BINDING *binding = nullptr, bool kernel_on_esp = false)
 {
     bool system_root = node == rootdir && binding && xj_root_binding_valid(binding) && writable;
     if (!source || is_virtual_fs(source) || !node || (node == rootdir && !system_root) || node->is_mount ||
@@ -464,6 +469,7 @@ static int mount_volume(const char *source, vfs_node_t node, bool writable,
         if (!mount->writer || !mount->workspace) { destroy(mount); return -ENOMEM; }
         xjext4::WriteDevice io = {read_device, write_device, flush_device, mount, device->size};
         RootValidation validation = {binding, {}};
+        validation.kernel_on_esp = kernel_on_esp;
         error = xjext4::WriteSession::storage_size(io, mount->storage.bytes);
         if (!error)
         {
@@ -1178,7 +1184,8 @@ int ext4fs_factory_ready()
     return 0;
 }
 
-int ext4fs_format_node(vfs_node_t device, const ext4_format_options *options, ext4_format_status *status)
+static int format_offline(vfs_node_t device, const ext4_format_options *options, ext4_format_status *status,
+                           const BlockAccessWindow *window)
 {
     // These are trusted kernel pointers. Snapshot options before clearing a
     // potentially overlapping output structure; never accept user pointers.
@@ -1200,7 +1207,7 @@ int ext4fs_format_node(vfs_node_t device, const ext4_format_options *options, ex
     if (!context) return failure(-ENOMEM);
     context->workspace = static_cast<xjext4::FormatWorkspace *>(malloc(sizeof(xjext4::FormatWorkspace)));
     if (!context->workspace) { free(context); return failure(-ENOMEM); }
-    int error = xjext4::format_storage_size(device->size, context->storage.bytes);
+    int error = xjext4::format_storage_size(window ? window->bytes : device->size, context->storage.bytes);
     if (!error && context->storage.bytes)
     {
         context->storage.data = malloc(context->storage.bytes);
@@ -1209,7 +1216,23 @@ int ext4fs_format_node(vfs_node_t device, const ext4_format_options *options, ex
     if (!error) error = block_access_resolve_node(device, &context->extent);
     if (!error && (context->extent.bytes != device->size || !context->extent.bytes)) error = -EINVAL;
     if (!error) error = block_access_require_flush(context->extent);
-    if (!error) error = block_access_claim(context->extent, true, &context->lease);
+    context->device = device;
+    if (!error && window)
+    {
+        const auto &actual = context->extent;
+        const auto &expected = window->whole;
+        if (actual.device != expected.device || actual.generation != expected.generation ||
+            actual.physical_device != expected.physical_device || actual.physical_generation != expected.physical_generation ||
+            actual.start != expected.start || actual.bytes != expected.bytes) error = -ESTALE;
+        if (!error)
+        {
+            context->lease = window->lease;
+            context->io_offset = window->offset;
+            context->io_bytes = window->bytes;
+            error = format_window_access(context);
+        }
+    }
+    else if (!error) error = block_access_claim(context->extent, true, &context->lease);
     if (error)
     {
         free(context->storage.data);
@@ -1217,8 +1240,8 @@ int ext4fs_format_node(vfs_node_t device, const ext4_format_options *options, ex
         free(context);
         return failure(error);
     }
-    context->owns_lease = true;
-    context->io_bytes = context->extent.bytes;
+    context->owns_lease = window == nullptr;
+    if (!window) context->io_bytes = context->extent.bytes;
     context->device = device;
     vfs_child_lock();
     bool overflow = device->refcount == uint32_t(-1);
@@ -1226,7 +1249,7 @@ int ext4fs_format_node(vfs_node_t device, const ext4_format_options *options, ex
     vfs_child_unlock();
     if (overflow)
     {
-        block_access_release(context->lease);
+        if (context->owns_lease) block_access_release(context->lease);
         free(context->storage.data);
         free(context->workspace);
         free(context);
@@ -1241,12 +1264,12 @@ int ext4fs_format_node(vfs_node_t device, const ext4_format_options *options, ex
     native_options.time_seconds = snapshot.time_seconds;
     native_options.journal_mib = snapshot.journal_mib;
     memcpy(native_options.label, snapshot.label, sizeof(native_options.label));
-    xjext4::Ext4FormatDevice io = {context, format_read, format_write, format_flush, context->extent.bytes};
+    xjext4::Ext4FormatDevice io = {context, format_read, format_write, format_flush, context->io_bytes};
     error = xjext4::format(io, native_options, *context->workspace, context->geometry, &context->storage);
     if (operation_has_failed()) format_fail_io(context);
     if (status)
     {
-        status->bytes = context->extent.bytes;
+        status->bytes = context->io_bytes;
         status->blocks = context->geometry.blocks;
         status->groups = context->geometry.groups;
         status->inodes = context->geometry.inodes;
@@ -1263,11 +1286,24 @@ int ext4fs_format_node(vfs_node_t device, const ext4_format_options *options, ex
     while (*previous && *previous != context) previous = &(*previous)->next;
     if (*previous) *previous = context->next;
     vfs_close(context->device);
-    block_access_release(context->lease);
+    if (context->owns_lease) block_access_release(context->lease);
     free(context->storage.data);
     free(context->workspace);
     free(context);
     return failure(error);
+}
+
+int ext4fs_format_node(vfs_node_t device, const ext4_format_options *options, ext4_format_status *status)
+{
+    return format_offline(device, options, status, nullptr);
+}
+
+int ext4fs_format_window(const BlockAccessWindow *window, const ext4_format_options *options,
+                         ext4_format_status *status)
+{
+    if (!window) return failure(-EINVAL);
+    BlockAccessWindow snapshot = *window;
+    return format_offline(snapshot.node, options, status, &snapshot);
 }
 
 namespace {
@@ -1495,6 +1531,12 @@ int ext4fs_mount_bound_root(const char *device, const XJ_ROOT_BINDING *binding)
 {
     if (!device || !binding || !xj_root_binding_valid(binding)) return failure(-EINVAL);
     return mount_volume(device, rootdir, true, binding);
+}
+
+int ext4fs_mount_bound_root_from_esp(const char *device, const XJ_ROOT_BINDING *binding)
+{
+    if (!device || !binding || !xj_root_binding_valid(binding)) return failure(-EINVAL);
+    return mount_volume(device, rootdir, true, binding, true);
 }
 
 int ext4fs_finish_all()

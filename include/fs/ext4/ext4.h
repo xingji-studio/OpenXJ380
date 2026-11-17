@@ -43,6 +43,8 @@ struct ext4_format_status
 // status for completed phases, not as a guarantee that failed I/O did not land.
 int ext4fs_format_node(vfs_node_t device, const ext4_format_options *options,
                        ext4_format_status *status = nullptr);
+int ext4fs_format_window(const BlockAccessWindow *, const ext4_format_options *,
+                         ext4_format_status *status = nullptr);
 
 struct ext4_build_status
 {
@@ -83,6 +85,8 @@ int ext4fs_build_window(const BlockAccessWindow *window, const ext4_format_optio
 
 void ext4fs_init();
 int ext4fs_mount_bound_root(const char *device, const XJ_ROOT_BINDING *binding);
+// Trusted boot-only entry after the EFI loader verified the ESP kernel.
+int ext4fs_mount_bound_root_from_esp(const char *device, const XJ_ROOT_BINDING *binding);
 // Task context only; permanently ends ext4 access before firmware poweroff.
 int ext4fs_finish_all();
 // Task-context hook before quiescent FD/VFS cleanup and before terminal TCB

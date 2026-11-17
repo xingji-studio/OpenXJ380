@@ -356,6 +356,7 @@ int tmpfs_setup(void)
 // invoke the legacy callbacks above: their runtime publication/lifetime and
 // allocator locking need a separate review before an installer root can run.
 #include <fs/vfs/tmpfs.h>
+#include <installer/root_limits.h>
 #include <task/pcb.h>
 
 namespace
@@ -668,8 +669,8 @@ int tmpfs_private_discard(TmpfsPrivateTree *tree)
 #include <user/permissions.h>
 namespace
 {
-constexpr uint64_t managed_memory_limit = 64ULL << 20;
-constexpr uint64_t managed_entry_limit = 32768;
+constexpr uint64_t managed_memory_limit = installer::root_memory_limit;
+constexpr uint64_t managed_entry_limit  = installer::root_entry_limit;
 int managed_root_id;
 
 class RamLock
@@ -697,8 +698,7 @@ int ram_error(int error)
 
 bool ram_budget(uint64_t entries, uint64_t bytes)
 {
-    return entries <= managed_entry_limit && bytes <= managed_memory_limit - 4096 &&
-           entries <= (managed_memory_limit - 4096 - bytes) / 1024;
+    return entries <= managed_entry_limit && installer::root_memory_fits(entries, bytes);
 }
 
 bool ram_entry_valid(PrivateEntry *entry)

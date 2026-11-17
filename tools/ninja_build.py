@@ -241,6 +241,10 @@ def copy_common_assets(root: Path) -> None:
     cp(ROOT / "driver/fs/ext4/SOURCE.json", ext4_notices)
     cp(ROOT / "driver/fs/ext4/REFERENCES.json", ext4_notices)
     cp(ROOT / "driver/fs/ext4/LWEXT4_BSD_NOTICE.txt", ext4_notices)
+    ntfs_notices = root / "system/licenses/native-ntfs"
+    mkdir(ntfs_notices)
+    for name in ("PROVENANCE.md", "SOURCE.json"):
+        cp(ROOT / "driver/fs/ntfs" / name, ntfs_notices)
     cp(ROOT / "resources/licenses/es1371.txt", root / "system/licenses/es1371.txt")
 
 

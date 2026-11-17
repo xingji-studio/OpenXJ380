@@ -25,6 +25,8 @@ struct JobSessionView
     const void *fat32_package = nullptr;
     __SIZE_TYPE__ fat32_package_bytes = 0;
     xjpak2::DataReader source_reader = {};
+    const void *boot_package = nullptr;
+    __SIZE_TYPE__ boot_package_bytes = 0;
 };
 
 // Implemented by the boot/session owner. Validation reauthenticates the retained
@@ -40,6 +42,7 @@ struct JobRequest
     // must never copy arbitrary user GUID/LBA choices into this structure.
     xjinstaller::FactoryOptions factory;
     uint32_t filesystem = 2;
+    uint32_t action = 0;
 };
 
 enum class JobState : uint32_t
@@ -68,6 +71,11 @@ struct JobSnapshot
 // Unreleased handles from a vanished issuing thread conservatively retain their
 // bounded slots/pins until reboot; they cannot be adopted through TCB reuse.
 int jobs_select_target(uint32_t device, uint64_t generation, JobHandle *);
+// Same-owner synchronous borrow; no lease or credential is transferred.
+// The selected static target retains the node until return or reboot after an
+// abandoned borrow. Callers must never return a failed/quarantined I/O borrow.
+int jobs_borrow_target(JobHandle, uint64_t epoch, struct vfs_node **, BlockExtent *);
+int jobs_return_target(JobHandle, bool quarantined = false);
 int jobs_release_target(JobHandle);
 int jobs_queue(JobHandle target, const JobRequest *, JobHandle *job);
 int jobs_query(JobHandle, JobSnapshot *);

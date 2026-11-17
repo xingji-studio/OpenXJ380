@@ -12,6 +12,11 @@
 #include <task/scheduler.h>
 #include <user/permissions.h>
 
+// Optional partition extension retains all existing whole-disk callers.
+extern int installer_run_partition_tool(struct vfs_node *, const installer::JobRequest *,
+                                         xjinstaller::FactoryStatus *) __attribute__((weak));
+extern void installer_release_partition_plan(const xjinstaller::PartitionInstall *) __attribute__((weak));
+
 namespace installer
 {
 namespace
@@ -91,7 +96,8 @@ bool same_session(const JobSessionView &a, const JobSessionView &b)
            same_extent(a.source_extent, b.source_extent) && a.package == b.package &&
            a.package_bytes == b.package_bytes && a.fat32_package == b.fat32_package &&
            a.fat32_package_bytes == b.fat32_package_bytes && a.source_reader.read == b.source_reader.read &&
-           a.source_reader.context == b.source_reader.context && a.source_reader.bytes == b.source_reader.bytes;
+           a.source_reader.context == b.source_reader.context && a.source_reader.bytes == b.source_reader.bytes &&
+           a.boot_package == b.boot_package && a.boot_package_bytes == b.boot_package_bytes;
 }
 
 int current_session(JobSessionView *output)
@@ -181,6 +187,11 @@ int clean_job(Job *job, bool release_slot)
         error = vfs_close(job->target.node);
         if (!error) job->target = {};
     }
+    if (!error && job->request.factory.partition && installer_release_partition_plan)
+    {
+        installer_release_partition_plan(job->request.factory.partition);
+        job->request.factory.partition = nullptr;
+    }
     RegistryLock lock;
     if (error)
     {
@@ -257,6 +268,49 @@ int jobs_select_target(uint32_t device, uint64_t generation, JobHandle *output)
     return close ? close : error;
 }
 
+int jobs_borrow_target(JobHandle handle, uint64_t epoch, vfs_node **node, BlockExtent *extent)
+{
+    if (!node || !extent) return -EINVAL;
+    *node = nullptr; *extent = {};
+    Owner owner{};
+    int error = caller(&owner, true);
+    if (error) return error;
+    JobSessionView session{};
+    error = current_session(&session);
+    if (error) return error;
+    Target *target;
+    {
+        RegistryLock lock;
+        if (service_quarantined || admitted_job) return service_quarantined ? -EIO : -EBUSY;
+        target = find_target(handle);
+        if (!target) return -ENOENT;
+        if (!same_owner(target->owner, owner)) return -EACCES;
+        if (target->epoch != epoch || epoch != session.epoch) return -ESTALE;
+        if (target->state != TargetState::Selected) return -EBUSY;
+        target->state = TargetState::Borrowed;
+    }
+    error = validate_target(target->reference, session);
+    if (error) { jobs_return_target(handle); return error; }
+    *node = target->reference.node;
+    *extent = target->reference.extent;
+    return 0;
+}
+
+int jobs_return_target(JobHandle handle, bool quarantined)
+{
+    Owner owner{};
+    int error = caller(&owner, false);
+    if (error) return error;
+    RegistryLock lock;
+    Target *target = find_target(handle);
+    if (!target) return -ENOENT;
+    if (!same_owner(target->owner, owner)) return -EACCES;
+    if (target->state != TargetState::Borrowed) return -EBUSY;
+    target->state = quarantined ? TargetState::Quarantined : TargetState::Selected;
+    if (quarantined) { target->reference.quarantined = true; service_quarantined = true; }
+    return 0;
+}
+
 int jobs_release_target(JobHandle handle)
 {
     Owner owner = {};
@@ -289,7 +343,8 @@ int jobs_queue(JobHandle target_handle, const JobRequest *request, JobHandle *ou
     if (error) return error;
     if (snapshot.mode != XJ380_INSTALLER_MODE_FRESH || snapshot.language != session.language ||
         snapshot.components != session.components) return -EOPNOTSUPP;
-    if (snapshot.filesystem != 2) return -EOPNOTSUPP;
+    if (snapshot.filesystem != 2 || snapshot.action > 3 ||
+        (snapshot.action && !snapshot.factory.partition)) return -EOPNOTSUPP;
     Target *target;
     Job *job = nullptr;
     {
@@ -447,7 +502,12 @@ int jobs_run(JobHandle handle)
     options.filesystem = job->request.filesystem;
     options.progress = {progress_update, job};
     options.source_reader = job->session.source_reader;
-    if (!error)
+    options.boot_package = job->session.boot_package;
+    options.boot_package_bytes = job->session.boot_package_bytes;
+    if (!error && job->request.action)
+        error = installer_run_partition_tool ? installer_run_partition_tool(job->target.node, &job->request, &status) :
+                                               -EOPNOTSUPP;
+    else if (!error)
         error = installer_build_ext4_disk(job->target.node, job->source_pin, &options,
             job->session.package, job->session.package_bytes, &status);
     if (!error && (!status.complete || !status.activation_durable || status.io_failed || status.quarantined))

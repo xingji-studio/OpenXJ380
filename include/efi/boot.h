@@ -16,6 +16,8 @@
 #define BOOT_FLAG_INSTALLER        (1ULL << 7)
 #define BOOT_FLAG_BOUND_ROOT       (1ULL << 8)
 #define BOOT_FLAG_INSTALLER_HANDOFF (1ULL << 9)
+// Bound boot loaded and CRC-checked the vendor kernel from this ESP.
+#define BOOT_FLAG_ESP_KERNEL_VERIFIED (1ULL << 10)
 
 typedef struct
 {

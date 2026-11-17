@@ -18,6 +18,14 @@
 #include <task/pcb.h>
 #include <user/permissions.h>
 
+extern int installer_partition_layout(const xj_inst_partition_request *, xj_inst_partition_layout *)
+    __attribute__((weak));
+extern int installer_partition_prepare(const xj_inst_partition_request *, bool, installer::JobRequest *)
+    __attribute__((weak));
+extern void installer_release_partition_plan(const xjinstaller::PartitionInstall *) __attribute__((weak));
+extern "C" void *calloc(__SIZE_TYPE__, __SIZE_TYPE__);
+extern "C" void free(void *);
+
 namespace
 {
 using namespace installer;
@@ -194,7 +202,7 @@ int fresh_options(xjinstaller::FactoryOptions *options)
         if (!distinct) continue;
         options->time_seconds = realtime_ns() / 1000000000ULL;
         options->journal_mib = 6;
-        options->esp_bytes = 64ULL << 20;
+        options->esp_bytes = 100ULL << 20;
         write_serial_fmt("installer: identity random source=%s\n", rng_source_name(random_source));
         return 0;
     }
@@ -288,12 +296,53 @@ int cleanup_queued(JobHandle handle)
     return error;
 }
 
+int dispatch_job(page_directory_t *directory, uint64_t address, uint64_t epoch,
+                 JobHandle target, const JobRequest &request)
+{
+    auto release_plan = [&]()
+    {
+        if (request.factory.partition && installer_release_partition_plan)
+            installer_release_partition_plan(request.factory.partition);
+    };
+    WorkerTicket *ticket = reserve_ticket();
+    if (!ticket) { release_plan(); return -ENOSPC; }
+    JobHandle job = 0;
+    int error = jobs_queue(target, &request, &job);
+    if (error) { finish_ticket(ticket, false); release_plan(); return error; }
+    ticket->handle = job;
+    xj_inst_native_handle response;
+    xj_inst_native_initialize(&response, sizeof(response));
+    response.session_epoch = epoch;
+    response.handle = job;
+    if (!write_response(directory, address, &response, sizeof(response)))
+    {
+        error = cleanup_queued(job);
+        finish_ticket(ticket, error != 0);
+        return error ? error : -EFAULT;
+    }
+    {
+        TicketLock lock;
+        ticket->state = TicketState::Dispatched;
+    }
+    size_t tid = create_kernel_worker(reinterpret_cast<void *>(native_worker), ticket, "Native installer");
+    if (int64_t(tid) < 0)
+    {
+        error = cleanup_queued(job);
+        finish_ticket(ticket, error != 0);
+        xj_inst_native_initialize(&response, sizeof(response));
+        write_response(directory, address, &response, sizeof(response));
+        return error ? error : int64_t(tid);
+    }
+    return 0;
+}
+
 union Request
 {
     xj_inst_native_header header;
     xj_inst_native_release_targets targets;
     xj_inst_native_submit submit;
     xj_inst_native_handle handle;
+    xj_inst_partition_request partition;
 };
 } // namespace
 
@@ -304,6 +353,15 @@ uint64_t do_xapi_InstallerNative(uint64_t operation, uint64_t request_address, u
     size_t expected_request = 0, expected_response = 0;
     switch (operation)
     {
+    case XJ_INST_NATIVE_PARTITION_LAYOUT:
+        expected_request = sizeof(xj_inst_partition_request);
+        expected_response = sizeof(xj_inst_partition_layout);
+        break;
+    case XJ_INST_NATIVE_PARTITION_APPLY:
+    case XJ_INST_NATIVE_PARTITION_INSTALL:
+        expected_request = sizeof(xj_inst_partition_request);
+        expected_response = sizeof(xj_inst_native_handle);
+        break;
     case XJ_INST_NATIVE_INFO:
         expected_request = sizeof(xj_inst_native_header);
         expected_response = sizeof(xj_inst_native_info);
@@ -353,6 +411,7 @@ uint64_t do_xapi_InstallerNative(uint64_t operation, uint64_t request_address, u
         response.filesystem = XJ_INST_NATIVE_FILESYSTEM_EXT4;
         response.language = view.language;
         response.flags = XJ_INST_NATIVE_INFO_SESSION;
+        if (installer_partition_layout && installer_partition_prepare) response.flags |= XJ_INST_NATIVE_INFO_PARTITIONS;
         if (view.profile == XJ_INSTALLER_PROFILE_EXT4_PAK2 || view.profile == XJ_INSTALLER_PROFILE_DUAL ||
             view.profile == XJ_INSTALLER_PROFILE_STREAM_INDEX)
         {
@@ -376,6 +435,36 @@ uint64_t do_xapi_InstallerNative(uint64_t operation, uint64_t request_address, u
         return uint64_t(error);
     }
     if (operation == XJ_INST_NATIVE_RELEASE_TARGETS) return uint64_t(release_targets(request.targets));
+    if (operation == XJ_INST_NATIVE_PARTITION_LAYOUT || operation == XJ_INST_NATIVE_PARTITION_APPLY ||
+        operation == XJ_INST_NATIVE_PARTITION_INSTALL)
+    {
+        if (!installer_partition_layout || !installer_partition_prepare) return uint64_t(-EOPNOTSUPP);
+        JobSessionView view{};
+        int error = live_session(&view, true);
+        if (!error) error = require_admin();
+        if (error) return uint64_t(error);
+        if (request.partition.session_epoch != view.epoch) return uint64_t(-ESTALE);
+        if (operation == XJ_INST_NATIVE_PARTITION_LAYOUT)
+        {
+            auto *output = static_cast<xj_inst_partition_layout *>(calloc(1, sizeof(xj_inst_partition_layout)));
+            if (!output) return uint64_t(-ENOMEM);
+            error = installer_partition_layout(&request.partition, output);
+            if (!error && !write_response(directory, response_address, output, sizeof(*output))) error = -EFAULT;
+            free(output);
+            return uint64_t(error);
+        }
+        JobRequest job_request{};
+        job_request.mode = XJ_INST_NATIVE_MODE_FRESH;
+        job_request.language = XJ_INST_NATIVE_LANGUAGE_PACKAGE;
+        job_request.components = XJ_INST_NATIVE_COMPONENTS_FULL;
+        job_request.filesystem = XJ_INST_NATIVE_FILESYSTEM_EXT4;
+        error = fresh_options(&job_request.factory);
+        if (!error) error = installer_partition_prepare(&request.partition,
+            operation == XJ_INST_NATIVE_PARTITION_INSTALL, &job_request);
+        if (error) return uint64_t(error);
+        return uint64_t(dispatch_job(directory, response_address, view.epoch,
+                                     request.partition.target_handle, job_request));
+    }
     if (operation == XJ_INST_NATIVE_SUBMIT)
     {
         JobSessionView view = {};
@@ -395,36 +484,7 @@ uint64_t do_xapi_InstallerNative(uint64_t operation, uint64_t request_address, u
         job_request.filesystem = input.filesystem;
         error = fresh_options(&job_request.factory);
         if (error) return uint64_t(error);
-        WorkerTicket *ticket = reserve_ticket();
-        if (!ticket) return uint64_t(-ENOSPC);
-        JobHandle job = 0;
-        error = jobs_queue(input.target_handle, &job_request, &job);
-        if (error) { finish_ticket(ticket, false); return uint64_t(error); }
-        ticket->handle = job;
-        xj_inst_native_handle response;
-        xj_inst_native_initialize(&response, sizeof(response));
-        response.session_epoch = view.epoch;
-        response.handle = job;
-        if (!write_response(directory, response_address, &response, sizeof(response)))
-        {
-            error = cleanup_queued(job);
-            finish_ticket(ticket, error != 0);
-            return uint64_t(error ? error : -EFAULT);
-        }
-        {
-            TicketLock lock;
-            ticket->state = TicketState::Dispatched;
-        }
-        size_t tid = create_kernel_worker(reinterpret_cast<void *>(native_worker), ticket, "Native installer");
-        if (int64_t(tid) < 0)
-        {
-            error = cleanup_queued(job);
-            finish_ticket(ticket, error != 0);
-            xj_inst_native_initialize(&response, sizeof(response));
-            write_response(directory, response_address, &response, sizeof(response));
-            return uint64_t(error ? error : int64_t(tid));
-        }
-        return 0;
+        return uint64_t(dispatch_job(directory, response_address, view.epoch, input.target_handle, job_request));
     }
     if (!request.handle.handle || !request.handle.session_epoch) return uint64_t(-EINVAL);
     if (operation == XJ_INST_NATIVE_CANCEL || operation == XJ_INST_NATIVE_RELEASE_JOB)
@@ -452,6 +512,7 @@ uint64_t do_xapi_InstallerNative(uint64_t operation, uint64_t request_address, u
     if (snapshot.factory.io_failed) response.flags |= XJ_INST_NATIVE_JOB_IO_FAILED;
     if (snapshot.factory.activation_attempted) response.flags |= XJ_INST_NATIVE_JOB_ACTIVATION_ATTEMPTED;
     if (snapshot.factory.activation_durable) response.flags |= XJ_INST_NATIVE_JOB_ACTIVATION_DURABLE;
+    if (snapshot.factory.boot_registration_error) response.flags |= XJ_INST_NATIVE_JOB_BOOT_ENTRY_FAILED;
     response.read_bytes = snapshot.factory.read_bytes;
     response.written_bytes = snapshot.factory.written_bytes;
     response.package_records = snapshot.factory.package_records;

@@ -13,6 +13,8 @@ typedef __INT64_TYPE__ xj_inst_native_i64;
 #define XJ_INST_NATIVE_NAME_BYTES 64U
 #define XJ_INST_NATIVE_FILESYSTEM_EXT4 2U
 #define XJ_INST_NATIVE_FILESYSTEM_FAT32 1U
+#define XJ_INST_NATIVE_FILESYSTEM_EXFAT 3U
+#define XJ_INST_NATIVE_FILESYSTEM_NTFS 4U
 #define XJ_INST_NATIVE_MODE_FRESH 0U
 #define XJ_INST_NATIVE_LANGUAGE_PACKAGE 0xffffffffU
 #define XJ_INST_NATIVE_COMPONENTS_FULL 15ULL
@@ -24,6 +26,17 @@ typedef __INT64_TYPE__ xj_inst_native_i64;
 #define XJ_INST_NATIVE_QUERY 5U
 #define XJ_INST_NATIVE_CANCEL 6U
 #define XJ_INST_NATIVE_RELEASE_JOB 7U
+#define XJ_INST_NATIVE_PARTITION_LAYOUT 8U
+#define XJ_INST_NATIVE_PARTITION_APPLY 9U
+#define XJ_INST_NATIVE_PARTITION_INSTALL 10U
+#define XJ_INST_NATIVE_INFO_PARTITIONS 16ULL
+#define XJ_INST_NATIVE_PARTITION_ROWS 257U
+#define XJ_INST_NATIVE_PARTITION_CREATE 1U
+#define XJ_INST_NATIVE_PARTITION_DELETE 2U
+#define XJ_INST_NATIVE_PARTITION_FORMAT 3U
+#define XJ_INST_NATIVE_PARTITION_ESP 1U
+#define XJ_INST_NATIVE_PARTITION_FREE 2U
+#define XJ_INST_NATIVE_PARTITION_READONLY 4U
 
 #define XJ_INST_NATIVE_INFO_SESSION 1ULL
 #define XJ_INST_NATIVE_INFO_READY 2ULL
@@ -44,6 +57,7 @@ typedef __INT64_TYPE__ xj_inst_native_i64;
 #define XJ_INST_NATIVE_JOB_IO_FAILED 4ULL
 #define XJ_INST_NATIVE_JOB_ACTIVATION_ATTEMPTED 8ULL
 #define XJ_INST_NATIVE_JOB_ACTIVATION_DURABLE 16ULL
+#define XJ_INST_NATIVE_JOB_BOOT_ENTRY_FAILED 32ULL
 
 #define XJ_INST_NATIVE_STAGE_NONE 0U
 #define XJ_INST_NATIVE_STAGE_PREFLIGHT 1U
@@ -117,6 +131,28 @@ typedef struct xj_inst_native_job
     xj_inst_native_u64 completed_units, total_units;
     xj_inst_native_u32 progress_stage, progress_permille;
 } xj_inst_native_job;
+
+typedef struct xj_inst_partition_request
+{
+    xj_inst_native_header header;
+    xj_inst_native_u64 session_epoch, target_handle, fingerprint;
+    xj_inst_native_u64 esp_handle, esp_fingerprint, first_lba, sectors;
+    xj_inst_native_u32 action, partition, esp_partition, filesystem;
+} xj_inst_partition_request;
+
+typedef struct xj_inst_partition_row
+{
+    xj_inst_native_u64 first_lba, sectors;
+    xj_inst_native_u32 number, filesystem, flags, reserved;
+} xj_inst_partition_row;
+
+typedef struct xj_inst_partition_layout
+{
+    xj_inst_native_header header;
+    xj_inst_native_u64 session_epoch, fingerprint, disk_bytes;
+    xj_inst_native_u32 scheme, count;
+    xj_inst_partition_row rows[XJ_INST_NATIVE_PARTITION_ROWS];
+} xj_inst_partition_layout;
 
 static inline void xj_inst_native_initialize(void *object, __SIZE_TYPE__ bytes)
 {

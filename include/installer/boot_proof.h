@@ -28,6 +28,9 @@ struct TableReader
     bool nx_enabled = true;
     bool gigabyte_pages = true;
     BootProofDiagnostic *diagnostic     = nullptr;
+    // False only when CPUID omits the width leaf and physical_bits is the
+    // conservative 36-bit fallback. Actual translation checks stay strict.
+    bool                 physical_bits_known = true;
 };
 
 struct Mapping
@@ -44,11 +47,20 @@ struct TableWorkEntry
     unsigned level;
 };
 
+struct TableClosureReport
+{
+    // Successful ownership walks may encounter unused firmware leaves beyond
+    // the fallback width. These are diagnostic evidence, never a mapping proof.
+    uint64_t high_leaf_count = 0, first_table = 0, first_entry = 0;
+    unsigned first_level = 0, first_index = 0;
+};
+
 struct TableWorkspace
 {
     // Large boot-lifetime scratch: supply static/BSS storage, never a boot stack object.
     TableWorkEntry entries[table_workspace_capacity];
     uint64_t count;
+    TableClosureReport report;
 };
 
 struct BootPackageProof
@@ -63,7 +75,9 @@ bool verify_direct_span(TableReader, uint64_t root_table, uint64_t physical, uin
 // Visits every present non-leaf table in the current four-level tree. The reader
 // must reject table pages overlapping packages before reading their first byte.
 // Same-level sharing is legal; reuse at another level and capacity exhaustion fail.
-// The workspace count is cleared before traversal and on failure. No allocation or I/O.
+// Only with the unknown 36-bit fallback may otherwise valid leaf addresses exceed
+// its mask. All non-leaf addresses remain strict; resolve_mapping is always strict.
+// The count/report are cleared before traversal and on failure. No allocation or I/O.
 bool verify_table_closure(TableReader, uint64_t root_table, TableWorkspace *);
 bool packages_overlap(const BootPackageProof &, uint64_t physical, uint64_t bytes);
 // Maps are already readable bootstrap storage. No package byte is read here.

@@ -58,4 +58,9 @@ EspVerifySize esp_verify_bitmap_bytes(uint64_t device_bytes);
 int esp_verify_prepare_publication(const EspReadDevice &, const EspExpectedFiles &, const XJ_ROOT_BINDING &,
                                    EspVerifyWorkspace &, EspPublication &);
 
+// Read-only admission for an existing FAT32 ESP, before any root/GPT write.
+// Accepts ordinary FAT32 geometry and foreign files. Checks FAT copies, entry
+// bounds and enough genuinely free clusters for our complete new file set.
+int esp_check_existing_capacity(const EspReadDevice &, const EspExpectedFiles &, EspVerifyWorkspace &);
+
 } // namespace xjinstaller

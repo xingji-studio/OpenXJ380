@@ -1517,6 +1517,7 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, struct EFI_SYSTEM_TABLE *SystemTable
     void                     *system_payload_buffer = NULL;
     int                       installer_mode = 0;
     int                       bound_root_mode = 0;
+    int                       vendor_kernel_mode = 0;
     XJ_ROOT_BINDING           root_binding;
     XJ_INSTALLER_HANDOFF      installer_handoff;
     xmemset(&installer_handoff, 0, sizeof(installer_handoff));
@@ -1548,7 +1549,10 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, struct EFI_SYSTEM_TABLE *SystemTable
     if (bound_root_mode)
     {
         // A bound kernel must come from the same ESP as this EFI image.
-        status = read_boot_file(root, L"\\system\\kernel.krl", &kernel_buffer, &kernel_size);
+        status = read_boot_file(root, L"\\EFI\\XJ380\\kernel.krl", &kernel_buffer, &kernel_size);
+        if (!EFI_ERROR(status)) vendor_kernel_mode = 1;
+        if (status == EFI_NOT_FOUND)
+            status = read_boot_file(root, L"\\system\\kernel.krl", &kernel_buffer, &kernel_size);
     }
     else
     {
@@ -1656,6 +1660,7 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, struct EFI_SYSTEM_TABLE *SystemTable
                 ;
         }
         BootMenuFlags |= BOOT_FLAG_BOUND_ROOT;
+        if (vendor_kernel_mode) BootMenuFlags |= BOOT_FLAG_ESP_KERNEL_VERIFIED;
         write_serial_string("Bound root descriptor and ESP kernel verified.\n");
     }
 

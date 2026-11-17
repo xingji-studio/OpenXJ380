@@ -337,4 +337,54 @@ int esp_verify_prepare_publication(const EspReadDevice &device, const EspExpecte
     return verifier.run(publication, binding);
 }
 
+int esp_check_existing_capacity(const EspReadDevice &device, const EspExpectedFiles &files,
+                                 EspVerifyWorkspace &work)
+{
+    auto read_sector = [&](uint64_t sector, uint8_t *output)
+    {
+        if (work.io_failed || sector >= device.bytes / 512) return false;
+        ++work.read_requests;
+        if (device.read(device.context, sector * 512, output, 512)) return true;
+        work.io_failed = true;
+        return false;
+    };
+    if (!device.read || device.bytes < 512 || !files.loader_bytes || !files.kernel_bytes ||
+        !read_sector(0, work.boot)) return -5;
+    const auto *b = work.boot;
+    uint32_t cluster_sectors = b[13], reserved = le16(b + 14), fats = b[16], sectors = le32(b + 32);
+    uint32_t fat_sectors = le32(b + 36), flags = le16(b + 40);
+    if (le16(b + 11) != 512 || !cluster_sectors || cluster_sectors > 128 ||
+        (cluster_sectors & (cluster_sectors - 1)) || !reserved || (fats != 1 && fats != 2) ||
+        !fat_sectors || le16(b + 17) || le16(b + 22) || le16(b + 42) ||
+        b[510] != 0x55 || b[511] != 0xaa || !sectors || sectors > device.bytes / 512) return -22;
+    uint64_t data = reserved + uint64_t(fats) * fat_sectors;
+    if (data >= sectors) return -22;
+    uint64_t clusters = (sectors - data) / cluster_sectors;
+    unsigned active = flags & 0x80 ? flags & 15 : 0;
+    if (active >= fats || clusters < 65525 || clusters >= 0x0ffffff0ULL ||
+        uint64_t(fat_sectors) * 128 < clusters + 2 || le32(b + 44) < 2 ||
+        le32(b + 44) > clusters + 1) return -22;
+    uint64_t available = 0;
+    for (uint64_t sector = 0; sector * 128 < clusters + 2; ++sector)
+    {
+        if (!read_sector(reserved + uint64_t(active) * fat_sectors + sector, work.fat)) return -5;
+        if (fats == 2 && !(flags & 0x80))
+        {
+            if (!read_sector(reserved + fat_sectors + sector, work.mirror)) return -5;
+            if (!same(work.fat, work.mirror, 512)) return -117;
+        }
+        for (unsigned i = 0; i < 128 && sector * 128 + i < clusters + 2; ++i)
+        {
+            uint64_t cluster = sector * 128 + i;
+            if (cluster < 2) continue;
+            uint32_t value = le32(work.fat + i * 4) & 0x0fffffffU;
+            if (!value) ++available;
+            else if (value < 2 || (value > clusters + 1 && value < 0x0ffffff0U)) return -117;
+        }
+    }
+    uint64_t unit = cluster_sectors * 512ULL;
+    uint64_t required = (files.loader_bytes + unit - 1) / unit + (files.kernel_bytes + unit - 1) / unit + 8;
+    return available >= required ? 0 : -28;
+}
+
 } // namespace xjinstaller
