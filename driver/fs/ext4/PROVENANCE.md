@@ -183,6 +183,18 @@ original native extent/xattr parsing and mutation algorithms are retained;
 the GPL `ext4_extent.c`, `ext4_extents.c` spelling and `ext4_xattr.c` are explicitly
 excluded as source inputs, regardless of any replacement SPDX label.
 
+The 2026-11-18 completed-write cache update copies whole aligned blocks into
+the existing clean cache only after the exclusive backend reports full write
+success. Every attempted write still invalidates first. Incomplete or failed
+writes never publish cache entries, and failed flushes still quarantine the
+session. Caller buffers are copied, not retained; transaction/recovery overlays,
+metadata validation, all six commit barriers and recovery ordering are unchanged.
+This removes device rereads of acknowledged home/checkpoint bytes and adds no
+dirty writeback, asynchronous journal work or external implementation.
+The session retains its validated immutable cache block size while rebuilding
+the Volume view at checkpoints; superblock geometry is still checked by the
+complete before/after-state guard, and a fresh open resets both cache and size.
+
 SOURCE.json records the reviewed source bytes. Both Ninja generators run
 `tools/check_ext4_sources.py` to detect missing, changed, extra, or incorrectly
 licensed driver inputs. The tool also restricts the isolated parser's literal

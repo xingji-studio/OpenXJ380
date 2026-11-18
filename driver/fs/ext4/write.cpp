@@ -238,9 +238,12 @@ bool WriteSession::home_read(void *context, uint64_t offset, void *output, Size 
 bool WriteSession::read_home(uint64_t offset, void *output, Size bytes)
 {
     if (failed_) return false;
+    // Checkpoint revalidation rebuilds volume_ from its superblock. Its
+    // temporary reset must not bypass the cache of our exclusively owned
+    // device. The complete guard still rejects every immutable geometry change.
+    uint32_t size = cache_block_size_ ? cache_block_size_ : (volume_.ready_ ? volume_.block_size_ : 0);
     bool ok = workspace_->read_cache.read(device_.read, device_.context, device_.bytes,
-                                          volume_.ready_ ? volume_.block_size_ : 0, offset, output, bytes,
-                                          device_.performance);
+                                          size, offset, output, bytes, device_.performance);
     if (!ok) { workspace_->read_cache.reset(); failed_ = true; }
     return ok;
 }
@@ -263,6 +266,7 @@ bool WriteSession::journal_write(void *context, uint64_t block, const void *data
     session->workspace_->read_cache.invalidate(offset, bytes, size);
     bool ok = session->device_.write(session->device_.context, offset, data, bytes);
     if (!ok) session->failed_ = true;
+    else session->workspace_->read_cache.complete_write(offset, data, bytes, size);
     return ok;
 }
 
@@ -951,6 +955,7 @@ int WriteSession::set_recovery(bool enabled)
     copy(block + 1024 % size, super_, sizeof(super_));
     workspace_->read_cache.invalidate(offset, size, size);
     if (!device_.write(device_.context, offset, block, size) || !device_.flush(device_.context)) return stop(-EIO);
+    workspace_->read_cache.complete_write(offset, block, size, size);
     volume_.incompat_ = enabled ? features | 4U : features & ~4U;
     return 0;
 }
@@ -969,6 +974,7 @@ int WriteSession::open(const WriteDevice &device, WriteWorkspace &workspace,
     device_ = device;
     workspace_ = &workspace;
     workspace_->read_cache.reset();
+    cache_block_size_ = 0;
     initial_validator_ = validator;
     initial_validator_context_ = validator_context;
     initial_validated_ = false;
@@ -981,6 +987,7 @@ int WriteSession::open(const WriteDevice &device, WriteWorkspace &workspace,
     bool bootstrap = (le32(super_ + 0x60) & 4U) != 0;
     int error = volume_.mount_internal(home_read, this, device.bytes, true, bootstrap);
     if (error) return stop(error);
+    cache_block_size_ = volume_.block_size_;
     first_inode_ = 0;
     metadata_count_ = journal_blocks_ = journal_metadata_count_ = 0;
     journal_first_ = ~uint64_t(0);

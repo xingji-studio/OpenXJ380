@@ -119,6 +119,7 @@ public:
 private:
     WriteDevice device_;
     WriteWorkspace *workspace_;
+    uint32_t cache_block_size_; // Immutable session geometry survives Volume revalidation.
     Volume volume_;
     Inode journal_inode_;
     Journal journal_;

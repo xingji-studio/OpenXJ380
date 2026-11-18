@@ -10,6 +10,7 @@ namespace xjext4 {
 
 // Clean copies only. The exclusive device owner must invalidate before EVERY
 // attempted write, even if the device reports failure after writing some bytes.
+// Only a fully successful backend write may publish its complete block copies.
 // Transaction/recovery overlays belong above this cache. No allocation, dirty
 // writeback, read-ahead, retained caller pointers or internal locking occurs.
 struct ReadCache
@@ -53,6 +54,37 @@ struct ReadCache
         uint64_t first = offset / size, last = (offset + length - 1) / size;
         for (unsigned i = 0; i < kEntries; ++i)
             if (rank[i] && blocks[i] >= first && blocks[i] <= last) discard(i);
+    }
+
+    // The exclusive caller has already invalidated the range and completed
+    // its backend write. Remember those exact bytes without rereading them.
+    // Partial/unaligned writes leave the range cold; never retain a caller's
+    // pointer or install speculative transaction/recovery after-images here.
+    void complete_write(uint64_t offset, const void *input, Size length, uint32_t size)
+    {
+        if (!input || !length || (size != 1024 && size != 2048 && size != 4096) ||
+            offset % size || length % size || length - 1 > ~uint64_t(0) - offset) return;
+        const auto *source = static_cast<const uint8_t *>(input);
+        for (Size at = 0; at < length; at += size)
+        {
+            uint64_t block = (offset + at) / size;
+            unsigned slot = kEntries;
+            for (unsigned i = 0; i < kEntries; ++i)
+                if (rank[i] && blocks[i] == block) { slot = i; break; }
+            if (slot == kEntries)
+            {
+                slot = 0;
+                for (unsigned i = 0; i < kEntries; ++i)
+                {
+                    if (!rank[i]) { slot = i; break; }
+                    if (rank[i] > rank[slot]) slot = i;
+                }
+            }
+            discard(slot);
+            for (Size i = 0; i < size; ++i) data[slot][i] = source[at + i];
+            blocks[slot] = block;
+            touch(slot);
+        }
     }
 
     // Geometry and reader identity must stay fixed between resets. Larger or
