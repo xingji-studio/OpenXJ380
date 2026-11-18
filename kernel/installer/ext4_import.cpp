@@ -113,6 +113,8 @@ bool read(void *context, uint64_t offset, void *output, Size bytes)
     auto &work = *static_cast<Ext4ImportWorkspace *>(context);
     if (work.stopped || work.status.io_failed) return false;
     if (offset > work.io.bytes || bytes > work.io.bytes - offset) return io_failure(work);
+    xjext4::PerformanceScope measured(work.io.performance, &xjext4::Performance::target_read);
+    if (work.io.performance) work.io.performance->target_read_bytes += bytes;
     return work.io.read(work.io.context, offset, output, bytes) || io_failure(work);
 }
 bool write(void *context, uint64_t offset, const void *input, Size bytes)
@@ -120,12 +122,15 @@ bool write(void *context, uint64_t offset, const void *input, Size bytes)
     auto &work = *static_cast<Ext4ImportWorkspace *>(context);
     if (work.stopped || work.status.io_failed) return false;
     if (offset > work.io.bytes || bytes > work.io.bytes - offset) return io_failure(work);
+    xjext4::PerformanceScope measured(work.io.performance, &xjext4::Performance::target_write);
+    if (work.io.performance) work.io.performance->target_write_bytes += bytes;
     return work.io.write(work.io.context, offset, input, bytes) || io_failure(work);
 }
 bool flush(void *context)
 {
     auto &work = *static_cast<Ext4ImportWorkspace *>(context);
     if (work.stopped || work.status.io_failed) return false;
+    xjext4::PerformanceScope measured(work.io.performance, &xjext4::Performance::target_flush);
     return work.io.flush(work.io.context) || io_failure(work);
 }
 bool sparse(uint32_t group)
@@ -254,6 +259,90 @@ const char *filename(Ext4ImportWorkspace &work, const xjpak2::Record &record)
     work.name[length] = 0;
     return work.name;
 }
+int small_files(Ext4ImportWorkspace &work, Size first, Size &next, uint64_t seconds)
+{
+    using Request = xjext4::SmallFileCreate;
+    static_assert(Request::kMaximumFiles * 256 <= sizeof(work.scratch), "bounded batch names");
+    auto *requests = work.writer_workspace->small_files;
+    Size indices[Request::kMaximumFiles];
+    unsigned count = 0;
+    Size source_used = 0;
+    next = first;
+    while (next < work.plan.count && count < Request::kMaximumFiles)
+    {
+        const auto &record = work.records[next];
+        if (record.kind != xjpak2::Kind::Regular) { ++next; continue; }
+        if (record.payload.size > Request::kMaximumBytes) break;
+        if (record.payload_external && record.payload.size > sizeof(work.source_buffer) - source_used) break;
+        work.status.last_record = uint32_t(next + 1);
+        const uint8_t *data = record.payload.data;
+        if (record.payload_external)
+        {
+            data = work.source_buffer + source_used;
+            int error = xjpak2::read_payload(work.plan, record, 0, work.source_buffer + source_used,
+                                             record.payload.size);
+            if (error) { work.status.io_failed = true; return error; }
+            if (xjpak2::crc32c(data, record.payload.size) != record.payload_crc32c) return -EUCLEAN;
+            source_used += record.payload.size;
+        }
+        const char *name = filename(work, record);
+        Size length = 0;
+        while (name[length]) ++length;
+        char *saved_name = reinterpret_cast<char *>(work.scratch) + count * 256;
+        copy(saved_name, name, length + 1);
+        indices[count] = next;
+        requests[count++] = {work.entries[work.entries[next].parent_index].inode,
+                             saved_name, data, record.payload.size};
+        ++next;
+    }
+    if (!count) return -EINVAL;
+    for (unsigned done = 0; done < count;)
+    {
+        unsigned amount = count - done;
+        int error;
+        do
+        {
+            work.status.last_record = uint32_t(indices[done + amount - 1] + 1);
+            error = work.writer->create_small_files(requests + done, amount, seconds,
+                                                     work.writer_workspace->small_inodes);
+            if (error != -E2BIG || amount == 1) break;
+            amount = (amount + 1) / 2;
+        } while (true);
+        if (error == -E2BIG)
+        {
+            // An unusually expensive directory split may consume the complete
+            // image budget. Keep the original durable create/pwrite path for it.
+            const auto &request = requests[done];
+            xjext4::Inode created;
+            error = work.writer->create(request.parent, request.name, 0100600, 0, 0, seconds, created);
+            if (error) return error;
+            work.entries[indices[done]].inode = created.number;
+            ++work.status.inodes_created; ++work.status.names_created;
+            Size completed = 0;
+            if (request.bytes)
+                error = work.writer->pwrite(created.number, 0, request.data, request.bytes, seconds, completed);
+            if (completed > request.bytes) return -EUCLEAN;
+            work.status.data_bytes_committed += completed;
+            if (error) return error;
+            if (completed != request.bytes) return -EIO;
+        }
+        else
+        {
+            if (error) return error;
+            for (unsigned j = 0; j < amount; ++j)
+            {
+                work.entries[indices[done + j]].inode = work.writer_workspace->small_inodes[j];
+                work.status.data_bytes_committed += requests[done + j].bytes;
+            }
+            work.status.inodes_created += amount; work.status.names_created += amount;
+        }
+        done += amount;
+        report_progress(work.progress, InstallStage::Copying, work.status.data_bytes_committed,
+                        work.plan.data_bytes);
+    }
+    return 0;
+}
+
 int metadata(Ext4ImportWorkspace &work, Size index, uint64_t seconds)
 {
     const auto &record = work.plan.records[index];
@@ -385,7 +474,7 @@ int ext4_import_apply_fresh(const xjext4::WriteDevice &device, uint64_t seconds,
                                      work.source.read ? &work.source : nullptr);
     if (error) return error;
     if (!regions_valid(work.package, work.package_bytes, work, work.plan.count, true, storage)) return -EINVAL;
-    work.io = {device.read, device.write, device.flush, device.context, device.bytes};
+    work.io = {device.read, device.write, device.flush, device.context, device.bytes, device.performance};
     work.progress = progress ? *progress : ProgressObserver{};
     work.used = true;
     work.status.phase = Ext4ImportPhase::Preflight;
@@ -397,7 +486,7 @@ int ext4_import_apply_fresh(const xjext4::WriteDevice &device, uint64_t seconds,
     work.status.preflight_complete = true;
     work.status.phase = Ext4ImportPhase::Opening;
     work.status.writer_started = true;
-    xjext4::WriteDevice wrapped = {read, write, flush, &work, device.bytes};
+    xjext4::WriteDevice wrapped = {read, write, flush, &work, device.bytes, device.performance};
     error = work.writer->open(wrapped, *work.writer_workspace, initial, &work, storage,
                               xjext4::Journal::kExtendedUpdates);
     if (error) return finish(work, error, status);
@@ -428,6 +517,13 @@ int ext4_import_apply_fresh(const xjext4::WriteDevice &device, uint64_t seconds,
     {
         const auto &record = work.records[i];
         if (record.kind != xjpak2::Kind::Regular) continue;
+        if (record.payload.size <= xjext4::SmallFileCreate::kMaximumBytes)
+        {
+            Size next;
+            error = small_files(work, i, next, seconds);
+            if (!error) i = next - 1;
+            continue;
+        }
         work.status.last_record = uint32_t(i + 1);
         xjext4::Inode created;
         error = work.writer->create(work.entries[work.entries[i].parent_index].inode, filename(work, record),
@@ -513,24 +609,36 @@ int ext4_import_apply_fresh(const xjext4::WriteDevice &device, uint64_t seconds,
     }
     if (error) return finish(work, error, status);
     work.status.phase = Ext4ImportPhase::Times;
+    // Keep bounded requests in caller-owned heap storage. Each request edits
+    // only its inode-table block, so 64 requests always fit the opted-in journal.
     // Reverse path order places every directory after all of its descendants.
+    unsigned attribute_count = 0;
     for (Size i = work.plan.count; !error && i;)
     {
         --i;
         const auto &record = work.records[i];
         if (record.kind == xjpak2::Kind::Hardlink) continue;
         work.status.last_record = uint32_t(i + 1);
-        xjext4::AttributeUpdate update = {};
-        // All namespace/data/EA changes precede this final inode transaction.
-        // Chown, the explicit final mode and mtime share the same six durable
-        // journal barriers; reverse order restores parent times last.
+        auto &change = work.writer_workspace->attribute_changes[attribute_count++];
+        change.inode = work.entries[i].inode;
+        auto &update = change.update;
+        update = {};
+        // All namespace/data/EA changes precede these final inode batches.
+        // Ownership, final mode and mtime keep their original per-inode order;
+        // multiple inodes now share the same six durable journal barriers.
         update.mask = xjext4::kAttributeUid | xjext4::kAttributeGid |
                       xjext4::kAttributeMode | xjext4::kAttributeMtime;
         update.uid = record.uid; update.gid = record.gid; update.mode = uint16_t(record.mode);
         update.mtime_seconds = record.mtime_seconds; update.mtime_nanoseconds = record.mtime_nsec;
-        error = work.writer->set_attributes(work.entries[i].inode, update, seconds);
-        if (!error) report_progress(work.progress, InstallStage::Metadata,
-                                    work.plan.count * 2 - i, work.plan.count * 2);
+        if (attribute_count == xjext4::Journal::kExtendedUpdates || !i)
+        {
+            error = work.writer->set_attributes_batch(work.writer_workspace->attribute_changes,
+                                                       attribute_count, seconds);
+            attribute_count = 0;
+            // Acknowledged progress covers complete durable batches only.
+            if (!error) report_progress(work.progress, InstallStage::Metadata,
+                                        work.plan.count * 2 - i, work.plan.count * 2);
+        }
     }
     if (error) return finish(work, error, status);
     work.status.phase = Ext4ImportPhase::Closing;

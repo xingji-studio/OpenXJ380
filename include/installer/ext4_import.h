@@ -8,6 +8,7 @@ namespace xjext4 {
 struct WriteDevice;
 struct WriteWorkspace;
 struct WriteStorage;
+struct Performance;
 class WriteSession;
 class Volume;
 }
@@ -63,6 +64,7 @@ struct Ext4ImportIO
     bool (*flush)(void *);
     void *context;
     uint64_t bytes;
+    xjext4::Performance *performance = nullptr;
 };
 
 // Caller owns every object/arena and zero-initializes this workspace. None may

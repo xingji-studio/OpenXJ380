@@ -7,12 +7,12 @@
   "sources": [
     {
       "path": "attributes.cpp",
-      "sha256": "f15abb0d71b11652838c9286a8f2eb86c62230e0438c9d29e104cc71c3f0ce51",
+      "sha256": "2a0a0315aa9d5af0a119c9c40c2a81e751a296d312e34499f157e2f1550f27e0",
       "spdx": "Apache-2.0"
     },
     {
       "path": "attributes.h",
-      "sha256": "dae005e659eafe7198a633c8430c21cf8c00fd0b51c9d1f80a6ed62086c77263",
+      "sha256": "b0f301184b22f3b8badd01b1810880e99c4a7372137e5868483f7c93424ff0da",
       "spdx": "Apache-2.0"
     },
     {
@@ -37,7 +37,7 @@
     },
     {
       "path": "ext4.cpp",
-      "sha256": "cc425b6d38931bbad868d1896beabca87ea4099dfebe8d4cdb742ba1ad95399e",
+      "sha256": "a65694c83abc48658c76af4724052965d344805bb61c1d03e95bf06376bc70e2",
       "spdx": "Apache-2.0"
     },
     {
@@ -52,17 +52,17 @@
     },
     {
       "path": "io_cache.h",
-      "sha256": "385729089978c3cb1d8fe3d884f782e911276cb4651f6c72ed231f43f6f778fd",
+      "sha256": "ed159baf8825130101d7c66b3811fe57609dbddaed59b3e5b31e97b7da9d490f",
       "spdx": "Apache-2.0"
     },
     {
       "path": "journal.cpp",
-      "sha256": "899e4cd45af5060407db9094ec65de0c95efa081b2db96dd83ecba6816d49c6a",
+      "sha256": "0f97bda96ea02121b28372bdc3575e9899ccf1b408eafbd1e1c55a5b0c4fb348",
       "spdx": "Apache-2.0"
     },
     {
       "path": "journal.h",
-      "sha256": "053df4a8e0c602625cbd0ef4ff87fc033a950eccd1b1bc58364ccad35d16e175",
+      "sha256": "bb3ae80f6ba15099fbb08bebe267d6223e38844a97a295c62d119e65d9e0f30b",
       "spdx": "Apache-2.0"
     },
     {
@@ -72,7 +72,7 @@
     },
     {
       "path": "namespace.cpp",
-      "sha256": "963a0f985c207a96fd7795be73fb17a2f321d04929409c45e3851b2e5716e2f1",
+      "sha256": "985e155dbc3951d5c56627d35b11833ea78b1e15388ce0b0795d145fcf54d3f8",
       "spdx": "Apache-2.0"
     },
     {
@@ -91,13 +91,18 @@
       "spdx": "Apache-2.0"
     },
     {
+      "path": "performance.h",
+      "sha256": "43ac3a45ff88596e596f2f9723139949626757f8375a639327281bf74f2e7fa1",
+      "spdx": "Apache-2.0"
+    },
+    {
       "path": "write.cpp",
-      "sha256": "39110a24fcda6ff85ebdc70e448493e31c1bbc55aca7fd8f8644fef165b9ce14",
+      "sha256": "e2628e7b1439595a069f571fe91eca159802215c444fa4685cbdc2d2ee93d998",
       "spdx": "Apache-2.0"
     },
     {
       "path": "write.h",
-      "sha256": "fc154cd6e65e2a09b968ed85f1ab729a45ffd71b4f80d1b8eca4c7cf8531888d",
+      "sha256": "4d4d6eb50dffa5f0e31ebc86e72e00f4e20756f7a569b3b6e6acec1f2d5f6004",
       "spdx": "Apache-2.0"
     },
     {

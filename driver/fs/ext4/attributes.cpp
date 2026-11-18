@@ -19,9 +19,7 @@ void store32(uint8_t *p, uint32_t value)
     for (unsigned i = 0; i < 4; ++i) p[i] = uint8_t(value >> (8 * i));
 }
 
-} // namespace
-
-int WriteSession::set_attributes(uint32_t number, const AttributeUpdate &update, uint64_t seconds)
+int check_attributes(const AttributeUpdate &update, uint64_t seconds)
 {
     if (update.mask & ~31U) return -EINVAL;
     if (!update.mask) return 0;
@@ -32,7 +30,54 @@ int WriteSession::set_attributes(uint32_t number, const AttributeUpdate &update,
                                            update.mtime_seconds > 0x37fffffffLL))) return -EOVERFLOW;
     if (((update.mask & kAttributeAtime) && update.atime_nanoseconds >= 1000000000U) ||
         ((update.mask & kAttributeMtime) && update.mtime_nanoseconds >= 1000000000U)) return -EINVAL;
+    return 0;
+}
+
+} // namespace
+
+int WriteSession::set_attributes(uint32_t number, const AttributeUpdate &update, uint64_t seconds)
+{
+    AttributeChange change = {number, update};
+    return set_attributes_batch(&change, 1, seconds);
+}
+
+int WriteSession::set_attributes_batch(const AttributeChange *changes, unsigned count, uint64_t seconds)
+{
+    PerformanceScope measured(active_ ? device_.performance : nullptr, &Performance::attributes);
+    if (!count) return 0;
+    if (!changes) return -EINVAL;
+    if (count > Journal::kExtendedUpdates) return -E2BIG;
+    unsigned changed = 0;
+    for (unsigned i = 0; i < count; ++i)
+    {
+        int error = check_attributes(changes[i].update, seconds);
+        if (error) return error;
+        if (changes[i].update.mask) ++changed;
+    }
+    if (active_ && device_.performance) device_.performance->attribute_requests += count;
+    if (!changed) return 0;
+    if (!active_) return -EINVAL;
+    if (count > tx_capacity_) return -E2BIG;
     int error = tx_begin();
+    if (error) return error;
+    for (unsigned i = 0; !error && i < count; ++i)
+    {
+        if (changes[i].update.mask)
+            error = tx_set_attributes(changes[i].inode, changes[i].update, seconds);
+    }
+    if (error)
+    {
+        tx_cancel();
+        return stop(error);
+    }
+    error = tx_commit();
+    if (!error && device_.performance) device_.performance->attributes_committed += changed;
+    return error;
+}
+
+int WriteSession::tx_set_attributes(uint32_t number, const AttributeUpdate &update, uint64_t seconds)
+{
+    int error = 0;
     uint8_t *raw = nullptr;
     if (!error) error = tx_inode(number, raw);
     if (!error && (read32(raw + 0x20) & 0x30U)) error = -EPERM;
@@ -74,9 +119,7 @@ int WriteSession::set_attributes(uint32_t number, const AttributeUpdate &update,
         }
         error = tx_finish_inode(number, raw, seconds, false);
     }
-    if (!error) return tx_commit();
-    tx_cancel();
-    return stop(error);
+    return error;
 }
 
 } // namespace xjext4

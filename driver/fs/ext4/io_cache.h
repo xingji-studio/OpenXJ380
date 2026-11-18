@@ -4,6 +4,7 @@
 // recorded in REFERENCES.json and LWEXT4_BSD_NOTICE.txt. No upstream code is ported.
 
 #include "native.h"
+#include "performance.h"
 
 namespace xjext4 {
 
@@ -57,20 +58,29 @@ struct ReadCache
     // Geometry and reader identity must stay fixed between resets. Larger or
     // crossing requests go directly to the backend without splitting its I/O.
     bool read(Reader reader, void *context, uint64_t limit, uint32_t size,
-              uint64_t offset, void *output, Size length)
+              uint64_t offset, void *output, Size length, Performance *performance = nullptr)
     {
         if (!reader || (!output && length) || offset > limit || length > limit - offset) return false;
         if (!length) return true;
+        auto backend = [&](uint64_t position, void *data, Size bytes) -> bool
+        {
+            PerformanceScope measured(performance, &Performance::backend_read);
+            return reader(context, position, data, bytes);
+        };
         if ((size != 1024 && size != 2048 && size != 4096) || length > size - offset % size)
-            return reader(context, offset, output, length);
+        {
+            if (performance) ++performance->cache_bypasses;
+            return backend(offset, output, length);
+        }
         uint64_t block = offset / size;
         unsigned slot = kEntries;
         for (unsigned i = 0; i < kEntries; ++i)
             if (rank[i] && blocks[i] == block) { slot = i; break; }
         if (slot == kEntries)
         {
+            if (performance) ++performance->cache_misses;
             // Do not extend a legal partial read beyond the device's end.
-            if (size > limit - block * size) return reader(context, offset, output, length);
+            if (size > limit - block * size) return backend(offset, output, length);
             slot = 0;
             for (unsigned i = 0; i < kEntries; ++i)
             {
@@ -78,9 +88,10 @@ struct ReadCache
                 if (rank[i] > rank[slot]) slot = i;
             }
             discard(slot);
-            if (!reader(context, block * size, data[slot], size)) return false;
+            if (!backend(block * size, data[slot], size)) return false;
             blocks[slot] = block;
         }
+        else if (performance) ++performance->cache_hits;
         touch(slot);
         auto *destination = static_cast<uint8_t *>(output);
         for (Size i = 0; i < length; ++i) destination[i] = data[slot][offset % size + i];

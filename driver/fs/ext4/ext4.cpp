@@ -468,7 +468,7 @@ static int mount_volume(const char *source, vfs_node_t node, bool writable,
         mount->writer = (xjext4::WriteSession *)calloc(1, sizeof(xjext4::WriteSession));
         mount->workspace = (xjext4::WriteWorkspace *)malloc(sizeof(xjext4::WriteWorkspace));
         if (!mount->writer || !mount->workspace) { destroy(mount); return -ENOMEM; }
-        xjext4::WriteDevice io = {read_device, write_device, flush_device, mount, device->size};
+        xjext4::WriteDevice io = {read_device, write_device, flush_device, mount, device->size, nullptr};
         RootValidation validation = {binding, {}};
         validation.kernel_on_esp = kernel_on_esp;
         error = xjext4::WriteSession::storage_size(io, mount->storage.bytes);
@@ -1323,6 +1323,7 @@ struct BuildContext
     xjinstaller::Ext4ImportWorkspace import;
     xjext4::WriteStorage storage;
     xjinstaller::Ext4ImportStatus import_status;
+    xjext4::Performance performance;
 };
 
 } // namespace
@@ -1483,10 +1484,41 @@ static int build_offline(vfs_node_t device, const BlockAccessWindow *window, con
     if (!error)
     {
         if (status) status->import_started = true;
+        context->performance.now = [](void *) -> uint64_t { return nanoTime(); };
         xjext4::WriteDevice writer_io = {format_read, format_write, format_flush, &context->format,
-                                        context->format.io_bytes};
+                                        context->format.io_bytes, &context->performance};
         error = xjinstaller::ext4_import_apply_fresh(writer_io, snapshot.time_seconds, context->import,
                                                     context->import_status, &context->storage, &observer);
+        // One summary after import, including failure. No per-file serial I/O
+        // perturbs the hot path; the counters distinguish acknowledged commits.
+        const auto &p = context->performance;
+        auto value = [](uint64_t n) -> unsigned long long { return n; };
+        write_serial_fmt("EXT4_IMPORT_PERF error=%d commits=%llu blocks=%llu capacity=%llu peak=%llu "
+                         "attrs=%llu/%llu flushes=%llu writes=%llu write_bytes=%llu cache=%llu/%llu/%llu\n",
+                         error, value(p.transactions_committed), value(p.blocks_committed), value(p.capacity_committed),
+                         value(p.peak_transaction_blocks), value(p.attributes_committed), value(p.attribute_requests),
+                         value(p.flush.calls), value(p.device_write_calls), value(p.device_write_bytes),
+                         value(p.cache_hits), value(p.cache_misses), value(p.cache_bypasses));
+        write_serial_fmt("EXT4_IMPORT_OPS creates=%llu pwrite=%llu attr_batches=%llu payload_bytes=%llu "
+                         "log_data_bytes=%llu home_data_bytes=%llu\n",
+                         value(p.create.calls), value(p.pwrite.calls), value(p.attributes.calls),
+                         value(p.payload_bytes_committed), value(p.log_data_bytes_succeeded),
+                         value(p.checkpoint_data_bytes_succeeded));
+        write_serial_fmt("EXT4_IMPORT_SMALL attempts=%llu batches=%llu files=%llu time_ns=%llu\n",
+                         value(p.small_create.calls), value(p.small_batches_committed),
+                         value(p.small_files_committed), value(p.small_create.nanoseconds));
+        write_serial_fmt("EXT4_IMPORT_IO reads=%llu read_bytes=%llu writes=%llu write_bytes=%llu "
+                         "flushes=%llu read_ns=%llu write_ns=%llu flush_ns=%llu\n",
+                         value(p.target_read.calls), value(p.target_read_bytes), value(p.target_write.calls),
+                         value(p.target_write_bytes), value(p.target_flush.calls), value(p.target_read.nanoseconds),
+                         value(p.target_write.nanoseconds), value(p.target_flush.nanoseconds));
+        write_serial_fmt("EXT4_IMPORT_TIME_NS create=%llu pwrite=%llu attributes=%llu commit=%llu "
+                         "validate=%llu layout=%llu log=%llu checkpoint=%llu flush=%llu read=%llu\n",
+                         value(p.create.nanoseconds), value(p.pwrite.nanoseconds), value(p.attributes.nanoseconds),
+                         value(p.commit.nanoseconds), value(p.validation.nanoseconds),
+                         value(p.layout_validation.nanoseconds),
+                         value(p.log_write.nanoseconds), value(p.checkpoint_write.nanoseconds),
+                         value(p.flush.nanoseconds), value(p.backend_read.nanoseconds));
     }
     if (operation_has_failed()) format_fail_io(&context->format);
     if (status)
@@ -1693,7 +1725,7 @@ int ext4fs_pwrite_existing(vfs_node_t node, uint64_t offset, const void *bytes, 
     mount->compatibility = context;
     auto *session = context->session;
     auto *workspace = context->workspace;
-    xjext4::WriteDevice io = {read_device, write_device, flush_device, mount, mount->device->size};
+    xjext4::WriteDevice io = {read_device, write_device, flush_device, mount, mount->device->size, nullptr};
     int error = xjext4::WriteSession::storage_size(io, context->storage.bytes);
     if (!error)
     {

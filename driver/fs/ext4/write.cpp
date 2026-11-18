@@ -239,7 +239,8 @@ bool WriteSession::read_home(uint64_t offset, void *output, Size bytes)
 {
     if (failed_) return false;
     bool ok = workspace_->read_cache.read(device_.read, device_.context, device_.bytes,
-                                          volume_.ready_ ? volume_.block_size_ : 0, offset, output, bytes);
+                                          volume_.ready_ ? volume_.block_size_ : 0, offset, output, bytes,
+                                          device_.performance);
     if (!ok) { workspace_->read_cache.reset(); failed_ = true; }
     return ok;
 }
@@ -530,6 +531,7 @@ bool WriteSession::validate_update(void *context, uint64_t block, const void *af
 bool WriteSession::validate_transaction(void *context, const JournalTransaction &transaction)
 {
     auto *session = static_cast<WriteSession *>(context);
+    PerformanceScope measured(session->device_.performance, &Performance::validation);
     if ((!transaction.count && !session->initial_validator_) ||
         (transaction.count && (!transaction.read || !transaction.blocks)) ||
         transaction.count > JournalWorkspace::kMaximumBlocks ||
@@ -887,6 +889,7 @@ int WriteSession::validate_afterstate()
 
 int WriteSession::verify_recovered_layout(bool checkpoint)
 {
+    PerformanceScope measured(device_.performance, &Performance::layout_validation);
     uint8_t recovered[1024];
     if (!read_home(1024, recovered, sizeof(recovered))) return -EIO;
     for (Size i = 0; i < sizeof(recovered); ++i)
@@ -1001,6 +1004,7 @@ int WriteSession::open(const WriteDevice &device, WriteWorkspace &workspace,
     journal_device.workspace = &workspace.journal;
     journal_device.maximum_transfer_blocks = Journal::kMaximumUpdates;
     journal_device.maximum_updates = tx_capacity_;
+    journal_device.performance = device_.performance;
     journal_device.read = journal_read;
     journal_device.write = journal_write;
     journal_device.flush = journal_flush;
@@ -1560,6 +1564,7 @@ int WriteSession::tx_commit()
 int WriteSession::pwrite(uint32_t number, uint64_t offset, const void *data, Size length,
                         uint64_t seconds, Size &completed)
 {
+    PerformanceScope measured(active_ ? device_.performance : nullptr, &Performance::pwrite);
     completed = 0;
     if (!active_) return -EINVAL;
     if (failed_ || journal_.failed()) return stop(-EIO);
@@ -1614,6 +1619,67 @@ int WriteSession::pwrite(uint32_t number, uint64_t offset, const void *data, Siz
         }
         if (error) return stop(error);
         completed += amount;
+        if (device_.performance) device_.performance->payload_bytes_committed += amount;
+    }
+    return 0;
+}
+
+int WriteSession::create_small_files(const SmallFileCreate *files, unsigned count, uint64_t seconds,
+                                    uint32_t *created)
+{
+    PerformanceScope measured(active_ ? device_.performance : nullptr, &Performance::small_create);
+    if (!count) return 0;
+    if (!files || !created) return -EINVAL;
+    if (count > SmallFileCreate::kMaximumFiles) return -E2BIG;
+    if (!active_) return -EINVAL;
+    if (failed_ || journal_.failed()) return stop(-EIO);
+    if (volume_.block_size_ != 4096 || tx_capacity_ != Journal::kExtendedUpdates) return -EOPNOTSUPP;
+    if (seconds > 0x37fffffffULL) return -EOVERFLOW;
+    for (unsigned i = 0; i < count; ++i)
+    {
+        if (files[i].bytes > SmallFileCreate::kMaximumBytes) return -EFBIG;
+        if (files[i].bytes && !files[i].data) return -EINVAL;
+    }
+    int error = tx_begin();
+    if (error) return error;
+    uint32_t numbers[SmallFileCreate::kMaximumFiles];
+    uint64_t bytes = 0;
+    for (unsigned i = 0; !error && i < count; ++i)
+    {
+        const auto &file = files[i];
+        uint8_t *raw = nullptr;
+        error = tx_create(file.parent, file.name, 0100600, 0, 0, seconds, numbers[i], raw);
+        if (!error && file.bytes) error = tx_resize(numbers[i], raw, file.bytes);
+        for (Size offset = 0; !error && offset < file.bytes;)
+        {
+            uint64_t physical;
+            error = tx_map(raw, uint32_t(offset / 4096), physical, true);
+            uint8_t *block = nullptr;
+            if (!error) error = tx_edit(physical, block);
+            Size amount = file.bytes - offset;
+            if (amount > 4096) amount = 4096;
+            if (!error) copy(block, file.data + offset, amount);
+            offset += amount;
+        }
+        if (!error) error = tx_finish_inode(numbers[i], raw, seconds);
+        bytes += file.bytes;
+    }
+    if (error)
+    {
+        // Allocation, namespace and payload images have remained in memory.
+        // A capacity retry starts from the identical committed filesystem.
+        tx_cancel();
+        return stop(error);
+    }
+    error = tx_commit();
+    if (error) return error; // Ambiguous failed I/O must never publish output.
+    for (unsigned i = 0; i < count; ++i) created[i] = numbers[i];
+    if (device_.performance)
+    {
+        auto &p = *device_.performance;
+        ++p.small_batches_committed;
+        p.small_files_committed += count;
+        p.payload_bytes_committed += bytes;
     }
     return 0;
 }

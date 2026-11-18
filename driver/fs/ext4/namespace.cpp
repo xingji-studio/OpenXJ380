@@ -175,6 +175,7 @@ int WriteSession::symlink(uint32_t parent, const char *name, const char *target,
 int WriteSession::create(uint32_t parent, const char *name, uint16_t mode, uint32_t uid, uint32_t gid,
                          uint64_t seconds, Inode &result)
 {
+    PerformanceScope measured(active_ ? device_.performance : nullptr, &Performance::create);
     int length = name_length(name);
     if (length < 0) return length;
     if (seconds > 0x37fffffffULL) return -EOVERFLOW;
@@ -183,8 +184,26 @@ int WriteSession::create(uint32_t parent, const char *name, uint16_t mode, uint3
     if (type != kRegular && type != kDirectory) return -EOPNOTSUPP;
     int error = tx_begin();
     if (error) return error;
+    uint32_t number = 0;
+    uint8_t *raw = nullptr;
+    error = tx_create(parent, name, mode, uid, gid, seconds, number, raw);
+    if (!error) error = tx_commit();
+    else { tx_cancel(); return stop(error); }
+    if (!error) error = volume_.read_inode(number, result);
+    return stop(error);
+}
+
+int WriteSession::tx_create(uint32_t parent, const char *name, uint16_t mode, uint32_t uid, uint32_t gid,
+                            uint64_t seconds, uint32_t &number, uint8_t *&raw)
+{
+    int length = name_length(name);
+    if (length < 0) return length;
+    if (seconds > 0x37fffffffULL) return -EOVERFLOW;
+    uint16_t type = mode & 0170000;
+    if (!type) { type = kRegular; mode |= kRegular; }
+    if (type != kRegular && type != kDirectory) return -EOPNOTSUPP;
     uint8_t *directory = nullptr;
-    error = ns_directory(parent, directory);
+    int error = ns_directory(parent, directory);
     DirectoryPosition existing = {};
     if (!error)
     {
@@ -198,8 +217,8 @@ int WriteSession::create(uint32_t parent, const char *name, uint16_t mode, uint3
         gid = get16(directory + 0x18) | uint32_t(get16(directory + 0x7a)) << 16;
         if (type == kDirectory) mode |= 02000;
     }
-    uint32_t number = 0;
-    uint8_t *raw = nullptr;
+    number = 0;
+    raw = nullptr;
     if (!error) error = tx_allocate_inode(mode, uid, gid, seconds, number, raw);
     if (!error && type == kDirectory)
     {
@@ -231,10 +250,7 @@ int WriteSession::create(uint32_t parent, const char *name, uint16_t mode, uint3
     if (!error) error = ns_insert(parent, directory, name, number, entry_type(mode));
     if (!error) error = tx_finish_inode(number, raw, seconds);
     if (!error) error = tx_finish_inode(parent, directory, seconds);
-    if (!error) error = tx_commit();
-    else { tx_cancel(); return stop(error); }
-    if (!error) error = volume_.read_inode(number, result);
-    return stop(error);
+    return error;
 }
 
 int WriteSession::unlink(uint32_t parent, const char *name, uint64_t seconds, bool defer_cleanup)

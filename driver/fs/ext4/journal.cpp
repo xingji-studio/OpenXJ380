@@ -129,6 +129,11 @@ unsigned Journal::transfer_limit() const
 int Journal::store_run(uint64_t block, const void *input, unsigned count)
 {
     if (failed_) return -EIO;
+    if (device_.performance)
+    {
+        ++device_.performance->device_write_calls;
+        device_.performance->device_write_bytes += uint64_t(count) * device_.block_size;
+    }
     if (!count || count > transfer_limit() || block >= device_.filesystem_blocks ||
         count > device_.filesystem_blocks - block ||
         !device_.write(device_.context, block, input, count * device_.block_size))
@@ -141,6 +146,7 @@ int Journal::store_run(uint64_t block, const void *input, unsigned count)
 
 int Journal::write_updates(const BlockUpdate *updates, unsigned count, bool log, uint8_t *single)
 {
+    PerformanceScope measured(device_.performance, log ? &Performance::log_write : &Performance::checkpoint_write);
     const unsigned limit = transfer_limit();
     uint8_t *buffer = limit > 1 ? device_.workspace->transfer : single;
     for (unsigned first = 0; first < count;)
@@ -162,6 +168,12 @@ int Journal::write_updates(const BlockUpdate *updates, unsigned count, bool log,
         }
         int error = store_run(physical, buffer, run);
         if (error) return error;
+        if (device_.performance)
+        {
+            uint64_t &bytes = log ? device_.performance->log_data_bytes_succeeded :
+                                    device_.performance->checkpoint_data_bytes_succeeded;
+            bytes += uint64_t(run) * device_.block_size;
+        }
         first += run;
     }
     return 0;
@@ -170,6 +182,7 @@ int Journal::write_updates(const BlockUpdate *updates, unsigned count, bool log,
 int Journal::barrier()
 {
     if (failed_) return -EIO;
+    PerformanceScope measured(device_.performance, &Performance::flush);
     if (!device_.flush(device_.context))
     {
         failed_ = true;
@@ -346,6 +359,7 @@ int Journal::commit(const BlockUpdate *updates, unsigned count)
     if (!ready_) return -EINVAL;
     if (failed_) return -EIO;
     if (start_) return -EBUSY;
+    PerformanceScope measured(device_.performance, &Performance::commit);
     if (!updates || !count || count > device_.maximum_updates) return -EINVAL;
     for (unsigned index = 0; index < count; ++index)
     {
@@ -445,6 +459,14 @@ int Journal::commit(const BlockUpdate *updates, unsigned count)
     if (!result) result = write_updates(updates, count, false, block);
     if (!result) result = barrier();
     if (!result) result = clear();
+    if (!result && device_.performance)
+    {
+        auto &performance = *device_.performance;
+        ++performance.transactions_committed;
+        performance.blocks_committed += count;
+        performance.capacity_committed += device_.maximum_updates;
+        if (count > performance.peak_transaction_blocks) performance.peak_transaction_blocks = count;
+    }
     return result;
 }
 

@@ -26,4 +26,10 @@ struct AttributeUpdate
     uint32_t mtime_nanoseconds;
 };
 
+struct AttributeChange
+{
+    uint32_t inode;
+    AttributeUpdate update;
+};
+
 } // namespace xjext4

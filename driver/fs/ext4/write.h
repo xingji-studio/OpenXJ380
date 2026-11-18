@@ -19,6 +19,8 @@ struct WriteDevice
     Flusher flush;
     void *context;
     uint64_t bytes;
+    // Zero-initialize the aggregate; sessions also live in calloc-owned storage.
+    Performance *performance;
 };
 
 // Optional caller-owned arena. The session never allocates or frees it.
@@ -26,6 +28,18 @@ struct WriteDevice
 struct WriteStorage
 {
     void *data;
+    Size bytes;
+};
+
+// Create-only offline batches. Parents must already exist; names/data remain
+// immutable for the call. The initial mode is 0600, with normal SGID inheritance.
+struct SmallFileCreate
+{
+    static constexpr unsigned kMaximumFiles = 16;
+    static constexpr Size kMaximumBytes = 16384;
+    uint32_t parent;
+    const char *name;
+    const uint8_t *data;
     Size bytes;
 };
 
@@ -37,6 +51,9 @@ struct WriteWorkspace
 {
     uint8_t blocks[Journal::kExtendedUpdates][4096];
     BlockUpdate updates[Journal::kExtendedUpdates];
+    AttributeChange attribute_changes[Journal::kExtendedUpdates];
+    SmallFileCreate small_files[SmallFileCreate::kMaximumFiles];
+    uint32_t small_inodes[SmallFileCreate::kMaximumFiles];
     JournalWorkspace journal;
     DirectoryIndexWorkspace directory;
     ReadCache read_cache;
@@ -65,6 +82,12 @@ public:
     int truncate(uint32_t number, uint64_t size, uint64_t timestamp_seconds);
     int create(uint32_t parent, const char *name, uint16_t mode, uint32_t uid, uint32_t gid,
                uint64_t timestamp_seconds, Inode &created);
+    // Explicit 64-image, 4 KiB importer profile. Names, inode allocation and
+    // complete data share one atomic journal transaction. E2BIG/semantic errors
+    // discard the whole batch before writes; callers may split E2BIG batches.
+    // Output inode numbers are published only after full durable success.
+    int create_small_files(const SmallFileCreate *files, unsigned count, uint64_t timestamp_seconds,
+                           uint32_t *created);
     int unlink(uint32_t parent, const char *name, uint64_t timestamp_seconds, bool defer_cleanup = false);
     int rename(uint32_t source_parent, const char *source, uint32_t destination_parent,
                const char *destination, uint64_t timestamp_seconds, bool defer_target_cleanup = false);
@@ -73,6 +96,12 @@ public:
     int symlink(uint32_t parent, const char *name, const char *target, uint32_t uid, uint32_t gid,
                 uint64_t timestamp_seconds, Inode &created);
     int set_attributes(uint32_t number, const AttributeUpdate &attributes, uint64_t timestamp_seconds);
+    // One atomic transaction, at most the session's 16/64 requests. Attribute
+    // changes touch only inode-table blocks, so each request costs at most one
+    // image. Semantic errors discard the entire batch before journal writes.
+    // Duplicate inodes are applied in order. Success acknowledges the complete
+    // durable batch; failed I/O can still have persisted it and needs recovery.
+    int set_attributes_batch(const AttributeChange *changes, unsigned count, uint64_t timestamp_seconds);
     int set_xattr(uint32_t number, const char *name, const void *value, Size length,
                   unsigned flags, uint64_t timestamp_seconds);
     int remove_xattr(uint32_t number, const char *name, uint64_t timestamp_seconds);
@@ -196,6 +225,9 @@ private:
     int validate_indirect_node(const Volume &after, uint64_t block, unsigned depth, uint64_t &blocks);
     int claim_mapping_block(const Volume &after, uint64_t block);
     bool protected_block(uint64_t block) const;
+    int tx_create(uint32_t parent, const char *name, uint16_t mode, uint32_t uid, uint32_t gid,
+                  uint64_t seconds, uint32_t &number, uint8_t *&raw);
+    int tx_set_attributes(uint32_t number, const AttributeUpdate &update, uint64_t seconds);
     int tx_begin();
     void tx_cancel();
     int tx_edit(uint64_t block, uint8_t *&data, bool zero = false);

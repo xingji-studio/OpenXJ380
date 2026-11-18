@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <stdint.h>
+#include "performance.h"
 
 // First-party, bounded JBD2 redo writer. The format facts are documented at
 // https://www.kernel.org/doc/html/latest/filesystems/ext4/journal.html
@@ -75,6 +76,8 @@ struct JournalDevice
     // may opt into 64 images with caller-owned workspace. Recovery always
     // accepts complete supported on-disk transactions, independent of this cap.
     uint32_t maximum_updates;
+    // Zero-initialize the aggregate; sessions also live in calloc-owned storage.
+    Performance *performance;
 };
 
 struct BlockUpdate
