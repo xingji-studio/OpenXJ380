@@ -1254,6 +1254,19 @@ static int xj380_provider_get_netinfo(socket_netinfo_t *out_info)
             out_info->ip_ready = 1;
         }
     }
+
+    LOCK_TCPIP_CORE();
+    for (u8_t i = 0; i < LWIP_ND6_NUM_ROUTERS; ++i)
+    {
+        const auto &router = default_router_list[i];
+        if (router.neighbor_entry != NULL && router.neighbor_entry->netif == &g_netif &&
+            router.invalidation_timer != 0)
+        {
+            xj380_copy_ip6_to_bytes(&router.neighbor_entry->next_hop_address, out_info->ipv6_gateway);
+            break;
+        }
+    }
+    UNLOCK_TCPIP_CORE();
 #endif
 
     uint32_t dns_addr = 0;

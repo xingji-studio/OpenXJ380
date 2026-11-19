@@ -82,6 +82,17 @@ struct sockaddr_nl {
     uint32_t    nl_groups;
 };
 
+// Linux x86_64 ifreq layout for interface name/index queries. The remaining
+// union members are opaque here; their size and alignment are part of UAPI.
+typedef struct socket_ifreq {
+    char name[16];
+    union {
+        int32_t  index;
+        uint64_t alignment;
+        uint8_t  bytes[24];
+    } value;
+} socket_ifreq_t;
+
 struct sockaddr_in {
     sa_family_t     sin_family;
     in_port_t       sin_port;
@@ -116,6 +127,8 @@ typedef struct socket_netinfo {
     uint8_t  ipv6_linklocal_ready;
     uint8_t  ipv6_global_ready;
     uint8_t  reserved2[2];
+    uint8_t  reserved3[2]; // Keep appended data beyond the original structure size.
+    uint8_t  ipv6_gateway[16]; // An all-zero address means no active default router.
 } socket_netinfo_t;
 
 typedef struct socket_ipv4_config {

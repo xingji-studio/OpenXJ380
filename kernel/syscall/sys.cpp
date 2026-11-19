@@ -424,6 +424,9 @@ static size_t ioctl_arg_size(int request)
 {
     switch (request)
     {
+    case SIOCGIFNAME:
+    case SIOCGIFINDEX:
+        return sizeof(socket_ifreq_t);
     case TCGETS:
     case TCSETS:
     case TCSETSW:
@@ -463,6 +466,8 @@ static bool ioctl_writes_user(int request)
 {
     switch (request)
     {
+    case SIOCGIFNAME:
+    case SIOCGIFINDEX:
     case TCGETS:
     case FIONREAD:
     case TIOCGWINSZ:
@@ -487,6 +492,8 @@ static bool ioctl_reads_user(int request)
 {
     switch (request)
     {
+    case SIOCGIFNAME:
+    case SIOCGIFINDEX:
     case TCSETS:
     case TCSETSW:
     case TCSETSF:
@@ -3437,7 +3444,8 @@ sys_(clock_gettime, uint64_t arg0, struct timespec *ts)
             return SYSCALL_FAULT_(EFAULT);
         return 0;
     }
-    case 0: {
+    case 0:
+    case 5: {
         uint64_t now_ns = realtime_ns();
         kts.tv_sec  = now_ns / 1000000000ULL;
         kts.tv_nsec = now_ns % 1000000000ULL;

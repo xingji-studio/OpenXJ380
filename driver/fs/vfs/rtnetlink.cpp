@@ -10,6 +10,9 @@ namespace {
 constexpr uint16_t NL_REQUEST = 1, NL_MULTI = 2, NL_DUMP = 0x300;
 constexpr uint16_t NL_ERROR = 2, NL_DONE = 3;
 constexpr uint16_t RT_NEWLINK = 16, RT_GETLINK = 18, RT_NEWADDR = 20, RT_GETADDR = 22;
+constexpr uint16_t RT_NEWROUTE = 24, RT_GETROUTE = 26;
+constexpr uint16_t ROUTE_ATTR_OIF = 4, ROUTE_ATTR_GATEWAY = 5, ROUTE_ATTR_PRIORITY = 6, ROUTE_ATTR_PREFSRC = 7;
+constexpr uint8_t  ROUTE_TABLE_MAIN = 254, ROUTE_SCOPE_UNIVERSE = 0, ROUTE_TYPE_UNICAST = 1;
 constexpr uint64_t LINUX_PEEK = 2, LINUX_DONTWAIT = 0x40;
 constexpr size_t   RESPONSE_BYTES = 2048, QUEUE_LIMIT = 8;
 
@@ -31,17 +34,24 @@ struct Address
     uint8_t  family, prefix, flags, scope;
     uint32_t index;
 };
+struct Route
+{
+    uint8_t  family, destination_prefix, source_prefix, tos;
+    uint8_t  table, protocol, scope, type;
+    uint32_t flags;
+};
 struct Attribute
 {
     uint16_t length, type;
 };
-static_assert(sizeof(Header) == 16 && sizeof(Link) == 16 && sizeof(Address) == 8);
+static_assert(sizeof(Header) == 16 && sizeof(Link) == 16 && sizeof(Address) == 8 && sizeof(Route) == 12);
 static_assert(sizeof(sockaddr_nl) == 12);
 
 struct Response
 {
     Response *next;
     size_t    length;
+    size_t    offset, completion;
     uint8_t   bytes[RESPONSE_BYTES];
 };
 struct RouteSocket
@@ -131,6 +141,27 @@ void address(Builder &out, const Header &request, uint32_t port, uint32_t index,
     if (broadcast) out.attribute(4, broadcast, length);
     out.attribute(3, name, strlen(name) + 1);
     out.finish();
+}
+
+void default_route(Builder &out, const Header &request, uint32_t port, uint8_t family, uint32_t index,
+                   const void *gateway, size_t gateway_size, const void *preferred_source = NULL)
+{
+    out.start(RT_NEWROUTE, request, port);
+    Route value = {family, 0, 0, 0, ROUTE_TABLE_MAIN, 0, ROUTE_SCOPE_UNIVERSE, ROUTE_TYPE_UNICAST, 0};
+    out.append(&value, sizeof(value));
+    uint32_t metric = 0;
+    out.attribute(ROUTE_ATTR_OIF, &index, sizeof(index));
+    out.attribute(ROUTE_ATTR_GATEWAY, gateway, gateway_size);
+    if (preferred_source) out.attribute(ROUTE_ATTR_PREFSRC, preferred_source, sizeof(uint32_t));
+    out.attribute(ROUTE_ATTR_PRIORITY, &metric, sizeof(metric));
+    out.finish();
+}
+
+bool nonzero(const uint8_t *bytes, size_t size)
+{
+    for (size_t i = 0; i < size; ++i)
+        if (bytes[i]) return true;
+    return false;
 }
 
 int create(int domain, int type, int protocol, void **result)
@@ -259,6 +290,22 @@ ssize_t sendto(void *implementation, const void *buffer, size_t size, uint64_t f
             if (info.ipv6_global_ready) address(out, request, port, 2, info.ifname, AF_INET6, 64, 0, info.ipv6_global);
         }
     }
+    else if (request.type == RT_GETROUTE)
+    {
+        if (request.length < sizeof(Header) + sizeof(Route))
+            error = -EINVAL;
+        else if (family != AF_UNSPEC && family != AF_INET && family != AF_INET6)
+            error = -EAFNOSUPPORT;
+        else
+        {
+            if (ethernet && info.ipv4_addr && info.ipv4_gateway && (family == AF_UNSPEC || family == AF_INET))
+                default_route(out, request, port, AF_INET, 2, &info.ipv4_gateway, sizeof(info.ipv4_gateway),
+                              &info.ipv4_addr);
+            if (ethernet && nonzero(info.ipv6_gateway, sizeof(info.ipv6_gateway)) &&
+                (family == AF_UNSPEC || family == AF_INET6))
+                default_route(out, request, port, AF_INET6, 2, info.ipv6_gateway, sizeof(info.ipv6_gateway));
+        }
+    }
     else
         error = -EOPNOTSUPP;
     if (error)
@@ -271,6 +318,11 @@ ssize_t sendto(void *implementation, const void *buffer, size_t size, uint64_t f
     }
     else
     {
+        // Keep route records and NLMSG_DONE in distinct datagrams. Some Linux
+        // clients stop scanning a packet once they find a zero-metric route
+        // and receive again for completion. Retain both parts in one queued
+        // request so queue pressure cannot publish a dump without its end.
+        if (request.type == RT_GETROUTE) response->completion = response->length;
         out.start(NL_DONE, request, port);
         int success = 0;
         out.append(&success, sizeof(success));
@@ -316,24 +368,30 @@ ssize_t recvfrom(void *implementation, void *buffer, size_t size, uint64_t flags
             scheduler_yield();
             continue;
         }
-        // Reject a short buffer without silently losing a partial dump. The
+        size_t packet_end = response->completion && !response->offset ? response->completion : response->length;
+        size_t received   = packet_end - response->offset;
+        // Reject a short buffer without silently losing a partial datagram. The
         // legacy provider ABI cannot return recvmsg's MSG_TRUNC output flag.
-        if (size < response->length)
+        if (size < received)
         {
             spin_unlock(&socket->lock);
             return -EMSGSIZE;
         }
-        size_t received = response->length;
-        memcpy(buffer, response->bytes, received);
-        bool consume = !(flags & LINUX_PEEK);
-        if (consume)
+        memcpy(buffer, response->bytes + response->offset, received);
+        bool retire = false;
+        if (!(flags & LINUX_PEEK))
         {
-            socket->head = response->next;
-            if (!socket->head) socket->tail = NULL;
-            --socket->queued;
+            response->offset = packet_end;
+            if (response->offset == response->length)
+            {
+                socket->head = response->next;
+                if (!socket->head) socket->tail = NULL;
+                --socket->queued;
+                retire = true;
+            }
         }
         spin_unlock(&socket->lock);
-        if (consume) free(response);
+        if (retire) free(response);
         if (source)
         {
             sockaddr_nl value = {AF_NETLINK, 0, 0, 0};

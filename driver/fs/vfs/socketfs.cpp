@@ -6,6 +6,7 @@
 #include <errno.h>
 #include <fs/vfs/vfs.h>
 #include <krlibc.h>
+#include <ioctl.h>
 #include <net/socket.h>
 #include <net/rtnetlink.h>
 #include <syscall/syscall.h>
@@ -167,10 +168,34 @@ static size_t socketfs_write_cb(void *file, const void *addr, size_t offset, siz
 
 static errno_t socketfs_ioctl(void *file, size_t req, void *arg)
 {
-    (void)file;
-    (void)req;
-    (void)arg;
-    return -ENOTTY;
+    if (req != SIOCGIFNAME && req != SIOCGIFINDEX) return -ENOTTY;
+    if (!file) return -EBADF;
+    if (!arg) return -EFAULT;
+    auto *value = static_cast<socket_ifreq_t *>(arg);
+    // Use the same indices as NETLINK_ROUTE's link/address/route dumps. These
+    // requests receive a kernel buffer copied by sys_ioctl, never a user pointer.
+    const char *name     = "lo";
+    int32_t     index    = 1;
+    bool        loopback = req == SIOCGIFNAME ? value->value.index == 1 :
+                                              strncmp(value->name, "lo", sizeof(value->name)) == 0;
+    socket_netinfo_t info = {};
+    if (!loopback)
+    {
+        if (socket_get_netinfo(&info) < 0 || !info.stack_ready || !info.ifname[0]) return -ENODEV;
+        info.ifname[sizeof(info.ifname) - 1] = '\0';
+        if (req == SIOCGIFNAME ? value->value.index != 2 : strncmp(value->name, info.ifname, sizeof(value->name)) != 0)
+            return -ENODEV;
+        name = info.ifname;
+        index = 2;
+    }
+    if (req == SIOCGIFNAME)
+    {
+        memset(value->name, 0, sizeof(value->name));
+        memcpy(value->name, name, strlen(name));
+    }
+    else
+        value->value.index = index;
+    return 0;
 }
 
 static errno_t socketfs_poll_cb(void *file, size_t events)
