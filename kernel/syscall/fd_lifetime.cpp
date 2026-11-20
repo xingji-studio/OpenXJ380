@@ -268,6 +268,12 @@ int fd_set_status_flags(FdOperationRecord *record, uint64_t mask, uint64_t flags
 int fd_position_begin(FdOperationRecord *first, FdOperationRecord *second, bool update_first, bool update_second)
 {
     if (!first || (second && second == first)) return -EINVAL;
+    // A process exit can mark a thread DEATH while it is still unwinding a
+    // blocking file syscall.  Do not let that thread remain in this wait
+    // loop forever: the boundary/operation scope will finish the termination
+    // path after the position and descriptor pins are released.
+    tcb_t waiter = get_current_task();
+    if (!waiter) return -ESRCH;
     FdOperationRecord *records[] = {first, second};
     bool updates[] = {update_first, update_second};
     unsigned count = second ? 2 : 1;
@@ -280,7 +286,10 @@ int fd_position_begin(FdOperationRecord *first, FdOperationRecord *second, bool 
     {
         spin_lock(&registry_lock);
         bool busy = false;
-        int error = (first->positions || (second && second->positions)) ? -EBUSY : 0;
+        TaskStatus waiter_status = __atomic_load_n(&waiter->status, __ATOMIC_ACQUIRE);
+        bool waiter_exiting = waiter_status == DEATH || waiter_status == OUT ||
+                              __atomic_load_n(&waiter->kernel_exit_pending, __ATOMIC_ACQUIRE);
+        int error = waiter_exiting ? -EINTR : ((first->positions || (second && second->positions)) ? -EBUSY : 0);
         for (unsigned index = 0; index < count && !error; ++index)
         {
             fd_file_handle *handle = records[index]->handle;

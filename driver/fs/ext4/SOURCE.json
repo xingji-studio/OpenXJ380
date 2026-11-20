@@ -77,17 +77,17 @@
     },
     {
       "path": "native.cpp",
-      "sha256": "00597b148a6587757485c94495e3206e845d7a1513f47f510cb64e0d54a633a8",
+      "sha256": "c46a4cf1bc4a1469677af947d1e625ae21c36abe04ec3ab15546e3847a82e19d",
       "spdx": "Apache-2.0"
     },
     {
       "path": "native.h",
-      "sha256": "9726804ea02e1aa8ac5fa03f65b09348283fdfe9cb543d2311abaa00e4cf93c7",
+      "sha256": "cfcb54f5faec61144699f7e543f520415d6ef99bdcca338df74e99fc15061b6c",
       "spdx": "Apache-2.0"
     },
     {
       "path": "orphan.cpp",
-      "sha256": "f33fcb63b81656a5b653bdaa2e4711036535b8ae34e9b73632386955ae6f8edd",
+      "sha256": "ebe86064aa7f005167bbf515fcb48ac48265aabd6b859346545ac70cb7bef807",
       "spdx": "Apache-2.0"
     },
     {

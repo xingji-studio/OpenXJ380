@@ -120,7 +120,10 @@ int WriteSession::validate_orphans_afterstate(const Volume &after)
         error = after.read_raw_inode(current, raw);
         if (error) return error;
         Inode inode;
-        error = after.read_inode(current, inode);
+        // Reaching this inode from the head already proves membership. Keep
+        // the ordinary inode checks without searching the chain again for
+        // every member: Maven can hold hundreds of deleted lock files open.
+        error = after.read_inode_internal(current, inode, true);
         if (error) return error;
         if (!supported(inode)) return -EOPNOTSUPP;
         current = get32(raw + 0x14);

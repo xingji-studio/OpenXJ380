@@ -8,9 +8,10 @@
 
 extern bool no_interrupt;
 
-// Limit the IRQ scope to existing filesystem, descriptor, futex and blocking
-// child-wait entry points. Image creation, memory mapping, device ioctl and unrelated syscalls
-// retain their own entry contracts. Native file APIs use the same boundary.
+// Limit the IRQ scope to existing filesystem, descriptor, socket creation,
+// futex and blocking child-wait entry points. Image creation, memory mapping,
+// device ioctl and unrelated syscalls retain their own entry contracts.
+// Native file APIs use the same boundary.
 static inline bool syscall_file_io_may_block(uint64_t number)
 {
     switch (number)
@@ -95,6 +96,9 @@ static inline bool syscall_file_io_may_block(uint64_t number)
     case SYS_PSELECT6:
     case SYS_FUTEX:
     case SYS_WAIT4:
+    // Provider startup may wait for network readiness. Keep timer delivery
+    // live during that wait, including when no network device is present.
+    case SYS_SOCKET:
     case SYS_SOCKETPAIR:
     case SYS_SENDMSG:
     case SYS_SENDMMSG:

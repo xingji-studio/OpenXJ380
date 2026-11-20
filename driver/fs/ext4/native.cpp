@@ -275,6 +275,11 @@ int Volume::orphan_member(uint32_t number, bool &member) const
 
 int Volume::read_inode(uint32_t number, Inode &inode) const
 {
+    return read_inode_internal(number, inode, false);
+}
+
+int Volume::read_inode_internal(uint32_t number, Inode &inode, bool orphan_member_known) const
+{
     uint8_t raw[4096];
     int result = read_raw_inode(number, raw);
     if (result) return result;
@@ -298,7 +303,7 @@ int Volume::read_inode(uint32_t number, Inode &inode) const
     inode.mode = little16(raw);
     inode.links = little16(raw + 0x1a);
     inode.flags = little32(raw + 0x20);
-    if (!inode.links || little32(raw + 0x14))
+    if ((!inode.links || little32(raw + 0x14)) && !orphan_member_known)
     {
         // The traditional orphan list temporarily uses i_dtime as its next
         // pointer while a linked file is being truncated. Public read-only

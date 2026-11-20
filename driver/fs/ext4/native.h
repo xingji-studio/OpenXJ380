@@ -94,6 +94,7 @@ private:
 
     int fetch(uint64_t offset, void *output, Size length) const;
     int read_raw_inode(uint32_t number, uint8_t *raw, uint64_t *location = nullptr) const;
+    int read_inode_internal(uint32_t number, Inode &inode, bool orphan_member_known) const;
     int orphan_member(uint32_t number, bool &member) const;
     int map_block(const Inode &inode, uint32_t logical, uint64_t &physical, bool &unwritten,
                   BlockVisitor metadata = nullptr, void *context = nullptr) const;

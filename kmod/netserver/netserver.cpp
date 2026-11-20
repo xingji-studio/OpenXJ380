@@ -594,6 +594,25 @@ static ssize_t xj380_socket_sendto_impl(xj380_lwip_socket_t *socket,
     return (ssize_t)size;
 }
 
+static bool xj380_wait_network_ready()
+{
+    // Provider calls run in task context. Sleep outside the TCP/IP lock so
+    // DHCP and ordinary tasks can progress on a single CPU. A retry count
+    // would multiply scheduling delays; bound the whole wait by elapsed time.
+    const uint64_t timeout = 10000000000ULL;
+    uint64_t start = nanoTime();
+    while (!native_network_ready())
+    {
+        xj380_update_net_state();
+        if (native_network_ready()) return true;
+        uint64_t elapsed = nanoTime() - start;
+        if (elapsed >= timeout) return false;
+        uint64_t remaining = timeout - elapsed;
+        scheduler_sleep_ns(remaining < 10000000ULL ? remaining : 10000000ULL);
+    }
+    return true;
+}
+
 static int xj380_provider_create(int domain, int type, int protocol, void **out_socket)
 {
     if (netserver_trace_allowed())
@@ -603,15 +622,7 @@ static int xj380_provider_create(int domain, int type, int protocol, void **out_
     if (out_socket == NULL) {
         return -EINVAL;
     }
-    if (!native_network_ready())
-    {
-        for (int retry = 0; retry < 1000 && !native_network_ready(); ++retry)
-        {
-            xj380_update_net_state();
-            delay_ms_hp(10);
-        }
-        if (!native_network_ready()) { return -ENETDOWN; }
-    }
+    if (!xj380_wait_network_ready()) return -ENETDOWN;
     if (type != SOCK_STREAM && type != SOCK_DGRAM) {
         return -EAFNOSUPPORT;
     }
