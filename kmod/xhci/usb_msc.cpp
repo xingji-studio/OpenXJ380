@@ -1,4 +1,5 @@
 #include "xhci.h"
+#include <ioctl.h>
 #ifdef XHCI_BUILTIN
 #    include <block_source.h>
 #    include <efi/boot.h>
@@ -277,6 +278,32 @@ static size_t usb_msc_device_write(int drive, uint8_t *buffer, size_t number,
     return usb_msc_device_rw(drive, buffer, number, lba, true);
 }
 
+static int usb_msc_device_ioctl(device_t *device, size_t request, void *argument)
+{
+    (void)argument;
+    if (request != IOBLKSYNC) return -EOPNOTSUPP;
+    if (!device || device->vdiskid >= 256) return -ENODEV;
+
+    xhci_msc_state *msc;
+    {
+        UsbMscRegistryLock lock;
+        msc = g_usb_msc_by_drive[device->vdiskid];
+        if (!msc || !msc->ready || msc->disconnected || !msc->slot || !msc->controller) return -ENODEV;
+        if (msc->hardware_read_only || msc->boot_source_read_only) return -EROFS;
+        __atomic_add_fetch(&msc->io_users, 1U, __ATOMIC_ACQ_REL);
+    }
+
+    // Serialize the flush after earlier READ/WRITE commands and pin the slot
+    // through disconnect. No registry spin lock is held during USB transfers.
+    while (__sync_lock_test_and_set(&msc->io_lock, 1U) != 0U)
+        __asm__ volatile("pause" ::: "memory");
+    int result = __atomic_load_n(&msc->disconnected, __ATOMIC_ACQUIRE) ? -ENODEV :
+                 xhci_msc_scsi_sync_cache(msc->controller, msc->slot);
+    __sync_lock_release(&msc->io_lock);
+    __atomic_sub_fetch(&msc->io_users, 1U, __ATOMIC_RELEASE);
+    return result;
+}
+
 static void usb_msc_fill_block_device(device_t *dev,
                                       const xhci_msc_state *msc) {
     memset(dev, 0, sizeof(*dev));
@@ -286,7 +313,7 @@ static void usb_msc_fill_block_device(device_t *dev,
     dev->read = usb_msc_device_read;
     dev->write       = (msc->hardware_read_only || msc->boot_source_read_only) ? NULL : usb_msc_device_write;
     dev->flag = 1;
-    dev->ioctl = (ioctlf)empty;
+    dev->ioctl = usb_msc_device_ioctl;
     dev->poll = (pollf)empty;
     dev->map = (mapf)empty;
     dev->max_size = (0x1FFFFU / msc->block_size) * (uint64_t)msc->block_size;
@@ -316,7 +343,9 @@ static int usb_msc_register_disk(usb_device *usbdev, xhci_msc_state *msc,
     device_t dev;
     usb_msc_fill_block_device(&dev, msc);
 
-    int device_id = regist_device(NULL, dev);
+    // Durability is backed by SYNCHRONIZE CACHE, not the old no-op ioctl.
+    // Read-only installation sources retain their ordinary registration.
+    int device_id = dev.write ? regist_durable_block_device(NULL, dev) : regist_device(NULL, dev);
     if (device_id < 0 || device_id >= 256) {
         printk("usb: msc probe failed topology=%s stage=regist-device rc=%d\n",
                usbdev->topology, device_id);

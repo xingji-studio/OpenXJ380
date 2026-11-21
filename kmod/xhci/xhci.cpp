@@ -2100,6 +2100,14 @@ int xhci_msc_scsi_rw(xhci_controller *xhci, xhci_slot_state *slot,
                                 NULL);
 }
 
+int xhci_msc_scsi_sync_cache(xhci_controller *xhci, xhci_slot_state *slot)
+{
+    // IMMED=0: wait for media completion. LBA=0 and block count=0 flush the
+    // complete logical unit; no data phase or host-side success substitute.
+    uint8_t cdb[10] = {SCSI_SYNCHRONIZE_CACHE_10};
+    return xhci_msc_bot_command(xhci, slot, cdb, sizeof(cdb), NULL, 0, false, false, NULL);
+}
+
 int xhci_msc_scsi_mode_sense6(xhci_controller *xhci, xhci_slot_state *slot, void *data)
 {
     // The four-byte mode parameter header contains the device's WP bit.

@@ -287,13 +287,48 @@ static uint32_t partition_crc32(const void *data, size_t bytes, bool header)
     return value ^ 0xffffffffU;
 }
 
-static bool partition_gpt_is_strict(const GPT_DPT *header, const uint8_t *entries, size_t bytes,
+static bool partition_gpt_image_backup_matches(vfs_node_t device, const GPT_DPT *header, const uint8_t *entries,
+                                               size_t bytes, const device_t &disk)
+{
+    // Raw removable images may be written to larger devices. Admit their
+    // original bounded GPT extent only when both metadata copies agree. Do
+    // not relocate headers, grow partitions or write to the boot device.
+    if (disk.sector_size > 4096 || bytes > 65536) return false;
+    auto *copy = static_cast<uint8_t *>(malloc(disk.sector_size + bytes));
+    if (!copy) return false;
+    auto *backup = reinterpret_cast<GPT_DPT *>(copy);
+    const uint64_t table_sectors = (bytes + disk.sector_size - 1) / disk.sector_size;
+    bool valid = partition_read_exact(device, disk, copy, header->alternate_lba * disk.sector_size,
+                                      disk.sector_size, "image GPT backup");
+    if (valid)
+        valid = !memcmp(backup->signature, "EFI PART", 8) && backup->revision == header->revision &&
+                backup->header_size == header->header_size && !backup->reserved &&
+                backup->my_lba == header->alternate_lba && backup->alternate_lba == 1 &&
+                backup->first_usable_lba == header->first_usable_lba &&
+                backup->last_usable_lba == header->last_usable_lba &&
+                !memcmp(backup->disk_guid, header->disk_guid, 16) &&
+                backup->num_partition_entries == header->num_partition_entries &&
+                backup->size_of_partition_entry == header->size_of_partition_entry &&
+                backup->partition_entry_array_crc32 == header->partition_entry_array_crc32 &&
+                backup->my_lba > table_sectors &&
+                backup->partition_entry_lba == backup->my_lba - table_sectors &&
+                backup->partition_entry_lba > header->last_usable_lba &&
+                partition_crc32(backup, backup->header_size, true) == backup->header_crc32;
+    if (valid)
+        valid = partition_read_exact(device, disk, copy + disk.sector_size,
+                                      backup->partition_entry_lba * disk.sector_size, bytes, "image GPT entries") &&
+                !memcmp(copy + disk.sector_size, entries, bytes);
+    free(copy);
+    return valid;
+}
+
+static bool partition_gpt_is_strict(vfs_node_t device, const GPT_DPT *header, const uint8_t *entries, size_t bytes,
                                     const device_t &disk)
 {
     uint64_t sectors = disk.size / disk.sector_size;
     if (header->revision != 0x00010000U || header->header_size < sizeof(GPT_DPT) ||
         header->header_size > disk.sector_size || header->reserved || header->my_lba != 1 ||
-        !sectors || header->alternate_lba != sectors - 1 || header->alternate_lba <= header->last_usable_lba ||
+        !sectors || header->alternate_lba >= sectors || header->alternate_lba <= header->last_usable_lba ||
         !partition_guid_present(header->disk_guid) || header->partition_entry_lba < 2 ||
         header->size_of_partition_entry % 128 ||
         partition_crc32(header, header->header_size, true) != header->header_crc32 ||
@@ -302,6 +337,9 @@ static bool partition_gpt_is_strict(const GPT_DPT *header, const uint8_t *entrie
     uint64_t table_sectors = (bytes + disk.sector_size - 1) / disk.sector_size;
     if (header->partition_entry_lba > header->first_usable_lba ||
         table_sectors > header->first_usable_lba - header->partition_entry_lba)
+        return false;
+    if (header->alternate_lba != sectors - 1 &&
+        !partition_gpt_image_backup_matches(device, header, entries, bytes, disk))
         return false;
     size_t occupied = 0;
     for (uint32_t i = 0; i < header->num_partition_entries; ++i)
@@ -370,7 +408,7 @@ static bool parse_gpt_partitions(vfs_node_t device, struct GPT_DPT *gpt, device_
 
     // Legacy enumeration retains its tolerant behavior. A bound root requires
     // strict primary GPT checks and a complete, non-overlapping inventory.
-    identity.complete = partition_gpt_is_strict(gpt, reinterpret_cast<const uint8_t *>(dptes), dptes_size, disk);
+    identity.complete = partition_gpt_is_strict(device, gpt, reinterpret_cast<const uint8_t *>(dptes), dptes_size, disk);
     if (!identity.complete) partition_inventory_complete = false;
 
     for (size_t j = 0; j < gpt->num_partition_entries; j++)
