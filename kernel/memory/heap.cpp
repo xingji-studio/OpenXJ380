@@ -39,6 +39,17 @@ static void allocator_irq_restore(uint64_t flags)
                      : "memory");
 }
 
+static bool extend_heap_for_allocation(size_t size)
+{
+    // A new allocator arena needs its own metadata as well as the payload.
+    // An exact payload-sized extension cannot satisfy a large allocation.
+    // One page covers the arena/allocation headers; aligned callers also
+    // include their requested alignment below. Keep the existing heap cap.
+    const size_t metadata_padding = ALIGNED_BASE;
+    if (size > ((size_t)-1) - metadata_padding) return false;
+    return kernel_heap_extend(size + metadata_padding);
+}
+
 static void *retry_heap_alloc(void *(*alloc_fn)(size_t), size_t size)
 {
     uint64_t flags = allocator_irq_save();
@@ -49,7 +60,7 @@ static void *retry_heap_alloc(void *(*alloc_fn)(size_t), size_t size)
         return ptr;
     }
 
-    if (!kernel_heap_extend(size))
+    if (!extend_heap_for_allocation(size))
     {
         allocator_irq_restore(flags);
         return NULL;
@@ -84,7 +95,7 @@ extern "C" void *__wrap_realloc(void *ptr, size_t size)
         return new_ptr;
     }
 
-    if (!kernel_heap_extend(size))
+    if (!extend_heap_for_allocation(size))
     {
         allocator_irq_restore(flags);
         return NULL;
@@ -106,7 +117,7 @@ extern "C" void *__wrap_aligned_alloc(size_t alignment, size_t size)
 
     size_t extend_size = size + alignment;
     if (extend_size < size) extend_size = size;
-    if (!kernel_heap_extend(extend_size))
+    if (!extend_heap_for_allocation(extend_size))
     {
         allocator_irq_restore(flags);
         return NULL;

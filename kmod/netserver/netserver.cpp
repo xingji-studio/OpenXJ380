@@ -891,6 +891,16 @@ static int xj380_provider_getsockopt(void *socket_ptr, int level, int optname, v
     switch (level) {
     case SOL_SOCKET:
         switch (optname) {
+        case SO_SNDBUF:
+            if (NETCONNTYPE_GROUP(netconn_type(socket->conn)) != NETCONN_TCP) return -ENOPROTOOPT;
+            // This netconn backend has a fixed TCP send capacity. Report that
+            // capacity, rather than the currently unused bytes in the PCB.
+            value = TCP_SND_BUF;
+            break;
+        case SO_RCVBUF:
+            if (NETCONNTYPE_GROUP(netconn_type(socket->conn)) != NETCONN_TCP) return -ENOPROTOOPT;
+            value = TCP_WND;
+            break;
         case SO_TYPE:
             switch (NETCONNTYPE_GROUP(netconn_type(socket->conn))) {
             case NETCONN_TCP: value = SOCK_STREAM; break;

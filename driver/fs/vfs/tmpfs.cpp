@@ -302,6 +302,14 @@ static int tmpfs_dummy()
     return -ENOSYS;
 }
 
+static void *tmpfs_map(void *, void *, size_t, size_t, size_t, size_t)
+{
+    // mmap callbacks return pointer-sized errors. Casting the int dummy to
+    // this callback type zero-extends -ENOSYS into a successful user address,
+    // corrupting the dynamic loader's mapping and subsequent cleanup range.
+    return reinterpret_cast<void *>(int64_t(-ENOSYS));
+}
+
 static void tmpfs_close(void *current)
 {
     (void)current;
@@ -335,7 +343,7 @@ static struct vfs_callback tmpfs_callbacks = {
     .ioctl    = (vfs_ioctl_t)tmpfs_dummy,
     .dup      = tmpfs_dup,
     .poll     = tmpfs_poll,
-    .map      = (vfs_mapfile_t)tmpfs_dummy,
+    .map      = tmpfs_map,
     .resize   = tmpfs_resize,
     .del      = tmpfs_delete,
     .rename   = tmpfs_rename,
