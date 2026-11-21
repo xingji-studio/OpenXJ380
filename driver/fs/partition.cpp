@@ -6,6 +6,7 @@
 #include "krlibc.h"
 #include <efi/boot.h>
 #include <fs/ext4/ext4.h>
+#include <fs/iso9660/iso9660.h>
 #include <installer/fat32.h>
 #include <ioctl.h>
 #include <dlinker.h>
@@ -648,6 +649,7 @@ extern "C" void partition_device_added(size_t vdisk_id)
     // source retention or consume a target's exclusive installation lease.
     bool auto_mount = !EFI_BC || !(EFI_BC->boot_flags & BOOT_FLAG_INSTALLER);
     partition_scan_single_device(vdisk_id, auto_mount);
+    if (auto_mount) iso9660fs_try_automount(vdisk_id);
 }
 EXPORT_SYMBOL(partition_device_added);
 

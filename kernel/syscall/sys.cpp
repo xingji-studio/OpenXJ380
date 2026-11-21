@@ -7,6 +7,7 @@
 #include <fs/vfs/vfs.h>
 #include <fs/fatfs/fatfs.h>
 #include <fs/ext4/ext4.h>
+#include <fs/iso9660/iso9660.h>
 #include <ioctl.h>
 #include <cpu/fsgsbase.h>
 #include <task/poll.h>
@@ -306,6 +307,12 @@ static uint64_t statfs_kernel_node(vfs_node_t node, struct statfs *buf)
     if (ext4fs_owns_node(node))
     {
         int error = ext4fs_statfs(node, &kbuf);
+        if (error < 0) return SYSCALL_FAULT_(-error);
+    }
+
+    if (iso9660fs_owns_node(node))
+    {
+        int error = iso9660fs_statfs(node, &kbuf);
         if (error < 0) return SYSCALL_FAULT_(-error);
     }
 

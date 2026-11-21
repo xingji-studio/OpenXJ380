@@ -1,0 +1,27 @@
+{
+  "format_references": [
+    {
+      "publisher": "Ecma International",
+      "url": "https://ecma-international.org/publications-and-standards/standards/ecma-119/",
+      "scope": "ISO 9660 volume descriptors, directory records, both-endian integers and file sections"
+    },
+    {
+      "publisher": "Ecma International",
+      "url": "https://ecma-international.org/wp-content/uploads/ECMA-119_5th_edition_december_2024.pdf",
+      "scope": "ISO 9660 format facts and Annex B.2 Joliet UCS-2 descriptor escape sequences"
+    }
+  ],
+  "imported_implementations": [],
+  "license_screening": [
+    {
+      "project": "FreeBSD cd9660",
+      "url": "https://github.com/freebsd/freebsd-src/tree/main/sys/fs/cd9660",
+      "decision": "Headers and integration interfaces inspected during planning; no implementation imported or translated"
+    },
+    {
+      "project": "GNU libcdio",
+      "url": "https://github.com/libcdio/libcdio-C/blob/main/COPYING",
+      "decision": "Excluded from linked inputs under the project's licensing policy"
+    }
+  ]
+}

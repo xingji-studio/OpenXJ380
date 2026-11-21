@@ -250,6 +250,12 @@ def copy_common_assets(root: Path) -> None:
     cp(ROOT / "driver/ide/PROVENANCE.md", ide_notices)
     cp(ROOT / "driver/ide/SOURCE.json", ide_notices)
     ntfs_notices = root / "system/licenses/native-ntfs"
+    iso_notices = root / "system/licenses/native-iso9660"
+    mkdir(iso_notices)
+    cp(ROOT / "LICENSE", iso_notices / "LICENSE")
+    for name in ("PROVENANCE.md", "SOURCE.json", "REFERENCES.json"):
+        cp(ROOT / "driver/fs/iso9660" / name, iso_notices)
+    cp(ROOT / "docs/ISO9660.md", root / "system/docs/ISO9660.md")
     mkdir(ntfs_notices)
     for name in ("PROVENANCE.md", "SOURCE.json", "REFERENCES.json", "UINXED_LICENSE.txt", "UINXED_NOTICE.txt",
                  "DISCUTILS_LICENSE.txt", "DISCUTILS_NOTICE.txt"):

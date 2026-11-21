@@ -460,6 +460,8 @@ def main() -> None:
                    check=True, stdout=subprocess.DEVNULL)
     subprocess.run([sys.executable, str(ROOT / "tools/check_ntfs_sources.py"), "--root", str(ROOT)],
                    check=True, stdout=subprocess.DEVNULL)
+    subprocess.run([sys.executable, str(ROOT / "tools/check_iso9660_sources.py"), "--root", str(ROOT)],
+                   check=True, stdout=subprocess.DEVNULL)
 
     # Environment knobs keep the same defaults as the historical build.
     builtin_xhci = os.environ.get("BUILTIN_XHCI", "1") == "1"
