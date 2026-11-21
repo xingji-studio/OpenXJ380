@@ -94,6 +94,9 @@ void initialize(const FrameBufferConfig &fbc);
 void begin(const FrameBufferConfig &fbc, Step step);
 void returned(const FrameBufferConfig &fbc, Step step);
 void skip(const FrameBufferConfig &fbc, Step first, Step last);
+// BSP-only boot root diagnostics, before the scheduler/display handoff. Uses
+// the initialized GOP directly, without the GUI, filesystem or allocations.
+void root_status(const char *phase, int error, uint64_t completed, uint64_t total);
 #else
 inline uint32_t reserved_height(const FrameBufferConfig &)
 {
@@ -107,6 +110,7 @@ inline void begin(const FrameBufferConfig &, Step) {}
 inline void returned(const FrameBufferConfig &, Step) {}
 
 inline void skip(const FrameBufferConfig &, Step, Step) {}
+inline void root_status(const char *, int, uint64_t, uint64_t) {}
 #endif
 
 inline void skip(const FrameBufferConfig &fbc, Step step)
