@@ -201,6 +201,7 @@ extern "C" {
 #define SCSI_READ_CAPACITY_10 0x25U
 #define SCSI_READ_10 0x28U
 #define SCSI_WRITE_10 0x2AU
+#define SCSI_SYNCHRONIZE_CACHE_10 0x35U
 #define SCSI_SERVICE_ACTION_IN_16 0x9EU
 #define SCSI_READ_16 0x88U
 #define SCSI_WRITE_16 0x8AU
@@ -745,6 +746,7 @@ int xhci_msc_scsi_read_capacity10(xhci_controller *xhci,
 int xhci_msc_scsi_read_capacity16(xhci_controller *xhci,
                                   xhci_slot_state *slot, void *data);
 int  xhci_msc_scsi_mode_sense6(xhci_controller *xhci, xhci_slot_state *slot, void *data);
+int xhci_msc_scsi_sync_cache(xhci_controller *xhci, xhci_slot_state *slot);
 int xhci_msc_scsi_rw(xhci_controller *xhci, xhci_slot_state *slot,
                      void *buffer, uint64_t lba, uint32_t blocks, bool write);
 
