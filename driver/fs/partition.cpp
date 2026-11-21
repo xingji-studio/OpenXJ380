@@ -10,6 +10,7 @@
 #include <ioctl.h>
 #include <dlinker.h>
 #include <block_access.h>
+#include "../../kernel/boot_debug_color.h"
 extern device_t device_ctl[256];
 partition_t     partitions[MAX_PARTITIONS_NUM];
 size_t          partition_num = 0;
@@ -904,9 +905,15 @@ static int partition_select_bound_root(const XJ_ROOT_BINDING &binding, size_t &r
 
 static int partition_mount_bound_root(const XJ_ROOT_BINDING &binding)
 {
+    boot_debug::root_status("select bound partition", 0, 0, 0);
     size_t index = 0;
     int error = partition_select_bound_root(binding, index);
-    if (error) return error;
+    if (error)
+    {
+        boot_debug::root_status(partition_inventory_complete ? "partition selection" : "GPT inventory incomplete",
+                                error, 0, 0);
+        return error;
+    }
     device_t *device = get_device(partitions[index].vdisk_id);
     if (!device || device->flag < 1 || device->type != DEVICE_BLOCK) return -ENODEV;
     char path[64];
@@ -917,6 +924,7 @@ static int partition_mount_bound_root(const XJ_ROOT_BINDING &binding)
     // legacy boots retain the root-resident kernel content comparison.
     if (xj_root_binding_filesystem(&binding) == XJ_ROOT_FILESYSTEM_FAT32)
         return fatfs_mount_bound_root(path, &binding);
+    boot_debug::root_status("mount bound ext4", 0, 0, 0);
     return EFI_BC && (EFI_BC->boot_flags & BOOT_FLAG_ESP_KERNEL_VERIFIED) ?
         ext4fs_mount_bound_root_from_esp(path, &binding) : ext4fs_mount_bound_root(path, &binding);
 }
@@ -938,6 +946,7 @@ void mount_root()
             return;
         }
         pr_warn("Bound root refused: %d (no legacy fallback)\n", error);
+        boot_debug::root_status("STOP - bound root rejected", error, 0, 0);
         root_mount_halt();
     }
     for (uint64_t i = 0; i < partition_num; i++)

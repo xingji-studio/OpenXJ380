@@ -21,6 +21,7 @@
 #include <wsod_storage.h>
 #include <fs/fatfs/diskio.h>
 #include <user/permissions.h>
+#include "../../../kernel/boot_debug_color.h"
 
 static FATFS volume[10];
 static int   fatfs_id = 0;
@@ -1200,21 +1201,39 @@ int fatfs_mount_bound_root(const char *source, const XJ_ROOT_BINDING *binding)
 {
     if (!source || !binding || !xj_root_binding_valid(binding) ||
         xj_root_binding_filesystem(binding) != XJ_ROOT_FILESYSTEM_FAT32) return -EINVAL;
+    boot_debug::root_status("FAT open device", 0, 0, 0);
     vfs_node_t device = vfs_open(source);
-    if (!device) return -ENODEV;
+    if (!device) { boot_debug::root_status("FAT open device", -ENODEV, 0, 0); return -ENODEV; }
     auto *buffer = static_cast<uint8_t *>(malloc(65536));
-    if (!buffer) { vfs_close(device); return -ENOMEM; }
+    if (!buffer) { vfs_close(device); boot_debug::root_status("FAT scratch buffer", -ENOMEM, 0, 0); return -ENOMEM; }
     int error = 0;
+    const char *phase = "FAT read boot sector";
+    uint64_t completed = 0, total = 0;
+    boot_debug::root_status(phase, 0, 0, 0);
     if (vfs_read(device, buffer, 0, 512) != 512) error = -EIO;
+    if (!error) phase = "FAT volume identity";
     if (!error && (buffer[510] != 0x55 || buffer[511] != 0xaa ||
         memcmp(buffer + 82, "FAT32   ", 8) ||
         xj_root_binding_le32(buffer + 67) != xj_root_binding_fat32_id(binding))) error = -EUCLEAN;
-    if (!error) error = vfs_mount(source, rootdir);
     if (!error)
     {
+        phase = "FAT mount filesystem";
+        boot_debug::root_status(phase, 0, 0, 0);
+        error = vfs_mount(source, rootdir);
+    }
+    if (!error)
+    {
+        phase = "FAT open kernel";
+        boot_debug::root_status(phase, 0, 0, 0);
         vfs_node_t kernel = vfs_open("/system/kernel.krl");
         if (!kernel || kernel->size != xj_root_binding_kernel_bytes(binding)) error = -EUCLEAN;
         uint32_t crc = 0xffffffffU;
+        if (!error)
+        {
+            total = kernel->size;
+            phase = "FAT verify kernel";
+            boot_debug::root_status(phase, 0, 0, total);
+        }
         for (uint64_t at = 0; !error && at < kernel->size;)
         {
             size_t count = kernel->size - at > 65536 ? 65536 : size_t(kernel->size - at);
@@ -1225,12 +1244,16 @@ int fatfs_mount_bound_root(const char *source, const XJ_ROOT_BINDING *binding)
                 for (unsigned bit = 0; bit < 8; ++bit) crc = (crc >> 1) ^ ((0U - (crc & 1U)) & 0x82f63b78U);
             }
             at += count;
+            completed = at;
+            if (at == total || (at >> 21) != ((at - count) >> 21))
+                boot_debug::root_status(phase, 0, at, total);
         }
-        if (!error && ~crc != xj_root_binding_le32(binding->bytes + 88)) error = -EUCLEAN;
-        if (kernel && vfs_close(kernel)) error = -EIO;
+        if (!error && ~crc != xj_root_binding_le32(binding->bytes + 88)) { phase = "FAT kernel checksum"; error = -EUCLEAN; }
+        if (kernel && vfs_close(kernel) && !error) { phase = "FAT close kernel"; error = -EIO; }
     }
     free(buffer);
-    if (vfs_close(device)) error = -EIO;
+    if (vfs_close(device) && !error) { phase = "FAT close device"; error = -EIO; }
+    boot_debug::root_status(error ? phase : "FAT root ready", error, completed, total);
     return error;
 }
 

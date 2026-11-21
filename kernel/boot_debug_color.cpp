@@ -1,4 +1,8 @@
 #include "boot_debug_color.h"
+#include <krlibc.h>
+#include <proto.hpp>
+
+extern const uint8_t _binary___font_hankaku_bin_start;
 
 #if DEVELOP_MODE_BOOT_DEBUG_COLOR == 1
 namespace boot_debug {
@@ -10,6 +14,9 @@ constexpr uint32_t ROWS       = (STEP_COUNT + COLUMNS - 1) / COLUMNS;
 constexpr uint32_t BACKGROUND = 0x000d1223;
 constexpr uint32_t PENDING    = 0x00252b3b;
 constexpr uint32_t SKIPPED    = 0x006c7080;
+static FrameBufferConfig root_framebuffer;
+static char root_previous[160], root_current[160], root_phase[80];
+static int root_error;
 
 struct Layout
 {
@@ -108,11 +115,53 @@ void initialize(const FrameBufferConfig &fbc)
 {
     Layout layout = layout_for(fbc);
     if (layout.cell == 0) return;
+    root_framebuffer = fbc;
+    root_previous[0] = root_current[0] = root_phase[0] = 0;
+    root_error = 0;
     // BSP-only, bounded, allocation-free stores: usable before CPU/heap setup.
     // No console or graphics locks are acquired, even with the boot gate shut.
     fill(fbc, 0, 0, fbc.horizontal_resolution, layout.height, BACKGROUND);
     for (uint32_t slot = 0; slot < STEP_COUNT; ++slot)
         paint(fbc, layout, static_cast<Step>(slot), layout.cell, PENDING);
+    __asm__ volatile("sfence" ::: "memory");
+}
+
+void root_status(const char *phase, int error, uint64_t completed, uint64_t total)
+{
+    if (!phase) return;
+    if (strcmp(root_phase, phase) || root_error != error)
+    {
+        memcpy(root_previous, root_current, sizeof(root_previous));
+        snprintf(root_phase, sizeof(root_phase), "%s", phase);
+    }
+    root_error = error;
+    if (total)
+        snprintf(root_current, sizeof(root_current), "ROOT: %s error=%d %llu/%llu KiB", phase, error,
+                 (unsigned long long)(completed / 1024), (unsigned long long)(total / 1024));
+    else
+        snprintf(root_current, sizeof(root_current), "ROOT: %s error=%d", phase, error);
+    write_serial_fmt_heapless("%s\n", root_current);
+
+    const auto &fbc = root_framebuffer;
+    Layout layout = layout_for(fbc);
+    if (!layout.cell) return;
+    uint32_t top = layout.height + 16; // Leave the existing progress bar intact.
+    uint32_t color = error ? 0x00ff6b6b : 0x00e8edf2;
+    const char *lines[] = {root_previous, root_current};
+    for (unsigned row = 0; row < 2; ++row)
+    {
+        uint32_t y = top + row * 18;
+        fill(fbc, 0, y, fbc.horizontal_resolution, 18, BACKGROUND);
+        for (unsigned column = 0; lines[row][column] && column < fbc.horizontal_resolution / 8; ++column)
+        {
+            unsigned character = static_cast<unsigned char>(lines[row][column]);
+            if (character < 32 || character > 126) character = '?';
+            const uint8_t *glyph = &_binary___font_hankaku_bin_start + character * 16;
+            for (unsigned gy = 0; gy < 16; ++gy)
+                for (unsigned gx = 0; gx < 8; ++gx)
+                    if (glyph[gy] & (0x80U >> gx)) fill(fbc, column * 8 + gx, y + gy, 1, 1, color);
+        }
+    }
     __asm__ volatile("sfence" ::: "memory");
 }
 
