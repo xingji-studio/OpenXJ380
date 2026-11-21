@@ -228,6 +228,9 @@ def copy_system_apps(root: Path) -> None:
     system = root / "apps/system/shell"
     mkdir(system)
     cp(ROOT / "out/shell.elf", system / "shell.elf")
+    mountiso = root / "apps/system/mountiso"
+    mkdir(mountiso)
+    cp(ROOT / "out/mountiso.elf", mountiso / "mountiso.elf")
 
 
 def copy_common_assets(root: Path) -> None:

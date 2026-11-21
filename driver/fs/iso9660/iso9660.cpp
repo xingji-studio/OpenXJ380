@@ -32,15 +32,18 @@ struct Mount
     BlockExtent      extent;
     BlockAccessToken lease;
     Node            *handles;
-    bool             io_failed;
+    uint64_t         source_bytes, source_dev, source_inode, device_number;
+    vfs_node_t       source_root;
+    bool             io_failed, file_source;
 };
 
-mutex_t operation_lock;
-Mount  *mounts[16];
-int     filesystem_id;
-bool    initialized, poisoned;
-tcb_t   operation_owner;
-size_t  operation_depth;
+mutex_t  operation_lock;
+Mount   *mounts[16];
+int      filesystem_id;
+bool     initialized, poisoned;
+tcb_t    operation_owner;
+size_t   operation_depth;
+uint32_t mount_sequence;
 
 int failure(int error)
 {
@@ -112,14 +115,24 @@ bool same_extent(const BlockExtent &a, const BlockExtent &b)
 bool read_device(void *context, uint64_t offset, void *output, xjiso::Size length)
 {
     auto *mount = static_cast<Mount *>(context);
-    if (failed() || mount->io_failed || offset > mount->extent.bytes || length > mount->extent.bytes - offset)
+    if (failed() || mount->io_failed || offset > mount->source_bytes || length > mount->source_bytes - offset)
         return false;
-    BlockExtent current;
-    if (!block_access_resolve_node(mount->device, &current) && same_extent(current, mount->extent) &&
-        vfs_read(mount->device, output, offset, length) == length)
-        return true;
+    bool current = false;
+    if (mount->file_source)
+    {
+        vfs_update(mount->device);
+        current = (mount->device->type & ~(file_delete | file_unlinked)) == file_none &&
+                  mount->device->size == mount->source_bytes && mount->device->dev == mount->source_dev &&
+                  mount->device->inode == mount->source_inode && mount->device->root == mount->source_root;
+    }
+    else
+    {
+        BlockExtent extent;
+        current = !block_access_resolve_node(mount->device, &extent) && same_extent(extent, mount->extent);
+    }
+    if (current && vfs_read(mount->device, output, offset, length) == length) return true;
     mount->io_failed = true;
-    block_access_poison(mount->lease);
+    if (mount->lease) block_access_poison(mount->lease);
     return false;
 }
 
@@ -160,20 +173,43 @@ int destroy(Mount *mount)
     return 0;
 }
 
-void metadata(Node *handle, vfs_node_t node)
+uint64_t inode_number(const xjiso::Inode &inode)
+{
+    return inode.serial ? inode.serial : inode.identifier;
+}
+
+int metadata(Node *handle, vfs_node_t node)
 {
     const xjiso::Inode &inode = handle->inode;
     handle->node              = node;
-    node->type                = inode.directory ? file_dir : file_none;
-    node->inode               = inode.identifier;
+    node->type                = inode.directory ? file_dir : inode.symlink ? file_symlink : file_none;
+    node->inode               = inode_number(inode);
     node->size                = inode.directory ? 0 : inode.size;
     node->realsize            = inode.size;
     node->blksz               = xjiso::Sector;
-    node->owner = node->group = 0;
-    node->mode = node->permissions = inode.directory ? 0555 : 0444;
-    node->createtime = node->readtime = node->writetime = inode.modified;
-    node->dev                                           = handle->mount->device->rdev;
+    node->owner               = inode.uid;
+    node->group               = inode.gid;
+    node->mode = node->permissions = inode.mode & 07777;
+    node->createtime               = inode.changed;
+    node->readtime                 = inode.accessed;
+    node->writetime                = inode.modified;
+    node->dev                      = handle->mount->device_number;
     ime_vfs_resolved_name(node, node->name);
+    if (inode.symlink && !node->linkname)
+    {
+        char *target = static_cast<char *>(malloc(inode.size + 1));
+        if (!target) return failure(-ENOMEM);
+        size_t completed = 0;
+        int    error     = handle->mount->volume.readlink(inode, target, inode.size, completed, handle->mount->work);
+        if (error || completed != inode.size)
+        {
+            free(target);
+            return failure(error ? error : -EIO);
+        }
+        target[completed] = 0;
+        node->linkname    = target;
+    }
+    return 0;
 }
 
 unsigned name_hash(const char *name)
@@ -188,7 +224,8 @@ int update(Node *handle, vfs_node_t node)
 {
     Mount *mount = handle->mount;
     if (failed() || mount->io_failed) return failure(-EIO);
-    metadata(handle, node);
+    int metadata_error = metadata(handle, node);
+    if (metadata_error) return metadata_error;
     if (!handle->inode.directory) return 0;
     vfs_child_lock();
     bool cached = node->visited || node->child;
@@ -226,7 +263,10 @@ int update(Node *handle, vfs_node_t node)
             if (entry.inode.version > duplicate->inode.version)
             {
                 duplicate->inode = entry.inode;
-                metadata(duplicate, duplicate->node);
+                free(duplicate->node->linkname);
+                duplicate->node->linkname = nullptr;
+                error                     = metadata(duplicate, duplicate->node);
+                if (error) break;
             }
             continue;
         }
@@ -248,7 +288,16 @@ int update(Node *handle, vfs_node_t node)
         child->root   = prepared.root;
         child->fsid   = filesystem_id;
         child->handle = child_handle;
-        metadata(child_handle, child);
+        error         = metadata(child_handle, child);
+        if (error)
+        {
+            free(link);
+            free(child->linkname);
+            free(child->name);
+            free(child);
+            release(child_handle);
+            break;
+        }
         child_handle->hash_next = buckets[hash];
         buckets[hash]           = child_handle;
         link->next              = prepared.child;
@@ -274,13 +323,14 @@ int mount_volume(const char *source, vfs_node_t node)
     if (!strncmp(source, "iso9660:", 8)) source += 8;
     if (source[0] != '/') return -EINVAL;
     if (failed()) return failure(-EIO);
-    // Resolve the source before taking the backend mutex: another filesystem
-    // may participate in path lookup. Only authentic devfs block nodes qualify.
+    // Resolve before the backend mutex. A retained ordinary-file reference
+    // keeps the source inode and its managed parent mount alive until teardown.
     tcb_t task = get_current_task();
     if (task) ++task->ime_storage_depth;
     vfs_node_t device = vfs_open(source);
     if (task) --task->ime_storage_depth;
-    if (!device || !(device->type & file_block))
+    bool file_source = device && device->type == file_none;
+    if (!device || (!(device->type & file_block) && !file_source))
     {
         if (device) vfs_close(device);
         return -ENODEV;
@@ -291,10 +341,20 @@ int mount_volume(const char *source, vfs_node_t node)
         vfs_close(device);
         return failure(-EIO);
     }
+    if (file_source)
+    {
+        for (Mount *mounted : mounts)
+            if (mounted && mounted->file_source && mounted->source_root == device->root &&
+                mounted->source_dev == device->dev && mounted->source_inode == device->inode)
+            {
+                vfs_close(device);
+                return failure(-EBUSY);
+            }
+    }
     unsigned slot = 0;
     while (slot < 16 && mounts[slot])
         ++slot;
-    if (slot == 16)
+    if (slot == 16 || mount_sequence == uint32_t(-1))
     {
         vfs_close(device);
         return failure(-ENOSPC);
@@ -305,11 +365,22 @@ int mount_volume(const char *source, vfs_node_t node)
         vfs_close(device);
         return failure(-ENOMEM);
     }
-    mount->device = device;
-    mounts[slot]  = mount;
-    int error     = block_access_resolve_node(device, &mount->extent);
-    if (!error) error = block_access_claim(mount->extent, false, &mount->lease);
-    if (!error) error = mount->volume.mount(read_device, mount, mount->extent.bytes, mount->work);
+    mount->device        = device;
+    mount->file_source   = file_source;
+    mount->source_bytes  = device->size;
+    mount->source_dev    = device->dev;
+    mount->source_inode  = device->inode;
+    mount->source_root   = device->root;
+    mount->device_number = (uint64_t(0x9660) << 32) | ++mount_sequence;
+    mounts[slot]         = mount;
+    int error            = 0;
+    if (!file_source)
+    {
+        error = block_access_resolve_node(device, &mount->extent);
+        if (!error) error = block_access_claim(mount->extent, false, &mount->lease);
+        if (!error) mount->source_bytes = mount->extent.bytes;
+    }
+    if (!error) error = mount->volume.mount(read_device, mount, mount->source_bytes, mount->work);
     Node *handle = error ? nullptr : attach(mount, mount->volume.root());
     if (!error && !handle) error = -ENOMEM;
     struct vfs_node previous = *node;
@@ -335,8 +406,11 @@ int mount_volume(const char *source, vfs_node_t node)
     vfs_filesystem_t old = get_filesystem_node(&previous);
     if (previous.handle && old) old->callback->close(previous.handle);
     handle->node = node;
-    write_serial_fmt("ISO9660: read-only %s volume mounted from %s\n", mount->volume.joliet() ? "Joliet" : "ISO",
-                     source);
+    write_serial_fmt("ISO9660: read-only %s volume mounted from %s%s\n",
+                     mount->volume.rock_ridge() ? "Rock Ridge"
+                     : mount->volume.joliet()   ? "Joliet"
+                                                : "ISO",
+                     source, file_source ? " [file]" : "");
     return 0;
 }
 
@@ -366,7 +440,7 @@ void open_node(void *parent_context, const char *name, vfs_node_t node)
     }
     xjiso::Entry entry;
     int          error = parent->mount->volume.lookup(parent->inode, name, entry, parent->mount->work);
-    if (!error && entry.inode.identifier != node->inode) error = -ESTALE;
+    if (!error && inode_number(entry.inode) != node->inode) error = -ESTALE;
     if (!error)
     {
         node->handle = attach(parent->mount, entry.inode);
@@ -511,6 +585,36 @@ void iso9660fs_init()
 bool iso9660fs_owns_node(vfs_node_t node)
 {
     return node && filesystem_id > 0 && node->fsid == filesystem_id;
+}
+
+int iso9660fs_stat(vfs_node_t node, struct stat *result)
+{
+    Guard guard;
+    if (!iso9660fs_owns_node(node) || !result || !node->handle) return failure(-EINVAL);
+    auto *handle = static_cast<Node *>(node->handle);
+    if (failed() || handle->mount->io_failed) return failure(-EIO);
+    const xjiso::Inode &inode = handle->inode;
+    memset(result, 0, sizeof(*result));
+    result->st_dev     = handle->mount->device_number;
+    result->st_ino     = inode_number(inode);
+    result->st_mode    = inode.mode;
+    result->st_nlink   = inode.links;
+    result->st_uid     = inode.uid;
+    result->st_gid     = inode.gid;
+    result->st_size    = inode.size;
+    result->st_blksize = xjiso::Sector;
+    result->st_blocks  = inode.symlink ? 0 : ((inode.size + xjiso::Sector - 1) / xjiso::Sector) * 4;
+    result->st_atim    = {inode.accessed / 1000000000ULL, inode.accessed % 1000000000ULL};
+    result->st_mtim    = {inode.modified / 1000000000ULL, inode.modified % 1000000000ULL};
+    result->st_ctim    = {inode.changed / 1000000000ULL, inode.changed % 1000000000ULL};
+    unsigned type      = inode.mode & 0170000;
+    if (type == 0020000 || type == 0060000)
+    {
+        uint64_t major = inode.major, minor = inode.minor;
+        result->st_rdev =
+            (minor & 0xff) | ((major & 0xfff) << 8) | ((minor & ~0xffULL) << 12) | ((major & ~0xfffULL) << 32);
+    }
+    return 0;
 }
 
 int iso9660fs_statfs(vfs_node_t node, struct statfs *result)

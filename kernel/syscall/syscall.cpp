@@ -89,6 +89,7 @@ static const char *debug_syscall_name(uint64_t nr)
     case SYS_FCNTL: return "fcntl";
     case SYS_FLOCK: return "flock";
     case SYS_UMOUNT2: return "umount2";
+    case SYS_MOUNT: return "mount";
     case SYS_SYNC: return "sync";
     case SYS_FSYNC: return "fsync";
     case SYS_FDATASYNC: return "fdatasync";
@@ -399,6 +400,10 @@ extern "C" uint64_t c_syscall_handler(struct X64_REGS *regs, uint64_t user_rsp)
     case SYS_FCNTL: regs->rax = (uint64_t)sys_fcntl(regs->rdi, regs->rsi, regs->rdx, 0, 0, 0, regs); break;
     case SYS_FLOCK: regs->rax = (uint64_t)sys_flock(regs->rdi, regs->rsi, 0, 0, 0, 0, regs); break;
     case SYS_UMOUNT2: regs->rax = (uint64_t)sys_umount2(regs->rdi, regs->rsi, 0, 0, 0, 0, regs); break;
+    case SYS_MOUNT:
+        regs->rax = sys_mount((char *)regs->rdi, (char *)regs->rsi, (char *)regs->rdx, regs->r10,
+                              (void *)regs->r8, 0, regs);
+        break;
     case SYS_SYNC: regs->rax = (uint64_t)sys_sync(0, 0, 0, 0, 0, 0, regs); break;
     case SYS_FSYNC: regs->rax = (uint64_t)sys_fsync(regs->rdi, 0, 0, 0, 0, 0, regs); break;
     case SYS_FDATASYNC: regs->rax = (uint64_t)sys_fdatasync(regs->rdi, 0, 0, 0, 0, 0, regs); break;

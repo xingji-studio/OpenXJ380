@@ -23,28 +23,6 @@ bool both32(const uint8_t *p, uint32_t &value)
     return value == (uint32_t(p[7]) | uint32_t(p[6]) << 8 | uint32_t(p[5]) << 16 | uint32_t(p[4]) << 24);
 }
 
-bool leap(unsigned year)
-{
-    return year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
-}
-
-uint64_t timestamp(const uint8_t *p)
-{
-    unsigned                  year = 1900 + p[0], month = p[1], day = p[2];
-    static constexpr unsigned Days[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
-    int                       zone   = int(int8_t(p[6]));
-    if (year < 1970 || !month || month > 12 || !day || day > Days[month - 1] + unsigned(month == 2 && leap(year)) ||
-        p[3] > 23 || p[4] > 59 || p[5] > 59 || zone < -48 || zone > 52)
-        return 0;
-    uint64_t days = 0;
-    for (unsigned y = 1970; y < year; ++y)
-        days += leap(y) ? 366 : 365;
-    for (unsigned m = 1; m < month; ++m)
-        days += Days[m - 1] + unsigned(m == 2 && leap(year));
-    int64_t seconds = int64_t((days + day - 1) * 86400 + p[3] * 3600 + p[4] * 60 + p[5]) - zone * 900;
-    return seconds < 0 ? 0 : uint64_t(seconds) * 1000000000ULL;
-}
-
 int parse_record(const uint8_t *p, unsigned available, uint64_t volume_bytes, Inode &inode)
 {
     unsigned length = p[0];
@@ -58,13 +36,16 @@ int parse_record(const uint8_t *p, unsigned available, uint64_t volume_bytes, In
     uint64_t data = (uint64_t(block) + p[1]) * Sector;
     if (data > volume_bytes || size > volume_bytes - data) return -EIO;
     bool directory = (p[25] & 2) != 0;
-    if (directory && (!size || (p[25] & 0x80) || size > MaxDirectoryBytes || size % Sector)) return -EOPNOTSUPP;
+    if (directory && ((p[25] & 0x80) || size > MaxDirectoryBytes || size % Sector)) return -EOPNOTSUPP;
     inode      = {};
     inode.size = inode.first_bytes = size;
     inode.data                     = data;
-    inode.modified                 = timestamp(p + 18);
+    inode.modified                 = iso_recording_time(p + 18);
+    inode.accessed = inode.changed = inode.modified;
     inode.directory                = directory;
     inode.sections                 = 1;
+    inode.mode                     = directory ? 0040555 : 0100444;
+    inode.links                    = directory ? 2 : 1;
     return 0;
 }
 
@@ -142,19 +123,30 @@ int Volume::mount(Reader input, void *opaque, uint64_t device_bytes, Workspace &
     }
     if (!terminated || !primary_bytes || uint64_t(descriptor_end) * Sector > primary_bytes) return -EIO;
     if (best_level && supplementary_bytes != primary_bytes) return -EIO;
-    unicode    = best_level != 0;
-    bytes      = primary_bytes;
-    root_inode = unicode ? supplementary : primary;
-    // Read the actual '.' record too; the descriptor alone cannot establish a
-    // usable directory, and no partially validated tree may be published.
-    uint64_t position = root_inode.data;
+    bytes             = primary_bytes;
+    uint64_t position = primary.data;
     Inode    dot;
-    int      error = record_at(position, root_inode.records_end, dot, work);
+    int      error = record_at(position, primary.records_end, dot, work);
     if (error != 1) return error < 0 ? error : -EIO;
+    if (work.record[32] != 1 || work.record[33] || !dot.directory || dot.data != primary.data ||
+        dot.size != primary.size)
+        return -EIO;
+    error = rock_ridge_probe(reader, context, bytes, work.record, ridge, work.susp);
+    if (error) return error;
+    unicode    = !ridge.enabled && best_level != 0;
+    root_inode = unicode ? supplementary : primary;
+    if (unicode)
+    {
+        position = root_inode.data;
+        error    = record_at(position, root_inode.records_end, dot, work);
+        if (error != 1) return error < 0 ? error : -EIO;
+    }
     if (work.record[32] != 1 || work.record[33] || !dot.directory || dot.data != root_inode.data ||
         dot.size != root_inode.size)
         return -EIO;
-    return 0;
+    error             = apply_ridge(root_inode, work, true);
+    root_inode.parent = root_inode.data;
+    return error;
 }
 
 int Volume::record_at(uint64_t &position, uint64_t end, Inode &inode, Workspace &work) const
@@ -181,6 +173,68 @@ int Volume::record_at(uint64_t &position, uint64_t end, Inode &inode, Workspace 
         position          += length;
         return 1;
     }
+    return 0;
+}
+
+int Volume::apply_ridge(Inode &inode, Workspace &work, bool root_record) const
+{
+    int error = rock_ridge_parse(reader, context, bytes, work.record, ridge, work.ridge, work.susp, root_record);
+    if (error) return error;
+    const RockRidgeInfo &info = work.ridge;
+    if (info.attributes)
+    {
+        unsigned type = info.mode & 0170000;
+        if (type != 0100000 && type != 0040000 && type != 0120000 && type != 0020000 && type != 0060000 &&
+            type != 0010000 && type != 0140000)
+            return -EIO;
+        if (bool(type == 0040000) != inode.directory && !info.child) return -EIO;
+        inode.mode   = info.mode;
+        inode.uid    = info.uid;
+        inode.gid    = info.gid;
+        inode.links  = info.links;
+        inode.serial = info.serial;
+    }
+    if (info.symlink)
+    {
+        if (inode.directory) return -EIO;
+        inode.symlink = true;
+        inode.mode    = (inode.mode & 07777) | 0120000;
+        inode.size    = info.target_size;
+    }
+    if (info.have_modified) inode.modified = info.modified;
+    inode.accessed    = info.have_accessed ? info.accessed : inode.modified;
+    inode.changed     = info.have_changed ? info.changed : info.have_created ? info.created : inode.modified;
+    inode.major       = info.major;
+    inode.minor       = info.minor;
+    inode.unsupported = info.unsupported;
+    if (root_record && (info.child || info.parent || info.relocated || inode.symlink || !inode.directory)) return -EIO;
+    return 0;
+}
+
+int Volume::relocate(Inode &inode, uint32_t block, uint64_t parent, Workspace &work) const
+{
+    uint64_t location = uint64_t(block) * Sector;
+    if (location == parent || location > bytes || Sector > bytes - location) return -ELOOP;
+    uint64_t position = location;
+    Inode    target;
+    int      error = record_at(position, location + Sector, target, work);
+    if (error != 1) return error < 0 ? error : -EIO;
+    if (work.record[32] != 1 || work.record[33] || !target.directory || target.data != location || !target.size)
+        return -EIO;
+    error = apply_ridge(target, work);
+    if (error) return error;
+    if (work.ridge.child || work.ridge.parent || work.ridge.relocated || target.symlink) return -ELOOP;
+    Inode dotdot;
+    error = record_at(position, target.data + target.size, dotdot, work);
+    if (error != 1) return error < 0 ? error : -EIO;
+    if (work.record[32] != 1 || work.record[33] != 1 || !dotdot.directory) return -EIO;
+    error = apply_ridge(dotdot, work);
+    if (error) return error;
+    if (uint64_t(work.ridge.parent) * Sector != parent || work.ridge.child || work.ridge.relocated) return -EIO;
+    target.identifier  = inode.identifier;
+    target.records_end = inode.records_end;
+    target.parent      = parent;
+    inode              = target;
     return 0;
 }
 
@@ -236,7 +290,8 @@ bool Volume::names_equal(const char *a, const char *b) const
     while (*a && *b)
     {
         unsigned left = uint8_t(*a++), right = uint8_t(*b++);
-        if ((unicode ? left : lower(left)) != (unicode ? right : lower(right))) return false;
+        bool     exact = unicode || ridge.enabled;
+        if ((exact ? left : lower(left)) != (exact ? right : lower(right))) return false;
     }
     return *a == *b;
 }
@@ -244,10 +299,10 @@ bool Volume::names_equal(const char *a, const char *b) const
 int Volume::cursor(const Inode &directory, Cursor &cursor) const
 {
     if (!directory.directory) return -ENOTDIR;
-    if (directory.sections != 1 || directory.size > MaxDirectoryBytes || directory.data > bytes ||
+    if (directory.sections != 1 || !directory.size || directory.size > MaxDirectoryBytes || directory.data > bytes ||
         directory.size > bytes - directory.data)
         return -EIO;
-    cursor = {directory.data, directory.data + directory.size, 0};
+    cursor = {directory.data, directory.data + directory.size, 0, directory.data, directory.parent};
     return 0;
 }
 
@@ -259,14 +314,30 @@ int Volume::next(Cursor &cursor, Entry &entry, Workspace &work) const
         if (result != 1) return result;
         if (++cursor.entries > MaxEntries) return -E2BIG;
         unsigned length = work.record[32], flags = work.record[25];
+        unsigned special = length == 1 && work.record[33] <= 1 ? unsigned(work.record[33]) + 1 : 0;
+        result           = apply_ridge(entry.inode, work, entry.inode.identifier == root_inode.data);
+        if (result) return result;
+        uint32_t child     = work.ridge.child;
+        bool     relocated = work.ridge.relocated;
+        if (work.ridge.parent && (special != 2 || uint64_t(work.ridge.parent) * Sector != cursor.parent)) return -EIO;
         if (length == 1 && work.record[33] <= 1)
         {
-            if (!entry.inode.directory) return -EIO;
+            if (!entry.inode.directory || entry.inode.symlink || child || relocated) return -EIO;
+            if (work.ridge.name_present && !names_equal(work.ridge.name, special == 1 ? "." : "..")) return -EIO;
             continue;
         }
         for (unsigned i = 0; i < length; ++i)
             work.original_name[i] = work.record[33 + i];
-        result = decode_name(work.original_name, length, entry.inode.directory, entry);
+        if (work.ridge.name_present)
+        {
+            for (unsigned i = 0; i <= work.ridge.name_size; ++i)
+                entry.name[i] = work.ridge.name[i];
+            if ((work.ridge.name_size == 1 && entry.name[0] == '.') ||
+                (work.ridge.name_size == 2 && entry.name[0] == '.' && entry.name[1] == '.'))
+                return -EIO;
+        }
+        else
+            result = decode_name(work.original_name, length, entry.inode.directory, entry);
         if (result) return result;
         bool     more           = (flags & 0x80) != 0;
         uint32_t previous_bytes = entry.inode.first_bytes;
@@ -283,7 +354,52 @@ int Volume::next(Cursor &cursor, Entry &entry, Workspace &work) const
             ++entry.inode.sections;
             previous_bytes = section.first_bytes;
             more           = (work.record[25] & 0x80) != 0;
+            if (ridge.enabled)
+            {
+                result = apply_ridge(section, work);
+                if (result) return result;
+                if (section.directory || section.symlink || work.ridge.child || work.ridge.parent ||
+                    work.ridge.relocated)
+                    return -EIO;
+                entry.inode.unsupported |= section.unsupported;
+                if (!more)
+                {
+                    // SUSP attributes on the final section describe the whole
+                    // file. Keep the first section's physical chain identity.
+                    entry.inode.mode     = section.mode;
+                    entry.inode.uid      = section.uid;
+                    entry.inode.gid      = section.gid;
+                    entry.inode.links    = section.links;
+                    entry.inode.serial   = section.serial;
+                    entry.inode.major    = section.major;
+                    entry.inode.minor    = section.minor;
+                    entry.inode.modified = section.modified;
+                    entry.inode.accessed = section.accessed;
+                    entry.inode.changed  = section.changed;
+                    entry.inode.version  = 0;
+                    if (work.ridge.name_present)
+                    {
+                        for (unsigned i = 0; i <= work.ridge.name_size; ++i)
+                            entry.name[i] = work.ridge.name[i];
+                        if (names_equal(entry.name, ".") || names_equal(entry.name, "..")) return -EIO;
+                    }
+                    else
+                    {
+                        result = decode_name(work.original_name, length, false, entry);
+                        if (result) return result;
+                    }
+                }
+            }
         }
+        if (relocated) continue;
+        entry.inode.parent = cursor.directory;
+        if (child)
+        {
+            if (entry.inode.sections != 1) return -EIO;
+            result = relocate(entry.inode, child, cursor.directory, work);
+            if (result) return result;
+        }
+        if (entry.inode.directory && !entry.inode.size) return -EIO;
         // Associated files are a separate namespace, not duplicate ordinary
         // directory names. Hidden ordinary files remain visible to the VFS.
         if (!(flags & 4)) return 1;
@@ -311,6 +427,8 @@ int Volume::read(const Inode &inode, uint64_t offset, void *output, Size length,
 {
     completed = 0;
     if (inode.directory) return -EISDIR;
+    if (inode.symlink) return -EINVAL;
+    if (inode.unsupported || (inode.mode & 0170000) != 0100000) return -EOPNOTSUPP;
     if (!length || offset >= inode.size) return 0;
     if (!output || !inode.sections || inode.sections > MaxSections) return -EINVAL;
     if (length > inode.size - offset) length = Size(inode.size - offset);
@@ -361,5 +479,23 @@ int Volume::read(const Inode &inode, uint64_t offset, void *output, Size length,
         logical += section.size;
     }
     return logical == inode.size && completed == length ? 0 : -EIO;
+}
+
+int Volume::readlink(const Inode &inode, void *output, Size capacity, Size &completed, Workspace &work) const
+{
+    completed = 0;
+    if (!inode.symlink || !ridge.enabled || (!output && capacity)) return -EINVAL;
+    uint64_t position = inode.identifier;
+    Inode    current;
+    int      error = record_at(position, inode.records_end, current, work);
+    if (error != 1) return error < 0 ? error : -EIO;
+    if (current.identifier != inode.identifier) return -EIO;
+    error = apply_ridge(current, work);
+    if (error) return error;
+    if (!current.symlink || current.size != inode.size) return -EIO;
+    completed = capacity < work.ridge.target_size ? capacity : work.ridge.target_size;
+    for (Size i = 0; i < completed; ++i)
+        static_cast<char *>(output)[i] = work.ridge.target[i];
+    return 0;
 }
 } // namespace xjiso

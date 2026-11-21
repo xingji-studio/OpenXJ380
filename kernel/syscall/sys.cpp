@@ -186,6 +186,11 @@ static uint64_t fill_stat_from_node(vfs_node_t node, struct stat *out)
         int error = ext4fs_stat(node, out);
         return error < 0 ? SYSCALL_FAULT_(-error) : 0;
     }
+    if (iso9660fs_owns_node(node))
+    {
+        int error = iso9660fs_stat(node, out);
+        return error < 0 ? SYSCALL_FAULT_(-error) : 0;
+    }
     memset(out, 0, sizeof(*out));
     uint64_t ctime_ns = node->createtime;
     uint64_t mtime_ns = node->writetime;
@@ -743,7 +748,8 @@ static uint64_t open_kernel_path(char *path0, uint64_t flags, uint64_t mode)
     if (normalized_path == NULL) return SYSCALL_FAULT_(ENOMEM);
 
     vfs_node_t node = vfs_open(path0);
-    if (node == NULL && permissions_file_error())
+    if (node == NULL && permissions_file_error() &&
+        (!(flags & O_CREAT) || permissions_file_error() != ENOENT))
     {
         free(normalized_path);
         return SYSCALL_FAULT_(vfs_last_error());
@@ -4476,6 +4482,8 @@ sys_(pwrite, int fd, uint8_t *buffer, size_t size, int64_t offset)
 
 sys_(mount, char *dev_name, char *dir_name, char *type, uint64_t flags, void *data)
 {
+    // Namespace moves, bind mounts and remount flags need separate lifetime support.
+    if (flags & ~uint64_t(MS_RDONLY)) return SYSCALL_FAULT_(EOPNOTSUPP);
     if (dir_name == NULL) return SYSCALL_FAULT_(EINVAL);
 
     char *udir_name = NULL;
@@ -4492,51 +4500,23 @@ sys_(mount, char *dev_name, char *dir_name, char *type, uint64_t flags, void *da
         return SYSCALL_FAULT_(ENOENT);
     }
 
-    if (flags & MS_MOVE)
+    struct MountPointReference
     {
-        if (flags & (MS_REMOUNT | MS_BIND))
+        vfs_node_t node;
+        ~MountPointReference()
         {
-            free(ndir_name);
-            return SYSCALL_FAULT_(EINVAL);
+            vfs_close(node);
         }
-        if (dev_name == NULL) { free(ndir_name); return SYSCALL_FAULT_(EINVAL); }
-        char *udev_name = NULL;
-        copy_ret = copy_string_from_user(&udev_name, dev_name, USER_PATH_MAX);
-        if (copy_ret < 0) { free(ndir_name); return SYSCALL_FAULT_((int)-copy_ret); }
-        char      *old_root_p = vfs_cwd_path_build(udev_name);
-        free(udev_name);
-        if (old_root_p == NULL) { free(ndir_name); return SYSCALL_FAULT_(ENOMEM); }
-        vfs_node_t old_root   = vfs_open(old_root_p);
-        free(old_root_p);
-        if (old_root == NULL || !old_root->is_mount) return SYSCALL_FAULT_(EINVAL);
-        if (dir != rootdir) list_append(dir->parent->child, old_root);
-        char *nb       = old_root->name;
-        old_root->name = dir->name;
-        dir->name      = nb;
-        list_append(old_root->parent->child, dir);
+    } mount_point_reference{dir};
 
-        list_delete(old_root->parent->child, old_root);
-        if (dir != rootdir)
-            list_delete(dir->parent->child, dir);
-        else
-            rootdir = old_root;
-
-        vfs_node_t parent = dir->parent;
-        dir->parent       = old_root->parent;
-        old_root->parent  = parent;
-
-        vfs_close(old_root);
-        vfs_close(dir);
-        return 0;
-    }
-
-    if (type == NULL) return SYSCALL_FAULT_(EINVAL);
+    if (type == NULL) { free(ndir_name); return SYSCALL_FAULT_(EINVAL); }
 
     char            *ndev_name = NULL;
     char            *udev_name = NULL;
     char            *ktype = NULL;
     copy_ret = copy_string_from_user(&ktype, type, USER_PATH_MAX);
     if (copy_ret < 0) { free(ndir_name); return SYSCALL_FAULT_((int)-copy_ret); }
+    bool iso_source = !strcmp(ktype, "iso9660");
     vfs_filesystem_t filesystem = get_filesystem(ktype);
     free(ktype);
     if (filesystem == NULL) { free(ndir_name); return SYSCALL_FAULT_(EINVAL); }
@@ -4552,12 +4532,29 @@ sys_(mount, char *dev_name, char *dir_name, char *type, uint64_t flags, void *da
     ndev_name = vfs_cwd_path_build(udev_name);
     free(udev_name);
     if (ndev_name == NULL) { free(ndir_name); return SYSCALL_FAULT_(ENOMEM); }
+    if (iso_source)
+    {
+        // The requested type must not fall through to a different backend.
+        size_t length = strlen(ndev_name);
+        char *explicit_source = (char *)malloc(length + 9);
+        if (!explicit_source)
+        {
+            free(ndev_name);
+            free(ndir_name);
+            return SYSCALL_FAULT_(ENOMEM);
+        }
+        memcpy(explicit_source, "iso9660:", 8);
+        memcpy(explicit_source + 8, ndev_name, length + 1);
+        free(ndev_name);
+        ndev_name = explicit_source;
+    }
 mount:
     if (vfs_mount((const char *)ndev_name, dir) == VFS_STATUS_FAILED)
     {
+        int error = vfs_last_error();
         free(ndir_name);
-        free(ndev_name);
-        return SYSCALL_FAULT_(ENOENT);
+        if (filesystem->id == 0) free(ndev_name);
+        return SYSCALL_FAULT_(error ? error : EINVAL);
     }
     free(ndir_name);
     if (filesystem->id == 0) free(ndev_name);

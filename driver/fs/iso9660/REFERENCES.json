@@ -9,6 +9,16 @@
       "publisher": "Ecma International",
       "url": "https://ecma-international.org/wp-content/uploads/ECMA-119_5th_edition_december_2024.pdf",
       "scope": "ISO 9660 format facts and Annex B.2 Joliet UCS-2 descriptor escape sequences"
+    },
+    {
+      "publisher": "IEEE CD-ROM File System Format Working Group (archived draft)",
+      "url": "https://people.freebsd.org/~emaste/rrip112.pdf",
+      "scope": "IEEE P1282 RRIP 1.12 on-disk NM/PX/PN/TF/SL/CL/PL/RE format facts; no standard text or implementation copied"
+    },
+    {
+      "publisher": "IEEE CD-ROM File System Format Working Group (archived draft)",
+      "url": "https://rsync.osuosl.org/pub/netwinder/devteam/andrewm/udf/docs/SUSP112.DOC",
+      "scope": "IEEE P1281 SUSP 1.12 SP/ER/ES/CE/ST record identification, extension selection and continuation format facts"
     }
   ],
   "imported_implementations": [],

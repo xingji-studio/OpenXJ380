@@ -64,6 +64,24 @@ int main(int argc, char **argv)
         printf("%llu %llu %u\n", static_cast<unsigned long long>(volume.volume_bytes()),
                static_cast<unsigned long long>(inode.size), unsigned(volume.joliet()));
     }
+    else if (!strcmp(argv[2], "format"))
+    {
+        puts(volume.rock_ridge() ? "rock-ridge" : volume.joliet() ? "joliet" : "iso9660");
+    }
+    else if (!strcmp(argv[2], "stat"))
+    {
+        printf("%u %u %u %u %llu %llu %llu %llu %u\n", inode.mode, inode.uid, inode.gid, inode.links,
+               static_cast<unsigned long long>(inode.size), static_cast<unsigned long long>(inode.modified),
+               static_cast<unsigned long long>(inode.accessed), static_cast<unsigned long long>(inode.changed),
+               inode.serial);
+    }
+    else if (!strcmp(argv[2], "readlink"))
+    {
+        char        target[xjiso::MaxLinkBytes + 1];
+        xjiso::Size completed = 0;
+        error                 = volume.readlink(inode, target, sizeof(target), completed, work);
+        if (!error) fwrite(target, 1, completed, stdout);
+    }
     else if (!strcmp(argv[2], "list"))
     {
         xjiso::Cursor cursor;

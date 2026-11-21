@@ -5,10 +5,12 @@ OpenXJ380 C++ code under Apache-2.0. They use published on-disk format facts
 and existing first-party VFS, device, mutex and block-access interfaces.
 No third-party filesystem implementation, translated source or new link
 archive is included. The native core has only a read callback, uses no heap
-allocation and includes only its own header, stdint.h and errno.h.
+allocation and includes only its own headers, stdint.h and errno.h.
 
 ECMA-119 format facts informed volume/record offsets, both-endian integers,
-file-section flags, recording dates and Joliet's UCS-2 namespace. References
+file-section flags, recording dates and Joliet's UCS-2 namespace. IEEE
+P1281/P1282 format facts informed SUSP traversal and Rock Ridge names,
+attributes, timestamps, symbolic links and relocated directories. References
 are recorded in REFERENCES.json. No standard text, tables, diagrams or sample
 implementation is redistributed. Format-document access is not represented
 as an additional intellectual-property grant.

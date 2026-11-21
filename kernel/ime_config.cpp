@@ -207,7 +207,8 @@ static bool ime_policy_access(vfs_node_t node, const char *path, ImeFileOperatio
     if (task->ime_config_depth && !task->permission_profile_owner) return true;
     if (permissions_dialog_metadata(node, operation)) return true;
     if (task->permission_profile_owner) return true;
-    if (operation == IME_FILE_MOUNT || (node && (node->type & file_block) && !task->ime_storage_depth)) return false;
+    if (operation == IME_FILE_MOUNT && (!node || node->type != file_dir)) return false;
+    if (node && (node->type & file_block) && !task->ime_storage_depth) return false;
     bool mutation = operation == IME_FILE_WRITE || operation == IME_FILE_REMOVE ||
                     operation == IME_FILE_MOUNT || operation == IME_FILE_READ_WRITE;
     uint64_t protection = node_policy(node);

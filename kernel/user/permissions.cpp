@@ -774,7 +774,19 @@ static bool file_access(vfs_node_t node, const char *path, int operation, unsign
     if (!task || task->task_level != TASK_APPLICATION_LEVEL) return true;
     if (operation == IME_FILE_LOOKUP) return true;
     if (permissions_dialog_metadata(node, operation)) return true;
-    if (operation == IME_FILE_MOUNT) { permissions_set_file_error(EACCES); return false; }
+    if (operation == IME_FILE_MOUNT)
+    {
+        // Mounting changes the shared namespace. Permit only a directory below
+        // /mnt, with settings and external-directory rights. Source data keeps
+        // its ordinary read checks; profile/picker scopes grant no mount right.
+        char *resolved = node ? vfs_get_fullpath(node) : NULL;
+        bool allowed = node && node->type == file_dir && !task->permission_profile_owner &&
+                       permissions_have(XPERM_CS | XPERM_NV) && resolved &&
+                       under(resolved, "/mnt") && !equal_fold(resolved, "/mnt");
+        free(resolved);
+        if (!allowed) permissions_set_file_error(EACCES);
+        return allowed;
+    }
     // Filesystem callbacks already authorized the file operation. Their scoped
     // backend block I/O must not additionally require NV on /dev or /disk.
     // A direct application device access has no storage scope and stays denied

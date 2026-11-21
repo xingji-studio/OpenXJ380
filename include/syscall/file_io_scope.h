@@ -40,6 +40,8 @@ static inline bool syscall_file_io_may_block(uint64_t number)
     case SYS_STATX:
     case SYS_STATFS:
     case SYS_FSTATFS:
+    case SYS_MOUNT:
+    case SYS_UMOUNT2:
     case SYS_ACCESS:
     case SYS_FACCESSAT:
     case SYS_FACCESSAT2:

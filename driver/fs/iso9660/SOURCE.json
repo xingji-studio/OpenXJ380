@@ -3,13 +3,15 @@
   "license": "Apache-2.0",
   "imported_implementations": [],
   "files": {
-    "driver/fs/iso9660/native.cpp": "67d10aea841ead823930295727dbd0555012f0c87c5636148fe04b09496f8cb2",
-    "driver/fs/iso9660/native.h": "574b2a94dd3888c60ae651446b5d1a96ce7bbf6e4806c3a4f37d067c8fd2c824",
-    "driver/fs/iso9660/iso9660.cpp": "2bcaa75c0c51adf396a28e16150d64468d29eb7684e308a1b4107ba8113d7625",
-    "include/fs/iso9660/iso9660.h": "7e5e4225fe086088e6a9bf9052818e895b21383288e904cea4f469daa71c4d6f"
+    "driver/fs/iso9660/iso9660.cpp": "9d77904a8ad1df6230c95abfaa220dcca0386087e133c32b58ecb02a4a284590",
+    "driver/fs/iso9660/native.cpp": "3af969c8f4b2c9921587e5d83db55d17f1aa4cb9bf3bf8a28d9fec566c6bbec9",
+    "driver/fs/iso9660/native.h": "aa68799cd0e0e9509366d9a58545d9c7994b5968d513e281f352e50acc09c6a9",
+    "driver/fs/iso9660/rock_ridge.cpp": "c52a29511042dccb2837b30e8104b41bfb686b35bf8ad580c94b4729b9b461cc",
+    "driver/fs/iso9660/rock_ridge.h": "b9bd42ff7118d70747ca62e338b1f6d22504f2f236c5f7fad65fab6b28604227",
+    "include/fs/iso9660/iso9660.h": "300f852624e332ff65a94cc037478922eb6e8b004799785385006d1361c5423d"
   },
   "documentation": {
-    "PROVENANCE.md": "6c2a958c110076d97196fa430c5eb8cc310893fce4570125ac578df971e4ab02",
-    "REFERENCES.json": "f7ebd8f0aa6f3b6232a5cd19175e3eca2f1bae728a56232ac06acb5bf2294c7c"
+    "PROVENANCE.md": "9ddb0b187c551039a590dfe3c9aa9a1fe70169be5ca5fbaea8f33f957b059c72",
+    "REFERENCES.json": "807432d2f3088a4a005e06ac72ffff91e72e55c42a5d57c14fb3314ba15b1dbe"
   }
 }

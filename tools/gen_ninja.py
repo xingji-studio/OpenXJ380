@@ -412,13 +412,18 @@ def user_compile(n: Ninja, out: Path, src: str, flags: str, implicit: list[Path]
 
 
 def user_apps(n: Ninja, core_objs: list[Path], constart_obj: Path) -> list[Path]:
-    """Emit the sole user-space example program."""
-    n.comment("USER APPS - command-line example")
+    """Emit the CLI example and native filesystem utility."""
+    n.comment("USER APPS - command-line programs")
     shell_obj = Path("out/cli_shell.o")
     user_compile(n, shell_obj, "user/cli_shell.cpp", "$user_cflags", headers("user/xapi/include"))
     target = Path("out/shell.elf")
     n.build(target, "user_ld", core_objs + [constart_obj, shell_obj], variables={"message": log_desc("LD", target.as_posix())})
-    return [target]
+    mount_obj = Path("out/mountiso.o")
+    user_compile(n, mount_obj, "user/mountiso.cpp", "$user_cflags", headers("user/xapi/include"))
+    mount_target = Path("out/mountiso.elf")
+    n.build(mount_target, "user_ld", core_objs + [constart_obj, mount_obj],
+            variables={"message": log_desc("LD", mount_target.as_posix())})
+    return [target, mount_target]
 
 
 def phony(n: Ninja, name: str, deps: list[Path | str]) -> None:

@@ -2538,11 +2538,17 @@ static bool readonly_subtree_busy(vfs_node_t node, bool root, unsigned depth)
 }
 
 errno_t vfs_unmount(const char *path) {
-    if (!vfs_check_access(NULL, NULL, IME_FILE_MOUNT)) return VFS_STATUS_FAILED;
     if (__atomic_load_n(&detached_retention_overflow, __ATOMIC_ACQUIRE))
     { permissions_set_file_error(EBUSY); return VFS_STATUS_FAILED; }
     vfs_node_t node = vfs_open(path);
     if (node == NULL) return VFS_STATUS_FAILED;
+    if (!vfs_check_access(node, path, IME_FILE_MOUNT))
+    {
+        int error = vfs_last_error();
+        vfs_close(node);
+        permissions_set_file_error(error);
+        return VFS_STATUS_FAILED;
+    }
     if (node->type != file_dir || node->fsid == 0)
     {
         vfs_close(node);

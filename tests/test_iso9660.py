@@ -28,10 +28,14 @@ def both32(value):
     return struct.pack("<I", value) + struct.pack(">I", value)
 
 
-def record(name, block, size, flags=0):
+def record(name, block, size, flags=0, system_use=b""):
     if isinstance(name, str):
         name = name.encode("ascii")
     result = bytearray(33 + len(name) + (len(name) % 2 == 0))
+    result.extend(system_use)
+    if len(result) % 2:
+        result.append(0)
+    assert len(result) <= 255
     result[0] = len(result)
     result[2:10] = both32(block)
     result[10:18] = both32(size)
@@ -57,8 +61,8 @@ def descriptor(root=20, sectors=64, joliet=False):
     return result
 
 
-def directory(entries, block=20, parent=20):
-    data = bytearray(record(b"\0", block, SECTOR, 2) + record(b"\1", parent, SECTOR, 2))
+def directory(entries, block=20, parent=20, dot_use=b"", parent_use=b""):
+    data = bytearray(record(b"\0", block, SECTOR, 2, dot_use) + record(b"\1", parent, SECTOR, 2, parent_use))
     offsets = []
     for entry in entries:
         if len(data) % SECTOR + len(entry) > SECTOR:
@@ -66,6 +70,41 @@ def directory(entries, block=20, parent=20):
         offsets.append(block * SECTOR + len(data))
         data.extend(entry)
     data.extend(bytes((-len(data)) % SECTOR))
+    return data, offsets
+
+
+def system_use(tag, data=b""):
+    return tag.encode("ascii") + bytes((4 + len(data), 1)) + data
+
+
+def posix(mode=0o100640, uid=123, gid=456, links=1, serial=7, old=False):
+    values = (mode, links, uid, gid) if old else (mode, links, uid, gid, serial)
+    return system_use("PX", b"".join(both32(value) for value in values))
+
+
+def name_entry(name, flags=0):
+    return system_use("NM", bytes((flags,)) + (name.encode() if isinstance(name, str) else name))
+
+
+def continuation(block, offset, size):
+    return system_use("CE", both32(block) + both32(offset) + both32(size))
+
+
+def rr_fixture(entries=None, extra_area=b"", root_extra=b"", skip=0):
+    data = bytearray(96 * SECTOR)
+    data[16 * SECTOR:17 * SECTOR] = descriptor(sectors=96)
+    data[17 * SECTOR:17 * SECTOR + 7] = b"\xffCD001\x01"
+    identifier = b"RRIP_1991A"
+    er = system_use("ER", bytes((len(identifier), 0, 0, 1)) + identifier)
+    data[41 * SECTOR:41 * SECTOR + len(er + root_extra)] = er + root_extra
+    dot_use = bytes(skip) + system_use("SP", b"\xbe\xef" + bytes((skip,))) + posix(0o40751, serial=1) + continuation(41, 0, len(er + root_extra))
+    if entries is None:
+        entries = [record("FILE.TXT;1", 50, 8, system_use=bytes(skip) + posix() + name_entry("Mixed-中文.txt"))]
+    root, offsets = directory(entries, dot_use=dot_use, parent_use=bytes(skip) + posix(0o40751, serial=1))
+    data[20 * SECTOR:20 * SECTOR + len(root)] = root
+    data[50 * SECTOR:50 * SECTOR + 8] = b"ridge\nOK"
+    if extra_area:
+        data[42 * SECTOR + 2000:42 * SECTOR + 2000 + len(extra_area)] = extra_area
     return data, offsets
 
 
@@ -112,7 +151,8 @@ class Iso9660Tests(unittest.TestCase):
         cls.binary = cls.work / "reader"
         subprocess.run(["g++", "-std=c++17", "-O1", "-g", "-Wall", "-Wextra", "-Werror",
                         "-fsanitize=address,undefined", "-fno-pie", "-no-pie", "-I", str(CORE),
-                        str(CORE / "native.cpp"), str(ROOT / "tests/iso9660_harness.cpp"), "-o", str(cls.binary)],
+                        str(CORE / "native.cpp"), str(CORE / "rock_ridge.cpp"),
+                        str(ROOT / "tests/iso9660_harness.cpp"), "-o", str(cls.binary)],
                        check=True)
 
     @classmethod
@@ -285,6 +325,142 @@ class Iso9660Tests(unittest.TestCase):
                 data[start + generator.randrange(34)] = generator.randrange(256)
             result = self.probe(data)
             self.assertIn(result.returncode, (0, 2), f"case {case}: {result.stderr.decode(errors='replace')}")
+
+    def test_rock_ridge_names_attributes_and_susp_prefix(self):
+        for skip in (0, 14):
+            data, _ = rr_fixture(skip=skip)
+            self.assertEqual(self.success(self.probe(data, "format")), b"rock-ridge\n")
+            self.assertIn("Mixed-中文.txt", self.success(self.probe(data)).decode().splitlines())
+            self.assertEqual(self.success(self.probe(data, "read", "/Mixed-中文.txt")), b"ridge\nOK")
+            self.rejected(self.probe(data, "read", "/mixed-中文.txt"), -2)
+            values = list(map(int, self.success(self.probe(data, "stat", "/Mixed-中文.txt")).split()))
+            self.assertEqual(values[:5], [0o100640, 123, 456, 1, 8])
+            self.assertEqual(values[-1], 7)
+        entry = record("OLD.TXT;1", 50, 8, system_use=posix(old=True) + name_entry("old"))
+        data, _ = rr_fixture([entry])
+        self.assertEqual(self.success(self.probe(data, "read", "/old")), b"ridge\nOK")
+
+    def test_rock_ridge_continued_name_and_cross_sector_area(self):
+        name = "N" * 220 + "中文.txt"
+        encoded = name.encode()
+        tail = name_entry(encoded[80:]) + system_use("ST")
+        entry = record("LONG.TXT;1", 50, 8, system_use=posix() + name_entry(encoded[:80], 1) + continuation(42, 2000, len(tail)))
+        data, _ = rr_fixture([entry], extra_area=tail)
+        self.assertEqual(self.success(self.probe(data, "read", "/" + name)), b"ridge\nOK")
+
+    def test_rock_ridge_symbolic_link_components_and_continuation(self):
+        first = system_use("SL", b"\1\x08\0\x00\x03dir\x01\x04long")
+        second = system_use("SL", b"\0\x00\x04name\x04\0\x02\0\x00\x03end")
+        tail = second + system_use("ST")
+        entry = record("LINK;1", 0, 0, system_use=posix(0o120777) + name_entry("link") + first + continuation(42, 2000, len(tail)))
+        data, _ = rr_fixture([entry], extra_area=tail)
+        self.assertEqual(self.success(self.probe(data, "readlink", "/link")), b"/dir/longname/.././end")
+        values = list(map(int, self.success(self.probe(data, "stat", "/link")).split()))
+        self.assertEqual(values[0], 0o120777)
+        self.assertEqual(values[4], len(b"/dir/longname/.././end"))
+        self.rejected(self.probe(data, "read", "/link"), -22)
+
+    def test_rock_ridge_relocated_directory_and_parent_link(self):
+        child = system_use("CL", both32(22))
+        parent = system_use("PL", both32(20))
+        entries = [record("DEEP;1", 0, 0, system_use=posix(0o40751, serial=8) + name_entry("deep") + child),
+                   record("HIDDEN", 22, SECTOR, 2, posix(0o40751, serial=8) + system_use("RE"))]
+        data, _ = rr_fixture(entries)
+        relocated, _ = directory([record("INNER.TXT;1", 50, 8, system_use=posix() + name_entry("inside.txt"))],
+                                 22, 20, posix(0o40751, serial=8), posix(0o40751, serial=1) + parent)
+        data[22 * SECTOR:23 * SECTOR] = relocated
+        self.assertEqual(self.success(self.probe(data)).decode().splitlines(), ["deep"])
+        self.assertEqual(self.success(self.probe(data, "read", "/deep/inside.txt")), b"ridge\nOK")
+        wrong = bytearray(data)
+        offset = wrong.index(parent)
+        wrong[offset + 4:offset + 12] = both32(23)
+        self.rejected(self.probe(wrong))
+
+    def test_rock_ridge_malformed_continuations_and_fields(self):
+        bad_areas = [continuation(41, 0, 28), continuation(0xffffffff, 0, 8), continuation(42, 0xffffffff, 8),
+                     b"CE\x03\x01", system_use("ER", b"\xff\0\0\1"), system_use("ES", b"\x02")]
+        for extra in bad_areas:
+            data, _ = rr_fixture(root_extra=extra)
+            self.rejected(self.probe(data))
+        for field in (name_entry(b"unfinished", 1), name_entry(b"a/b"), name_entry(b"a\0b"), name_entry(b".."),
+                      system_use("SL", b"\0\x01\x01a"), system_use("SL", b"\0\x08\x01a"),
+                      posix() + posix(), system_use("PX", bytes(32)), system_use("TF", b"\x02")):
+            entry = record("BAD;1", 50, 8, system_use=field)
+            data, _ = rr_fixture([entry])
+            self.rejected(self.probe(data))
+
+    def test_rock_ridge_sparse_and_compressed_data_are_not_returned_raw(self):
+        for tag in ("SF", "ZF"):
+            data, _ = rr_fixture([record("ENCODED;1", 50, 8, system_use=posix() + name_entry("encoded") + system_use(tag))])
+            self.rejected(self.probe(data, "read", "/encoded"), -95)
+
+    def test_rock_ridge_multiple_timestamp_entries_and_long_form(self):
+        short = bytes((124, 2, 29, 12, 34, 56, 4))
+        long = b"2024022912345699" + bytes((4,))
+        fields = posix() + name_entry("times")
+        fields += system_use("TF", b"\x02" + short) + system_use("TF", b"\x84" + long)
+        data, _ = rr_fixture([record("TIMES;1", 50, 8, system_use=fields)])
+        values = list(map(int, self.success(self.probe(data, "stat", "/times")).split()))
+        self.assertEqual(values[5:7], [1709206496000000000, 1709206496990000000])
+        fields += system_use("TF", b"\x02" + short)
+        data, _ = rr_fixture([record("TIMES;1", 50, 8, system_use=fields)])
+        self.rejected(self.probe(data))
+
+    def test_rock_ridge_mutated_system_use_areas_never_crash(self):
+        tail = name_entry(b"end") + system_use("ST")
+        fields = posix() + name_entry(b"start", 1) + continuation(42, 2000, len(tail))
+        original, offsets = rr_fixture([record("MUTATED;1", 50, 8, system_use=fields)], extra_area=tail)
+        generator = random.Random(1282)
+        for case in range(100):
+            data = bytearray(original)
+            begin = generator.choice([20 * SECTOR + 34, offsets[0] + 42, 41 * SECTOR, 42 * SECTOR + 2000])
+            for _ in range(generator.randrange(1, 9)):
+                data[begin + generator.randrange(30)] = generator.randrange(256)
+            result = self.probe(data)
+            self.assertIn(result.returncode, (0, 2), f"case {case}: {result.stderr.decode(errors='replace')}")
+
+    def test_rock_ridge_final_section_attributes_apply_to_whole_file(self):
+        entries = [record("SECTIONS;1", 50, SECTOR, 0x80, posix(uid=9) + name_entry("first")),
+                   record("SECTIONS;1", 52, 8, system_use=posix(0o100604) + name_entry("final"))]
+        data, _ = rr_fixture(entries)
+        data[50 * SECTOR:51 * SECTOR] = b"A" * SECTOR
+        data[52 * SECTOR:52 * SECTOR + 8] = b"ridge\nOK"
+        self.assertEqual(self.success(self.probe(data)).decode().splitlines(), ["final"])
+        values = list(map(int, self.success(self.probe(data, "stat", "/final")).split()))
+        self.assertEqual(values[:5], [0o100604, 123, 456, 1, SECTOR + 8])
+        self.assertEqual(self.success(self.probe(data, "read", "/final")), b"A" * SECTOR + b"ridge\nOK")
+
+    @unittest.skipUnless(shutil.which("xorriso"), "separate xorriso fixture generator missing")
+    def test_real_rock_ridge_precedence_links_attributes_and_deep_tree(self):
+        files = self.work / "ridge-files"
+        files.mkdir(exist_ok=True)
+        name = "Mixed-中文-" + "long-name-" * 18 + ".txt"
+        source = files / name
+        source.write_bytes(b"real rock ridge\n")
+        source.chmod(0o640)
+        os.utime(source, (1700000001, 1700000002))
+        (files / "relative-link").symlink_to(name)
+        (files / "absolute-link").symlink_to("/" + name)
+        deep = files
+        for index in range(12):
+            deep /= f"level-{index}"
+        deep.mkdir(parents=True, exist_ok=True)
+        (deep / "inside.txt").write_bytes(b"deep directory\n")
+        image = self.work / "real-ridge.iso"
+        subprocess.run(["xorriso", "-as", "mkisofs", "-quiet", "-iso-level", "3", "-R", "-J",
+                        "-rr_reloc_dir", ".rr_moved", "-uid", "123", "-gid", "456", "-o", str(image), str(files)],
+                       check=True, capture_output=True)
+        before = hashlib.sha256(image.read_bytes()).digest()
+        self.assertEqual(self.success(self.probe(operation="format", image=image)), b"rock-ridge\n")
+        self.assertEqual(self.success(self.probe(operation="read", path="/" + name, image=image)), source.read_bytes())
+        self.assertEqual(self.success(self.probe(operation="readlink", path="/relative-link", image=image)), name.encode())
+        self.assertEqual(self.success(self.probe(operation="readlink", path="/absolute-link", image=image)), ("/" + name).encode())
+        values = list(map(int, self.success(self.probe(operation="stat", path="/" + name, image=image)).split()))
+        self.assertEqual(values[:4], [0o100640, 123, 456, 1])
+        self.assertEqual(values[5:7], [1700000002000000000, 1700000001000000000])
+        self.assertEqual(self.success(self.probe(operation="read", path="/" + str((deep / "inside.txt").relative_to(files)), image=image)),
+                         b"deep directory\n")
+        self.assertEqual(hashlib.sha256(image.read_bytes()).digest(), before)
 
 
 if __name__ == "__main__":

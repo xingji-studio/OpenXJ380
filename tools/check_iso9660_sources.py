@@ -14,8 +14,10 @@ import re
 
 DIRECTORY = Path("driver/fs/iso9660")
 INCLUDES = {
-    "native.h": {"stdint.h"},
+    "native.h": {"rock_ridge.h"},
     "native.cpp": {"native.h", "errno.h"},
+    "rock_ridge.h": {"stdint.h"},
+    "rock_ridge.cpp": {"rock_ridge.h", "errno.h"},
     "iso9660.cpp": {"native.h", "block_access.h", "device.h", "efi/boot.h", "errno.h",
                     "fs/iso9660/iso9660.h", "input_method.h", "krlibc.h", "mutex.h",
                     "syscall/syscall.h", "task/scheduler.h", "user/permissions.h"},
