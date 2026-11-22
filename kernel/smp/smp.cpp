@@ -17,6 +17,8 @@
 
 XSK_SMP_INFO *xsi;
 
+#include "identity_aux.h"
+
 extern APIC_INFO ApicInfo;
 extern void     *temp_stack[MAX_CPU_NUM];
 extern uint32_t  smp_trampoline_rs;
@@ -108,6 +110,7 @@ extern "C" void apu_entry(uint64_t cpu_id, uint64_t tr)
     // AP reset/INIT disables caches and does not inherit the BSP's memory
     // types. Restore both before LAPIC calibration or running kernel/user work.
     mtrr_restore();
+    prepare_cpu_identity_aux(info);
 
     info->gdt_entries_t[0] = 0x0000000000000000U;
     info->gdt_entries_t[1] = 0x00a09a0000000000U;
@@ -264,6 +267,8 @@ bool start_ap(uint32_t cs_number, uint32_t lapic_id, PROCESSOR_INFO *cpuinf)
 PROCESSOR_INFO *get_current_cpu()
 {
     if (xsi == NULL) return NULL;
+
+    if (PROCESSOR_INFO *cpu = current_cpu_from_aux()) return cpu;
 
     // IRQs may enter from user mode without swapgs, so an arbitrary GSBASE
     // cannot identify this CPU. CPUID avoids the xAPIC MMIO/BQL access in
@@ -507,5 +512,8 @@ void init_smp(uint64_t MADT0)
         }
         current += (uint64_t)header->length;
     }
+    prepare_cpu_identity_aux(get_current_cpu());
+    finish_cpu_identity_aux_topology();
+
     write_serial_fmt("SMP init with %d cpus\n", xsi->cpu_count);
 }

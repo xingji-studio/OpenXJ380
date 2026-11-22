@@ -38,6 +38,18 @@ in `kernel/task/scheduler.cpp` are intentional ABI checks. New per-CPU state
 belongs after those assembly fields unless every assembly offset is reviewed
 and updated together.
 
+CPU identity can use a tagged array index in IA32_TSC_AUX when every online
+CPU advertises RDPID and verifies its own register during startup. AP setup
+runs after cache restoration; the BSP finalizes the firmware topology before
+publishing the fast path. Partial startup, missing features or failed readback
+retain the existing CPUID/LAPIC lookup. Tokens are bounded by the final CPU
+count and require an initialized scheduler queue. Preserve user GS state and
+the fixed entry ABI; the register stores CPU identity and does not change the
+HPET time source. The contract follows the [Intel RDPID instruction reference](https://www.intel.com/content/dam/www/public/us/en/documents/manuals/64-ia-32-architectures-software-developer-vol-2b-manual.pdf).
+`tests/test_cpu_identity_aux.py` covers publication ordering, mixed feature
+support, readback failures, sparse APIC IDs and invalid-token fallback; the
+legacy identity fixture continues to exercise the CPUID/LAPIC paths.
+
 Each AP must restore the BSP's MTRR/PAT snapshot and clear CR0.CD/NW before
 LAPIC calibration or runnable task publication. INIT leaves the AP's caches
 disabled; the trampoline and FPU setup do not enable them. `mtrr_save()` records
