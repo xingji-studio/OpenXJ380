@@ -2,6 +2,8 @@
 #ifdef XHCI_BUILTIN
 #include <block_source.h>
 #include <efi/boot.h>
+#include <fs/boot_root.h>
+#include "../../kernel/boot_debug_color.h"
 extern BOOT_CONFIG *EFI_BC;
 #endif
 
@@ -60,8 +62,26 @@ static xhci_controller *g_boot_probe_controller;
 static UsbBootDiagnostics g_boot_probe;
 static bool g_boot_probe_valid, g_boot_probe_capture;
 
+static bool xhci_bound_boot()
+{
+    return EFI_BC && (EFI_BC->boot_flags & BOOT_FLAG_BOUND_ROOT) &&
+           !(EFI_BC->boot_flags & BOOT_FLAG_INSTALLER) && xj_root_binding_valid(&EFI_BC->root_binding);
+}
+
 static void xhci_boot_init(xhci_controller *xhci)
 {
+    if (xhci_bound_boot())
+    {
+        // Native USB roots have no installer transport handoff. Retain an
+        // observation of the first controller without using it as authority.
+        if (!g_boot_probe_valid)
+        {
+            g_boot_probe = {};
+            g_boot_probe_controller = xhci;
+            g_boot_probe_valid = g_boot_probe_capture = true;
+        }
+        return;
+    }
     if (!EFI_BC || !(EFI_BC->boot_flags & BOOT_FLAG_INSTALLER_HANDOFF) ||
         !(EFI_BC->boot_flags & BOOT_FLAG_INSTALLER)) return;
     const auto &source = EFI_BC->installer_handoff.source;
@@ -178,8 +198,36 @@ bool xhci_boot_diagnostics(UsbBootDiagnostics *output)
     return true;
 }
 
+static void xhci_wait_bound_root()
+{
+    if (!xhci_bound_boot()) return;
+    uint64_t begin = nanoTime();
+    for (unsigned attempt = 0; attempt < 15; ++attempt)
+    {
+        if (partition_boot_disk_present(&EFI_BC->root_binding))
+        {
+            if (attempt) boot_debug::root_status("bound disk found after USB rescan", 0, 0, 0);
+            return;
+        }
+        if (nanoTime() - begin >= 1500000000ULL) break;
+        if (!attempt)
+        {
+            write_serial_fmt_heapless("xhci: waiting for bound root disk before partition scan\n");
+            boot_debug::root_status("waiting for bound USB disk", 0, 0, 0);
+        }
+        // Workers cannot run until root mounting completes. Finish discovery
+        // synchronously while partition_runtime_ready is still false, avoiding
+        // hotplug automounts before the selected root has been validated.
+        delay_ms_hp(100);
+        usb_scan_all_hubs();
+    }
+    if (partition_boot_disk_present(&EFI_BC->root_binding)) return;
+    boot_debug::root_status("bound disk not seen after USB rescans", -ENODEV, 0, 0);
+}
+
 static void xhci_wait_boot_source()
 {
+    if (xhci_bound_boot()) { xhci_wait_bound_root(); return; }
     if (!EFI_BC || !(EFI_BC->boot_flags & BOOT_FLAG_INSTALLER_HANDOFF) ||
         !(EFI_BC->boot_flags & BOOT_FLAG_INSTALLER)) return;
     const auto &source = EFI_BC->installer_handoff.source;

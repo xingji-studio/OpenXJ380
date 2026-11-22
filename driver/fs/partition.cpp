@@ -10,6 +10,10 @@
 #include <ioctl.h>
 #include <dlinker.h>
 #include <block_access.h>
+#include <fs/boot_root.h>
+#ifdef XHCI_BUILTIN
+#include <usb_boot_diagnostics.h>
+#endif
 #include "../../kernel/boot_debug_color.h"
 extern device_t device_ctl[256];
 partition_t     partitions[MAX_PARTITIONS_NUM];
@@ -664,6 +668,28 @@ int partition_ioctl(device_t *device, size_t req, void *arg)
     return EOK;
 }
 
+bool partition_boot_disk_present(const XJ_ROOT_BINDING *binding)
+{
+    if (!binding || !xj_root_binding_valid(binding)) return false;
+    alignas(16) uint8_t sector[4096];
+    for (unsigned id = 0; id < 256; ++id)
+    {
+        const device_t *entry = get_device(id);
+        if (!entry || entry->flag < 1 || entry->type != DEVICE_BLOCK) continue;
+        const device_t disk = *entry;
+        if (partition_name_is_slice(disk.drive_name) || disk.sector_size < 512 || disk.sector_size > sizeof(sector) ||
+            (disk.sector_size & (disk.sector_size - 1)) || disk.size / disk.sector_size < 2)
+            continue;
+        // Include SATA/NVMe disks so an already available internal root does
+        // not incur a USB wait. Read whole-device sector 1, never a partition.
+        if (device_read(1, 1, sector, id) != 1) continue;
+        if (!memcmp(sector, GPT_HEADER_SIGNATURE, 8) &&
+            !memcmp(sector + __builtin_offsetof(GPT_DPT, disk_guid), xj_root_binding_disk_guid(binding), 16))
+            return true;
+    }
+    return false;
+}
+
 void partition_init()
 {
     memset(partition_gpt_disks, 0, sizeof(partition_gpt_disks));
@@ -910,8 +936,35 @@ static int partition_mount_bound_root(const XJ_ROOT_BINDING &binding)
     int error = partition_select_bound_root(binding, index);
     if (error)
     {
-        boot_debug::root_status(partition_inventory_complete ? "partition selection" : "GPT inventory incomplete",
-                                error, 0, 0);
+        const char *reason = partition_inventory_complete ? "partition selection" : "GPT inventory incomplete";
+        char detail[128];
+        if (error == -ENOENT)
+        {
+            bool disk_seen = false, root_seen = false;
+            for (const auto &disk : partition_gpt_disks)
+                if (disk.seen && !memcmp(disk.disk_guid, xj_root_binding_disk_guid(&binding), 16)) disk_seen = true;
+            for (size_t i = 0; i < partition_num; ++i)
+                if (partitions[i].is_used && partitions[i].type == partitions[i].GPT &&
+                    !memcmp(partitions[i].unique_partition_guid, xj_root_binding_root_guid(&binding), 16))
+                    root_seen = true;
+            reason = !disk_seen ? "bound disk not detected" :
+                     !root_seen ? "bound system partition absent" : "bound EFI partition absent";
+#ifdef XHCI_BUILTIN
+            UsbBootDiagnostics usb;
+            if (!disk_seen && xhci_boot_diagnostics(&usb))
+            {
+                const auto &probe = usb.last;
+                snprintf(detail, sizeof(detail), "disk absent; USB %u/%u p%u %s rc=%d cc=%u %04x:%04x",
+                         usb.connected, usb.ports, probe.port, usb_boot_stage_name(probe.stage),
+                         probe.first_error ? probe.first_error : probe.result, probe.completion_code,
+                         unsigned(probe.vendor), unsigned(probe.product));
+                reason = detail;
+            }
+#else
+            (void)detail;
+#endif
+        }
+        boot_debug::root_status(reason, error, 0, 0);
         return error;
     }
     device_t *device = get_device(partitions[index].vdisk_id);
