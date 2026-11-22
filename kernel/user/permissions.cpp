@@ -38,11 +38,24 @@ struct PermissionRequest
 };
 static PermissionRequest *requests, *tail;
 
+static bool under(const char *path, const char *directory);
+
 static uint8_t mask_of(const UserInfo *user)
 {
     if (!user) return 0;
     return user->user_type == XUT_Custom ? user_permission_mask(user->user_prms) :
                                          user_type_permission_mask(user->user_type);
+}
+
+static void system_app_permissions_locked(UserInfo *user, const char *directory)
+{
+    if (!directory || !under(directory, "/apps/system")) return;
+    uint8_t mask = mask_of(user);
+    if (mask & XPERM_NV) return;
+    // Image placement grants NV independently of the account's consent ceiling.
+    // Custom represents the extended set without changing the global Visitor role.
+    user->user_prms = user_permissions_from_mask(mask | XPERM_NV);
+    user->user_type = XUT_Custom;
 }
 
 void permissions_session_publish(const UserInfo *info)
@@ -118,6 +131,7 @@ bool permissions_launch_matches(pcb_t process, pcb_t parent, ProcessCredentialSo
     UserInfo expected;
     spin_lock(&permission_lock);
     launch_user_locked(&expected, parent, source);
+    if (process) system_app_permissions_locked(&expected, process->permission_directory);
     bool matches = process && expected.user_type == process->permission_user.user_type &&
         mask_of(&expected) == mask_of(&process->permission_user) &&
         !strcmp(expected.name, process->permission_user.name);
@@ -133,6 +147,7 @@ void permissions_process_exec(pcb_t process, const char *directory)
     {
         strncpy(process->permission_directory, directory, sizeof(process->permission_directory) - 1);
         process->permission_directory[sizeof(process->permission_directory) - 1] = 0;
+        system_app_permissions_locked(&process->permission_user, process->permission_directory);
     }
     __atomic_add_fetch(&process->permission_revision, 1ULL, __ATOMIC_RELEASE); // Invalidate previous consent.
     spin_unlock(&permission_lock);
@@ -586,6 +601,24 @@ PermissionDialogReaderScope::~PermissionDialogReaderScope()
     if (reader) vfs_close(reader);
 }
 
+PermissionExecutableReadScope::PermissionExecutableReadScope(vfs_node_t executable) :
+    task(get_current_task()), previous(task ? task->permission_executable_reader : NULL)
+{
+    if (!task) return;
+    // The caller pins this node until the scope ends. Resolve before publishing
+    // the pointer so aliases cannot turn arbitrary data into a load exception.
+    char *path = executable ? vfs_get_fullpath(executable) : NULL;
+    bool allowed = path && under(path, "/apps/system") &&
+        !(executable->type & (file_dir | file_block | file_pipe | file_socket | file_stream | file_ptmx | file_pts));
+    task->permission_executable_reader = allowed ? executable : NULL;
+    free(path);
+}
+
+PermissionExecutableReadScope::~PermissionExecutableReadScope()
+{
+    if (task) task->permission_executable_reader = previous;
+}
+
 PermissionTerminalLaunchScope::PermissionTerminalLaunchScope(bool enabled) :
     task(get_current_task()), previous(task && task->permission_terminal_launch), active(task && enabled)
 {
@@ -644,7 +677,18 @@ static bool public_read_path(const char *path)
 static bool system_path(const char *path)
 {
     // Shared resources do not inherit SV/SR/SW from their /system parent.
-    return !shared_resource_path(path) && (under(path, "/system") || under(path, "/EFI"));
+    // Only the root itself is protected here; its ordinary children stay NV.
+    return equal_fold(path, "/") || (!shared_resource_path(path) &&
+        (under(path, "/system") || under(path, "/EFI") || under(path, "/apps/system")));
+}
+
+static int ordinary_category(const char *path, const char *application)
+{
+    // A root-installed executable owns its descendants, never the root node.
+    // Other application directories precede the system-directory category.
+    if (equal_fold(path, "/")) return 0;
+    if (under(path, application)) return 1;
+    return system_path(path) ? 0 : 2;
 }
 
 static bool account_store_path(const char *path, bool ancestors)
@@ -715,13 +759,14 @@ static bool path_access(const char *path, bool directory, int operation, uint8_t
         }
     }
     uint8_t required;
-    if (system_path(path))
+    int category = ordinary_category(path, application);
+    if (category == 0)
     {
         required = metadata || (directory && read) ? (uint8_t)XPERM_SV :
             (uint8_t)((read ? XPERM_SR : 0) | (write ? XPERM_SW : 0));
         if (directory && write) required |= XPERM_SW;
     }
-    else if (under(path, application))
+    else if (category == 1)
         required = (write ? XPERM_W : 0) | ((read || metadata) ? XPERM_R : 0);
     else
     {
@@ -844,10 +889,11 @@ static bool file_access(vfs_node_t node, const char *path, int operation, unsign
     application[sizeof(application) - 1] = 0;
     char *resolved = node ? vfs_get_fullpath(node) : path ? canonical_target(path) : NULL;
     if (!resolved) { permissions_set_file_error(EACCES); return false; }
-    // Fixed runtime image loading has read-only exceptions. The picker never
-    // receives permission to read selected data.
+    // Runtime image reads authorize only the selected node or fixed service.
+    // These scopes do not change the caller's ordinary data permissions.
     bool service_read = operation == IME_FILE_READ &&
-        ((task->permission_dialog_launch_depth && equal_fold(resolved, XJ380_FILE_DIALOG_PATH)) ||
+        ((node && task->permission_executable_reader == node && under(resolved, "/apps/system")) ||
+         (task->permission_dialog_launch_depth && equal_fold(resolved, XJ380_FILE_DIALOG_PATH)) ||
          (task->permission_terminal_launch && equal_fold(resolved, XJ380_TERMINAL_PATH)));
     bool allowed = service_read || path_access(resolved, node && (node->type & file_dir), operation, mask, username,
                                                application, process, required_out);
@@ -1016,7 +1062,10 @@ int permissions_query_file_access(const char *path, uint64_t access, char *resol
             // requiring ordinary NV on its existing home directory.
             const char *owner = get_current_task()->parent_group->permission_user.name;
             bool album = canonical && special_permissions_path_mask(canonical, IME_FILE_WRITE, owner);
-            if (allowed && !album) allowed = permissions_file_requirements(parent, NULL, IME_FILE_WRITE, &required);
+            // Root protection applies to the root node, not creating a child.
+            // The actual missing components below classify their own paths.
+            if (allowed && !album && base && !equal_fold(base, "/"))
+                allowed = permissions_file_requirements(parent, NULL, IME_FILE_WRITE, &required);
             // Include each directory that mkdir/mkfile would have to create.
             size_t base_length = base ? strlen(base) : 0;
             for (char *p = canonical ? canonical + base_length : NULL; allowed && p && *p; ++p)
@@ -1112,7 +1161,7 @@ static int transfer_category(const char *path, const char *application)
     // Public reads are a separate category: a persistent hard link from an
     // ordinary NV/application file must not make that file universally readable.
     if (public_read_path(path)) return 5;
-    return system_path(path) ? 0 : under(path, application) ? 1 : 2;
+    return ordinary_category(path, application);
 }
 
 static bool file_transfer(vfs_node_t node, const char *destination, bool hard_link)

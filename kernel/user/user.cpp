@@ -311,6 +311,7 @@ static void free_file_image(uint8_t *buf, uint64_t size)
 static int read_vfs_file(vfs_node_t file, uint8_t **out, uint64_t *out_size)
 {
     if (file == NULL || out == NULL || out_size == NULL) return -EINVAL;
+    PermissionExecutableReadScope image_read(file);
     uint64_t size = file->size;
     if (size == 0) return -ENOEXEC;
     if (size > ~0ULL - (PAGE_SIZE - 1)) return -EFBIG;
@@ -899,7 +900,11 @@ int create_user_process_with_options(char *path, pcb_t pcb, char *argv[], const 
     for (unsigned depth = 0; script.node; ++depth)
     {
         unsigned char magic[4] = {};
-        size_t got = vfs_read(script.node, magic, 0, sizeof(magic));
+        size_t got;
+        {
+            PermissionExecutableReadScope image_read(script.node);
+            got = vfs_read(script.node, magic, 0, sizeof(magic));
+        }
         bool shebang = got >= 2 && magic[0] == '#' && magic[1] == '!';
         const char *extension = strrchr(path, '.');
         bool binary = got == 4 && ((magic[0] == 0x7f && magic[1] == 'E' && magic[2] == 'L' && magic[3] == 'F') ||

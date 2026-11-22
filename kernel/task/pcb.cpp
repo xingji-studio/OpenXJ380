@@ -1685,7 +1685,11 @@ int rewrite_shebang_exec(vfs_node_t *node, char **norm_path, char ***argv, size_
 
     char header[EXECVE_STRING_MAX];
     memset(header, 0, sizeof(header));
-    size_t got = vfs_read(*node, header, 0, sizeof(header) - 1);
+    size_t got;
+    {
+        PermissionExecutableReadScope image_read(*node);
+        got = vfs_read(*node, header, 0, sizeof(header) - 1);
+    }
     if (got < 2 || header[0] != '#' || header[1] != '!')
     {
         if (!fallback) return 0;

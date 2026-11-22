@@ -250,6 +250,7 @@ struct thread_control_block
     uint32_t kernel_boundary_depth;
     bool kernel_operation_pinned;
     bool kernel_exit_pending;
+    vfs_node_t permission_executable_reader; // Borrowed node, scoped to kernel image reads; never inherited.
 };
 
 extern pcb_t kernel_group;
