@@ -1317,7 +1317,9 @@ sys_(setsockopt, int fd, int level, int optname, const void *optval, socklen_t o
 
     // Preserve the existing compatibility behavior for other options. In
     // particular, glibc DNS uses advisory options absent from this provider.
-    if (level != SOL_SOCKET || optname != SO_REUSEADDR) return 0;
+    bool socket_option = level == SOL_SOCKET && optname == SO_REUSEADDR;
+    bool tcp_option = level == IPPROTO_TCP && optname == TCP_NODELAY;
+    if (!socket_option && !tcp_option) return 0;
     if (optlen < sizeof(int)) return SYSCALL_FAULT_(EINVAL);
     // The implemented option receives a kernel copy, never a user pointer.
     int value = 0;

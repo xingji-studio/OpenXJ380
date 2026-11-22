@@ -871,6 +871,16 @@ static int xj380_provider_setsockopt(void *socket_ptr, int level, int optname, c
         if (value) ip_set_option(socket->conn->pcb.ip, SOF_REUSEADDR);
         else ip_reset_option(socket->conn->pcb.ip, SOF_REUSEADDR);
     }
+    else if (level == IPPROTO_TCP && optname == TCP_NODELAY &&
+             NETCONNTYPE_GROUP(netconn_type(socket->conn)) == NETCONN_TCP && socket->conn->pcb.tcp)
+    {
+        // Netty enables this before sending latency-sensitive game updates.
+        // Returning success without changing the PCB leaves Nagle enabled.
+        // lwIP replaces a listener's PCB with a shorter layout without flags.
+        if (socket->conn->pcb.tcp->state == LISTEN) result = -EINVAL;
+        else if (value) tcp_nagle_disable(socket->conn->pcb.tcp);
+        else tcp_nagle_enable(socket->conn->pcb.tcp);
+    }
     else result = -ENOPROTOOPT;
     UNLOCK_TCPIP_CORE();
     return result;
