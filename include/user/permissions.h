@@ -97,20 +97,7 @@ public:
     PermissionDialogReaderScope &operator=(const PermissionDialogReaderScope &) = delete;
 };
 
-// Kernel image loading may read only the selected resolved system application.
-// The caller owns the node reference; this scope never grants application data access.
-class PermissionExecutableReadScope
-{
-    tcb_t task;
-    vfs_node_t previous;
-public:
-    explicit PermissionExecutableReadScope(vfs_node_t executable);
-    ~PermissionExecutableReadScope();
-    PermissionExecutableReadScope(const PermissionExecutableReadScope &) = delete;
-    PermissionExecutableReadScope &operator=(const PermissionExecutableReadScope &) = delete;
-};
-
-// Console startup may load the fixed shell before its new image receives NV.
+// Console startup execs the fixed shell without adding NV to the application.
 // finish() must run before exec's non-returning user-mode handoff.
 class PermissionTerminalLaunchScope
 {

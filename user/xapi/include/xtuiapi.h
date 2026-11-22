@@ -136,10 +136,10 @@ UINT64  xapi_SetNotifyPrcor(XApiNotifyPrcor func);
 UINT64  xapi_SendNotification(const XApiNotificationRequest *req);
 void 	xapi_Sleep(UINT64 ms);
 void 	xapi_Run(WSTR path);
-// Run/RunArgs start a new Visitor; resolved /apps/system images also receive NV.
+// Ordinary Run/RunArgs start a new Visitor, independent of the caller.
 UINT64  xapi_RunArgs(WSTR path, WSTR argv[]);
 // Parent-associated fork/exec-style spawn: snapshots the caller's user and permissions.
-// Returns a child PID or a negative errno; /apps/system images additionally receive NV.
+// Returns a child PID or a negative errno; never grants permissions beyond the parent.
 UINT64  xapi_SpawnInherited(WSTR path, WSTR argv[]);
 // Zero means permitted; positive values are missing permission bits; negatives are errors.
 INT64 xapi_QueryFileAccess(const char *path, UINT64 access);
