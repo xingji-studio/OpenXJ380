@@ -483,6 +483,18 @@ int session_source_prepare()
     int result = retain_source(saved_config.installer_handoff.source, &retained_source,
                                package_proof.profile == XJ_INSTALLER_PROFILE_STREAM_INDEX);
     if (result < 0) return refuse(result);
+    if (source_index.version == 3)
+    {
+        // Parse carrier metadata only after hardware identity, the real node
+        // reference and source exclusion are retained. Publish neither a partial
+        // file map nor a source whose outer catalog differs from the EFI copy.
+        result = prepare_stream_source(source_read_context);
+        if (result < 0)
+        {
+            quarantine_source(&retained_source);
+            return refuse(result);
+        }
+    }
     result = publish_source(&retained_source);
     if (result < 0)
     {
@@ -535,7 +547,7 @@ bool session_job_view(JobSessionView *output)
     output->package = reinterpret_cast<const void *>(direct_map_base + ext4_span.physical);
     output->package_bytes = ext4_span.bytes;
     output->source_reader = source_reader;
-    if (source_index.version == 2)
+    if (source_index.version >= 2 && source_index.fat32.size)
     {
         output->boot_package = source_index.fat32.data;
         output->boot_package_bytes = source_index.fat32.size;

@@ -343,12 +343,14 @@ implementations are not covered by the host checks.
 The root package is still streamed PAK2 with complete metadata and link handling.
 Its staging root excludes `/EFI` and `/system/kernel.krl`. The separate
 `out/installer-boot/EFI/XJ380/` tree holds the loader and kernel as ordinary files;
-the ISO puts that tree under `/installer/boot-files/`. Streaming-index version 2
-contains the main PAK2 metadata plus a small boot-file catalog and source extents
-for those independent files. Native validation/CRC checks cover both streams
-before the first target write. Version 1 indexes and the legacy five-argument
-ISO script remain supported for older factory fixtures. Editing/repacking the
-ISO still requires regenerating the physical-extent index.
+the ISO puts that tree under `/installer/boot-files/`. Streaming-index version 3
+contains the main PAK2 metadata, a small boot-file catalog and logical ranges
+bound to fixed file IDs. Native validation/CRC checks cover both streams before
+the first target write. Versions 1 and 2 and the legacy five-argument ISO script
+remain supported for older factory fixtures. Copying version 3 files to another
+FAT32 carrier preserves the index; changing package contents requires rebuilding
+it. Versions 1/2 still require regenerating their physical-extent index after
+repacking the FAT filesystem.
 
 After verifying a vendor ESP kernel's size/CRC against the binding, the loader
 sets `BOOT_FLAG_ESP_KERNEL_VERIFIED` in the existing boot-flags prefix. This
@@ -474,18 +476,29 @@ python3 tools/gen_ninja.py --out build.ninja
 ./ninja -f build.ninja installer.iso
 ```
 
-The ISO supports both UEFI optical boot (including a VMware virtual CD/DVD)
-and raw USB boot. Its GPT EFI System Partition and El Torito boot catalog
-reference the same FAT32 image, `EFI/BOOT/efiboot.img`, containing the EFI loader
-and `/installer` packages. The streaming index's volume-relative offsets remain
-valid through both boot paths; the FAT image is stored only once.
+The product ISO exposes `/EFI/BOOT/BOOTX64.EFI` and the complete `/installer`
+tree directly in its ISO9660 root. UEFI optical boot (including a VMware virtual
+CD/DVD) and raw/DD USB boot share the FAT32 bootstrap `boot/efiboot.img`, exposed
+by El Torito and GPT. That bootstrap contains the loader, installer kernel,
+installer-root package and index; the large system PAK and independent target
+boot files are stored only in the outer ISO tree.
 
-Write the ISO to the whole USB device using raw/DD mode. ISO extraction or
-file-copy mode is not supported: copying the outer `EFI/BOOT/BOOTX64.EFI` leaves
-the installer packages inside `efiboot.img`, where that loader cannot find them.
-Repacking its contents into a different FAT filesystem also invalidates the
-streaming index's physical extents. In VMware, attach the same ISO as a virtual
-CD/DVD and use UEFI firmware as before.
+The version 3 index addresses named files rather than build-time FAT sectors.
+ISO-mode extraction to a FAT32 USB volume is supported by the native carrier
+reader, including noncontiguous and physically backward file cluster chains.
+Raw/DD USB and optical sources use the ISO9660 tree on the same authenticated
+physical device. The loader needs only firmware FAT support: it reads the
+bootstrap before ExitBootServices; native drivers then read the system files.
+All FAT32 carrier files and the combined logical stream must fit the existing
+4-GiB-minus-one source budget. UEFI is required; this does not add BIOS boot.
+
+The native adapter first retains the actual source disk and USB read-only guard,
+then privately resolves the fixed payload/boot paths and compares the source
+index byte-for-byte with the firmware-loaded copy before publication. It does
+not mount a second filesystem, scan other disks, or weaken source/target leases.
+ISO9660 installation data stays read-only; RAM runtime files and the target disk
+remain writable. The five-argument compatibility builder still emits resident
+or version 1 physical-extent fixtures; it is not the product ISO-mode format.
 
 Native USB sources use the built-in xHCI/BOT driver and logical unit zero.
 The loader captures the complete PCI/USB/Hub/interface path and the actual
@@ -808,6 +821,50 @@ files. This is fresh installation and normal persistence evidence, separate
 from arbitrary interrupted-upgrade or installation power-cut recovery.
 
 
+## File-addressed installation media (stream-index version 3)
+
+The 128-byte header and `XJSTRM01` magic are retained. Version 3 uses the final
+24-byte table as `{logical offset, fixed file ID, real file length}`. ID zero is
+`/installer/system-payload.pak`; IDs one and two are the independent
+`/installer/boot-files/EFI/XJ380/BOOTX64.EFI` and `kernel.krl`. There is exactly
+one entry without an independent boot catalog, or exactly three with one.
+Ranges cover the logical source without padding or gaps. Metadata still stores
+file-relative offsets, lengths and CRC32Cs, and source data is checked before
+any destructive target request. The existing handoff profile and fixed ABI
+prefix remain unchanged.
+
+After source retention, a bounded private FAT32 reader locates files inside the
+actual loaded EFI volume. If its system PAK is absent, the original allocation-
+free ISO9660 core resolves files in the same retained whole device. A present
+but invalid FAT payload does not fall back to another source. FAT chains must
+terminate at exactly the declared size; mirror mismatches, cycles, crosslinked
+source files and out-of-volume clusters are refused. At most 65536 FAT extents
+are retained, ordered logically rather than by physical address. Carrier
+metadata workspace is bounded independently of system-data size. Parsing and
+I/O run outside publication locks; workers use the existing single-reader
+admission and 64-KiB bounce buffer. The one-time metadata preparation also admits
+the retained BSP boot-owner idle TCB, whose identity and TID must match. Its
+preparation flag is cleared before publication; application tasks, foreign idle
+TCBs and a reused TID cannot acquire that bootstrap exception. There are no
+firmware calls after handoff.
+
+`tests/test_installer_source_media.py` links the production FAT/ISO carrier
+reader under ASan/UBSan, including a real product hybrid and backward
+fragmentation. The USB runner's `usb-iso` mode creates a fresh GPT/FAT32 regular
+image and copies the exact ISO's visible files into it; it tests extraction
+semantics, not the Rufus application UI. Use `--install --cold-boot` with
+`--modes usb usb-iso optical` for full guest installation, independent target
+readback and installed-system boot. The source ISO and every test input are
+frozen before running; only disposable image clones are changed.
+
+The 2026-11-21 production-image acceptance completed extraction-based FAT32 USB,
+raw/DD USB and UEFI optical installation with the same frozen ISO. QEMU used TCG,
+2 GiB RAM and a 4 GiB NVMe target. Each case installed all 16900 records, passed
+independent GPT/FAT/ext4 checks and full content/metadata/link/xattr readback,
+then booted its target clone through the registered vendor entry with the
+installer detached and the generic fallback loader renamed. Rufus UI and
+physical USB/DVD hardware were not exercised by this virtual-media acceptance.
+
 ## Single ext4 payload and bounded source reads
 
 The product ISO contains one ext4 PAK2 in `out/system-payload.pak` and a small
@@ -819,7 +876,7 @@ The target has an ext4 system root first and a separate 64 MiB FAT32 ESP last.
 
 The loader reads only the index and the small GUI package. Handoff profile 4
 retains the existing 880-byte BOOT_CONFIG layout. The index is bounded to 64 MiB;
-its 128-byte header contains magic `XJSTRM01`, u32 version 1, u32 header size
+the legacy physical index's 128-byte header contains magic `XJSTRM01`, u32 version 1, u32 header size
 128, then u64 index bytes, on-media data-file bytes, extent count, ext4 metadata
 offset/bytes, legacy FAT32 metadata offset/bytes and extent-table offset. The
 legacy metadata length is zero on current media. Bytes 80..119 are zero; body
