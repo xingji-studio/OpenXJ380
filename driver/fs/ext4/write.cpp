@@ -1012,6 +1012,7 @@ int WriteSession::open(const WriteDevice &device, WriteWorkspace &workspace,
     journal_device.maximum_transfer_blocks = Journal::kMaximumUpdates;
     journal_device.maximum_updates = tx_capacity_;
     journal_device.performance = device_.performance;
+    journal_device.defer_checkpoint_clear = true;
     journal_device.read = journal_read;
     journal_device.write = journal_write;
     journal_device.flush = journal_flush;
@@ -1711,7 +1712,8 @@ int WriteSession::sync()
 {
     if (!active_) return -EINVAL;
     if (failed_ || journal_.failed()) return stop(-EIO);
-    return device_.flush(device_.context) ? 0 : stop(-EIO);
+    int error = journal_.sync();
+    return error ? stop(error) : 0;
 }
 
 int WriteSession::close()

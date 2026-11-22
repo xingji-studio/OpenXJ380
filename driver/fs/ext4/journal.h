@@ -78,6 +78,10 @@ struct JournalDevice
     uint32_t maximum_updates;
     // Zero-initialize the aggregate; sessions also live in calloc-owned storage.
     Performance *performance;
+    // The home checkpoint is still flushed before commit returns. A guarded
+    // WriteSession may retain its replayable log until sync or the next commit,
+    // avoiding a separate journal-superblock clear after every small write.
+    bool defer_checkpoint_clear;
 };
 
 struct BlockUpdate
@@ -95,6 +99,7 @@ public:
     // supports 4096 mapping blocks and sixteen recovery after-images.
     int open(const JournalDevice &device);
     int commit(const BlockUpdate *updates, unsigned count);
+    int sync();
     // A guarded mount also validates an empty/stale recovery view before clear.
     int recover(bool &replayed, bool validate_empty = false);
     bool has_pending() const { return ready_ && start_ != 0; }
@@ -130,6 +135,7 @@ private:
     uint32_t checksum_seed_;
     bool ready_;
     bool failed_;
+    bool checkpoint_clear_pending_;
 
     int fetch(uint64_t block, void *output);
     int store(uint64_t block, const void *input);
@@ -137,7 +143,7 @@ private:
     unsigned transfer_limit() const;
     int write_updates(const BlockUpdate *updates, unsigned count, bool log, uint8_t *single);
     int barrier();
-    int clear();
+    int clear(bool defer = false);
     bool valid_target(uint64_t block) const;
     uint32_t advance(uint32_t block, unsigned count) const;
     static bool read_recovery_image(void *context, unsigned index, void *output);

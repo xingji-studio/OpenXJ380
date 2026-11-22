@@ -57,12 +57,12 @@
     },
     {
       "path": "journal.cpp",
-      "sha256": "0f97bda96ea02121b28372bdc3575e9899ccf1b408eafbd1e1c55a5b0c4fb348",
+      "sha256": "7ec70125e9fef4a85a5c5617a30049b3d2df6156f7c0c4fabdbfd7ca733a50f3",
       "spdx": "Apache-2.0"
     },
     {
       "path": "journal.h",
-      "sha256": "bb3ae80f6ba15099fbb08bebe267d6223e38844a97a295c62d119e65d9e0f30b",
+      "sha256": "a35915adcd9f5ce46053d864a58ba221f1cfe44de77a85749b07e9b4c05fb133",
       "spdx": "Apache-2.0"
     },
     {
@@ -97,7 +97,7 @@
     },
     {
       "path": "write.cpp",
-      "sha256": "dd4d470a5073cbb91f422bebe89109327ae92c3746b1f6560a0cc2a2cf97f811",
+      "sha256": "851806a4529f862a7095b080fd6381b44d59f846b8972d9a5e913f0e328e1e11",
       "spdx": "Apache-2.0"
     },
     {

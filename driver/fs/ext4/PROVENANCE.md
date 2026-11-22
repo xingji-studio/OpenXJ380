@@ -250,3 +250,14 @@ symlink reads retain single-block transfers. Each block mapping is validated;
 holes, unwritten extents and discontinuities stop a physical run. This changes
 read submission size without adding read-ahead, dirty writeback or dependencies.
 The VFS adapter retains its existing error return and operation-mutex boundary.
+
+Journal checkpoint clearing may be deferred by the guarded WriteSession until
+explicit sync or replacement by the next transaction. Every successful commit
+still persists its log anchor, future-commit invalidation, log payload, commit
+record and home checkpoint in that order. Only the already checkpointed log's
+empty-superblock publication is combined with sync. Retained logs remain valid
+JBD2 replay inputs; sync and close publish a durable empty journal before the
+filesystem recovery bit can be cleared. This is original first-party code
+based on the public journal format documentation above, with no imported
+implementation or dependency. Crash-prefix tests cover consecutive shorter
+transactions, sequence wrap, checksums, acknowledged home data and failed sync.

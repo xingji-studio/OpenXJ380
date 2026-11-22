@@ -271,6 +271,7 @@ bool Journal::find_recovery_image(void *context, uint64_t block, unsigned &index
 int Journal::open(const JournalDevice &device)
 {
     ready_ = failed_ = false;
+    checkpoint_clear_pending_ = false;
     start_ = sequence_ = first_ = maximum_ = 0;
     checksum_version_ = 0;
     wide_ = false;
@@ -339,18 +340,34 @@ int Journal::open(const JournalDevice &device)
     return 0;
 }
 
-int Journal::clear()
+int Journal::clear(bool defer)
 {
     put32(super_ + 0x1c, 0);
     put32(super_ + 0x18, sequence_ + 1U);
     seal_super();
-    int result = store(mapping_[0], super_);
-    if (!result) result = barrier();
+    // Deferred clearing is valid only after a durable home checkpoint. The
+    // old on-disk anchor still names a complete transaction, so replay after a
+    // crash is idempotent. sync() publishes this cached empty superblock;
+    // another commit publishes its new sequence before reusing any log blocks.
+    int result = defer ? 0 : store(mapping_[0], super_);
+    if (!result && !defer) result = barrier();
     if (!result)
     {
         start_ = 0;
         ++sequence_;
+        checkpoint_clear_pending_ = defer;
     }
+    return result;
+}
+
+int Journal::sync()
+{
+    if (!ready_) return -EINVAL;
+    if (failed_) return -EIO;
+    if (start_) return -EBUSY;
+    int result = checkpoint_clear_pending_ ? store(mapping_[0], super_) : 0;
+    if (!result) result = barrier();
+    if (!result) checkpoint_clear_pending_ = false;
     return result;
 }
 
@@ -386,6 +403,7 @@ int Journal::commit(const BlockUpdate *updates, unsigned count)
     start_ = first_;
     put32(super_ + 0x1c, start_);
     seal_super();
+    checkpoint_clear_pending_ = false;
     int result = store(mapping_[0], super_);
     if (!result) result = barrier();
     // Invalidate the future commit slot before publishing a new descriptor.
@@ -458,7 +476,7 @@ int Journal::commit(const BlockUpdate *updates, unsigned count)
     if (!result) result = barrier();
     if (!result) result = write_updates(updates, count, false, block);
     if (!result) result = barrier();
-    if (!result) result = clear();
+    if (!result) result = clear(device_.defer_checkpoint_clear);
     if (!result && device_.performance)
     {
         auto &performance = *device_.performance;
