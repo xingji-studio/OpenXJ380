@@ -681,7 +681,14 @@ extern "C" registers_t *timer_handle(registers_t *reg)
 
     if (likely(current->status == RUNNING && current->task_level != TASK_IDLE_LEVEL)) {
         cpu->scheduler_ticks++;
-        if (cpu->scheduler_ticks < TIME_SLICE) {
+        // EEVDF slices are nanoseconds, while the calibrated APIC tick need
+        // not be 1 ms (the USB kernel uses 250 Hz). Reconsider at the first
+        // tick after this slice expires instead of multiplying it by four.
+        // Keep the tick ceiling for a stalled/regressing clock and for the
+        // explicit scheduler_yield() request; neither changes PCB/CPU layouts.
+        const uint64_t dispatched = current->eevdf_last_start;
+        const bool slice_expired = now >= dispatched && now - dispatched >= task_sched_slice(current);
+        if (cpu->scheduler_ticks < TIME_SLICE && !slice_expired) {
             send_eoi();
             return reg;
         }

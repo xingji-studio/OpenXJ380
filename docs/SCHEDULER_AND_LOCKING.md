@@ -109,8 +109,16 @@ Wake placement caps old sleeper lag with `max(old_vruntime, queue_base - credit)
 it must never erase consumed CPU time. A remote wake uses the target queue's
 non-idle runnable current task, or its minimum runnable vruntime, rather than the
 calling CPU's unrelated vruntime domain. CPU accounting and placement retain
-terminal-state CAS rules. The 250Hz hardware timer and four-tick switch policy
-remain unchanged; no task class receives an audio-specific priority or slice.
+terminal-state CAS rules. The hardware timer remains at 250Hz; no task class
+receives an audio-specific priority or slice. The timer reevaluates selection
+at the first interrupt after the current task's nanosecond slice expires.
+Four interrupts remain a fallback for a stalled or regressing clock and the
+explicit yield path, not the normal conversion from a four-ms slice to ticks.
+At 250Hz, waiting four interrupts would stretch that slice to sixteen ms and
+delay both runnable competitors and expired short sleepers. The product's
+`tests/test_scheduler_quantum.py` executes the production timer and selector at
+250Hz and 1000Hz, with the old four-tick condition as a failing control. It also
+checks short slices, between-tick dispatch, blocking, yield and disabled gates.
 `tests/test_scheduler_fairness.py` executes the production timer and selection
 with sixteen sub-tick sleepers competing against an ordinary four-ms-slice
 producer. An old-policy control reproduces starvation; the fixed policy has
