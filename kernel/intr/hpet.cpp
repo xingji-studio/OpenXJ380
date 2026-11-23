@@ -3,6 +3,7 @@
 #include <dlinker.h>
 #include <proto.hpp>
 #include <stdint.h>
+#include <boot_poll.h>
 
 HpetInfo       *info;
 static uint32_t hpetPeriodFs = 0;
@@ -62,6 +63,7 @@ void nsleep(uint64_t nano)
             targetTime  = n;
         }
         if (after >= nano) { return; }
+        boot_poll(n);
     }
 }
 

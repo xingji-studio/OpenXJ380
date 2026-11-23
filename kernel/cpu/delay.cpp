@@ -1,5 +1,8 @@
 #include <stdint.h>
 #include <dlinker.h>
+#include <boot_poll.h>
+
+BootPollHook boot_poll_hook = nullptr;
 
 #ifndef UINT64_MAX
     #define UINT64_MAX 0xffffffffffffffff
@@ -32,6 +35,25 @@ uint64_t get_cpu_freq_mhz()
 
 extern uint64_t nanoTime();
 
+void boot_poll_idle()
+{
+    // AP startup has already released apu_lock and published its idle task.
+    // Only one spare AP polls the clock; other APs retain their normal idle
+    // path. Unpublishing the hook releases this AP for ordinary scheduling.
+    static bool polling  = false;
+    bool        expected = false;
+    if (!__atomic_load_n(&boot_poll_hook, __ATOMIC_ACQUIRE) ||
+        !__atomic_compare_exchange_n(&polling, &expected, true, false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
+        return;
+    while (BootPollHook hook = __atomic_load_n(&boot_poll_hook, __ATOMIC_ACQUIRE))
+    {
+        hook(nanoTime());
+        for (unsigned pause = 0; pause < 128; ++pause)
+            __asm__ volatile("pause" ::: "memory");
+    }
+    __atomic_store_n(&polling, false, __ATOMIC_RELEASE);
+}
+
 void delay_ns(uint64_t ns)
 {
     uint64_t last = nanoTime();
@@ -47,6 +69,7 @@ void delay_ns(uint64_t ns)
             elapsed += d_time;
         }
         last = now;
+        boot_poll(now);
     }
 }
 

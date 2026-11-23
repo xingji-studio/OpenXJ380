@@ -2,6 +2,7 @@
 #include "cpu/lock.h"
 #include "cpu/regio.h"
 #include <cpu/idle.h>
+#include <boot_poll.h>
 #include "pctable/gdt.h"
 #include "pctable/idt.h"
 #include "proto.hpp"
@@ -185,6 +186,7 @@ extern "C" void apu_entry(uint64_t cpu_id, uint64_t tr)
     __atomic_fetch_add(&scheduler_is_ready, 1, __ATOMIC_RELEASE);
     spin_unlock(&apu_lock);
     enable_intr();
+    boot_poll_idle();
 
     while (true)
     {
